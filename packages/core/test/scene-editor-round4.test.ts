@@ -251,7 +251,7 @@ describe('P2 硬约束 4：validateProject 边界', () => {
     );
     expect(() =>
       editor.openProject(corrupt((p) => (p.scenes[0]!.activeCameraId = 'sample-ground'))),
-    ).toThrow(/活动机位不存在或不属于活动场景/);
+    ).toThrow(/场景「主场景」的机位不存在或不是相机/);
     // 机位属于其他场景：活动场景不可达 → 拒绝
     expect(() =>
       editor.openProject(
@@ -271,7 +271,7 @@ describe('P2 硬约束 4：validateProject 边界', () => {
           p.scenes[0]!.activeCameraId = camBId;
         }),
       ),
-    ).toThrow(/活动机位不存在或不属于活动场景/);
+    ).toThrow(/场景「主场景」的机位不属于该场景/);
     expect(editor.getProject()).toBeNull();
   });
 });

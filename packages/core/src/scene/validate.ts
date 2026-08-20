@@ -43,6 +43,12 @@ export function validateSceneObjectData(object: unknown): string | null {
   if (!isFiniteVec3(t.position) || !isFiniteVec3(t.rotation) || !isFiniteVec3(t.scale)) {
     return '数值非法（不允许 NaN/Infinity）';
   }
+  // 分类型判别（R6，TML-57 第六轮）：载荷必须按类型存在，且字段类型与联合匹配
+  if (o.type === 'camera' && o.camera === undefined) return 'camera 对象缺少 camera 载荷';
+  if (o.type === 'light' && o.light === undefined) return 'light 对象缺少 light 载荷';
+  if (o.type === 'model' && typeof o.assetId !== 'string') {
+    return 'model 对象缺少资源引用（assetId）';
+  }
   if (o.geometry !== undefined) {
     if (typeof o.geometry !== 'object' || o.geometry === null) return 'geometry 非法';
     const kind = (o.geometry as { kind?: unknown }).kind;
@@ -84,7 +90,8 @@ export function validateSceneObjectData(object: unknown): string | null {
         return `camera.${field} 非法（不允许 NaN/Infinity）`;
       }
     }
-    if (camera.aspect !== null && !isFinitePair(camera.aspect)) return 'camera.aspect 非法';
+    // aspect 联合为 number|null（null 跟随项目画幅）；数组对是历史非法形态，须拒绝
+    if (camera.aspect !== null && typeof camera.aspect !== 'number') return 'camera.aspect 非法';
   }
   if (o.assetId !== undefined && typeof o.assetId !== 'string') return 'assetId 非法';
   return null;
@@ -152,6 +159,12 @@ export function validateProjectSchema(project: unknown): string | null {
           return '资源 part 字段非法';
         }
       }
+    }
+  }
+  // 交叉引用（R6）：model 对象的 assetId 必须指向项目内已注册资源
+  for (const object of p.objects) {
+    if (object.type === 'model' && !assetIds.has(object.assetId as string)) {
+      return `模型对象引用不存在的资源（${(object.assetId as string | undefined) ?? '缺失'}）`;
     }
   }
   return null;

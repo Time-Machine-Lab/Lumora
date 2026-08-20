@@ -31,16 +31,28 @@ export function getChildIds(project: Project, parentId: string | null): string[]
   return project.objects.filter((object) => object.parentId === parentId).map((object) => object.id);
 }
 
-/** 全部后代 ID（不含自身），深度优先 */
+/** 全部后代 ID（不含自身），深度优先。父级索引一次构建（O(n)），
+ *  不再每层全量 filter（深层链 O(n²)，R6，TML-57 第六轮） */
 export function getDescendantIds(project: Project, id: string): string[] {
+  const childrenOf = new Map<string, string[]>();
+  for (const object of project.objects) {
+    if (object.parentId === null) continue;
+    const list = childrenOf.get(object.parentId);
+    if (list) list.push(object.id);
+    else childrenOf.set(object.parentId, [object.id]);
+  }
   const result: string[] = [];
-  const walk = (parentId: string) => {
-    for (const child of project.objects.filter((o) => o.parentId === parentId)) {
-      result.push(child.id);
-      walk(child.id);
+  // 逆序入栈保持先父后子、同层按插入序的深度优先输出（与原递归实现一致）
+  const stack = [...(childrenOf.get(id) ?? [])].reverse();
+  while (stack.length > 0) {
+    const childId = stack.pop()!;
+    result.push(childId);
+    const grandchildren = childrenOf.get(childId);
+    if (grandchildren) {
+      // 保持深度优先且先父后子的输出顺序：逆序入栈
+      for (let i = grandchildren.length - 1; i >= 0; i--) stack.push(grandchildren[i]!);
     }
-  };
-  walk(id);
+  }
   return result;
 }
 

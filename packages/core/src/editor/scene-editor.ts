@@ -15,7 +15,7 @@ import {
   removeObjects,
   updateObject,
 } from '../scene/scene-graph';
-import { cloneProject, deepFreeze } from '../scene/immutable';
+import { deepFreeze } from '../scene/immutable';
 import { validateProjectSchema, validateSceneObjectData } from '../scene/validate';
 import { isSceneObject } from '../scene/types';
 import type { AssetData, Project, SceneObjectData, TransformData } from '../scene/types';
@@ -126,7 +126,14 @@ export class SceneEditor {
   }
 
   getView(): ViewState {
-    return { ...this.view, guides: { ...this.view.guides } };
+    return {
+      ...this.view,
+      viewMode:
+        this.view.viewMode === 'director'
+          ? 'director'
+          : { cameraObjectId: this.view.viewMode.cameraObjectId },
+      guides: { ...this.view.guides },
+    };
   }
 
   getHistoryState() {
@@ -139,16 +146,17 @@ export class SceneEditor {
   }
 
   openProject(project: Project): void {
-    // 输入先经完整校验（schema + 结构），失败同步抛错且不触碰任何状态；
-    // 再深克隆为编辑器自有状态并递归冻结：调用方/宿主此后持有的引用与编辑器完全解耦，
-    // 对输入的改动不可能影响编辑器（owned immutable）。
+    // 原子提交（R6）：先在局部完成 clone → 校验 → 冻结与 next state 构造，
+    // 全部就绪后才一次性提交 project/history/session/revision；
+    // 任何一步失败（DataCloneError/校验失败）都不触碰既有状态。
     this.assertAlive();
-    this.validateProject(project);
-    this.revisionCounter = project.revision;
+    const owned = this.own(project); // clone 先行：校验与冻结都在编辑器自有副本上进行
+    this.validateProject(owned);
+    this.swapState(owned, [], { resetView: true });
+    this.revisionCounter = owned.revision;
     this.history.clear();
     this.dragSnapshot = null;
     this.sessionToken += 1;
-    this.swapState(deepFreeze(cloneProject(project)), [], { resetView: true });
     this.emitProjectEvents();
     this.emitHistory();
   }
@@ -263,19 +271,20 @@ export class SceneEditor {
   addObject(object: SceneObjectData): Result<string> {
     const project = this.requireProject();
     if (!project) return failure('未打开项目');
-    if (!isSceneObject(object) || object.parentId !== null) return failure('对象数据不合法');
+    const owned = this.own(object); // 无条件克隆为编辑器自有数据（R6）
+    if (!isSceneObject(owned) || owned.parentId !== null) return failure('对象数据不合法');
     const scene = project.scenes.find((s) => s.id === project.activeSceneId);
     if (!scene) return failure('场景不存在');
     const scenes = project.scenes.map((s) =>
-      s.id === scene.id ? { ...s, rootObjectIds: [...s.rootObjectIds, object.id] } : s,
+      s.id === scene.id ? { ...s, rootObjectIds: [...s.rootObjectIds, owned.id] } : s,
     );
     const result = this.commit(
-      { ...project, scenes, objects: [...project.objects, object] },
-      `创建 ${object.name}`,
-      [object.id],
+      { ...project, scenes, objects: [...project.objects, owned] },
+      `创建 ${owned.name}`,
+      [owned.id],
     );
     if (!result.ok) return result;
-    return { ok: true, value: object.id };
+    return { ok: true, value: owned.id };
   }
 
   /** 删除选中对象（含子树）；子树含锁定对象时拒绝（FR-002） */
@@ -406,7 +415,8 @@ export class SceneEditor {
     if (!isInActiveScene(project, objectId)) return failure('对象不属于活动场景');
     if (!isValidTransform(transform)) return failure('数值非法（不允许 NaN/Infinity）');
     if (object.locked) return failure(`「${object.name}」已锁定，无法变换`);
-    return this.commit(updateObject(project, objectId, (o) => ({ ...o, transform })), label);
+    // 克隆数组为编辑器自有数据：调用方事后改 transform 不影响状态（R6）
+    return this.commit(updateObject(project, objectId, (o) => ({ ...o, transform: this.ownTransform(transform) })), label);
   }
 
   /**
@@ -432,7 +442,7 @@ export class SceneEditor {
       this.dragSnapshot = null;
       return failure(`「${object.name}」已锁定，无法变换`);
     }
-    const next = updateObject(project, objectId, (o) => ({ ...o, transform }));
+    const next = updateObject(project, objectId, (o) => ({ ...o, transform: this.ownTransform(transform) }));
     const before = this.dragSnapshot;
     this.dragSnapshot = null;
     const current: EditorSnapshot = { project, selection: [...this.selection] };
@@ -477,7 +487,9 @@ export class SceneEditor {
     }
     const problem = validateSceneObjectData(nextObject);
     if (problem) return failure('属性值非法');
-    return this.commit(updateObject(project, objectId, () => nextObject), label);
+    // 返回对象可能嵌入调用方持有的嵌套结构：克隆为编辑器自有数据后再提交，
+    // 不就地冻结调用方对象（R6）
+    return this.commit(updateObject(project, objectId, () => this.own(nextObject)), label);
   }
 
   setVisible(ids: string[], visible: boolean): Result {
@@ -512,23 +524,26 @@ export class SceneEditor {
     if (!project) return failure('未打开项目');
     const existing = findAssetByHash(project, asset.hash);
     if (existing) return { ok: true, value: { asset: existing, deduped: true } };
-    const result = this.commit(addAsset(project, asset), `注册资源 ${asset.name}`);
+    const owned = this.own(asset); // 无条件克隆为编辑器自有数据（R6）
+    const result = this.commit(addAsset(project, owned), `注册资源 ${owned.name}`);
     if (!result.ok) return result;
-    return { ok: true, value: { asset, deduped: false } };
+    return { ok: true, value: { asset: owned, deduped: false } };
   }
 
   /** 导入模型 = 注册资源 + 创建模型对象，作为一步历史 */
   importModel(asset: AssetData, object: SceneObjectData): Result<string> {
     const project = this.requireProject();
     if (!project) return failure('未打开项目');
-    if (!isSceneObject(object) || object.parentId !== null) return failure('对象数据不合法');
+    const ownedAsset = this.own(asset);
+    const ownedObject = this.own(object); // 无条件克隆为编辑器自有数据（R6）
+    if (!isSceneObject(ownedObject) || ownedObject.parentId !== null) return failure('对象数据不合法');
     const scene = project.scenes.find((s) => s.id === project.activeSceneId);
     if (!scene) return failure('场景不存在');
-    const existing = findAssetByHash(project, asset.hash);
-    const effectiveAsset = existing ?? asset;
+    const existing = findAssetByHash(project, ownedAsset.hash);
+    const effectiveAsset = existing ?? ownedAsset;
     // 同 hash 重复导入统一引用有效资源：无论调用方带什么 assetId，
     // 落库对象一律指向实际生效的资源（可能是已存在的去重资源）
-    const normalizedObject: SceneObjectData = { ...object, assetId: effectiveAsset.id };
+    const normalizedObject: SceneObjectData = { ...ownedObject, assetId: effectiveAsset.id };
     const scenes = project.scenes.map((s) =>
       s.id === scene.id ? { ...s, rootObjectIds: [...s.rootObjectIds, normalizedObject.id] } : s,
     );
@@ -561,22 +576,25 @@ export class SceneEditor {
 
   setViewMode(mode: ViewMode): void {
     if (this.disposed) return;
+    // 参数复制为自有数据：调用方事后改 mode 对象不影响编辑器（R6）
+    let owned: ViewMode =
+      mode === 'director' ? 'director' : { cameraObjectId: mode.cameraObjectId };
     // 机位视图按活动场景隔离：机位不存在/不是相机/不属于活动场景 → 一律回退导演视图
-    if (mode !== 'director') {
+    if (owned !== 'director') {
       const project = this.project;
-      const cameraId = mode.cameraObjectId;
+      const cameraId = owned.cameraObjectId;
       const camera = project ? findObject(project, cameraId) : undefined;
       if (!camera || camera.type !== 'camera' || !isInActiveScene(project!, cameraId)) {
-        mode = 'director';
+        owned = 'director';
       }
     }
     const same =
-      this.view.viewMode === mode ||
+      this.view.viewMode === owned ||
       (this.view.viewMode !== 'director' &&
-        mode !== 'director' &&
-        this.view.viewMode.cameraObjectId === mode.cameraObjectId);
+        owned !== 'director' &&
+        this.view.viewMode.cameraObjectId === owned.cameraObjectId);
     if (same) return;
-    this.view = { ...this.view, viewMode: mode };
+    this.view = { ...this.view, viewMode: owned };
     this.events.emit('view:changed', { view: this.getView() });
   }
 
@@ -606,6 +624,21 @@ export class SceneEditor {
     // 已释放的编辑器没有项目：一切写入都以「未打开项目」拒绝（无晚到提交）
     if (this.disposed) return null;
     return this.project;
+  }
+
+  /** 公开 ingress 的统一收口：克隆为编辑器自有数据再递归冻结（R6）。
+   *  校验与冻结都发生在自有副本上，调用方持有的对象永不被就地冻结、永不被别名。 */
+  private own<T>(value: T): T {
+    return deepFreeze(structuredClone(value));
+  }
+
+  /** transform 参数收口：三向量数组复制为自有数据（不复制整个对象） */
+  private ownTransform(transform: TransformData): TransformData {
+    return {
+      position: [...transform.position],
+      rotation: [...transform.rotation],
+      scale: [...transform.scale],
+    };
   }
 
   private duplicateSubtree(
@@ -778,13 +811,15 @@ export class SceneEditor {
     }
     const scene = project.scenes.find((s) => s.id === project.activeSceneId);
     if (!scene) throw new Error('活动场景不存在');
-    if (scene.activeCameraId !== null) {
-      const camera = byId.get(scene.activeCameraId);
+    // 所有场景的 activeCameraId 都必须指向本场景可达的相机（R6：非活动场景同样校验）
+    for (const s of project.scenes) {
+      if (s.activeCameraId === null) continue;
+      const camera = byId.get(s.activeCameraId);
       if (!camera || camera.type !== 'camera') {
-        throw new Error('活动机位不存在或不属于活动场景');
+        throw new Error(`场景「${s.name}」的机位不存在或不是相机`);
       }
-      if (!this.isReachableFrom(scene.rootObjectIds, project.objects, scene.activeCameraId)) {
-        throw new Error('活动机位不存在或不属于活动场景');
+      if (!this.isReachableFrom(s.rootObjectIds, project.objects, s.activeCameraId)) {
+        throw new Error(`场景「${s.name}」的机位不属于该场景`);
       }
     }
   }

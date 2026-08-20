@@ -62,6 +62,8 @@ export class TypedEventEmitter<E extends Record<string, unknown>> implements Dis
     const set = this.handlers.get(event);
     if (set) {
       for (const handler of [...set]) {
+        // 每个 handler 前检查终态：dispose 重入（监听器内释放）立即停止剩余监听器
+        if (this.disposedFlag) break;
         try {
           handler(payload);
         } catch (error) {
@@ -70,6 +72,7 @@ export class TypedEventEmitter<E extends Record<string, unknown>> implements Dis
       }
     }
     for (const handler of [...this.anyHandlers]) {
+      if (this.disposedFlag) break;
       try {
         handler(event, payload);
       } catch (error) {
