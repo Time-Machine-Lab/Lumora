@@ -2511,6 +2511,10 @@ describe('PluginHost', () => {
         async () => ({ default: { activate: () => activateGate } }),
       ),
     );
+    let bResolved = false;
+    registeringB.then(() => {
+      bResolved = true;
+    });
     await vi.waitFor(() => expect(host.getPlugin('com.example.plugin.b')?.state).toBe('activating'));
     // joiner：销毁窗口内加入 B 的在途激活
     const joining = host.enable('com.example.plugin.b');
@@ -2524,18 +2528,108 @@ describe('PluginHost', () => {
       disposeResolved = true;
     });
     await vi.waitFor(() => expect(deactivateA).toHaveBeenCalledTimes(1));
-    // 放行 B 的激活：成功路径发布 active，但宿主销毁仍卡在 A —— joiner 不得提前解析
+    // 放行 B 的激活：成功路径发布 active，但宿主销毁仍卡在 A —— joiner 与
+    // owner 均不得提前解析（owner 经成功路径的公共退出契约与共享销毁完成点收敛）
     releaseActivate();
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(joinedResolved).toBe(false);
+    expect(bResolved).toBe(false);
     expect(disposeResolved).toBe(false);
     releaseDeactivate();
     await disposing;
     expect(disposeResolved).toBe(true);
     await joining;
     expect(joinedResolved).toBe(true);
-    // B 的 owner（register）同样经公共退出契约收敛
     await registeringB;
+    expect(bResolved).toBe(true);
+    expect(host.listPlugins()).toHaveLength(0);
+  });
+
+  it('enabled:false 的 disabled 事件内启动慢 enable：register 收敛到 active，不返回 loading 快照', async () => {
+    const host = new PluginHost();
+    let releaseLoader!: () => void;
+    const loaderGate = new Promise<void>((resolve) => {
+      releaseLoader = resolve;
+    });
+    const entry = vi.fn(async () => {
+      await loaderGate;
+      return { default: definitionOf() };
+    });
+    let reentered = false;
+    host.events.on('plugin:state-changed', (e) => {
+      if (e.instanceId !== 'com.example.plugin' || e.state !== 'disabled' || reentered) return;
+      reentered = true;
+      // disabled 终态事件内同步启动慢 enable：监听器在首个 await 前把记录推进到 loading
+      void host.enable('com.example.plugin');
+    });
+    const registering = host.register(descriptor({ ...VALID_MANIFEST, enabled: false }, entry));
+    let registeredResolved = false;
+    let info: PluginInfo | undefined;
+    registering.then((result) => {
+      registeredResolved = true;
+      info = result;
+    });
+    await vi.waitFor(() => expect(entry).toHaveBeenCalledTimes(1));
+    // 慢 loader 在途：register（owner）必须加入同一加载/激活收敛，
+    // 不得以 loading 过渡态快照提前成功
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(registeredResolved).toBe(false);
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('loading');
+    releaseLoader();
+    await registering;
+    expect(registeredResolved).toBe(true);
+    expect(info?.state).toBe('active');
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('active');
+    expect(entry).toHaveBeenCalledTimes(1);
+  });
+
+  it('非法 Manifest 的 failed 事件内触发跨记录慢 host dispose：register 经公共退出契约收敛', async () => {
+    const host = new PluginHost();
+    let releaseDeactivate!: () => void;
+    const deactivateGate = new Promise<void>((resolve) => {
+      releaseDeactivate = resolve;
+    });
+    const deactivateA = vi.fn(() => deactivateGate);
+    // A：正常插件，deactivate 挂起（销毁顺序清理时卡在 A）
+    await host.register(
+      descriptor(VALID_MANIFEST, async () => ({ default: definitionOf({ deactivate: deactivateA }) })),
+    );
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('active');
+    // B：非法 Manifest —— failed 终态事件内触发宿主销毁
+    let disposing!: Promise<void>;
+    let disposeTriggered = false;
+    let disposeResolved = false;
+    host.events.on('plugin:state-changed', (e) => {
+      if (e.instanceId !== 'com.example.invalid' || e.state !== 'failed' || disposeTriggered) return;
+      disposeTriggered = true;
+      disposing = host.dispose();
+      disposing.then(() => {
+        disposeResolved = true;
+      });
+    });
+    const registering = host.register(
+      descriptor({ ...VALID_MANIFEST, id: 'com.example.invalid', contributes: 'not-an-array' }),
+    );
+    let registeredResolved = false;
+    let info: PluginInfo | undefined;
+    registering.then((result) => {
+      registeredResolved = true;
+      info = result;
+    });
+    await vi.waitFor(() => expect(disposeTriggered).toBe(true));
+    await vi.waitFor(() => expect(deactivateA).toHaveBeenCalledTimes(1));
+    // 宿主销毁仍卡在 A：B 的 register（failed 终态出口）不得提前解析
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(registeredResolved).toBe(false);
+    expect(disposeResolved).toBe(false);
+    releaseDeactivate();
+    await disposing;
+    expect(disposeResolved).toBe(true);
+    await registering;
+    expect(registeredResolved).toBe(true);
+    // 销毁下生命周期落定终态：failed 记录返回 inactive（销毁合并目标），
+    // 而非 deactivating 过渡态快照
+    expect(info?.state).toBe('inactive');
     expect(host.listPlugins()).toHaveLength(0);
   });
 });

@@ -277,11 +277,20 @@ export class PluginHost {
 
     if (!record.ready) {
       this.fail(record, record.reason ?? '插件未通过校验');
+      // failed 终态事件返回后必须经公共退出契约收敛再读取 info：事件内可能登记
+      // 宿主销毁（销毁同步把本记录推进到 deactivating）或启动新加载/激活 ——
+      // 不得以 deactivating 等过渡态快照或销毁在途状态提前返回；稳定且无重入
+      // 时该调用为无操作
+      await this.settleExit(record);
       return record.info();
     }
     if (record.manifest.enabled === false) {
       record.state = 'disabled';
       this.emitState(record, 'disabled');
+      // disabled 终态事件返回后必须经公共退出契约收敛再读取 info：事件内的重入
+      // enable 可能在首个 await 前把记录推进到 loading/activating —— 本调用作为
+      // 该流程的 owner 一并收敛到稳定终态，不得以 loading 快照提前成功
+      await this.settleExit(record);
       return record.info();
     }
 
