@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "types": ["vite/client"],
+    "paths": {
+      "@lumora/core": ["../../packages/core/src/index.ts"],
+      "@lumora/plugin-sdk": ["../../packages/plugin-sdk/src/index.ts"],
+      "@lumora/studio": ["../../packages/studio/src/index.ts"],
+      "@lumora/mock-plugin": ["../../examples/mock-plugin/src/index.tsx"],
+      "@lumora/mock-plugin/lumora.plugin.json": ["../../examples/mock-plugin/lumora.plugin.json"]
+    }
+  },
+  "include": ["src"]
+}

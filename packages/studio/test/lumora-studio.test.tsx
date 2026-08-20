@@ -1,0 +1,171 @@
+import { describe, expect, it, vi } from 'vitest';
+import { render, screen, waitFor } from '@testing-library/react';
+import type { Manifest, PanelContextProps, PluginDescriptor } from '@lumora/core';
+import { LumoraStudio } from '../src/components/LumoraStudio';
+import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
+import { createRef } from 'react';
+
+vi.mock('@react-three/fiber', () => ({
+  Canvas: ({ children }: { children?: React.ReactNode }) => (
+    <div data-testid="mock-canvas">{children}</div>
+  ),
+}));
+
+vi.mock('@react-three/drei', () => ({
+  OrbitControls: () => null,
+}));
+
+function TestPanel(props: PanelContextProps) {
+  return <div data-testid="test-panel">面板内容 · 插件 {props.pluginId}</div>;
+}
+
+const GOOD_MANIFEST: Manifest = {
+  schemaVersion: '1',
+  id: 'com.test.good',
+  name: '好插件',
+  version: '0.1.0',
+  entry: './dist/index.js',
+};
+
+const goodPlugin: PluginDescriptor = {
+  manifest: GOOD_MANIFEST,
+  entry: async () => ({
+    default: {
+      activate: (context) =>
+        context.contribute({
+          panels: [
+            { kind: 'panel', id: 'com.test.good.panel', title: '测试面板', component: TestPanel },
+          ],
+          toolbars: [
+            { kind: 'toolbar', id: 'com.test.good.tb', label: '测试命令', commandId: 'com.test.good.cmd' },
+          ],
+          commands: [
+            {
+              kind: 'command',
+              command: { id: 'com.test.good.cmd', title: '测试命令', execute: () => ({ ok: true }) },
+            },
+          ],
+        }),
+    },
+  }),
+};
+
+const badPlugin: PluginDescriptor = {
+  manifest: {
+    schemaVersion: '2',
+    id: 'com.test.bad',
+    name: '坏插件',
+    version: '0.1.0',
+    entry: './dist/index.js',
+  } as unknown as Manifest,
+};
+
+describe('LumoraStudio', () => {
+  it('渲染壳层并激活合法插件：面板、工具栏贡献项可见', async () => {
+    render(<LumoraStudio plugins={[goodPlugin]} hostVersion="0.1.0" />);
+    expect(await screen.findByTestId('lumora-studio')).toBeInTheDocument();
+    expect(await screen.findByTestId('mock-canvas')).toBeInTheDocument();
+    expect(await screen.findByTestId('test-panel')).toBeInTheDocument();
+    expect(await screen.findByTestId('toolbar-com.test.good.tb')).toBeInTheDocument();
+    expect(screen.getByTestId('open-plugin-manager')).toBeInTheDocument();
+  });
+
+  it('非法 Manifest 插件进入 failed 并在插件管理中显示原因', async () => {
+    render(<LumoraStudio plugins={[goodPlugin, badPlugin]} hostVersion="0.1.0" />);
+    await screen.findByTestId('test-panel');
+    screen.getByTestId('open-plugin-manager').click();
+    expect(await screen.findByTestId('plugin-reason-com.test.bad')).toHaveTextContent('Manifest 非法');
+    expect(await screen.findByTestId('plugin-state-com.test.good')).toHaveTextContent('运行中');
+    expect(screen.getByTestId('plugin-state-com.test.bad')).toHaveTextContent('失败');
+  });
+
+  it('禁用插件后其面板与工具栏贡献项全部移除，壳层仍可用', async () => {
+    render(<LumoraStudio plugins={[goodPlugin]} hostVersion="0.1.0" />);
+    await screen.findByTestId('test-panel');
+    screen.getByTestId('open-plugin-manager').click();
+    (await screen.findByTestId('plugin-toggle-com.test.good')).click();
+    await waitFor(() =>
+      expect(screen.queryByTestId('panel-tab-com.test.good.panel')).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId('test-panel')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('toolbar-com.test.good.tb')).not.toBeInTheDocument();
+    // 壳层依然可用
+    expect(screen.getByTestId('open-sample-project')).toBeInTheDocument();
+    expect(await screen.findByTestId('plugin-state-com.test.good')).toHaveTextContent('已禁用');
+  });
+
+  it('打开示例项目后 project:opened 事件可被宿主监听，关闭项目发出 project:closed', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    render(<LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" />);
+    await screen.findByTestId('test-panel');
+    const runtime = handle.current!.runtime;
+    const opened = vi.fn();
+    const closed = vi.fn();
+    runtime.events.on('project:opened', opened);
+    runtime.events.on('project:closed', closed);
+
+    screen.getByTestId('open-sample-project').click();
+    await waitFor(() => expect(opened).toHaveBeenCalledTimes(1));
+    expect(opened.mock.calls[0]![0].project.objects.length).toBeGreaterThan(0);
+    expect(runtime.getProject()?.uri).toBe('lumora://sample-project');
+    expect(screen.queryByTestId('studio-empty-hint')).not.toBeInTheDocument();
+
+    screen.getByTestId('close-project').click();
+    await waitFor(() => expect(closed).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId('studio-empty-hint')).toBeInTheDocument();
+  });
+
+  it('卸载组件时释放运行时：插件停用、订阅清空（WebGL 资源随 Canvas 卸载）', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const deactivate = vi.fn();
+    const plugin: PluginDescriptor = {
+      manifest: GOOD_MANIFEST,
+      entry: async () => ({
+        default: {
+          activate: (context) => {
+            context.events.on('project:opened', () => {});
+            return context.contribute({});
+          },
+          deactivate,
+        },
+      }),
+    };
+    const { unmount } = render(<LumoraStudio ref={handle} plugins={[plugin]} hostVersion="0.1.0" />);
+    await waitFor(() =>
+      expect(handle.current!.runtime.host.getPlugin('com.test.good')?.state).toBe('active'),
+    );
+    const events = handle.current!.runtime.events;
+    expect(events.handlerCount).toBeGreaterThan(0);
+
+    unmount();
+    await waitFor(() => expect(deactivate).toHaveBeenCalledTimes(1));
+    expect(events.handlerCount).toBe(0);
+  });
+
+  it('面板渲染抛错时显示错误边界并可通过其禁用插件', async () => {
+    function ExplodingPanel(): never {
+      throw new Error('面板渲染崩溃');
+    }
+    const plugin: PluginDescriptor = {
+      manifest: GOOD_MANIFEST,
+      entry: async () => ({
+        default: {
+          activate: (context) =>
+            context.contribute({
+              panels: [
+                { kind: 'panel', id: 'com.test.good.panel', title: '爆炸面板', component: ExplodingPanel },
+              ],
+            }),
+        },
+      }),
+    };
+    render(<LumoraStudio plugins={[plugin]} hostVersion="0.1.0" />);
+    expect(await screen.findByTestId('panel-error-fallback')).toBeInTheDocument();
+    // 壳层仍可用，且可经错误边界禁用插件
+    expect(screen.getByTestId('open-sample-project')).toBeInTheDocument();
+    screen.getByTestId('disable-plugin-from-panel').click();
+    await waitFor(() =>
+      expect(screen.queryByTestId('panel-error-fallback')).not.toBeInTheDocument(),
+    );
+  });
+});
