@@ -87,16 +87,27 @@ interface Entry {
   torn: boolean;
 }
 
+/** LeaseImpl 模块级 brand（R6，TML-57 第六轮）：release/discard 只认本模块签发的
+ *  真实 lease 实例，调用方伪造的 {hash, generation, release} 对象一律忽略。 */
+const issuedLeases = new WeakSet<LeaseImpl>();
+
 class LeaseImpl implements CacheLease {
   readonly hash: string;
   readonly generation: number;
   readonly content: Promise<GLTF>;
+  /** 所属 entry 反向引用：释放路径直接操作自身条目，不按 hash 查找 ——
+   * 同 hash 新 generation 取代旧条目后，旧 lease 的释放仍然从自己所在条目移除，
+   * 绝不因 generation 错配早退而把 stale 成员永久滞留在旧条目的 leases 里。
+   * LeaseImpl 为模块私有，ContentCache 通过该引用读写自身条目。 */
+  readonly entry: Entry;
   private released = false;
 
-  constructor(private cache: ContentCache, hash: string, generation: number, content: Promise<GLTF>) {
-    this.hash = hash;
-    this.generation = generation;
+  constructor(private cache: ContentCache, entry: Entry, content: Promise<GLTF>) {
+    this.entry = entry;
+    this.hash = entry.hash;
+    this.generation = entry.generation;
     this.content = content;
+    issuedLeases.add(this);
   }
 
   release(): void {
@@ -119,34 +130,65 @@ function defaultLoader(url: string): Promise<GLTF> {
   return new GLTFLoader().loadAsync(url);
 }
 
+/** 材质引用的全部纹理：对象值（map/normalMap/roughnessMap…）+
+ *  ShaderMaterial uniforms 的纹理值与纹理数组（R6，TML-57 第六轮）。 */
+function collectMaterialTextures(material: THREE.Material): THREE.Texture[] {
+  const textures: THREE.Texture[] = [];
+  for (const value of Object.values(material)) {
+    if (value && typeof value === 'object' && 'isTexture' in value) {
+      textures.push(value as THREE.Texture);
+    }
+  }
+  const uniforms = (material as THREE.ShaderMaterial).uniforms;
+  if (uniforms && typeof uniforms === 'object') {
+    for (const uniform of Object.values(uniforms) as { value?: unknown }[]) {
+      const value = uniform?.value;
+      if (value && typeof value === 'object' && 'isTexture' in value) {
+        textures.push(value as THREE.Texture);
+      } else if (Array.isArray(value)) {
+        for (const item of value) {
+          if (item && typeof item === 'object' && 'isTexture' in item) {
+            textures.push(item as THREE.Texture);
+          }
+        }
+      }
+    }
+  }
+  return textures;
+}
+
 /**
- * 按能力统一释放：Mesh/Points/Line/SkinnedMesh 均带 geometry + material；
- * 材质对象值中的全部纹理（map/normalMap/roughnessMap…）一并释放。
- * 以 identity Set 遍历完整资源图：GLTF 内同一 geometry/material/texture 可能被
- * 多个节点共享（DAG），每个 GPU 资源 exactly-once。
+ * 按能力统一释放（整 GLTF）：Mesh/Points/Line/SkinnedMesh 均带 geometry + material，
+ * 材质对象值与 ShaderMaterial uniforms 中的纹理一并释放；SkinnedMesh 的
+ * Skeleton.boneTexture（DataTexture）单独释放。
+ * 以全局 identity Set 遍历完整资源图：GLTF 内同一 geometry/material/texture 可能被
+ * 多个节点乃至多个场景（gltf.scene 与 gltf.scenes，R6 补全）共享（DAG），
+ * 每个 GPU 资源 exactly-once。
  */
-function disposeObject(object: THREE.Object3D): void {
+function disposeGltf(gltf: GLTF): void {
   const disposedGeometries = new Set<THREE.BufferGeometry>();
   const disposedMaterials = new Set<THREE.Material>();
   const disposedTextures = new Set<THREE.Texture>();
-  object.traverse((child) => {
-    const renderable = child as THREE.Mesh & {
-      geometry?: THREE.BufferGeometry;
-      material?: THREE.Material | THREE.Material[];
-    };
-    if (renderable.geometry && !disposedGeometries.has(renderable.geometry)) {
-      disposedGeometries.add(renderable.geometry);
-      renderable.geometry.dispose();
-    }
-    if (renderable.material) {
-      const materials = Array.isArray(renderable.material) ? renderable.material : [renderable.material];
-      for (const material of materials) {
-        if (disposedMaterials.has(material)) continue;
-        disposedMaterials.add(material);
-        material.dispose();
-        for (const value of Object.values(material)) {
-          if (value && typeof value === 'object' && 'isTexture' in value) {
-            const texture = value as THREE.Texture;
+  const visited = new Set<THREE.Object3D>();
+  const visit = (root: THREE.Object3D) => {
+    root.traverse((child) => {
+      if (visited.has(child)) return; // 多场景共享同一节点：只访问一次
+      visited.add(child);
+      const renderable = child as THREE.Mesh & {
+        geometry?: THREE.BufferGeometry;
+        material?: THREE.Material | THREE.Material[];
+      };
+      if (renderable.geometry && !disposedGeometries.has(renderable.geometry)) {
+        disposedGeometries.add(renderable.geometry);
+        renderable.geometry.dispose();
+      }
+      if (renderable.material) {
+        const materials = Array.isArray(renderable.material) ? renderable.material : [renderable.material];
+        for (const material of materials) {
+          if (disposedMaterials.has(material)) continue;
+          disposedMaterials.add(material);
+          material.dispose();
+          for (const texture of collectMaterialTextures(material)) {
             if (!disposedTextures.has(texture)) {
               disposedTextures.add(texture);
               texture.dispose();
@@ -154,8 +196,15 @@ function disposeObject(object: THREE.Object3D): void {
           }
         }
       }
-    }
-  });
+      const skeleton = (child as { skeleton?: THREE.Skeleton }).skeleton;
+      if (skeleton?.boneTexture && !disposedTextures.has(skeleton.boneTexture)) {
+        disposedTextures.add(skeleton.boneTexture);
+        skeleton.boneTexture.dispose();
+      }
+    });
+  };
+  for (const scene of gltf.scenes ?? []) visit(scene);
+  if (gltf.scene && !visited.has(gltf.scene)) visit(gltf.scene);
 }
 
 function basename(path: string): string {
@@ -163,10 +212,37 @@ function basename(path: string): string {
 }
 
 /**
+ * 统一 URI 规范化（R6，TML-57 第六轮）：percent-decode 路径段、剥离 query/fragment、
+ * 归并 dot-segment（. / ..）。GLTF 规范里相对 URI 是编码形态，依赖文件实体路径是
+ * 解码形态；两侧都规范化后再比较，编码差异不得造成漏匹配或假缺失。
+ */
+function normalizeUri(raw: string): string {
+  let path = raw;
+  try {
+    path = decodeURIComponent(path);
+  } catch {
+    // 孤立 % 等非法编码序列：按字面路径处理
+  }
+  const queryIndex = path.search(/[?#]/);
+  if (queryIndex >= 0) path = path.slice(0, queryIndex);
+  const segments = path.split('/');
+  const out: string[] = [];
+  for (const segment of segments) {
+    if (segment === '.' || segment === '') continue;
+    if (segment === '..') {
+      if (out.length > 0) out.pop();
+      continue;
+    }
+    out.push(segment);
+  }
+  return out.join('/');
+}
+
+/**
  * GLTF URI → 依赖文件 的规范解析（模型导入预检与缓存 URL 构建共用同一规则，
  * 保证「预检通过 ⇔ 可加载」，消除两处逻辑分叉）：
- * 精确相对路径优先；basename 仅当唯一时才兜底；0 个命中 = 缺失、>1 个命中 = 歧义，
- * 两者都必须失败（歧义不得静默取其一）。
+ * 精确相对路径优先（两侧经 normalizeUri 统一）；basename 仅当唯一时才兜底；
+ * 0 个命中 = 缺失、>1 个命中 = 歧义，两者都必须失败（歧义不得静默取其一）。
  */
 export type PartResolution<T extends { path: string }> =
   | { kind: 'exact'; part: T }
@@ -178,10 +254,11 @@ export function resolvePartPath<T extends { path: string }>(
   uri: string,
   parts: readonly T[],
 ): PartResolution<T> {
-  const exact = parts.find((p) => p.path === uri);
+  const norm = normalizeUri(uri);
+  const exact = parts.find((p) => normalizeUri(p.path) === norm);
   if (exact) return { kind: 'exact', part: exact };
-  const base = basename(uri);
-  const candidates = parts.filter((p) => basename(p.path) === base);
+  const base = basename(norm);
+  const candidates = parts.filter((p) => basename(normalizeUri(p.path)) === base);
   if (candidates.length === 1) return { kind: 'unique-basename', part: candidates[0]! };
   return { kind: candidates.length === 0 ? 'missing' : 'ambiguous', uri };
 }
@@ -331,13 +408,17 @@ export class ContentCache {
    * 主动放弃 + 判死刑：导入取消路径。条目无其他 lease 时立即清理；
    * loader 在途则延至 settle（condemned 的唯一 owner 收尾）。
    * 其他 lease 仍在使用时不得判死刑（同 hash 新会话正持租用），只释放自身。
+   * 只认真实 lease 且必须是本条目当前的 live 成员（R6，TML-57 第六轮）：
+   * 已 release/stale 的 lease 无权判死刑（release 后已从 Set 移除，membership 即真伪）。
    */
   discard(lease: CacheLease): void {
-    const entry = this.entries.get(lease.hash);
-    if (entry && entry.generation === lease.generation && !entry.condemned && entry.leases.size === 1) {
-      entry.condemned = true;
+    if (!(lease instanceof LeaseImpl) || !issuedLeases.has(lease)) return; // 伪造 lease：忽略
+    const impl = lease as LeaseImpl;
+    if (impl.entry.leases.has(impl)) {
+      // 本 lease 是唯一持有者 → 判死刑；还有其他持有者 → 只释放自身
+      if (!impl.entry.condemned && impl.entry.leases.size === 1) impl.entry.condemned = true;
     }
-    lease.release();
+    impl.release();
   }
 
   /**
@@ -386,17 +467,20 @@ export class ContentCache {
   }
 
   private addLease(entry: Entry): CacheLease {
-    const lease = new LeaseImpl(this, entry.hash, entry.generation, entry.promise);
+    const lease = new LeaseImpl(this, entry, entry.promise);
     entry.leases.add(lease);
     return lease;
   }
 
   /** LeaseImpl.release() 的内部入口（类内私有，模块内唯一调用方） */
   releaseLease(lease: LeaseImpl): void {
+    if (!(lease instanceof LeaseImpl) || !issuedLeases.has(lease)) return; // 伪造 lease：忽略
     if (lease.isReleased) return; // dispose 后幂等 no-op
     lease.revoke();
-    const entry = this.entries.get(lease.hash);
-    if (!entry || entry.generation !== lease.generation || entry.torn) return;
+    // 从自身 entry 移除（R6，TML-57 第六轮）：不按 hash 查找、无 generation 早退 ——
+    // 同 hash 新 generation 取代旧条目后，旧 lease 仍从旧条目里删除自己，
+    // stale 成员不会永久滞留，condemned 的旧条目才能被 sweep/settle 收尾
+    const entry = lease.entry;
     entry.leases.delete(lease);
     // condemned 且无 lease 且已就绪 → 立即清理；loading 情形由 settle 收尾
     if (entry.condemned && entry.leases.size === 0 && entry.gltf) this.teardown(entry);
@@ -440,7 +524,7 @@ export class ContentCache {
   private settle(entry: Entry, gltf: GLTF | null, error: unknown): void {
     if (entry.torn) {
       // teardown 已执行（仅可能发生在 settle 之前的 ready 路径之外，防御）
-      if (gltf) disposeObject(gltf.scene);
+      if (gltf) disposeGltf(gltf);
       return;
     }
     if (error || !gltf) {
@@ -453,7 +537,7 @@ export class ContentCache {
     }
     if (this.entries.get(entry.hash) !== entry) {
       // 被同 hash 新 generation 取代：只清理自己的内容与 URL，绝不触碰新条目
-      disposeObject(gltf.scene);
+      disposeGltf(gltf);
       this.revoke(entry);
       return;
     }
@@ -468,7 +552,7 @@ export class ContentCache {
     if (this.entries.get(entry.hash) === entry) this.entries.delete(entry.hash);
     entry.torn = true;
     this.revoke(entry);
-    if (entry.gltf) disposeObject(entry.gltf.scene);
+    if (entry.gltf) disposeGltf(entry.gltf);
   }
 
   private revoke(entry: Entry): void {

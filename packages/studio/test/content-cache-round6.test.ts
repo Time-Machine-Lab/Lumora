@@ -175,7 +175,7 @@ describe('R6 全资源图析构（整 GLTF exactly-once）', () => {
       geometry: vi.spyOn(geometry, 'dispose'),
       material: vi.spyOn(material, 'dispose'),
       texture: vi.spyOn(texture, 'dispose'),
-      boneTexture: vi.spyOn(skeleton.boneTexture, 'dispose'),
+      boneTexture: vi.spyOn(skeleton.boneTexture!, 'dispose'),
       shaderTex: vi.spyOn(shaderTex, 'dispose'),
       listTexA: vi.spyOn(listTexA, 'dispose'),
       listTexB: vi.spyOn(listTexB, 'dispose'),
@@ -217,8 +217,9 @@ describe('R6 URI 规范化（decode / query-fragment 剥离 / dot-segment 归并
     const createSpy = vi.spyOn(URL, 'createObjectURL');
     let mainBlob: Blob | null = null;
     const loader = vi.fn(async (url: string) => {
-      const result = createSpy.mock.calls.find(([blob]) => blob instanceof Blob);
-      mainBlob = (result?.[0] as Blob) ?? null;
+      // buildLoadableUrl 先建依赖 blob、最后建主 JSON blob；loader 拿到的是主 URL
+      const last = createSpy.mock.calls[createSpy.mock.calls.length - 1];
+      mainBlob = (last?.[0] as Blob) ?? null;
       return makeGltf();
     });
     const cache = new ContentCache({ loader });
