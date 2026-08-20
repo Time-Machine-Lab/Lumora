@@ -2632,4 +2632,95 @@ describe('PluginHost', () => {
     expect(info?.state).toBe('inactive');
     expect(host.listPlugins()).toHaveLength(0);
   });
+
+  it('registered 事件内启动慢 enable：register 收敛到 active，不返回 loading 快照', async () => {
+    const host = new PluginHost();
+    let releaseLoader!: () => void;
+    const loaderGate = new Promise<void>((resolve) => {
+      releaseLoader = resolve;
+    });
+    const entry = vi.fn(async () => {
+      await loaderGate;
+      return { default: definitionOf() };
+    });
+    let reentered = false;
+    host.events.on('plugin:state-changed', (e) => {
+      if (e.instanceId !== 'com.example.plugin' || e.state !== 'registered' || reentered) return;
+      reentered = true;
+      // registered 同步事件内启动慢 enable：监听器在首个 await 前把记录推进到 loading
+      void host.enable('com.example.plugin');
+    });
+    const registering = host.register(descriptor(VALID_MANIFEST, entry));
+    let registeredResolved = false;
+    let info: PluginInfo | undefined;
+    registering.then((result) => {
+      registeredResolved = true;
+      info = result;
+    });
+    await vi.waitFor(() => expect(entry).toHaveBeenCalledTimes(1));
+    // 慢 loader 在途：register（owner）必须加入同一加载/激活收敛，
+    // 不得以 loading 过渡态快照提前成功
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(registeredResolved).toBe(false);
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('loading');
+    releaseLoader();
+    await registering;
+    expect(registeredResolved).toBe(true);
+    expect(info?.state).toBe('active');
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('active');
+    expect(entry).toHaveBeenCalledTimes(1);
+  });
+
+  it('首次 loader 抛错、failed 事件内立即 enable、第二次 gated 成功：重试驱动独立加载并收敛到 active', async () => {
+    const host = new PluginHost();
+    let releaseLoader!: () => void;
+    const loaderGate = new Promise<void>((resolve) => {
+      releaseLoader = resolve;
+    });
+    let call = 0;
+    const entry = vi.fn(async () => {
+      call += 1;
+      if (call === 1) throw new Error('首次加载失败');
+      await loaderGate;
+      return { default: definitionOf() };
+    });
+    let retried = false;
+    let retry!: Promise<void>;
+    let retryResolved = false;
+    host.events.on('plugin:state-changed', (e) => {
+      if (e.instanceId !== 'com.example.plugin' || e.state !== 'failed' || retried) return;
+      retried = true;
+      // failed 终态事件内同步重试：不得共享即将结束的旧失败加载（silent success），
+      // 必须创建独立加载重新驱动 loader
+      retry = host.enable('com.example.plugin');
+      retry.then(() => {
+        retryResolved = true;
+      });
+    });
+    const registering = host.register(descriptor(VALID_MANIFEST, entry));
+    let registeredResolved = false;
+    let info: PluginInfo | undefined;
+    registering.then((result) => {
+      registeredResolved = true;
+      info = result;
+    });
+    // 首次加载以拒绝（async 抛错）在微任务发布 failed；failed 事件内同步启动的
+    // 重试必须创建独立加载 —— loader 被第二次调用（第二次 gated 加载在途）
+    await vi.waitFor(() => expect(entry).toHaveBeenCalledTimes(2));
+    expect(retried).toBe(true);
+    await vi.waitFor(() => expect(host.getPlugin('com.example.plugin')?.state).toBe('loading'));
+    // 闸门释放前：重试调用与 register（owner）均不得解析 —— 不得 silent success 后仍停在 failed
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(registeredResolved).toBe(false);
+    expect(retryResolved).toBe(false);
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('loading');
+    releaseLoader();
+    await registering;
+    await retry;
+    expect(registeredResolved).toBe(true);
+    expect(retryResolved).toBe(true);
+    expect(info?.state).toBe('active');
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('active');
+    expect(entry).toHaveBeenCalledTimes(2);
+  });
 });

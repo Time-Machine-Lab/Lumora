@@ -270,8 +270,11 @@ export class PluginHost {
     // 立即终止注册链：不再加载/激活，不执行任何插件用户代码。
     // 断言避免 TS 对 record.state 持续收窄（否则其后对 'failed'/'loading' 的比较会被误判为无重叠）
     if (this.disposedFlag || (record.state as PluginState) !== 'registered') {
-      // 销毁已登记：经公共退出契约与共享宿主销毁完成点一并收敛，不得提前返回在途快照
-      if (this.disposedFlag) await this.settleExit(record);
+      // registered 同步事件内重入 enable 会在首个 await 前把记录推进到 loading/
+      // activating，或登记宿主销毁：无论是否销毁，一律经公共退出契约收敛（加入在途
+      // 加载/激活/销毁流程到稳定终态）再读取 info，不得以 loading 过渡态快照提前
+      // 成功；稳定且无重入时该调用为无操作
+      await this.settleExit(record);
       return record.info();
     }
 
@@ -660,6 +663,9 @@ export class PluginHost {
       return;
     }
     if (!record.loader) {
+      // 发布加载终态 failed 前按 identity 摘除旧 loading operation：
+      // failed 事件内同步重试 enable() 必须创建独立加载，不得共享即将结束的失败加载而 silent success
+      if (record.loading === operation) record.loading = null;
       this.fail(record, '未提供入口模块加载器（descriptor.entry）');
       return;
     }
@@ -670,13 +676,19 @@ export class PluginHost {
       if (this.disposedFlag || record.generation !== generation || record.loading !== operation) return;
       const definition = normalizePluginModule(module);
       if (!definition) {
+        // 同上的 loading 摘除：加载结果无效发布 failed 前，failed 事件内重试须独立加载
+        if (record.loading === operation) record.loading = null;
         this.fail(record, '入口模块未导出插件定义（缺少 default 或 activate）');
         return;
       }
       record.definition = definition;
     } catch (error) {
-      // 晚到的加载失败同样绑定代际：不得把已停用/禁用的插件改写为 failed
+      // 晚到的加载失败同样绑定代际：不得把已停用/禁用的插件改写为 failed；
+      // 发布 failed 前按 identity 摘除旧 loading operation —— failed 事件内同步重试的
+      // enable() 必须启动独立加载（loadDefinition 不再共享旧操作），否则旧加载完成后
+      // 重试在 record.state === 'failed' 处静默成功、插件实际仍失败（loader 不再调用）
       if (this.disposedFlag || record.generation !== generation || record.loading !== operation) return;
+      if (record.loading === operation) record.loading = null;
       this.fail(record, `入口模块加载失败: ${this.errorMessage(error)}`, error);
     }
   }
