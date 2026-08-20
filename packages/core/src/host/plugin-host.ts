@@ -56,12 +56,17 @@ interface LoadingOperation {
  * completion 是本尝试的唯一完成点：覆盖 activate 钩子 settle、晚到返回值的
  * async Disposable 清理与暂存资源清理 —— 生命周期操作等待它，旧代清理不会
  * 在 disable/enable 已返回后仍跨代污染新代。
+ * workflow 是完整激活流程的完成点：active 发布或失败/取消回滚的终态发布后
+ * settle（resolve 幂等）；register/enable/activate 遇到 activating 时加入
+ * 同一 promise，不提前返回。
  */
 interface ActivationAttempt {
   generation: number;
   /** 本尝试暂存资源（贡献项、订阅、activate 返回值）：生命周期操作与过期尝试共用，DisposableSet 幂等 */
   pending: DisposableSet;
   completion: Promise<void>;
+  /** 完整激活流程完成点（身份不变）：由 activateRecord 成功路径或 performLifecycle 终态后 settle */
+  workflow: Deferred<void>;
 }
 
 /** 生命周期操作的终态意图：由最后一位发布者决定（disable 的 disabled 可覆盖回滚的 failed） */
@@ -175,10 +180,13 @@ class TrackedEventBridge implements PluginEventBus {
  * 调用 loader 或 activate（插件用户代码）前复核 operation identity、generation
  * 与期望状态，事件中的停用立即终止注册/加载/激活链。每次激活持有独立尝试
  * 身份：过期尝试只能清理自身资源，不得修改新一代的 generation/pending/终态；
- * 尝试的唯一完成点覆盖钩子 settle、晚到返回值的清理与暂存清理。激活取消、
- * 失败回滚与停用收敛为同一生命周期操作，disable/deactivate/dispose 等待
- * 同一操作；终态事件发布前旧操作完整 detach，事件内重入的新激活失败进入
- * 独立生命周期并完成自身回滚。
+ * 尝试的唯一完成点覆盖钩子 settle、晚到返回值的清理与暂存清理；完整激活流程
+ * 另有共享完成点（active 发布或回滚终态发布后 settle），register/enable/activate
+ * 遇到 activating 时加入同一 promise，不提前返回快照。激活取消、失败回滚与
+ * 停用收敛为同一生命周期操作，disable/deactivate/dispose 等待同一操作；
+ * 激活失败先发布并认领失败生命周期、再执行回滚，回滚清理事件内的 disable
+ * 合并进同一操作且 disabled 优先于旧失败终态；终态事件发布前旧操作完整
+ * detach，事件内重入的新激活失败进入独立生命周期并完成自身回滚。
  */
 export class PluginHost {
   readonly hostVersion: string;
@@ -258,10 +266,30 @@ export class PluginHost {
       return record.info();
     }
 
-    await this.loadDefinition(record);
-    // 加载期间可能被 disable/dispose 接管（状态已离开 loading），晚到加载结果不得改写停用状态
+    const loadingPromise = this.loadDefinition(record);
+    // await 前捕获代际与加载操作身份：恢复后同时复核，旧注册流不得把新一代的
+    // loading 当成自己的操作（跨代 ABA），也不能依据新代 state 启动激活或写失败
+    const generation = record.generation;
+    const loading = record.loading;
+    await loadingPromise;
     const stateAfterLoad = record.state;
-    if (this.disposedFlag || stateAfterLoad === 'failed' || stateAfterLoad !== 'loading') return record.info();
+    // 过期注册流只能按取消路径结束（返回当前快照），不启动激活、不加入新代激活
+    if (this.disposedFlag || record.generation !== generation) return record.info();
+    if (stateAfterLoad === 'activating') {
+      // 加载期间重入 enable 已启动同代激活：加入同一完整激活流程，
+      // 等待 active 发布或失败/取消回滚终态，不得提前返回 activating 快照
+      await this.awaitActivationOutcome(record);
+      return record.info();
+    }
+    // 加载期间可能被 disable/dispose 接管（状态已离开 loading），晚到加载结果不得改写停用状态；
+    // 加载操作身份复核：同代内字段应已清空（操作完成）或仍指向本次操作
+    if (
+      stateAfterLoad === 'failed' ||
+      stateAfterLoad !== 'loading' ||
+      (record.loading !== null && record.loading !== loading)
+    ) {
+      return record.info();
+    }
 
     await this.activateRecord(record);
     return record.info();
@@ -296,7 +324,12 @@ export class PluginHost {
       throw new Error(`插件 "${instanceId}" 不可启用（${record.reason ?? '未通过校验'}）`);
     }
     const state = record.state;
-    if (state === 'active' || state === 'activating') return;
+    if (state === 'active') return;
+    if (state === 'activating') {
+      // 激活已在途：加入同一完整激活流程（active 或失败/取消回滚终态），不提前返回
+      await this.awaitActivationOutcome(record);
+      return;
+    }
     if (state === 'deactivating') {
       // 在途生命周期进行中：enable 意图不得被吞掉 —— 等待同一操作完成后继续
       await record.lifecycle?.promise;
@@ -336,6 +369,31 @@ export class PluginHost {
     const merged: LifecycleTarget =
       record.state === 'failed' ? { state: 'inactive' } : { state: target };
     return this.publishLifecycle(record, merged);
+  }
+
+  /**
+   * 等待在途激活的完整流程结果：active 发布或失败/取消回滚的终态发布后返回。
+   * register/enable/activate 遇到 activating 时加入同一完成，不提前返回快照。
+   * 若尝试已被生命周期操作摘除（回滚进行中），等待同一生命周期操作完成。
+   */
+  private async awaitActivationOutcome(record: PluginRecord): Promise<void> {
+    const attempt = record.activation;
+    if (attempt) {
+      try {
+        await attempt.workflow.promise;
+      } catch {
+        // 流程完成点承诺不拒绝；防御性兜底
+      }
+      return;
+    }
+    const lifecycle = record.lifecycle;
+    if (lifecycle) {
+      try {
+        await lifecycle.promise;
+      } catch {
+        // 生命周期承诺以成功收敛；防御性兜底
+      }
+    }
   }
 
   // ---------- 内部 ----------
@@ -482,16 +540,25 @@ export class PluginHost {
     if (!record.ready || !record.definition) {
       throw new Error(`插件 "${record.id}" 无法激活（${record.reason ?? '定义缺失'}）`);
     }
-    if (record.state === 'active' || record.state === 'activating' || record.state === 'deactivating') {
+    const state = record.state;
+    if (state === 'active') return;
+    if (state === 'activating') {
+      // 激活已在途：加入同一完整激活流程（active 或失败/取消回滚终态），不提前返回
+      await this.awaitActivationOutcome(record);
       return;
     }
+    if (state === 'deactivating') return;
 
-    // 本尝试的唯一完成点（身份不变）：钩子 settle、晚到返回值清理与暂存清理全部收敛于此
+    // 本尝试的唯一完成点（身份不变）：钩子 settle、晚到返回值清理与暂存清理全部收敛于此；
+    // workflow 为完整激活流程的完成点：active 发布或失败/取消回滚终态发布后 settle，
+    // 并发/重入的 register/enable/activate 加入同一 promise
     const completion = createDeferred<void>();
+    const workflow = createDeferred<void>();
     const attempt: ActivationAttempt = {
       generation: record.generation,
       pending: new DisposableSet(),
       completion: completion.promise,
+      workflow,
     };
     const gate: PluginGate = {
       commands: new PluginCommands(this.commands, () => this.isGateAlive(record, attempt)),
@@ -556,12 +623,16 @@ export class PluginHost {
     record.state = 'active';
     this.emitState(record, 'active');
     completion.resolve();
+    attempt.workflow.resolve();
   }
 
   /**
-   * 激活失败（同步抛错或异步拒绝）：当前尝试完成自身回滚自清理（暂存资源 dispose）
-   * 并解析唯一完成点后，发布独立的失败生命周期（回滚 completion、失败原因与贡献项
-   * 清除由该操作完成）；过期尝试只清理自身资源，不写入任何状态。
+   * 激活失败（同步抛错或异步拒绝）：当前尝试在任何回滚 await 之前先发布并认领
+   * 失败生命周期 —— 生命周期立即接管尝试并等待唯一完成点，回滚清理（暂存资源
+   * dispose、deactivate 钩子）由 completion 驱动在生命周期内执行；贡献清理事件
+   * 内的 disable 合并进同一生命周期，disabled 优先于本失败意图（见 publishLifecycle）。
+   * 等待回滚终态发布后返回，调用方（register/activateRecord）不会在回滚完成前结束。
+   * 过期尝试只清理自身资源，不写入任何状态。
    */
   private async failActivation(
     record: PluginRecord,
@@ -583,18 +654,19 @@ export class PluginHost {
       completion.resolve();
       return;
     }
-    // 当前尝试：钩子已完全 settle（不存在晚到返回值），先完成本尝试的回滚自清理
-    try {
-      await attempt.pending.dispose();
-    } catch {
-      // 清理失败不掩盖失败结论
-    }
-    completion.resolve();
-    await this.publishLifecycle(record, {
+    // 当前尝试：先发布失败生命周期（任何回滚 await 之前），再解析唯一完成点驱动
+    // 生命周期内的回滚清理；最后等待回滚终态（failed，或清理事件内 disable 合并的 disabled）
+    const failure = this.publishLifecycle(record, {
       state: 'failed',
       reason: `激活失败: ${this.errorMessage(error)}`,
       error,
     });
+    completion.resolve();
+    try {
+      await failure;
+    } catch {
+      // 生命周期承诺以成功收敛；防御性兜底
+    }
   }
 
   /**
@@ -602,12 +674,17 @@ export class PluginHost {
    * 先发布后执行 —— 身份不变的 deferred 先登记到 record.lifecycle 并推进代际
    * （任何状态事件之前），再启动清理；disable/deactivate/dispose 及状态事件内
    * 的重入共享同一操作、等待同一真实完成 promise。
-   * 目标终态由最后一位发布者决定（disable 的 disabled 覆盖回滚的 failed）。
+   * 目标终态由最后一位发布者决定：disabled 对旧失败终态有优先级 —— 回滚（failed）
+   * 不覆盖已在途的停用（disabled）意图，其余终态按后到者为准（回滚清理事件内的
+   * disable 以 disabled 覆盖已发布的 failed）。
    */
   private publishLifecycle(record: PluginRecord, target: LifecycleTarget): Promise<void> {
     const existing = record.lifecycle;
     if (existing) {
-      record.lifecycleTarget = target;
+      const current = record.lifecycleTarget;
+      if (!current || current.state !== 'disabled' || target.state !== 'failed') {
+        record.lifecycleTarget = target;
+      }
       return existing.promise;
     }
     // 推进代际：在途加载/激活/门面全部作废；晚到的贡献、订阅、结果整体拒绝
@@ -707,6 +784,11 @@ export class PluginHost {
     } catch (error) {
       // 清理异常不外泄：所有调用方都等待同一操作，操作整体以成功收敛
       this.onError(error);
+    } finally {
+      // 本操作消费的激活尝试的完整流程完成点：active 未发布，则失败/取消回滚
+      // 的终态（或销毁）已发布/已跳过发布，在此 settle —— 等待中的
+      // register/enable/activate 不会悬挂
+      attempt?.workflow.resolve();
     }
   }
 

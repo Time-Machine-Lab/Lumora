@@ -261,14 +261,15 @@ createRoot(document.getElementById('root')!).render(
   if (!studioPkg.exports?.['./style.css']) {
     throw new Error('@lumora/studio 安装后 exports 缺少 "./style.css"');
   }
-  // 依赖隔离：4 个 @lumora 包必须来自本地 tarball 副本，canonical 边界判定不得解析到仓库内
+  // 依赖隔离：4 个 @lumora 包必须来自本地 tarball 副本（安装进消费工程内），
+  // canonical 边界判定不得解析到仓库内；包含边界与断言提示语一致（consumerDir）
   for (const name of PACKAGES) {
     const shortName = name.replace('@lumora/', '');
     const pkgJson = join(consumerDir, 'node_modules', '@lumora', shortName, 'package.json');
     if (!existsSync(pkgJson)) {
       throw new Error(`安装后缺少 @lumora/${shortName}（依赖隔离断言失败）`);
     }
-    if (!isInside(pkgJson, tmp)) {
+    if (!isInside(pkgJson, consumerDir)) {
       throw new Error(`@lumora/${shortName} 解析到消费工程之外: ${realpathSync.native(pkgJson)}（依赖未隔离，可能被仓库依赖树捕获）`);
     }
   }
