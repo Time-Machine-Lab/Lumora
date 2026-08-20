@@ -12,6 +12,8 @@ export default defineConfig({
       entry: 'src/index.ts',
       formats: ['es'],
       fileName: 'index',
+      // 产物样式文件名与 package.json exports 的 "./style.css" 保持一致
+      cssFileName: 'style',
     },
     rollupOptions: {
       external: [

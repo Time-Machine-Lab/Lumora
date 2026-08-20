@@ -31,6 +31,8 @@ export interface Command {
 export interface CommandRegistryOptions {
   events?: TypedEventEmitter<EventMap>;
   services?: PluginServices;
+  /** 惰性服务提供者：宿主构造完成后再解析服务，避免注册表过早冻结空上下文 */
+  getServices?: () => PluginServices;
   getProject?: () => Project | null;
 }
 
@@ -59,6 +61,11 @@ const EMPTY_SERVICES: PluginServices = {
   },
 };
 
+interface CommandEntry {
+  command: Command;
+  pluginId?: string;
+}
+
 function toCommandResult(value: unknown): CommandResult {
   if (value !== null && typeof value === 'object' && 'ok' in value) {
     return value as CommandResult;
@@ -71,58 +78,64 @@ function toCommandResult(value: unknown): CommandResult {
  * execute 捕获处理器抛错并以 CommandResult 返回，不影响宿主。
  */
 export class CommandRegistry {
-  private readonly commands = new Map<string, Command>();
+  private readonly entries = new Map<string, CommandEntry>();
   private readonly events?: TypedEventEmitter<EventMap>;
-  private readonly services: PluginServices;
+  private readonly getServices: () => PluginServices;
   private readonly getProject: () => Project | null;
   private readonly fallbackEvents = new TypedEventEmitter<EventMap>();
   private disposedFlag = false;
 
   constructor(options: CommandRegistryOptions = {}) {
     this.events = options.events;
-    this.services = options.services ?? EMPTY_SERVICES;
+    this.getServices = options.getServices ?? (() => options.services ?? EMPTY_SERVICES);
     this.getProject = options.getProject ?? (() => null);
   }
 
-  register(command: Command): Disposable {
+  /** 注册命令；pluginId 为所属插件 id，注入到执行时的命令上下文 */
+  register(command: Command, pluginId?: string): Disposable {
     if (this.disposedFlag) throw new Error('命令注册表已销毁');
-    if (this.commands.has(command.id)) {
+    if (this.entries.has(command.id)) {
       throw new Error(`命令 id 重复: ${command.id}`);
     }
-    this.commands.set(command.id, command);
+    this.entries.set(command.id, { command, pluginId });
     this.events?.emit('command:changed', { id: command.id, added: true });
     return disposable(() => {
-      if (this.commands.delete(command.id)) {
+      if (this.entries.delete(command.id)) {
         this.events?.emit('command:changed', { id: command.id, added: false });
       }
     });
   }
 
   has(id: string): boolean {
-    return this.commands.has(id);
+    return this.entries.has(id);
   }
 
   get(id: string): Command | undefined {
-    return this.commands.get(id);
+    return this.entries.get(id)?.command;
+  }
+
+  /** 返回命令所属插件 id（未注册时为 undefined） */
+  ownerOf(id: string): string | undefined {
+    return this.entries.get(id)?.pluginId;
   }
 
   list(): Command[] {
-    return [...this.commands.values()];
+    return [...this.entries.values()].map((entry) => entry.command);
   }
 
   count(): number {
-    return this.commands.size;
+    return this.entries.size;
   }
 
   async execute(id: string, args?: unknown): Promise<CommandResult> {
-    const command = this.commands.get(id);
-    if (!command) {
+    const entry = this.entries.get(id);
+    if (!entry) {
       const result: CommandResult = { ok: false, error: new Error(`未知命令: ${id}`) };
       this.emitExecuted(id, result);
       return result;
     }
     try {
-      const value = await command.execute(args, this.createContext());
+      const value = await entry.command.execute(args, this.createContext(entry.pluginId));
       const result = toCommandResult(value);
       this.emitExecuted(id, result);
       return result;
@@ -133,11 +146,12 @@ export class CommandRegistry {
     }
   }
 
-  private createContext(): CommandContext {
+  private createContext(pluginId?: string): CommandContext {
     return {
+      pluginId,
       events: this.events ?? this.fallbackEvents,
       commands: this,
-      services: this.services,
+      services: this.getServices(),
       getProject: this.getProject,
     };
   }
@@ -148,6 +162,6 @@ export class CommandRegistry {
 
   dispose(): void {
     this.disposedFlag = true;
-    this.commands.clear();
+    this.entries.clear();
   }
 }

@@ -30,6 +30,10 @@ interface PluginRecord {
   manifest: Manifest;
   /** Manifest + 引擎校验通过且入口加载成功后的定义 */
   definition?: PluginDefinition;
+  /** 入口加载器：保存于注册时，enabled:false 插件首次启用时惰性加载 */
+  loader?: PluginDescriptor['entry'];
+  /** 进行中的入口加载，并发 load 共享同一 Promise，入口只加载一次 */
+  loadingPromise?: Promise<void>;
   state: PluginState;
   reason?: string;
   error?: unknown;
@@ -37,6 +41,8 @@ interface PluginRecord {
   owned: DisposableSet;
   /** 校验失败时为 false，宿主不会加载入口模块 */
   ready: boolean;
+  /** 生命周期代际：每次停用/销毁时递增，用于废弃进行中的激活（见 activateRecord） */
+  generation: number;
   info(): PluginInfo;
 }
 
@@ -80,11 +86,18 @@ class TrackedEventBridge implements PluginEventBus {
  * 状态机：registered → loading → activating → active
  *                       ↘ failed（校验/加载/激活任一环节失败）
  *         active → deactivating → inactive / disabled
+ *
+ * 并发与竞态：每个记录持有递增的代际号，停用/销毁时推进代际，
+ * 进行中的激活完成时发现代际不符即整体回滚本次激活产生的资源。
  */
 export class PluginHost {
   readonly hostVersion: string;
   readonly events = new TypedEventEmitter<EventMap>();
-  readonly commands = new CommandRegistry({ events: this.events, getProject: () => this.project });
+  readonly commands = new CommandRegistry({
+    events: this.events,
+    getServices: () => this.services,
+    getProject: () => this.project,
+  });
   readonly contributions = new ContributionRegistry({ events: this.events, commands: this.commands });
   readonly services: PluginServices;
 
@@ -121,7 +134,8 @@ export class PluginHost {
 
   /**
    * 注册并加载一个插件。Manifest 非法 / 引擎不兼容 / 无入口时进入 failed 状态，
-   * 且不会加载（import）入口模块；enabled: false 的插件注册后保持 disabled。
+   * 且不会加载（import）入口模块；enabled: false 的插件注册后保持 disabled，
+   * 首次 enable 时才加载入口。
    */
   async register(descriptor: PluginDescriptor): Promise<PluginInfo> {
     if (this.disposedFlag) throw new Error('插件宿主已销毁');
@@ -140,7 +154,7 @@ export class PluginHost {
       return record.info();
     }
 
-    await this.loadDefinition(record, descriptor.entry);
+    await this.loadDefinition(record);
     if (this.disposedFlag || record.state === 'failed') return record.info();
 
     await this.activateRecord(record);
@@ -158,9 +172,11 @@ export class PluginHost {
 
   async disable(id: string): Promise<void> {
     const record = this.requireRecord(id);
-    if (record.state === 'failed') return;
+    // failed 插件可停用（幂等清理残留资源）；停用后保持 inactive 并保留失败原因，
+    // 激活失败类插件因此可重新 enable 重试
+    const wasFailed = record.state === 'failed';
     await this.deactivateRecord(record);
-    if (record.state === 'inactive') {
+    if (!wasFailed && record.state === 'inactive') {
       record.state = 'disabled';
       this.emitState(record, 'disabled');
     }
@@ -168,10 +184,17 @@ export class PluginHost {
 
   async enable(id: string): Promise<void> {
     const record = this.requireRecord(id);
-    if (!record.ready || !record.definition) {
-      throw new Error(`插件 "${id}" 不可启用（${record.reason ?? '定义缺失'}）`);
+    if (!record.ready) {
+      throw new Error(`插件 "${id}" 不可启用（${record.reason ?? '未通过校验'}）`);
     }
-    if (record.state === 'active') return;
+    if (record.state === 'active' || record.state === 'activating' || record.state === 'deactivating') {
+      return;
+    }
+    if (!record.definition) {
+      // enabled:false 注册的插件首次启用时才加载入口（loadDefinition 去重，只加载一次）
+      await this.loadDefinition(record);
+      if (record.state === 'failed' || !record.definition) return;
+    }
     await this.activateRecord(record);
   }
 
@@ -192,34 +215,48 @@ export class PluginHost {
   private createRecord(descriptor: PluginDescriptor): PluginRecord {
     const validation = validateManifest(descriptor.manifest);
     const manifest = validation.ok && validation.manifest ? validation.manifest : null;
-    const base = {
-      id: manifest?.id ?? (descriptor.manifest as { id?: string })?.id ?? '<unknown>',
-      name: manifest?.name ?? (descriptor.manifest as { name?: string })?.name ?? '<unknown>',
-      version: manifest?.version ?? (descriptor.manifest as { version?: string })?.version ?? '0.0.0',
-      manifest: (manifest ?? descriptor.manifest) as Manifest,
-    };
-    if (this.plugins.has(base.id)) {
-      throw new Error(`插件 id 重复: ${base.id}（已注册 ${base.name}）`);
+    // 从原始输入安全提取展示字段：null / 数组 / 非对象等非法输入不会击穿隔离
+    const raw = descriptor.manifest as unknown as Record<string, unknown> | null | undefined;
+    const safeId = typeof raw?.id === 'string' ? raw.id : '<unknown>';
+    const safeName = typeof raw?.name === 'string' ? raw.name : '<unknown>';
+    const safeVersion = typeof raw?.version === 'string' ? raw.version : '0.0.0';
+    if (this.plugins.has(safeId)) {
+      throw new Error(`插件 id 重复: ${safeId}（已注册 ${safeName}）`);
     }
 
     let reason: string | undefined = !validation.ok
       ? `Manifest 非法: ${validation.errors.join('；')}`
       : undefined;
-
     let ready = reason === undefined;
-    if (ready) {
-      const engine = checkEngineCompatibility(base.manifest, this.hostVersion);
+    if (ready && manifest) {
+      const engine = checkEngineCompatibility(manifest, this.hostVersion);
       if (!engine.ok) {
         ready = false;
         reason = engine.reason;
       }
     }
 
+    // 校验失败时使用安全占位 Manifest（仅含可安全提取的展示字段），
+    // info()/事件等后续环节只接触占位对象，不再触碰原始输入
+    const safeManifest: Manifest = manifest ?? {
+      schemaVersion: '1',
+      id: safeId,
+      name: safeName,
+      version: safeVersion,
+      entry: typeof raw?.entry === 'string' ? raw.entry : './dist/index.js',
+      contributes: [],
+    };
+
     const record: PluginRecord = {
-      ...base,
+      id: safeId,
+      name: safeName,
+      version: safeVersion,
+      manifest: safeManifest,
+      loader: descriptor.entry,
       ready,
       state: 'registered',
       reason,
+      generation: 0,
       owned: new DisposableSet(),
       info() {
         return {
@@ -236,23 +273,25 @@ export class PluginHost {
     return record;
   }
 
-  private async loadDefinition(
-    record: PluginRecord,
-    loader: PluginDescriptor['entry'],
-  ): Promise<void> {
+  private loadDefinition(record: PluginRecord): Promise<void> {
+    if (record.definition) return Promise.resolve();
+    if (record.loadingPromise) return record.loadingPromise;
+    record.loadingPromise = this.doLoad(record).finally(() => {
+      record.loadingPromise = undefined;
+    });
+    return record.loadingPromise;
+  }
+
+  private async doLoad(record: PluginRecord): Promise<void> {
     record.state = 'loading';
     this.emitState(record, 'loading');
-    if (record.definition) return;
-    if (!loader) {
+    if (!record.loader) {
       this.fail(record, '未提供入口模块加载器（descriptor.entry）');
       return;
     }
     try {
-      const module = await loader();
-      if (this.disposedFlag) {
-        this.fail(record, '宿主已销毁，加载中止');
-        return;
-      }
+      const module = await record.loader();
+      if (this.disposedFlag) return;
       const definition = normalizePluginModule(module);
       if (!definition) {
         this.fail(record, '入口模块未导出插件定义（缺少 default 或 activate）');
@@ -264,36 +303,88 @@ export class PluginHost {
     }
   }
 
+  /**
+   * 激活事务：本次激活产生的资源先暂存在 pending，全部成功后才并入 owned；
+   * 激活抛错或激活期间被停用/销毁（代际不符）时，pending 整体逆序回滚。
+   */
   private async activateRecord(record: PluginRecord): Promise<void> {
     if (!record.ready || !record.definition) {
       throw new Error(`插件 "${record.id}" 无法激活（${record.reason ?? '定义缺失'}）`);
     }
-    if (record.state === 'active') return;
+    if (record.state === 'active' || record.state === 'activating' || record.state === 'deactivating') {
+      return;
+    }
 
+    const generation = record.generation;
     record.state = 'activating';
     record.error = undefined;
     record.reason = undefined;
     this.emitState(record, 'activating');
 
+    const pending: Disposable[] = [];
     const bridge = new TrackedEventBridge(this.events);
-    record.owned.add(bridge);
-    const context = this.createContext(record, bridge);
+    pending.push(bridge);
+    const context = this.createContext(record, bridge, (bundle) => {
+      if (this.disposedFlag || record.generation !== generation) {
+        throw new Error('插件已停用或宿主已销毁，无法提交贡献项');
+      }
+      const contributed = this.contributions.contribute(record.id, bundle);
+      pending.push(contributed);
+      return contributed;
+    });
     try {
       const result = await record.definition.activate(context);
-      if (this.disposedFlag) {
-        this.fail(record, '宿主已销毁，激活中止');
+      if (this.disposedFlag || record.generation !== generation) {
+        // 激活期间被停用/销毁：晚到的结果与暂存资源立即释放，不改变既有状态
+        if (result != null) pending.push(result);
+        try {
+          await this.disposeAll(pending);
+        } catch {
+          // 释放失败不影响已推进的停用状态
+        }
         return;
       }
-      if (result != null) record.owned.add(result);
+      if (result != null) pending.push(result);
+      for (const item of pending) record.owned.add(item);
       record.state = 'active';
       this.emitState(record, 'active');
     } catch (error) {
+      try {
+        await this.disposeAll(pending);
+      } catch {
+        // 回滚失败不掩盖原始激活错误
+      }
+      if (this.disposedFlag || record.generation !== generation) {
+        return; // 已被停用取代：失败不覆盖既有状态
+      }
       this.fail(record, `激活失败: ${this.errorMessage(error)}`, error);
     }
   }
 
   private async deactivateRecord(record: PluginRecord): Promise<void> {
     if (record.state === 'inactive' || record.state === 'disabled') return;
+    // 推进代际：任何进行中的激活完成时都会被废弃并回滚（见 activateRecord）
+    record.generation += 1;
+
+    if (record.state === 'failed') {
+      // failed 插件（校验/加载/激活失败）的停用：幂等清理残留资源，
+      // 保留失败原因，激活失败类插件重新 enable 时可重试
+      const errors: unknown[] = [];
+      try {
+        await record.owned.dispose();
+      } catch (error) {
+        errors.push(error);
+      }
+      record.owned = new DisposableSet();
+      if (errors.length > 0) {
+        record.error = errors;
+        record.reason = `清理失败: ${errors.map((e) => this.errorMessage(e)).join('；')}`;
+      }
+      record.state = 'inactive';
+      this.emitState(record, 'inactive');
+      return;
+    }
+
     record.state = 'deactivating';
     this.emitState(record, 'deactivating');
     const errors: unknown[] = [];
@@ -319,7 +410,11 @@ export class PluginHost {
     this.emitState(record, 'inactive');
   }
 
-  private createContext(record: PluginRecord, bridge: TrackedEventBridge): PluginContext {
+  private createContext(
+    record: PluginRecord,
+    bridge: TrackedEventBridge,
+    contribute: (bundle: Parameters<PluginContext['contribute']>[0]) => ReturnType<PluginContext['contribute']>,
+  ): PluginContext {
     const context: PluginContext = {
       pluginId: record.id,
       manifest: record.manifest,
@@ -327,11 +422,7 @@ export class PluginHost {
       events: bridge,
       commands: this.commands,
       services: this.services,
-      contribute: (bundle) => {
-        const contributed = this.contributions.contribute(record.id, bundle);
-        record.owned.add(contributed);
-        return contributed;
-      },
+      contribute,
       getProject: () => this.project,
       log: (level, message, data) => {
         const line = `[lumora:plugin:${record.id}] ${level.toUpperCase()} ${message}${data !== undefined ? ` ${JSON.stringify(data)}` : ''}`;
@@ -341,6 +432,12 @@ export class PluginHost {
       },
     };
     return context;
+  }
+
+  private disposeAll(items: Disposable[]): Promise<void> {
+    return Promise.all(items.map((item) => Promise.resolve(item.dispose()).catch(() => undefined))).then(
+      () => undefined,
+    );
   }
 
   private fail(record: PluginRecord, reason: string, error?: unknown): void {

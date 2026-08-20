@@ -13,6 +13,7 @@
     },
     "./lumora.plugin.json": "./lumora.plugin.json"
   },
+  "files": ["dist", "lumora.plugin.json"],
   "scripts": {
     "build": "vite build && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",

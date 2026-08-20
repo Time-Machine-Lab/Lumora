@@ -7,6 +7,12 @@ export default tseslint.config(
   {
     ignores: ['**/dist/**', '**/node_modules/**', '**/playwright-report/**', '**/test-results/**'],
   },
+  {
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      globals: { console: 'readonly' },
+    },
+  },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {

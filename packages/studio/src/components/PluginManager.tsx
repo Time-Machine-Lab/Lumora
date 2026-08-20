@@ -81,13 +81,22 @@ export function PluginManager({ runtime, onClose }: PluginManagerProps) {
                     type="button"
                     className="lumora-button"
                     data-testid={`plugin-toggle-${plugin.id}`}
-                    onClick={() => void runtime.host.enable(plugin.id)}
+                    onClick={() => {
+                      void runtime.host.enable(plugin.id).catch(() => {});
+                    }}
                   >
-                    启用
+                    {plugin.reason ? '重新启用' : '启用'}
                   </button>
                 )}
                 {plugin.state === 'failed' && (
-                  <span className="lumora-plugin-row__note">不可启用（未通过校验）</span>
+                  <button
+                    type="button"
+                    className="lumora-button lumora-button--danger"
+                    data-testid={`plugin-toggle-${plugin.id}`}
+                    onClick={() => void runtime.host.disable(plugin.id)}
+                  >
+                    禁用
+                  </button>
                 )}
               </div>
             </li>

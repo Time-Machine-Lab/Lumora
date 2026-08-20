@@ -56,4 +56,8 @@ test('非法 Manifest 与引擎不兼容插件进入 failed 并显示原因，�
   await expect(page.getByTestId('plugin-state-com.example.brokenengine')).toHaveText('失败');
   // 合法插件保持运行中
   await expect(page.getByTestId('plugin-state-com.lumora.mock')).toHaveText('运行中');
+  // 失败插件可停用（验收标准：激活异常后可禁用），停用后保留失败原因
+  await page.getByTestId('plugin-toggle-com.example.brokenmanifest').click();
+  await expect(page.getByTestId('plugin-state-com.example.brokenmanifest')).toHaveText('已停用');
+  await expect(page.getByTestId('plugin-reason-com.example.brokenmanifest')).toContainText('Manifest 非法');
 });

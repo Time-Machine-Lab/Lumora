@@ -24,7 +24,7 @@
     "@lumora/core": "0.1.0"
   },
   "peerDependencies": {
-    "react": ">=18"
+    "react": "^19.0.0"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",

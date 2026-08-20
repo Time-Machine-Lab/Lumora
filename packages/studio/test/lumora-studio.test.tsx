@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
+import { StrictMode, createRef } from 'react';
 import type { Manifest, PanelContextProps, PluginDescriptor } from '@lumora/core';
 import { LumoraStudio } from '../src/components/LumoraStudio';
 import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
-import { createRef } from 'react';
 
 vi.mock('@react-three/fiber', () => ({
   Canvas: ({ children }: { children?: React.ReactNode }) => (
@@ -140,6 +140,33 @@ describe('LumoraStudio', () => {
     unmount();
     await waitFor(() => expect(deactivate).toHaveBeenCalledTimes(1));
     expect(events.handlerCount).toBe(0);
+  });
+
+  it('StrictMode 下 effect 卸载重放不破坏运行时：插件只启动一次，命令可用，真实卸载仍释放', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const onError = vi.fn();
+    const { unmount } = render(
+      <StrictMode>
+        <LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" onError={onError} />
+      </StrictMode>,
+    );
+    // 启动只执行一次：插件达到 active、命令注册一次、无宿主错误上报
+    expect(await screen.findByTestId('test-panel')).toBeInTheDocument();
+    const runtime = handle.current!.runtime;
+    expect(runtime.host.getPlugin('com.test.good')?.state).toBe('active');
+    expect(runtime.host.commands.count()).toBe(1);
+    expect(onError).not.toHaveBeenCalled();
+
+    // 事件与命令在重放后的运行时可正常使用
+    const executed = vi.fn();
+    runtime.events.on('command:executed', executed);
+    await runtime.host.commands.execute('com.test.good.cmd');
+    expect(executed).toHaveBeenCalledTimes(1);
+
+    // 真实卸载仍释放运行时
+    unmount();
+    await waitFor(() => expect(runtime.events.handlerCount).toBe(0));
+    expect(runtime.host.listPlugins()).toHaveLength(0);
   });
 
   it('面板渲染抛错时显示错误边界并可通过其禁用插件', async () => {

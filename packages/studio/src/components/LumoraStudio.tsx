@@ -59,27 +59,48 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     };
   }, [runtime]);
 
-  // 挂载时一次性启动：注册插件并打开初始项目（与 props 变化解耦，避免重复注册）
+  // 挂载时一次性启动：注册插件并打开初始项目（与 props 变化解耦，避免重复注册）。
+  // StrictMode 下 effect 会卸载重放：boot 只执行一次，重放仅取消在途启动；
+  // 真正的运行时释放由根节点 ref 回调触发（StrictMode 不会分离 DOM ref）
+  const bootStartedRef = useRef(false);
+  const cancelBootRef = useRef(false);
   useEffect(() => {
+    // 每次 setup 清除取消标记：StrictMode 重放不会永久取消首个 effect 发起的启动
+    cancelBootRef.current = false;
+    if (bootStartedRef.current) return;
+    bootStartedRef.current = true;
     const pluginsRef = plugins;
     const initialRef = initialProject;
     const onErrorRef = onError;
-    let cancelled = false;
     const boot = async () => {
       for (const descriptor of pluginsRef) {
-        if (cancelled) return;
+        if (cancelBootRef.current) return;
         try {
           await runtime.host.register(descriptor);
         } catch (error) {
           onErrorRef?.(error);
         }
       }
-      if (!cancelled && initialRef) runtime.openProject(initialRef);
+      if (!cancelBootRef.current && initialRef) runtime.openProject(initialRef);
     };
     void boot();
     return () => {
-      cancelled = true;
-      void runtime.dispose();
+      cancelBootRef.current = true;
+    };
+  }, [runtime]);
+
+  // 真实卸载时释放运行时。StrictMode 会把 effect 卸载后重放：cleanup 若直接
+  // dispose 会销毁重放后仍要使用的运行时；DOM ref 回调同样会被 React 19
+  // StrictMode 重放。因此用「挂载计数 + 延迟确认」：cleanup 先减计数，
+  // 重放的下轮 setup 及时加回则取消释放，仅在最终卸载时真正 dispose
+  const mountedRef = useRef(0);
+  useEffect(() => {
+    mountedRef.current += 1;
+    return () => {
+      mountedRef.current -= 1;
+      setTimeout(() => {
+        if (mountedRef.current === 0) void runtime.dispose();
+      }, 0);
     };
   }, [runtime]);
 
