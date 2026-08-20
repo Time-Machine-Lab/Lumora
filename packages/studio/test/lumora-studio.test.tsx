@@ -205,10 +205,13 @@ describe('LumoraStudio', () => {
     const gate = new Promise<void>((resolve) => {
       releaseLoad = resolve;
     });
+    // loader 自身可观察的完成点：慢入口放行后真正执行到返回的位置
+    let loaderResolved = false;
     const slowPlugin: PluginDescriptor = {
       manifest: { ...GOOD_MANIFEST, id: 'com.test.slow', name: '慢插件' },
       entry: async () => {
         await gate;
+        loaderResolved = true;
         return { default: { activate: (context) => context.contribute({}) } };
       },
     };
@@ -236,11 +239,78 @@ describe('LumoraStudio', () => {
     // 放行慢入口：晚到的加载/激活不得复活插件、不得继续注册后续插件、
     // 不得写入初始项目、不得上报宿主错误
     releaseLoad();
-    await vi.waitFor(() => expect(runtime.host.getPlugin('com.test.slow')).toBeUndefined());
+    // 等待 loader 真正执行完成（晚到结果已送达宿主的可观察完成点），
+    // 再冲刷宏任务让 boot continuation 跑完——避免“条件本就为真”的假阳性
+    await vi.waitFor(() => expect(loaderResolved).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(runtime.host.getPlugin('com.test.slow')).toBeUndefined();
     expect(runtime.host.getPlugin('com.test.good')).toBeUndefined();
     expect(runtime.host.listPlugins()).toHaveLength(0);
     expect(runtime.getProject()).toBeNull();
     expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('命令面板：单个 when() 抛错被隔离并上报，异常命令不可用，正常命令与壳层照常工作', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const onError = vi.fn();
+    const plugin: PluginDescriptor = {
+      manifest: GOOD_MANIFEST,
+      entry: async () => ({
+        default: {
+          activate: (context) =>
+            context.contribute({
+              commands: [
+                {
+                  kind: 'command',
+                  command: {
+                    id: 'com.test.good.throwing',
+                    title: '坏条件',
+                    when: () => {
+                      throw new Error('when 爆炸');
+                    },
+                    execute: () => ({ ok: true }),
+                  },
+                },
+                { kind: 'command', command: { id: 'com.test.good.ok', title: '正常命令', execute: () => ({ ok: true }) } },
+              ],
+            }),
+        },
+      }),
+    };
+    render(<LumoraStudio ref={handle} plugins={[plugin]} hostVersion="0.1.0" onError={onError} />);
+    await waitFor(() => expect(handle.current!.runtime.host.commands.count()).toBe(2));
+
+    render(<CommandPalette runtime={handle.current!.runtime} onClose={vi.fn()} />);
+    // when 抛错：上报宿主错误，命令不可用、不进入面板
+    expect(await screen.findByTestId('palette-command-com.test.good.ok')).toBeInTheDocument();
+    expect(screen.queryByTestId('palette-command-com.test.good.throwing')).not.toBeInTheDocument();
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0]![0]).toBeInstanceOf(Error);
+    // Studio 壳层继续工作
+    expect(screen.getByTestId('open-sample-project')).toBeInTheDocument();
+    expect(screen.getByTestId('open-plugin-manager')).toBeInTheDocument();
+    expect(screen.getByTestId('mock-canvas')).toBeInTheDocument();
+  });
+
+  it('插件管理：多个缺 id 非法插件以唯一 instanceId 展示与操作，互不干扰', async () => {
+    const anonManifest = null as unknown as Manifest;
+    render(
+      <LumoraStudio
+        plugins={[{ manifest: anonManifest }, { manifest: anonManifest }]}
+        hostVersion="0.1.0"
+      />,
+    );
+    await screen.findByTestId('lumora-studio');
+    screen.getByTestId('open-plugin-manager').click();
+    // 两条记录各自成行：唯一 instanceId 作为 key/testid，展示 id 保持 '<unknown>'
+    const firstRow = await screen.findByTestId('plugin-row-<unknown:1>');
+    expect(screen.getByTestId('plugin-row-<unknown:2>')).toBeInTheDocument();
+    expect(firstRow).toHaveTextContent('Manifest 非法');
+    expect(firstRow).toHaveTextContent('<unknown>');
+    // 经各自 instanceId 禁用：互不影响
+    screen.getByTestId('plugin-toggle-<unknown:1>').click();
+    await waitFor(() => expect(screen.getByTestId('plugin-state-<unknown:1>')).toHaveTextContent('已停用'));
+    expect(screen.getByTestId('plugin-state-<unknown:2>')).toHaveTextContent('失败');
   });
 
   it('命令面板：when() 上下文注入命令所属插件 id，与 execute() 使用同一上下文', async () => {

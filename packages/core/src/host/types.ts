@@ -1,5 +1,5 @@
 import type { Disposable } from '../disposable';
-import type { CommandRegistry } from '../commands/command-registry';
+import type { PluginCommands } from '../commands/command-registry';
 import type { EventMap } from '../events/event-map';
 import type { ContributionBundle, ContributionKind } from '../contributions/types';
 import type { Manifest } from '../manifest/validate';
@@ -44,7 +44,8 @@ export interface PluginContext {
   manifest: Manifest;
   hostVersion: string;
   events: PluginEventBus;
-  commands: CommandRegistry;
+  /** 只读/执行能力面：禁止绕过生命周期直接注册命令（见 PluginCommands） */
+  commands: PluginCommands;
   services: PluginServices;
   /** 提交贡献项；返回的 Disposable 由宿主在停用时自动释放，插件亦可提前释放 */
   contribute(bundle: ContributionBundle): Disposable;
@@ -59,6 +60,9 @@ export interface PluginDescriptor {
 }
 
 export interface PluginInfo {
+  /** 生命周期与记录标识：稳定唯一（缺 id 的非法 Manifest 亦唯一），disable/enable 等操作使用它 */
+  instanceId: string;
+  /** Manifest 展示 id：仅用于展示；缺 id 时为 '<unknown>'，不得用于寻址 */
   id: string;
   name: string;
   version: string;

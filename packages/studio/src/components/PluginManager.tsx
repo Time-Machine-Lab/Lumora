@@ -45,7 +45,12 @@ export function PluginManager({ runtime, onClose }: PluginManagerProps) {
         <ul className="lumora-plugin-list">
           {plugins.length === 0 && <li className="lumora-plugin-list__empty">尚未注册任何插件</li>}
           {plugins.map((plugin) => (
-            <li key={plugin.id} className="lumora-plugin-row" data-testid={`plugin-row-${plugin.id}`}>
+            // 记录键/操作一律使用稳定唯一的 instanceId；manifest id 仅展示
+            <li
+              key={plugin.instanceId}
+              className="lumora-plugin-row"
+              data-testid={`plugin-row-${plugin.instanceId}`}
+            >
               <div className="lumora-plugin-row__main">
                 <span className="lumora-plugin-row__name">
                   {plugin.name} <code>{plugin.id}</code>
@@ -55,13 +60,16 @@ export function PluginManager({ runtime, onClose }: PluginManagerProps) {
                 </span>
                 <span
                   className={`lumora-state lumora-state--${plugin.state}`}
-                  data-testid={`plugin-state-${plugin.id}`}
+                  data-testid={`plugin-state-${plugin.instanceId}`}
                 >
                   {STATE_LABELS[plugin.state]}
                 </span>
               </div>
               {plugin.reason && (
-                <p className="lumora-plugin-row__reason" data-testid={`plugin-reason-${plugin.id}`}>
+                <p
+                  className="lumora-plugin-row__reason"
+                  data-testid={`plugin-reason-${plugin.instanceId}`}
+                >
                   {String(plugin.reason)}
                 </p>
               )}
@@ -70,8 +78,8 @@ export function PluginManager({ runtime, onClose }: PluginManagerProps) {
                   <button
                     type="button"
                     className="lumora-button lumora-button--danger"
-                    data-testid={`plugin-toggle-${plugin.id}`}
-                    onClick={() => void runtime.host.disable(plugin.id)}
+                    data-testid={`plugin-toggle-${plugin.instanceId}`}
+                    onClick={() => void runtime.host.disable(plugin.instanceId)}
                   >
                     禁用
                   </button>
@@ -80,9 +88,9 @@ export function PluginManager({ runtime, onClose }: PluginManagerProps) {
                   <button
                     type="button"
                     className="lumora-button"
-                    data-testid={`plugin-toggle-${plugin.id}`}
+                    data-testid={`plugin-toggle-${plugin.instanceId}`}
                     onClick={() => {
-                      void runtime.host.enable(plugin.id).catch(() => {});
+                      void runtime.host.enable(plugin.instanceId).catch(() => {});
                     }}
                   >
                     {plugin.reason ? '重新启用' : '启用'}
@@ -92,8 +100,8 @@ export function PluginManager({ runtime, onClose }: PluginManagerProps) {
                   <button
                     type="button"
                     className="lumora-button lumora-button--danger"
-                    data-testid={`plugin-toggle-${plugin.id}`}
-                    onClick={() => void runtime.host.disable(plugin.id)}
+                    data-testid={`plugin-toggle-${plugin.instanceId}`}
+                    onClick={() => void runtime.host.disable(plugin.instanceId)}
                   >
                     禁用
                   </button>

@@ -34,6 +34,8 @@ export interface CommandRegistryOptions {
   /** 惰性服务提供者：宿主构造完成后再解析服务，避免注册表过早冻结空上下文 */
   getServices?: () => PluginServices;
   getProject?: () => Project | null;
+  /** 插件回调（如 when）抛错时上报，错误隔离不影响注册表与宿主 */
+  onError?: (error: unknown) => void;
 }
 
 const EMPTY_SERVICES: PluginServices = {
@@ -74,6 +76,48 @@ function toCommandResult(value: unknown): CommandResult {
 }
 
 /**
+ * 插件可见的命令能力面：只读 + 执行，禁止绕过生命周期直接注册命令。
+ * 插件添加命令必须经 context.contribute({ commands }) 提交 —— 由宿主代管，
+ * 随停用/激活失败自动回收；直接注册会得到明确拒绝（旧 context 同样无法绕过）。
+ */
+export class PluginCommands {
+  constructor(private readonly registry: CommandRegistry) {}
+
+  execute(id: string, args?: unknown): Promise<CommandResult> {
+    return this.registry.execute(id, args);
+  }
+
+  isAvailable(command: Command): boolean {
+    return this.registry.isAvailable(command);
+  }
+
+  has(id: string): boolean {
+    return this.registry.has(id);
+  }
+
+  get(id: string): Command | undefined {
+    return this.registry.get(id);
+  }
+
+  list(): Command[] {
+    return this.registry.list();
+  }
+
+  count(): number {
+    return this.registry.count();
+  }
+
+  ownerOf(id: string): string | undefined {
+    return this.registry.ownerOf(id);
+  }
+
+  /** 类型上不存在该成员；为 JS 消费方提供明确拒绝而非静默绕过生命周期 */
+  register(): never {
+    throw new Error('插件不得直接注册命令：请通过 context.contribute({ commands }) 提交，由宿主代管并随停用回收');
+  }
+}
+
+/**
  * 命令注册表。命令 id 全局唯一，重复注册抛错；
  * execute 捕获处理器抛错并以 CommandResult 返回，不影响宿主。
  */
@@ -82,6 +126,7 @@ export class CommandRegistry {
   private readonly events?: TypedEventEmitter<EventMap>;
   private readonly getServices: () => PluginServices;
   private readonly getProject: () => Project | null;
+  private readonly onError?: (error: unknown) => void;
   private readonly fallbackEvents = new TypedEventEmitter<EventMap>();
   private disposedFlag = false;
 
@@ -89,6 +134,7 @@ export class CommandRegistry {
     this.events = options.events;
     this.getServices = options.getServices ?? (() => options.services ?? EMPTY_SERVICES);
     this.getProject = options.getProject ?? (() => null);
+    this.onError = options.onError;
   }
 
   /** 注册命令；pluginId 为所属插件 id，注入到执行时的命令上下文 */
@@ -122,11 +168,17 @@ export class CommandRegistry {
   /**
    * 以命令所属插件的上下文评估可用性（when）。与 execute 使用同一上下文构造，
    * 保证插件依赖 context.pluginId / services 的 when 判断与执行时一致。
+   * when 抛错时上报并视为不可用，异常命令不影响其它命令与宿主。
    */
   isAvailable(command: Command): boolean {
     const entry = this.entries.get(command.id);
     if (!entry) return false;
-    return entry.command.when?.(this.createContext(entry.pluginId)) ?? true;
+    try {
+      return entry.command.when?.(this.createContext(entry.pluginId)) ?? true;
+    } catch (error) {
+      this.onError?.(error);
+      return false;
+    }
   }
 
   list(): Command[] {

@@ -4,7 +4,7 @@
 // 失败时退出码非 0；临时目录总是被清理。
 import { execSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -26,11 +26,12 @@ const CONSUMER_DEV_DEPS = [
   'vite@^6.0.3',
 ];
 
-// Windows 上 os.tmpdir() 可能返回 8.3 短名路径（如 ADMINI~1）且 realpath 无法归一化，
-// 而 vite 内部 realpath 后是长名路径，混用会让 relative 计算出含 .. 的非法 fileName；
-// homedir() 恒为长名路径，在其下建目录即可得到规范化长路径，且完全位于仓库依赖树之外，
-// Node 不会向上解析到仓库 node_modules
-const tmp = mkdtempSync(join(homedir(), 'AppData', 'Local', 'Temp', 'lumora-smoke-'));
+// 临时目录统一使用跨平台 os.tmpdir()。Windows 上 %TEMP% 可能带 8.3 短名（如 ADMINI~1），
+// 普通 realpathSync 不归一化而 vite 内部会得到长名，混用会让 relative 计算出含 .. 的
+// 非法 fileName；realpathSync.native 能展开短名，把消费工程路径统一成系统长名形式。
+// 消费工程位于仓库依赖树之外，Node 不会向上解析到仓库 node_modules
+let tmp = mkdtempSync(join(tmpdir(), 'lumora-smoke-'));
+tmp = realpathSync.native(tmp);
 if (tmp.toLowerCase().startsWith(root.toLowerCase())) {
   throw new Error('冒烟消费工程不得位于仓库依赖树内');
 }

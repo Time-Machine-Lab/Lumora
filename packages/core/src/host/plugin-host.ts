@@ -1,5 +1,5 @@
 import { DisposableSet, noopDisposable, type Disposable } from '../disposable';
-import { CommandRegistry } from '../commands/command-registry';
+import { CommandRegistry, PluginCommands } from '../commands/command-registry';
 import { ContributionRegistry } from '../contributions/contribution-registry';
 import { TypedEventEmitter } from '../events/typed-event-emitter';
 import type { EventMap } from '../events/event-map';
@@ -24,9 +24,9 @@ export interface PluginHostOptions {
 }
 
 interface PluginRecord {
-  /** 内部唯一记录键：缺 id 的非法 Manifest 使用自增序号，多个非法记录互不冲突 */
+  /** 内部唯一记录键 = 公开 instanceId：缺 id 的非法 Manifest 使用自增序号，多个非法记录互不冲突 */
   key: string;
-  /** 展示 id：缺 id 时为 '<unknown>'，仅供隔离展示 */
+  /** 展示 id：缺 id 时为 '<unknown>'，仅供隔离展示，不得用于寻址 */
   id: string;
   name: string;
   version: string;
@@ -44,6 +44,8 @@ interface PluginRecord {
   owned: DisposableSet;
   /** 进行中激活暂存的资源：停用/销毁时立即清理（disable 返回前清零） */
   pending: Disposable[] | null;
+  /** 进行中的停用清理：deactivate/disable/dispose 并发时共享同一 Promise，等待同一完成 */
+  deactivating: Promise<void> | null;
   /** 校验失败时为 false，宿主不会加载入口模块 */
   ready: boolean;
   /** 生命周期代际：每次停用/销毁/激活失败时递增，用于废弃进行中的加载/激活（见 activateRecord） */
@@ -105,12 +107,8 @@ class TrackedEventBridge implements PluginEventBus {
 export class PluginHost {
   readonly hostVersion: string;
   readonly events = new TypedEventEmitter<EventMap>();
-  readonly commands = new CommandRegistry({
-    events: this.events,
-    getServices: () => this.services,
-    getProject: () => this.project,
-  });
-  readonly contributions = new ContributionRegistry({ events: this.events, commands: this.commands });
+  readonly commands: CommandRegistry;
+  readonly contributions: ContributionRegistry;
   readonly services: PluginServices;
 
   private readonly plugins = new Map<string, PluginRecord>();
@@ -127,6 +125,14 @@ export class PluginHost {
       ((error) => {
         console.error('[lumora:host] 未捕获的宿主错误:', error);
       });
+    // 宿主自身就绪后再构造命令/贡献项/服务：onError 与惰性 services 才能正确注入
+    this.commands = new CommandRegistry({
+      events: this.events,
+      getServices: () => this.services,
+      getProject: () => this.project,
+      onError: (error) => this.onError(error),
+    });
+    this.contributions = new ContributionRegistry({ events: this.events, commands: this.commands });
     this.services = createPluginServices(this.contributions, () => this.project);
   }
 
@@ -142,8 +148,9 @@ export class PluginHost {
     return [...this.plugins.values()].map((record) => record.info());
   }
 
-  getPlugin(id: string): PluginInfo | undefined {
-    return this.plugins.get(id)?.info();
+  /** 按 instanceId 查询插件（合法 Manifest 的 instanceId 与 manifest id 相同） */
+  getPlugin(instanceId: string): PluginInfo | undefined {
+    return this.plugins.get(instanceId)?.info();
   }
 
   /**
@@ -181,15 +188,16 @@ export class PluginHost {
     await this.activateRecord(record);
   }
 
-  async deactivate(id: string): Promise<void> {
-    await this.deactivateRecord(this.requireRecord(id));
+  async deactivate(instanceId: string): Promise<void> {
+    await this.deactivateRecord(this.requireRecord(instanceId));
   }
 
-  async disable(id: string): Promise<void> {
-    const record = this.requireRecord(id);
+  async disable(instanceId: string): Promise<void> {
+    const record = this.requireRecord(instanceId);
     // failed 插件可停用（幂等清理残留资源）；停用后保持 inactive 并保留失败原因，
     // 激活失败类插件因此可重新 enable 重试
     const wasFailed = record.state === 'failed';
+    // 与并发的 deactivate/dispose 共享同一清理 Promise：全部等待清理完成后再合并目标终态
     await this.deactivateRecord(record);
     if (!wasFailed && record.state === 'inactive') {
       record.state = 'disabled';
@@ -197,10 +205,10 @@ export class PluginHost {
     }
   }
 
-  async enable(id: string): Promise<void> {
-    const record = this.requireRecord(id);
+  async enable(instanceId: string): Promise<void> {
+    const record = this.requireRecord(instanceId);
     if (!record.ready) {
-      throw new Error(`插件 "${id}" 不可启用（${record.reason ?? '未通过校验'}）`);
+      throw new Error(`插件 "${instanceId}" 不可启用（${record.reason ?? '未通过校验'}）`);
     }
     if (record.state === 'active' || record.state === 'activating' || record.state === 'deactivating') {
       return;
@@ -280,8 +288,10 @@ export class PluginHost {
       generation: 0,
       owned: new DisposableSet(),
       pending: null,
+      deactivating: null,
       info() {
         return {
+          instanceId: record.key,
           id: record.id,
           name: record.name,
           version: record.version,
@@ -305,6 +315,7 @@ export class PluginHost {
   }
 
   private async doLoad(record: PluginRecord): Promise<void> {
+    const generation = record.generation;
     record.state = 'loading';
     this.emitState(record, 'loading');
     if (!record.loader) {
@@ -313,27 +324,27 @@ export class PluginHost {
     }
     try {
       const module = await record.loader();
-      if (this.disposedFlag) return;
+      // 停用/销毁接管（代际推进）后，晚到的加载结果一律丢弃：
+      // 有效导出不缓存定义、无有效导出不 fail —— 均不得改写停用终态
+      if (this.disposedFlag || record.generation !== generation) return;
       const definition = normalizePluginModule(module);
       if (!definition) {
         this.fail(record, '入口模块未导出插件定义（缺少 default 或 activate）');
         return;
       }
-      // 加载期间可能已被 disable/dispose（状态离开 loading）：
-      // 晚到的加载结果只缓存定义，不改写停用状态；是否激活由调用方（register/enable）判断
       record.definition = definition;
     } catch (error) {
-      // 加载期间被 disable/dispose 的插件：晚到的失败不得改写停用状态
-      if (record.state === 'loading') {
-        this.fail(record, `入口模块加载失败: ${this.errorMessage(error)}`, error);
-      }
+      // 晚到的加载失败同样绑定代际：不得把已停用/禁用的插件改写为 failed
+      if (this.disposedFlag || record.generation !== generation) return;
+      this.fail(record, `入口模块加载失败: ${this.errorMessage(error)}`, error);
     }
   }
 
   /**
    * 激活事务：本次激活产生的资源先暂存在 record.pending，全部成功后才并入 owned；
-   * 停用/销毁会立即清理 pending（disable 返回前清零）；激活抛错或代际不符（被停用取代）时
-   * 整体回滚；激活失败推进代际，彻底失效旧 context（无法再注入贡献项或订阅）。
+   * 停用/销毁会立即清理 pending（disable 返回前清零）并推进代际；激活失败或取消时
+   * 在任何 await 前同步推进代际原子失效 context，并确保已开始激活的插件最终执行
+   * 一次可等待的 deactivate；回滚后复核代际，等待期间被再次接管则不再改写终态。
    */
   private async activateRecord(record: PluginRecord): Promise<void> {
     if (!record.ready || !record.definition) {
@@ -367,8 +378,8 @@ export class PluginHost {
     try {
       const result = await record.definition.activate(context);
       if (this.disposedFlag || record.generation !== generation) {
-        // 激活期间被停用/销毁：激活期内的 pending 资源已由 deactivate 清理（幂等），
-        // 本分支只负责释放晚到的 activate 返回值
+        // 激活期间被停用/销毁接管：deactivateRecord 的 activating 分支已执行插件的
+        // 生命周期清理，本分支只负责释放晚到的 activate 返回值，不再触碰状态
         if (result != null) {
           try {
             await this.disposeAll([result]);
@@ -384,29 +395,42 @@ export class PluginHost {
       record.state = 'active';
       this.emitState(record, 'active');
     } catch (error) {
-      if (this.disposedFlag || record.generation !== generation) {
-        return; // 已被停用取代：deactivate 负责清理，失败不覆盖既有状态
-      }
+      if (this.disposedFlag) return;
+      const superseded = record.generation !== generation;
+      // 原子失效 context：在任何 await 前同步推进代际，旧 context 立即停止接受贡献/订阅
+      record.generation += 1;
       record.pending = null;
       try {
         await this.disposeAll(pending);
       } catch {
         // 回滚失败不掩盖原始激活错误
       }
-      // 推进代际：激活失败后的旧 context 无法再注入贡献项
-      record.generation += 1;
+      // 未被停用接管时：已开始激活的插件执行一次可等待的 deactivate
+      //（被停用接管时由 deactivateRecord 的 activating 分支负责，此处不得重复调用）
+      if (!superseded) await this.deactivateHookOnce(record);
+      // 回滚后复核代际：等待期间若被停用/销毁再次接管（代际再次推进），不再改写终态
+      if (this.disposedFlag || record.generation !== generation + 1) return;
       this.fail(record, `激活失败: ${this.errorMessage(error)}`, error);
     }
   }
 
-  private async deactivateRecord(record: PluginRecord): Promise<void> {
-    // 并发停用合并为一次：已停用/已禁用/停用进行中直接返回
-    if (record.state === 'inactive' || record.state === 'disabled' || record.state === 'deactivating') {
-      return;
-    }
+  /**
+   * 停用一条记录。in-flight 清理 Promise 记录在 record.deactivating：
+   * deactivate/disable/dispose 并发时共享同一 Promise，全部等待同一清理完成，
+   * 不提前返回；目标终态由调用方合并（disable → disabled；deactivate/dispose → inactive）。
+   */
+  private deactivateRecord(record: PluginRecord): Promise<void> {
+    if (record.state === 'inactive' || record.state === 'disabled') return Promise.resolve();
+    if (record.deactivating) return record.deactivating;
     // 推进代际：任何进行中的加载/激活完成时都会被废弃（见 doLoad / activateRecord）
     record.generation += 1;
+    record.deactivating = this.performDeactivate(record).finally(() => {
+      record.deactivating = null;
+    });
+    return record.deactivating;
+  }
 
+  private async performDeactivate(record: PluginRecord): Promise<void> {
     if (record.state === 'failed') {
       // failed 插件（校验/加载/激活失败）的停用：置为 deactivating 以合并并发停用，
       // 幂等清理残留资源，保留失败原因，激活失败类插件重新 enable 时可重试
@@ -430,7 +454,7 @@ export class PluginHost {
 
     if (record.state === 'loading' || record.state === 'registered') {
       // 加载中/未加载：无活动资源与 deactivate 钩子，直接置为 inactive；
-      // 晚到的加载结果只缓存定义（doLoad），由调用方决定是否激活
+      // 晚到的加载结果一律丢弃（doLoad 绑定代际），由调用方决定是否激活
       record.state = 'inactive';
       this.emitState(record, 'inactive');
       return;
@@ -441,8 +465,9 @@ export class PluginHost {
     this.emitState(record, 'deactivating');
 
     if (wasActivating) {
-      // 激活进行中：立即清理暂存资源（disable 返回前 pending 必须清零），
-      // 在途激活完成时只负责释放晚到的 activate 返回值（见 activateRecord）
+      // 激活进行中：立即清理暂存资源（disable 返回前 pending 必须清零）；
+      // 已开始激活的插件执行一次可等待的 deactivate（与 activateRecord 回滚协调，只调用一次；
+      // 若回滚已接管 pending，则由回滚负责调用）；在途激活完成时只释放晚到的返回值（见 activateRecord）
       const pending = record.pending;
       record.pending = null;
       if (pending) {
@@ -451,6 +476,7 @@ export class PluginHost {
         } catch {
           // 清理失败不掩盖停用
         }
+        await this.deactivateHookOnce(record);
       }
       record.state = 'inactive';
       this.emitState(record, 'inactive');
@@ -480,6 +506,15 @@ export class PluginHost {
     this.emitState(record, 'inactive');
   }
 
+  /** 已开始激活的插件的生命周期清理：执行一次可等待的 deactivate，失败不掩盖停用/激活结果 */
+  private async deactivateHookOnce(record: PluginRecord): Promise<void> {
+    try {
+      await record.definition?.deactivate?.();
+    } catch {
+      // 清理钩子失败不掩盖停用/激活结果
+    }
+  }
+
   private createContext(
     record: PluginRecord,
     bridge: TrackedEventBridge,
@@ -490,7 +525,8 @@ export class PluginHost {
       manifest: record.manifest,
       hostVersion: this.hostVersion,
       events: bridge,
-      commands: this.commands,
+      // 只读/执行能力面：插件不得绕过生命周期直接注册命令
+      commands: new PluginCommands(this.commands),
       services: this.services,
       contribute,
       getProject: () => this.project,
@@ -526,9 +562,10 @@ export class PluginHost {
     });
   }
 
-  private requireRecord(id: string): PluginRecord {
-    const record = this.plugins.get(id);
-    if (!record) throw new Error(`未知插件: ${id}`);
+  /** 按 instanceId 寻址记录（合法 Manifest 的 instanceId 与 manifest id 相同） */
+  private requireRecord(instanceId: string): PluginRecord {
+    const record = this.plugins.get(instanceId);
+    if (!record) throw new Error(`未知插件: ${instanceId}`);
     return record;
   }
 

@@ -18,7 +18,7 @@ export { checkEngineCompatibility } from './manifest/engine';
 export type { EngineCheckResult } from './manifest/engine';
 
 // 命令
-export { CommandRegistry } from './commands/command-registry';
+export { CommandRegistry, PluginCommands } from './commands/command-registry';
 export type { Command, CommandContext, CommandResult, CommandRegistryOptions } from './commands/command-registry';
 
 // 贡献项
