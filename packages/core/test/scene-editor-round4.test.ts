@@ -103,10 +103,10 @@ describe('P2 硬约束 4：EditorState 边界完整（dispose 终态）', () => 
     });
 
     editor.dispose();
-    // dispose 自身发过一次 close 事件（project/selection/view 原子置空）
+    // dispose 不发出任何事件（终态优先，无 close 事件）；视图已复位默认
     expect(editor.getView().viewMode).toBe('director');
-    expect(viewEmissions).toBe(1);
-    expect(selectionEmissions).toBe(1);
+    expect(viewEmissions).toBe(0);
+    expect(selectionEmissions).toBe(0);
     viewEmissions = 0;
     selectionEmissions = 0;
 
@@ -331,8 +331,8 @@ describe('P2 硬约束 4：transition(null) 覆盖 close/reset/dispose', () => {
     const unsubHistory = editor.events.on('history:changed', () => seen.push('history:changed'));
 
     editor.dispose();
-    // dispose 原子关闭：project/selection/view 一次置空（历史已清空，无 history:changed）
-    expect(seen).toEqual(['project:changed', 'selection:changed', 'view:changed']);
+    // dispose 原子关闭且不发出任何事件：状态一次置空（无 close 事件、无 history:changed）
+    expect(seen).toEqual([]);
     expect(editor.getProject()).toBeNull();
     expect(editor.getSelection()).toEqual([]);
     expect(editor.getView().viewMode).toBe('director');
@@ -366,7 +366,9 @@ describe('P2 边界：revision 只由当前应用状态单调生成', () => {
     persisted.revision = 7;
     editor.openProject(persisted);
     expect(editor.getProject()!.revision).toBe(7);
-    expect(editor.getProject()).toBe(persisted); // 打开引用保持（宿主快照契约）
+    // owned immutable：编辑器持有深克隆快照而非输入引用（宿主快照契约改为 owned 快照）
+    expect(editor.getProject()).not.toBe(persisted);
+    expect(editor.getProject()).toEqual(persisted);
     ok(editor.addObject(createGroupObject()));
     expect(editor.getProject()!.revision).toBe(8);
   });

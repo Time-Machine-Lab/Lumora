@@ -15,6 +15,8 @@ import {
   removeObjects,
   updateObject,
 } from '../scene/scene-graph';
+import { cloneProject, deepFreeze } from '../scene/immutable';
+import { validateProjectSchema, validateSceneObjectData } from '../scene/validate';
 import { isSceneObject } from '../scene/types';
 import type { AssetData, Project, SceneObjectData, TransformData } from '../scene/types';
 import { TypedEventEmitter } from '../events/typed-event-emitter';
@@ -49,6 +51,10 @@ export interface EditorEventMap {
   [event: string]: unknown;
 }
 
+function freshDefaultView(): ViewState {
+  return { ...DEFAULT_VIEW, guides: { ...DEFAULT_VIEW.guides } };
+}
+
 const DEFAULT_VIEW: ViewState = {
   transformMode: 'translate',
   transformSpace: 'local',
@@ -66,20 +72,36 @@ function failure(message: string): Result<never> {
   return { ok: false, error: new Error(message) };
 }
 
+/** 变换值等价（克隆副本引用必然不同，锁定校验必须按值比较） */
+function sameTransformData(a: TransformData, b: TransformData): boolean {
+  const { position: ap, rotation: ar, scale: as } = a;
+  const { position: bp, rotation: br, scale: bs } = b;
+  return (
+    ap[0] === bp[0] && ap[1] === bp[1] && ap[2] === bp[2] &&
+    ar[0] === br[0] && ar[1] === br[1] && ar[2] === br[2] &&
+    as[0] === bs[0] && as[1] === bs[1] && as[2] === bs[2]
+  );
+}
+
 /**
  * 核心 3D 场景编辑器（框架无关）：
- * - 持有项目、选择与视口 UI 状态；项目为不可变数据，所有变更经历史栈提交
+ * - 持有 owned immutable project：openProject 深克隆输入并递归冻结，编辑器外的任何
+ *   改动（宿主快照/插件/调用方持有的旧引用）都不可能影响编辑器状态；getProject() 等
+ *   getter 只暴露冻结引用，写入在严格模式下抛 TypeError、非严格模式静默失败
+ * - 提交路径为同一原子操作：validate/derive/stamp（校验 + 单调 revision + 冻结）、
+ *   状态换入、history 游标提交 —— 任一校验失败时状态与游标均不变
  * - 锁定对象不可变换/删除/变更层级；NaN/Infinity 数值拒绝
  * - 一次 Gizmo 拖动 = 一个历史步骤（beginTransform/commitTransform 成对）
+ * - dispose() 在任何同步事件前进入不可重入终态：失效 session/事务、永久关闭事件总线
  */
 export class SceneEditor {
   readonly events = new TypedEventEmitter<EditorEventMap>();
 
   private project: Project | null = null;
   private selection: string[] = [];
-  private view: ViewState = { ...DEFAULT_VIEW, guides: { ...DEFAULT_VIEW.guides } };
+  private view: ViewState = freshDefaultView();
   private history = new HistoryStack<EditorSnapshot>();
-  /** beginTransform 捕获的拖动前快照 */
+  /** beginTransform 捕获的拖动前快照（冻结引用，只读） */
   private dragSnapshot: EditorSnapshot | null = null;
   /** 会话令牌：openProject/reset/dispose 时递增；异步流程据此绑定所属项目会话 */
   private sessionToken = 0;
@@ -88,6 +110,7 @@ export class SceneEditor {
   /** 每次应用状态的单调序号（openProject/提交/撤销/重做各取新值） */
   private revisionCounter = 0;
 
+  /** 当前项目（owned immutable：只读冻结引用，不泄露可写引用） */
   getProject(): Project | null {
     return this.project;
   }
@@ -116,15 +139,17 @@ export class SceneEditor {
   }
 
   openProject(project: Project): void {
-    // 保持传入引用不变（宿主快照契约：getProject() 返回打开时的项目对象）；
-    // 单调序号从项目持久化 revision 起步，后续每次应用状态（提交/撤销/重做）严格递增
+    // 输入先经完整校验（schema + 结构），失败同步抛错且不触碰任何状态；
+    // 再深克隆为编辑器自有状态并递归冻结：调用方/宿主此后持有的引用与编辑器完全解耦，
+    // 对输入的改动不可能影响编辑器（owned immutable）。
     this.assertAlive();
     this.validateProject(project);
     this.revisionCounter = project.revision;
     this.history.clear();
     this.dragSnapshot = null;
     this.sessionToken += 1;
-    this.transition(project, { selection: [], resetView: true, seedRevision: true });
+    this.swapState(deepFreeze(cloneProject(project)), [], { resetView: true });
+    this.emitProjectEvents();
     this.emitHistory();
   }
 
@@ -133,7 +158,8 @@ export class SceneEditor {
     this.history.clear();
     this.dragSnapshot = null;
     this.sessionToken += 1;
-    this.transition(null, { resetView: true });
+    this.swapState(null, [], { resetView: true });
+    this.emitProjectEvents();
     this.emitHistory();
   }
 
@@ -149,18 +175,20 @@ export class SceneEditor {
 
   /**
    * 释放编辑器（不可逆终态）：runtime 卸载（组件 unmount）时调用。
-   * 原子关闭（project/selection/view 一次就位，发出 close 事件）后置终态标记、
-   * 递增会话令牌（在途异步导入校验失败、取消提交）、清空历史并永久关闭事件总线；
-   * 之后一切公开变更器拒绝 —— 卸载后不得有晚到写入。
+   * 在任何同步事件发出前进入不可重入终态：置终态标记、递增会话令牌（在途异步导入
+   * 校验失败、取消提交）、清空历史与拖动事务、置空状态，最后永久关闭事件总线
+   * （on/once/onAny 此后一律抛「事件总线已关闭」）。dispose 自身不发出任何事件。
    */
   dispose(): void {
     if (this.disposed) return;
-    this.transition(null, { resetView: true });
     this.disposed = true;
     this.sessionToken += 1;
     this.history.clear();
     this.dragSnapshot = null;
-    this.events.clear();
+    this.project = null;
+    this.selection = [];
+    this.view = freshDefaultView();
+    this.events.dispose();
   }
 
   // ---------- 选择 ----------
@@ -383,8 +411,8 @@ export class SceneEditor {
 
   /**
    * 一次 Gizmo 拖动：捕获拖动前快照。
-   * 项目为不可变数据（每次变更产生新 Project，旧引用永不改变），
-   * 因此直接持有引用即可作为拖动前状态——不做结构化克隆，
+   * 项目为 owned immutable（每次变更产生新 Project，旧引用递归冻结、永不改变），
+   * 因此直接持有冻结引用即可作为拖动前状态——不做结构化克隆，
    * 避免复制/序列化完整二进制 payload（大模型历史步骤与撤销无重负担）。
    */
   beginTransform(): void {
@@ -413,16 +441,18 @@ export class SceneEditor {
     // （并发编辑仍留在历史中，undo 时两者分开回退）
     if (before && before.project !== project) {
       if (this.sameTransform(project, next, objectId)) return { ok: true };
-      this.pushEntry({ label, before: current, after: { project: next, selection: current.selection } });
-      return { ok: true };
+      return this.commitEntry(label, current, next, current.selection);
     }
     // 局部比较（仅目标对象三向量），不做整项目 JSON 序列化
     if (this.sameTransform(before?.project ?? project, next, objectId)) return { ok: true };
-    this.pushEntry({ label, before: before ?? current, after: { project: next, selection: current.selection } });
-    return { ok: true };
+    return this.commitEntry(label, before ?? current, next, current.selection);
   }
 
-  /** 通用属性更新（名称/材质/灯光/摄像机/几何体等），可撤销 */
+  /**
+   * 通用属性更新（名称/材质/灯光/摄像机/几何体等），可撤销。
+   * updater 收到结构化克隆的工作副本：原地篡改（改 id/type/transform）不可能污染编辑器
+   * 状态；返回结果再做结构标识、锁定（按变换值比较）与完整 schema 校验后提交。
+   */
   updateObjectProps(
     objectId: string,
     updater: (object: SceneObjectData) => SceneObjectData | null,
@@ -433,18 +463,20 @@ export class SceneEditor {
     const object = findObject(project, objectId);
     if (!object) return failure('对象不存在');
     if (!isInActiveScene(project, objectId)) return failure('对象不属于活动场景');
-    const nextObject = updater(object);
+    const nextObject = updater(structuredClone(object));
     if (!nextObject) return failure('属性值非法');
     if (nextObject.id !== object.id || nextObject.type !== object.type) {
       return failure('结构标识（id/type）不可修改');
     }
-    if (nextObject.transform !== object.transform && object.locked) {
+    // 锁定校验按变换值比较：克隆副本引用必然不同，引用比较会误伤只读变换的更新（改名等）
+    if (!sameTransformData(nextObject.transform, object.transform) && object.locked) {
       return failure(`「${object.name}」已锁定，无法变换`);
     }
     if (nextObject.parentId !== object.parentId) {
       return failure('层级变更请使用拖拽或层级操作');
     }
-    if (!isSceneObject(nextObject)) return failure('属性值非法');
+    const problem = validateSceneObjectData(nextObject);
+    if (problem) return failure('属性值非法');
     return this.commit(updateObject(project, objectId, () => nextObject), label);
   }
 
@@ -557,17 +589,15 @@ export class SceneEditor {
   // ---------- 撤销/重做 ----------
 
   undo(): Result {
-    const snapshot = this.history.undo();
+    const snapshot = this.history.peekUndo();
     if (!snapshot) return failure('没有可撤销的操作');
-    this.applySnapshot(snapshot);
-    return { ok: true };
+    return this.applyHistorySnapshot(snapshot.before, 'undo');
   }
 
   redo(): Result {
-    const snapshot = this.history.redo();
+    const snapshot = this.history.peekRedo();
     if (!snapshot) return failure('没有可重做的操作');
-    this.applySnapshot(snapshot);
-    return { ok: true };
+    return this.applyHistorySnapshot(snapshot.after, 'redo');
   }
 
   // ---------- 内部 ----------
@@ -600,29 +630,53 @@ export class SceneEditor {
   }
 
   private commit(project: Project, label: string, afterSelection?: string[]): Result {
-    this.pushEntry({
-      label,
-      before: { project: this.project!, selection: [...this.selection] },
-      after: { project, selection: afterSelection ?? [...this.selection] },
-    });
-    return { ok: true };
+    const before: EditorSnapshot = { project: this.project!, selection: [...this.selection] };
+    return this.commitEntry(label, before, project, afterSelection ?? this.selection);
   }
 
   /**
-   * 推入历史并原子应用 after：transition 统一完成换入与事件（含视图推导）。
-   * 历史栈保存未盖章 revision 的快照；revision 只由当前应用状态单调生成
-   * （applySnapshot 应用时再取新值），undo/redo 每次应用都严格递增。
+   * 原子提交：stamp（校验 + 单调 revision + 冻结）→ 推入历史 → 换入 → 发事件。
+   * 候选状态校验失败时抛错被转换为失败结果，状态与历史游标均保持原样。
+   * 事件按固定顺序 project → selection → view → history 发出，观察者不会看到
+   * 「新项目 + 旧场景选择/旧机位」的跨场景中间态。
    */
-  private pushEntry(entry: { label: string; before: EditorSnapshot; after: EditorSnapshot }): void {
-    this.history.push({ ...entry, before: entry.before, after: entry.after });
-    this.transition(entry.after.project, { selection: entry.after.selection });
+  private commitEntry(
+    label: string,
+    before: EditorSnapshot,
+    afterProject: Project,
+    afterSelection: string[],
+  ): Result {
+    let stamped: Project;
+    try {
+      stamped = this.stampAndFreeze(afterProject);
+    } catch (error) {
+      return failure(error instanceof Error ? error.message : '提交失败');
+    }
+    const after: EditorSnapshot = {
+      project: stamped,
+      selection: this.filterSelection(stamped, afterSelection),
+    };
+    this.history.push({ label, before, after });
+    this.swapState(stamped, after.selection);
+    this.emitProjectEvents();
     this.emitHistory();
+    return { ok: true };
   }
 
-  /** 撤销/重做：过渡到快照（transition 取新 revision 并重新推导视图） */
-  private applySnapshot(snapshot: EditorSnapshot): void {
-    this.transition(snapshot.project, { selection: snapshot.selection });
+  /** 撤销/重做：peek 目标 → 盖章（失败时游标不动、状态不变）→ 游标提交 → 换入 → 发事件 */
+  private applyHistorySnapshot(snapshot: EditorSnapshot, move: 'undo' | 'redo'): Result {
+    let stamped: Project;
+    try {
+      stamped = this.stampAndFreeze({ ...snapshot.project });
+    } catch (error) {
+      return failure(error instanceof Error ? error.message : '应用历史快照失败');
+    }
+    if (move === 'undo') this.history.commitUndo();
+    else this.history.commitRedo();
+    this.swapState(stamped, snapshot.selection);
+    this.emitProjectEvents();
     this.emitHistory();
+    return { ok: true };
   }
 
   /** 选择按项目活动场景可达集过滤：跨场景/已删除对象不可选中 */
@@ -630,31 +684,32 @@ export class SceneEditor {
     return ids.filter((id) => findObject(project, id) && isInActiveScene(project, id));
   }
 
-  /**
-   * 原子应用状态（validate→swap→emit）：项目、选择、视图在发出任何事件前同时就位，
-   * 按固定顺序发 project:changed → selection:changed → view:changed → history:changed。
-   * 观察者（插件宿主/面板）不会看到「新项目 + 旧场景选择/旧机位」的跨场景中间态。
-   * revision 只由当前应用状态单调生成；seedRevision 仅 openProject 从持久化值起步。
-   */
-  private transition(
-    nextProject: Project | null,
-    opts: { selection?: string[]; resetView?: boolean; seedRevision?: boolean } = {},
+  /** 状态换入：项目/选择/视图一次就位（不发事件；事件由调用方按固定顺序发出） */
+  private swapState(
+    project: Project | null,
+    selection: string[],
+    opts: { resetView?: boolean } = {},
   ): void {
-    this.assertAlive();
-    if (nextProject) {
-      this.validateProject(nextProject);
-      if (opts.seedRevision) this.revisionCounter = nextProject.revision;
-      else nextProject = { ...nextProject, revision: ++this.revisionCounter };
-    }
-    this.project = nextProject;
-    this.selection = nextProject ? this.filterSelection(nextProject, opts.selection ?? this.selection) : [];
-    this.view =
-      opts.resetView || !nextProject
-        ? { ...DEFAULT_VIEW, guides: { ...DEFAULT_VIEW.guides } }
-        : this.deriveView(nextProject);
-    this.events.emit('project:changed', { project: nextProject });
+    this.project = project;
+    this.selection = project ? this.filterSelection(project, selection) : [];
+    this.view = opts.resetView || !project ? freshDefaultView() : this.deriveView(project);
+  }
+
+  /** 固定顺序广播当前状态快照：project → selection → view */
+  private emitProjectEvents(): void {
+    this.events.emit('project:changed', { project: this.project });
     this.events.emit('selection:changed', { ids: this.getSelection() });
     this.events.emit('view:changed', { view: this.getView() });
+  }
+
+  /**
+   * 候选状态盖章：完整校验（schema + 结构）→ 单调 revision → 深度冻结。
+   * 校验失败抛错且无任何副作用：调用方（提交/撤销/重做）据此保证
+   * 「失败时状态与历史游标均不变」。
+   */
+  private stampAndFreeze(candidate: Project): Project {
+    this.validateProject(candidate);
+    return deepFreeze({ ...candidate, revision: ++this.revisionCounter });
   }
 
   /** 机位视图从下一个项目推导：机位不存在/不是相机/不属于活动场景 → 导演视图 */
@@ -669,35 +724,46 @@ export class SceneEditor {
   }
 
   /**
-   * 项目结构校验（transition 每次应用前强制）：对象合法性、父子引用与循环、
-   * 根列表一致性（parentId === null ⇔ 恰好出现在一个场景根列表）、
+   * 项目校验（O(n)：对象索引 + 三色 parent 链检测，不做整项目扫描）：
+   * 完整 schema 与有限数值校验（validateProjectSchema）→ 父引用存在 →
+   * 父子循环 → 根列表一致性（parentId === null ⇔ 恰好出现在一个场景根列表）→
    * 活动场景与活动机位可达性。不合法即抛错（openProject 同步失败；
    * 提交路径为编辑器自身不变量的防御性校验）。
    */
   private validateProject(project: Project): void {
+    const schemaProblem = validateProjectSchema(project);
+    if (schemaProblem) throw new Error(schemaProblem);
+    const byId = new Map<string, SceneObjectData>();
     for (const object of project.objects) {
-      // 类型守卫对已类型化对象不会收窄失败分支（never），先取 id 供报错使用
-      const objectId = object.id;
-      if (!isSceneObject(object as unknown)) throw new Error(`对象数据不合法：${objectId}`);
-      if (object.parentId !== null && !findObject(project, object.parentId)) {
-        throw new Error(`对象缺少父级：${objectId}`);
+      if (byId.has(object.id)) throw new Error(`对象数据不合法：${object.id}`);
+      byId.set(object.id, object);
+    }
+    for (const object of project.objects) {
+      if (object.parentId !== null && !byId.has(object.parentId)) {
+        throw new Error(`对象缺少父级：${object.id}`);
       }
     }
-    // 父子循环：沿 parent 链上行，节点重复访问即循环
+    // 三色循环检测（O(n) 摊还）：顺序遍历 parent 链，路径内重复即循环；
+    // 已确认无环（'ok'）的链直接复用，不重复走
+    const status = new Map<string, 'in-progress' | 'ok'>();
     for (const object of project.objects) {
-      const seen = new Set<string>();
+      const path: string[] = [];
       let cursor: SceneObjectData | undefined = object;
       while (cursor && cursor.parentId !== null) {
-        if (seen.has(cursor.id)) throw new Error(`父子关系存在循环：${cursor.id}`);
-        seen.add(cursor.id);
-        cursor = findObject(project, cursor.parentId);
+        const s = status.get(cursor.id);
+        if (s === 'ok') break;
+        if (s === 'in-progress') throw new Error(`父子关系存在循环：${cursor.id}`);
+        status.set(cursor.id, 'in-progress');
+        path.push(cursor.id);
+        cursor = byId.get(cursor.parentId);
       }
+      for (const id of path) status.set(id, 'ok');
     }
     // 根列表一致性：rootObjectIds 引用合法根对象；每个根对象恰好出现一次
     const rootCount = new Map<string, number>();
     for (const scene of project.scenes) {
       for (const rootId of scene.rootObjectIds) {
-        const root = findObject(project, rootId);
+        const root = byId.get(rootId);
         if (!root || root.parentId !== null) throw new Error(`场景根列表引用非法：${rootId}`);
         rootCount.set(rootId, (rootCount.get(rootId) ?? 0) + 1);
       }
@@ -713,11 +779,32 @@ export class SceneEditor {
     const scene = project.scenes.find((s) => s.id === project.activeSceneId);
     if (!scene) throw new Error('活动场景不存在');
     if (scene.activeCameraId !== null) {
-      const camera = findObject(project, scene.activeCameraId);
-      if (!camera || camera.type !== 'camera' || !isInActiveScene(project, scene.activeCameraId)) {
+      const camera = byId.get(scene.activeCameraId);
+      if (!camera || camera.type !== 'camera') {
+        throw new Error('活动机位不存在或不属于活动场景');
+      }
+      if (!this.isReachableFrom(scene.rootObjectIds, project.objects, scene.activeCameraId)) {
         throw new Error('活动机位不存在或不属于活动场景');
       }
     }
+  }
+
+  /** 从场景根列表出发（DFS，按父级索引）目标是否可达 */
+  private isReachableFrom(roots: string[], objects: SceneObjectData[], target: string): boolean {
+    const childrenOf = new Map<string, string[]>();
+    for (const object of objects) {
+      if (object.parentId === null) continue;
+      const list = childrenOf.get(object.parentId);
+      if (list) list.push(object.id);
+      else childrenOf.set(object.parentId, [object.id]);
+    }
+    const stack = [...roots];
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      if (id === target) return true;
+      for (const childId of childrenOf.get(id) ?? []) stack.push(childId);
+    }
+    return false;
   }
 
   private assertAlive(): void {
@@ -729,13 +816,7 @@ export class SceneEditor {
     const aObject = findObject(a, objectId);
     const bObject = findObject(b, objectId);
     if (!aObject || !bObject) return false;
-    const { position: ap, rotation: ar, scale: as } = aObject.transform;
-    const { position: bp, rotation: br, scale: bs } = bObject.transform;
-    return (
-      ap[0] === bp[0] && ap[1] === bp[1] && ap[2] === bp[2] &&
-      ar[0] === br[0] && ar[1] === br[1] && ar[2] === br[2] &&
-      as[0] === bs[0] && as[1] === bs[1] && as[2] === bs[2]
-    );
+    return sameTransformData(aObject.transform, bObject.transform);
   }
 
   private emitHistory(): void {
