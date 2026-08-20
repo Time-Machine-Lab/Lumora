@@ -23,22 +23,45 @@ export interface PluginHostOptions {
   onError?: (error: unknown) => void;
 }
 
-/** 一代入口加载操作：先发布（任何状态事件之前），再启动加载；同代共享，异代整体丢弃 */
+/**
+ * 身份不变的 deferred promise：发布时即确定 promise 身份并登记到记录字段，
+ * 真实操作只 resolve/reject 该 promise —— 字段绝不中途替换。事件监听器重入
+ * 与并发调用在任何时点取到的都是同一真实完成 promise。
+ */
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve(value: T): void;
+  reject(reason?: unknown): void;
+}
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/** 一代入口加载操作：先发布 deferred（任何状态事件之前），再启动加载；同代共享，异代整体丢弃 */
 interface LoadingOperation {
   generation: number;
-  promise: Promise<void>;
+  deferred: Deferred<void>;
 }
 
 /**
  * 一次激活尝试的身份：持有身份（record.activation === attempt 且代际相符）者
- * 才能触碰 generation/pending/终态；过期尝试只能清理自身资源，不写入任何状态
+ * 才能触碰 generation/pending/终态；过期尝试只能清理自身资源，不写入任何状态。
+ * completion 是本尝试的唯一完成点：覆盖 activate 钩子 settle、晚到返回值的
+ * async Disposable 清理与暂存资源清理 —— 生命周期操作等待它，旧代清理不会
+ * 在 disable/enable 已返回后仍跨代污染新代。
  */
 interface ActivationAttempt {
   generation: number;
   /** 本尝试暂存资源（贡献项、订阅、activate 返回值）：生命周期操作与过期尝试共用，DisposableSet 幂等 */
   pending: DisposableSet;
-  /** activate 钩子的完成点（不含路由/回滚）：生命周期操作等待它以覆盖晚到外部副作用 */
-  settled: Promise<unknown>;
+  completion: Promise<void>;
 }
 
 /** 生命周期操作的终态意图：由最后一位发布者决定（disable 的 disabled 可覆盖回滚的 failed） */
@@ -77,8 +100,8 @@ interface PluginRecord {
   activation: ActivationAttempt | null;
   /** 当前代门面：命令回调（when/execute）与外部订阅经它绑定 owner/代际 */
   gate: PluginGate | null;
-  /** 在途生命周期操作对象：先登记对象（任何状态事件之前），promise 字段原地替换为真实操作；共享与合并读取同一对象 */
-  lifecycle: { promise: Promise<void> } | null;
+  /** 在途生命周期操作的 deferred（任何状态事件之前登记）：身份自发布起不变，共享与合并读取同一真实完成 promise */
+  lifecycle: Deferred<void> | null;
   /** 生命周期操作的终态意图：后发布者覆盖（合并） */
   lifecycleTarget: LifecycleTarget | null;
   /** 校验失败时为 false，宿主不会加载入口模块 */
@@ -146,12 +169,16 @@ class TrackedEventBridge implements PluginEventBus {
  *                       ↘ failed（校验/加载/激活任一环节失败）
  *         active → deactivating → inactive / disabled
  *
- * 并发与竞态：加载操作与生命周期操作都先发布后执行 —— 操作先登记到记录
- * （任何状态事件之前），再启动执行；状态事件内的重入调用共享同一操作，
- * 不会创建第二个清理/加载。每次激活持有独立尝试身份：过期尝试只能清理
- * 自身资源，不得修改新一代的 generation/pending/终态。激活取消、失败回滚
- * 与停用收敛为同一可等待的生命周期操作，disable/deactivate/dispose 等待
- * 同一操作，覆盖晚到副作用、回滚 completion 与状态事件重入。
+ * 并发与竞态：加载与生命周期操作自发布起持有身份不变的 deferred promise
+ * （先登记、后执行，真实操作只 settle，绝不替换字段），事件监听器重入与
+ * 并发调用在任何时点取得同一真实完成 promise；每次同步 emitState 返回后、
+ * 调用 loader 或 activate（插件用户代码）前复核 operation identity、generation
+ * 与期望状态，事件中的停用立即终止注册/加载/激活链。每次激活持有独立尝试
+ * 身份：过期尝试只能清理自身资源，不得修改新一代的 generation/pending/终态；
+ * 尝试的唯一完成点覆盖钩子 settle、晚到返回值的清理与暂存清理。激活取消、
+ * 失败回滚与停用收敛为同一生命周期操作，disable/deactivate/dispose 等待
+ * 同一操作；终态事件发布前旧操作完整 detach，事件内重入的新激活失败进入
+ * 独立生命周期并完成自身回滚。
  */
 export class PluginHost {
   readonly hostVersion: string;
@@ -216,6 +243,11 @@ export class PluginHost {
     this.plugins.set(record.key, record);
     this.emitState(record, 'registered');
 
+    // registered 事件内若发生停用（disable/deactivate 同步推进代际并接管状态），
+    // 立即终止注册链：不再加载/激活，不执行任何插件用户代码。
+    // 断言避免 TS 对 record.state 持续收窄（否则其后对 'failed'/'loading' 的比较会被误判为无重叠）
+    if (this.disposedFlag || (record.state as PluginState) !== 'registered') return record.info();
+
     if (!record.ready) {
       this.fail(record, record.reason ?? '插件未通过校验');
       return record.info();
@@ -228,7 +260,8 @@ export class PluginHost {
 
     await this.loadDefinition(record);
     // 加载期间可能被 disable/dispose 接管（状态已离开 loading），晚到加载结果不得改写停用状态
-    if (this.disposedFlag || record.state === 'failed' || record.state !== 'loading') return record.info();
+    const stateAfterLoad = record.state;
+    if (this.disposedFlag || stateAfterLoad === 'failed' || stateAfterLoad !== 'loading') return record.info();
 
     await this.activateRecord(record);
     return record.info();
@@ -379,20 +412,28 @@ export class PluginHost {
   }
 
   /**
-   * 发布本代入口加载操作：先登记到 record.loading（任何状态事件之前），再启动加载。
-   * 同代进行中的加载共享同一操作（loading 事件内重入 enable 不会二次加载）；
-   * 新一代 enable 不复用旧代操作，旧代的晚到结果按代际/身份整体丢弃。
+   * 发布本代入口加载操作：先登记身份不变的 deferred（任何状态事件之前），再启动加载。
+   * 同代进行中的加载共享同一操作（loading 事件内重入 enable 等待同一真实完成，
+   * 不会二次加载）；新一代 enable 不复用旧代操作，旧代的晚到结果按代际/身份整体丢弃。
    */
   private loadDefinition(record: PluginRecord): Promise<void> {
     if (record.definition) return Promise.resolve();
     const current = record.loading;
-    if (current && current.generation === record.generation) return current.promise;
-    const operation: LoadingOperation = { generation: record.generation, promise: Promise.resolve() };
+    if (current && current.generation === record.generation) return current.deferred.promise;
+    const deferred = createDeferred<void>();
+    const operation: LoadingOperation = { generation: record.generation, deferred };
     record.loading = operation;
-    operation.promise = this.doLoad(record).finally(() => {
-      if (record.loading === operation) record.loading = null;
-    });
-    return operation.promise;
+    this.doLoad(record).then(
+      () => {
+        if (record.loading === operation) record.loading = null;
+        deferred.resolve();
+      },
+      (error) => {
+        if (record.loading === operation) record.loading = null;
+        deferred.reject(error);
+      },
+    );
+    return deferred.promise;
   }
 
   private async doLoad(record: PluginRecord): Promise<void> {
@@ -400,6 +441,16 @@ export class PluginHost {
     const operation = record.loading;
     record.state = 'loading';
     this.emitState(record, 'loading');
+    // loading 事件内若发生停用（disable/deactivate/dispose 推进代际并接管状态），
+    // 复核通过才调用入口 loader（插件用户代码），否则不再继续
+    if (
+      this.disposedFlag ||
+      record.state !== 'loading' ||
+      record.generation !== generation ||
+      record.loading !== operation
+    ) {
+      return;
+    }
     if (!record.loader) {
       this.fail(record, '未提供入口模块加载器（descriptor.entry）');
       return;
@@ -435,10 +486,12 @@ export class PluginHost {
       return;
     }
 
+    // 本尝试的唯一完成点（身份不变）：钩子 settle、晚到返回值清理与暂存清理全部收敛于此
+    const completion = createDeferred<void>();
     const attempt: ActivationAttempt = {
       generation: record.generation,
       pending: new DisposableSet(),
-      settled: Promise.resolve(),
+      completion: completion.promise,
     };
     const gate: PluginGate = {
       commands: new PluginCommands(this.commands, () => this.isGateAlive(record, attempt)),
@@ -451,29 +504,37 @@ export class PluginHost {
     record.reason = undefined;
     this.emitState(record, 'activating');
 
+    // activating 事件内若发生停用（disable/deactivate/dispose 已推进代际并摘除尝试），
+    // 不得再调用 activate 钩子（插件用户代码）；收尾由在途生命周期操作完成
+    if (
+      this.disposedFlag ||
+      record.activation !== attempt ||
+      record.generation !== attempt.generation ||
+      record.state !== 'activating'
+    ) {
+      completion.resolve();
+      return;
+    }
+
     // activate 钩子可能同步抛错（贡献项冲突等），与异步拒绝走同一失败回滚路径
     let hook: Promise<Disposable | void> | Disposable | void;
     try {
       hook = record.definition.activate(this.createContext(record, attempt, gate));
     } catch (error) {
-      await this.failActivation(record, attempt, error);
+      await this.failActivation(record, attempt, completion, error);
       return;
     }
-    // settle 点供生命周期操作等待：覆盖激活完成后晚到的外部副作用窗口（不路由、不清理）
-    attempt.settled = Promise.resolve(hook).then(
-      () => undefined,
-      () => undefined,
-    );
 
     let result: Disposable | void;
     try {
       result = await hook;
     } catch (error) {
-      await this.failActivation(record, attempt, error);
+      await this.failActivation(record, attempt, completion, error);
       return;
     }
     if (this.disposedFlag || record.activation !== attempt) {
-      // 过期尝试：只清理自身资源（晚到返回值 + 暂存），不做任何状态写入
+      // 过期尝试：清理晚到返回值与暂存资源后解析唯一完成点 —— 生命周期等待它，
+      // disable 不会在晚到 async Disposable 清理结束前返回
       if (result != null) {
         try {
           await this.disposeAll([result]);
@@ -486,6 +547,7 @@ export class PluginHost {
       } catch {
         // 清理失败不影响已推进的停用状态
       }
+      completion.resolve();
       return;
     }
     record.activation = null;
@@ -493,15 +555,24 @@ export class PluginHost {
     if (result != null) record.owned.add(result);
     record.state = 'active';
     this.emitState(record, 'active');
+    completion.resolve();
   }
 
-  /** 激活失败（同步抛错或异步拒绝）收敛为生命周期操作；过期尝试只清理自身资源，不写入任何状态 */
+  /**
+   * 激活失败（同步抛错或异步拒绝）：当前尝试完成自身回滚自清理（暂存资源 dispose）
+   * 并解析唯一完成点后，发布独立的失败生命周期（回滚 completion、失败原因与贡献项
+   * 清除由该操作完成）；过期尝试只清理自身资源，不写入任何状态。
+   */
   private async failActivation(
     record: PluginRecord,
     attempt: ActivationAttempt,
+    completion: Deferred<void>,
     error: unknown,
   ): Promise<void> {
-    if (this.disposedFlag) return;
+    if (this.disposedFlag) {
+      completion.resolve();
+      return;
+    }
     if (record.activation !== attempt || record.generation !== attempt.generation) {
       // 过期尝试（生命周期操作已接管）：只清理自身资源，不触碰 generation/pending/终态
       try {
@@ -509,9 +580,16 @@ export class PluginHost {
       } catch {
         // 清理失败不掩盖过期结论
       }
+      completion.resolve();
       return;
     }
-    // 失败回滚收敛为单一生命周期操作：先原子发布（推进代际、登记操作），再等待完成
+    // 当前尝试：钩子已完全 settle（不存在晚到返回值），先完成本尝试的回滚自清理
+    try {
+      await attempt.pending.dispose();
+    } catch {
+      // 清理失败不掩盖失败结论
+    }
+    completion.resolve();
     await this.publishLifecycle(record, {
       state: 'failed',
       reason: `激活失败: ${this.errorMessage(error)}`,
@@ -521,8 +599,9 @@ export class PluginHost {
 
   /**
    * 发布生命周期操作：激活取消、失败回滚与停用收敛为同一操作。
-   * 先发布后执行 —— 操作先登记到 record.lifecycle 并推进代际（任何状态事件之前），
-   * 再启动清理；disable/deactivate/dispose 及状态事件内的重入共享同一操作。
+   * 先发布后执行 —— 身份不变的 deferred 先登记到 record.lifecycle 并推进代际
+   * （任何状态事件之前），再启动清理；disable/deactivate/dispose 及状态事件内
+   * 的重入共享同一操作、等待同一真实完成 promise。
    * 目标终态由最后一位发布者决定（disable 的 disabled 覆盖回滚的 failed）。
    */
   private publishLifecycle(record: PluginRecord, target: LifecycleTarget): Promise<void> {
@@ -534,14 +613,19 @@ export class PluginHost {
     // 推进代际：在途加载/激活/门面全部作废；晚到的贡献、订阅、结果整体拒绝
     record.generation += 1;
     record.lifecycleTarget = target;
-    // 先登记操作对象（任何状态事件之前），再启动执行：promise 字段原地替换为真实操作，
-    // 事件监听器重入与并发 disable/deactivate/dispose 读取同一对象，合并后等待真实操作
-    const operation: { promise: Promise<void> } = { promise: Promise.resolve() };
-    record.lifecycle = operation;
-    operation.promise = this.performLifecycle(record).finally(() => {
-      if (record.lifecycle === operation) record.lifecycle = null;
-    });
-    return operation.promise;
+    const deferred = createDeferred<void>();
+    record.lifecycle = deferred;
+    this.performLifecycle(record).then(
+      () => {
+        if (record.lifecycle === deferred) record.lifecycle = null;
+        deferred.resolve();
+      },
+      (error) => {
+        if (record.lifecycle === deferred) record.lifecycle = null;
+        deferred.reject(error);
+      },
+    );
+    return deferred.promise;
   }
 
   private async performLifecycle(record: PluginRecord): Promise<void> {
@@ -555,12 +639,13 @@ export class PluginHost {
 
     try {
       if (attempt) {
-        // 激活进行中/刚失败：先等待激活 settle（覆盖晚到外部副作用窗口），
-        // 再清理本尝试暂存资源，最后执行一次可等待的 deactivate（回滚 completion）
+        // 激活进行中/刚失败：先等待本尝试的唯一完成点（钩子 settle + 晚到返回值
+        // 的 async Disposable 清理 + 暂存清理，见 activateRecord/failActivation），
+        // 再执行一次可等待的 deactivate（回滚 completion）
         try {
-          await attempt.settled;
+          await attempt.completion;
         } catch {
-          // settle 点承诺不拒绝；防御性兜底
+          // 完成点承诺不拒绝；防御性兜底
         }
         try {
           await attempt.pending.dispose();
@@ -597,8 +682,12 @@ export class PluginHost {
       }
       // loading / registered：无活动资源，直接进入终态
       if (this.disposedFlag) return;
+      // 发布终态事件前让旧操作完整 detach：终态事件内的重入（enable 重新激活、
+      // failed 后再次停用等）将发布全新的操作/尝试，而不是合并进已消费完 target
+      // 的旧操作；终态前已取走 target，并发（非事件）合并的目标仍被消费
       const target = record.lifecycleTarget;
       record.lifecycleTarget = null;
+      record.lifecycle = null;
       // 目标终态必由 publishLifecycle 发布；缺省防御避免卡在 deactivating
       if (!target) return;
       if (target.state === 'failed') {

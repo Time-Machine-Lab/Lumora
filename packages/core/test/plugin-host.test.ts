@@ -1216,8 +1216,10 @@ describe('PluginHost', () => {
         void host.enable('com.example.plugin').catch(() => {});
       }
     });
-    const info = await host.register(descriptor(VALID_MANIFEST, entry));
-    expect(info.state).toBe('active');
+    await host.register(descriptor(VALID_MANIFEST, entry));
+    // 重入 enable 与注册流共享同一真实加载完成 Promise；register 可能先于
+    // 激活完成返回（快照 'activating'），终态由重入 enable 收敛到 active
+    await vi.waitFor(() => expect(host.getPlugin('com.example.plugin')?.state).toBe('active'));
     expect(entry).toHaveBeenCalledTimes(1);
     expect(host.commands.has('example.hello')).toBe(true);
   });
@@ -1282,5 +1284,233 @@ describe('PluginHost', () => {
     expect(host.getPlugin(first.instanceId)?.state).toBe('inactive');
     expect(host.getPlugin(second.instanceId)?.state).toBe('failed');
     expect(events[events.length - 1]?.instanceId).toBe(first.instanceId);
+  });
+
+  it('registered 状态事件内同步停用：注册链立即终止，loader 与 activate 均不执行', async () => {
+    const host = new PluginHost();
+    const entry = vi.fn(async () => ({ default: definitionOf() }));
+    let disabling!: Promise<void>;
+    host.events.on('plugin:state-changed', (e) => {
+      if (e.state === 'registered' && e.instanceId === 'com.example.plugin') {
+        disabling = host.disable(e.instanceId);
+      }
+    });
+    const info = await host.register(descriptor(VALID_MANIFEST, entry));
+    await disabling;
+    // 停用已接管：不得继续加载/激活链，不得执行任何插件用户代码
+    expect(entry).not.toHaveBeenCalled();
+    expect(info.state).toBe('disabled');
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('disabled');
+    expect(host.contributions.count()).toBe(0);
+  });
+
+  it('loading 状态事件内同步停用：入口 loader 不再执行，终态 disabled', async () => {
+    const host = new PluginHost();
+    const entry = vi.fn(async () => ({ default: definitionOf() }));
+    let disabling!: Promise<void>;
+    host.events.on('plugin:state-changed', (e) => {
+      if (e.state === 'loading' && e.instanceId === 'com.example.plugin') {
+        disabling = host.disable(e.instanceId);
+      }
+    });
+    const info = await host.register(descriptor(VALID_MANIFEST, entry));
+    await disabling;
+    // 事件内停用后不得再调用入口 loader（插件用户代码）
+    expect(entry).not.toHaveBeenCalled();
+    expect(info.state).toBe('disabled');
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('disabled');
+    expect(host.contributions.count()).toBe(0);
+  });
+
+  it('activating 状态事件内同步停用：activate 钩子不再执行，外部资源不被触碰', async () => {
+    const host = new PluginHost();
+    let external = true;
+    const activate = vi.fn(async () => {
+      external = false;
+    });
+    let disabling!: Promise<void>;
+    host.events.on('plugin:state-changed', (e) => {
+      if (e.state === 'activating' && e.instanceId === 'com.example.plugin') {
+        disabling = host.disable(e.instanceId);
+      }
+    });
+    await host.register(descriptor(VALID_MANIFEST, async () => ({ default: { activate } })));
+    await disabling;
+    // 事件内停用后不得再调用 activate 钩子：晚到的外部副作用被消除
+    expect(activate).not.toHaveBeenCalled();
+    expect(external).toBe(true);
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('disabled');
+    expect(host.contributions.count()).toBe(0);
+  });
+
+  it('deactivating 状态事件内重入 disable：取得同一真实完成 Promise，清理闸门释放前不返回', async () => {
+    const host = new PluginHost();
+    let releaseDeactivate!: () => void;
+    const deactivateGate = new Promise<void>((resolve) => {
+      releaseDeactivate = resolve;
+    });
+    const deactivate = vi.fn(async () => {
+      await deactivateGate;
+    });
+    await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: { activate: (context) => context.contribute({}), deactivate },
+      })),
+    );
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('active');
+
+    let reentrant!: Promise<void>;
+    host.events.on('plugin:state-changed', (e) => {
+      if (e.state === 'deactivating' && e.instanceId === 'com.example.plugin') {
+        reentrant = host.disable(e.instanceId);
+      }
+    });
+    const disabling = host.disable('com.example.plugin');
+    await vi.waitFor(() => expect(reentrant).toBeDefined());
+    let reentrantResolved = false;
+    reentrant.then(() => {
+      reentrantResolved = true;
+    });
+    let outerResolved = false;
+    disabling.then(() => {
+      outerResolved = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // 事件内重入 disable 必须等待同一真实 completion（不是已完成占位 Promise）
+    expect(reentrantResolved).toBe(false);
+    expect(outerResolved).toBe(false);
+    expect(deactivate).toHaveBeenCalledTimes(1);
+
+    releaseDeactivate();
+    await disabling;
+    await reentrant;
+    expect(deactivate).toHaveBeenCalledTimes(1); // 不启动第二次清理
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('disabled');
+  });
+
+  it('loading 状态事件内重入 enable：等待身份不变的加载完成 Promise，入口只加载一次', async () => {
+    const host = new PluginHost();
+    let releaseLoad!: () => void;
+    const loadGate = new Promise<void>((resolve) => {
+      releaseLoad = resolve;
+    });
+    const entry = vi.fn(async () => {
+      await loadGate;
+      return { default: definitionOf() };
+    });
+    let reentrant!: Promise<void>;
+    host.events.on('plugin:state-changed', (e) => {
+      if (e.state === 'loading' && e.instanceId === 'com.example.plugin') {
+        reentrant = host.enable(e.instanceId);
+      }
+    });
+    const registering = host.register(descriptor(VALID_MANIFEST, entry));
+    await vi.waitFor(() => expect(reentrant).toBeDefined());
+    let reentrantDone = false;
+    reentrant.then(() => {
+      reentrantDone = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // 重入 enable 不得吞下已完成占位 Promise：加载闸门释放前不完成
+    expect(reentrantDone).toBe(false);
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('loading');
+
+    releaseLoad();
+    await registering;
+    await reentrant;
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('active');
+    expect(entry).toHaveBeenCalledTimes(1);
+    expect(host.commands.has('example.hello')).toBe(true);
+  });
+
+  it('disabled 终态事件内重入 enable：新一代激活失败进入独立生命周期，回滚并记录失败原因', async () => {
+    const host = new PluginHost();
+    const boom = new Error('第二次激活爆炸');
+    let activationCount = 0;
+    const activate = vi.fn((context: PluginContext) => {
+      activationCount += 1;
+      if (activationCount === 1) {
+        return context.contribute({
+          commands: [
+            { kind: 'command', command: { id: 'example.first', title: '首次', execute: () => ({ ok: true }) } },
+          ],
+        });
+      }
+      // 第二次激活：贡献命令后同步抛错 —— 独立生命周期的回滚必须清除该命令
+      context.contribute({
+        commands: [
+          { kind: 'command', command: { id: 'example.second', title: '残留', execute: () => ({ ok: true }) } },
+        ],
+      });
+      throw boom;
+    });
+    await host.register(descriptor(VALID_MANIFEST, async () => ({ default: { activate } })));
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('active');
+    expect(host.commands.has('example.first')).toBe(true);
+
+    const reentrant: Promise<void>[] = [];
+    host.events.on('plugin:state-changed', (e) => {
+      if (e.state === 'disabled' && e.instanceId === 'com.example.plugin') {
+        reentrant.push(host.enable(e.instanceId));
+      }
+    });
+    await host.disable('com.example.plugin');
+    // 终态事件内重入 enable 的激活失败必须进入独立生命周期：状态 failed、原因落盘、贡献项清除
+    await Promise.all(reentrant);
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('failed');
+    expect(host.getPlugin('com.example.plugin')?.reason).toContain('激活失败');
+    expect(host.commands.has('example.first')).toBe(false);
+    expect(host.commands.has('example.second')).toBe(false);
+    expect(host.contributions.count()).toBe(0);
+  });
+
+  it('晚到 async Disposable 清理计入 disable completion：旧代清理完成后才返回，不污染新代', async () => {
+    const host = new PluginHost();
+    let releaseActivate!: () => void;
+    const activateGate = new Promise<void>((resolve) => {
+      releaseActivate = resolve;
+    });
+    let releaseDispose!: () => void;
+    const disposeGate = new Promise<void>((resolve) => {
+      releaseDispose = resolve;
+    });
+    let external = true;
+    const activate = vi.fn(async () => {
+      await activateGate;
+      external = true;
+      return {
+        async dispose() {
+          await disposeGate;
+          external = false;
+        },
+      };
+    });
+    const registering = host.register(descriptor(VALID_MANIFEST, async () => ({ default: { activate } })));
+    await vi.waitFor(() => expect(host.getPlugin('com.example.plugin')?.state).toBe('activating'));
+    // 激活挂起期间停用：生命周期等待本尝试的唯一完成点（钩子 settle + 晚到返回值清理）
+    const disabling = host.disable('com.example.plugin');
+    let disabled = false;
+    disabling.then(() => {
+      disabled = true;
+    });
+
+    // 钩子 settle 并返回 async Disposable：晚到清理挂起期间 disable 不得提前返回
+    releaseActivate();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(disabled).toBe(false);
+    expect(external).toBe(true);
+
+    // 放行晚到返回值清理：disable 在旧代完整收尾后返回，外部资源已释放
+    releaseDispose();
+    await disabling;
+    expect(external).toBe(false);
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('disabled');
+
+    // 旧代清理已完整结束：重新启用后不再被晚到的旧清理跨代污染
+    await registering;
+    await host.enable('com.example.plugin');
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('active');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(external).toBe(true);
   });
 });

@@ -2,12 +2,13 @@
 // 临时消费工程中以 tarball 安装（React 19 peer 边界）→ typecheck（skipLibCheck:false）
 // 并 vite build 消费端（含 @lumora/studio/style.css 导出存在性验证与依赖隔离断言）。
 // 失败时退出码非 0；临时目录总是被清理。
-// --self-test：边界判定自检（同前缀兄弟临时目录必须判为仓库外）。
+// --self-test：边界判定自检（同前缀兄弟临时目录必须判为仓库外）+ canonicalize
+// 抛错时的 raw path 清理回归。
 import { execSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import process from 'node:process';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -32,28 +33,45 @@ const CONSUMER_DEV_DEPS = [
  * dir 是否位于 rootDir 内（canonical 判定）：
  * 双方经 realpathSync.native 归一化（展开 Windows 8.3 短名，如 ADMINI~1 → Administrator），
  * 再用 path.relative + 路径段判断 —— 同前缀兄弟目录（<base>/lumora-smoke-x vs <base>/lumora）
- * 落在根外；POSIX 大小写敏感，不做大小写折叠。
+ * 落在根外；只拒绝 '..' 本身或以 '..<sep>' 开头的相对路径，首段形如 '..cache' 的
+ * 仓库内目录仍判为内部；POSIX 大小写敏感，不做大小写折叠。
  */
 const isInside = (dir, rootDir) => {
   const rel = relative(realpathSync.native(rootDir), realpathSync.native(dir));
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  return rel === '' || (rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel));
+};
+
+/**
+ * 在系统临时目录创建前缀目录，创建后立即进入 try/finally 再做 canonicalize
+ * （默认 realpathSync.native，可注入以模拟失败）：无论 canonicalize 是否抛错，
+ * finally 都按 raw path 清理，绝不遗留临时目录。
+ */
+const withRawTempDir = (prefix, fn, canonicalize = (raw) => realpathSync.native(raw)) => {
+  const raw = mkdtempSync(join(tmpdir(), prefix));
+  try {
+    return fn(canonicalize(raw));
+  } finally {
+    rmSync(raw, { recursive: true, force: true });
+  }
 };
 
 const isSelfTest = process.argv.includes('--self-test');
 if (isSelfTest) {
-  const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'lumora-boundary-')));
-  try {
+  withRawTempDir('lumora-boundary-', (base) => {
     const repo = join(base, 'lumora');
     const sibling = join(base, 'lumora-smoke-x');
     const consumer = join(repo, 'consumer');
     const other = join(base, 'other');
+    const dotDotSegment = join(repo, '..cache', 'x');
     // 判定基于已存在的真实路径（realpath 归一化），各用例目录都先创建
     mkdirSync(consumer, { recursive: true });
     mkdirSync(sibling, { recursive: true });
     mkdirSync(other, { recursive: true });
+    mkdirSync(dotDotSegment, { recursive: true });
     const cases = [
       ['仓库自身', isInside(repo, repo), true],
       ['仓库内部目录', isInside(consumer, repo), true],
+      ['首段 .. 的仓库内目录', isInside(dotDotSegment, repo), true],
       ['同前缀兄弟临时目录', isInside(sibling, repo), false],
       ['仓库父目录', isInside(base, repo), false],
       ['外部目录', isInside(join(base, 'other'), repo), false],
@@ -64,19 +82,32 @@ if (isSelfTest) {
       }
     }
     console.log('[smoke] 边界自检通过：同前缀兄弟目录判定为仓库外，仓库内部目录判定为仓库内');
-  } finally {
-    rmSync(base, { recursive: true, force: true });
+  });
+
+  // canonicalize 抛错清理回归：realpath 失败（或任何 canonicalize 异常）时，
+  // finally 必须按 raw path 清理，不得遗留临时目录
+  let leaked;
+  try {
+    withRawTempDir('lumora-boundary-', () => undefined, (raw) => {
+      leaked = raw;
+      throw new Error('模拟 canonicalize 失败');
+    });
+    throw new Error('边界自检失败: 期望 canonicalize 抛错');
+  } catch (error) {
+    if (!String(error.message).includes('模拟 canonicalize')) throw error;
   }
+  if (leaked && existsSync(leaked)) {
+    throw new Error('边界自检失败: canonicalize 抛错后临时目录未按 raw path 清理');
+  }
+  console.log('[smoke] canonicalize 抛错清理回归通过');
   process.exit(0);
 }
 
-// 临时目录统一使用跨平台 os.tmpdir()。Windows 上 %TEMP% 可能带 8.3 短名（如 ADMINI~1），
-// 普通 realpathSync 不归一化而 vite 内部会得到长名，混用会让 relative 计算出含 .. 的
-// 非法 fileName；realpathSync.native 能展开短名，把消费工程路径统一成系统长名形式。
-// 消费工程位于仓库依赖树之外，Node 不会向上解析到仓库 node_modules
-let tmp;
-try {
-  tmp = realpathSync.native(mkdtempSync(join(tmpdir(), 'lumora-smoke-')));
+// Windows 上 %TEMP% 可能带 8.3 短名（如 ADMINI~1），普通 realpathSync 不归一化
+// 而 vite 内部会得到长名，混用会让 relative 计算出含 .. 的非法 fileName；
+// realpathSync.native 能展开短名，把消费工程路径统一成系统长名形式（canonicalize）。
+// 消费工程位于仓库依赖树之外，Node 不会向上解析到仓库 node_modules。
+withRawTempDir('lumora-smoke-', (tmp) => {
   if (isInside(tmp, root)) {
     throw new Error('冒烟消费工程不得位于仓库依赖树内（临时目录与仓库路径冲突）');
   }
@@ -247,6 +278,4 @@ createRoot(document.getElementById('root')!).render(
   run('npm exec -- vite build', { cwd: consumerDir });
 
   console.log('[smoke] 通过：pack/install/typecheck/build 全链路正常');
-} finally {
-  if (tmp) rmSync(tmp, { recursive: true, force: true });
-}
+});
