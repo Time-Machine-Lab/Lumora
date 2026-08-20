@@ -235,6 +235,14 @@
   padding: 6px 0;
 }
 
+/* treeitem 的 li 与所属 group 的 ul：剥离列表默认样式，层级缩进由行内 padding 承担 */
+.lumora-tree__node,
+.lumora-tree__group {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
 .lumora-tree__empty {
   padding: 16px 12px;
   color: var(--lumora-text-dim);

@@ -1,7 +1,7 @@
 import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
 import type { Download, Page } from '@playwright/test';
-import { decodePng, pngPixel } from './helpers/png';
+import { decodePng, pngPixel, scanFrameBounds } from './helpers/png';
 
 /** 生成最小合法 GLB（仅 JSON chunk，无缓冲）：{asset, scenes, nodes} */
 function buildGlb(json: Record<string, unknown>): Buffer {
@@ -418,7 +418,7 @@ async function startDrag(page: Page): Promise<void> {
 
 /** 撤销直到按钮禁用（轴输入产生的历史步数不定：目标值可能等于当前值而无提交） */
 async function undoUntilDisabled(page: Page): Promise<void> {
-  for (let i = 0; i < 5; i += 1) {
+  for (let i = 0; i < 12; i += 1) {
     if (!(await page.getByTestId('undo').isEnabled())) break;
     await page.getByTestId('undo').click();
   }
@@ -551,4 +551,252 @@ test.describe('P0-8 letterbox 黑边像素验收', () => {
       });
     });
   }
+});
+
+test.describe('第三轮验收：生产路径（AC1/AC3/AC4）', () => {
+  test('AC1 生产 SceneContent：真实 GLB 材质与嵌套几何渲染（无占位框）', async ({ page }) => {
+    await page.getByTestId('toolbar-model-file-input').setInputFiles(FIXTURE_GLB);
+    await expect(page.getByTestId('lumora-toasts')).toContainText('已导入模型');
+    await expect(page.locator('.lumora-tree-row', { hasText: 'nested-mesh' })).toBeVisible();
+
+    // 内容挂载完成（占位框被 GLB 内容替换），导演视图渲染模型（原点）
+    await page.waitForTimeout(700);
+    await hideOverlays(page, '.lumora-viewport-toolbar');
+    const shot = await page.locator('.lumora-viewport canvas').screenshot();
+    await showOverlays(page, '.lumora-viewport-toolbar');
+    const png = decodePng(shot);
+
+    let bodyPixels = 0;
+    let placeholderPixels = 0;
+    let minX = png.width;
+    let maxX = 0;
+    let minY = png.height;
+    let maxY = 0;
+    for (let y = 0; y < png.height; y += 2) {
+      for (let x = 0; x < png.width; x += 2) {
+        const [r, g, b] = pngPixel(png, x, y);
+        // 车身 #d9480f（受光/环境光下均为红主导且绿>蓝）；示例对象中立方体
+        // #ff6b6b 与球/锥为蓝绿主导，不会误命中的原因：立方体 g==b 恒等
+        if (r > 60 && r > 2.2 * g && g > b) {
+          bodyPixels += 1;
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+        // 占位框（紫色线框 #7a6bff，70% 透明度叠背景 ≈ (91,82,188)）必须已全部替换。
+        // 紫色相 b>r>g；示例球体 #4dabf7 是蓝色相 b>g>r（阴影面 (44,127,181) 会误命中
+        // 宽松的 b>180 条件），用 g<r 区分两色相
+        if (b > 150 && g < r && g < 120) placeholderPixels += 1;
+      }
+    }
+    // 真实材质：GLB 的 MeshStandardMaterial 颜色经生产解析/挂载路径渲染成片
+    expect(bodyPixels).toBeGreaterThan(100);
+    expect(placeholderPixels).toBe(0);
+    // 嵌套几何：2×0.6×1 车身（45° 视角）在画面中宽显著大于高，且聚类居中
+    const clusterWidth = maxX - minX + 1;
+    const clusterHeight = maxY - minY + 1;
+    expect(clusterWidth).toBeGreaterThanOrEqual(120);
+    expect(clusterHeight).toBeGreaterThanOrEqual(20);
+    expect(clusterWidth).toBeGreaterThan(1.5 * clusterHeight);
+    expect((minX + maxX) / 2).toBeCloseTo(png.width / 2, -1);
+  });
+
+  test('AC3 Gizmo 生产路径：拖动实时预览、撤销/重做精确恢复、中断回滚（preview→rollback）', async ({ page }) => {
+    await centerCubeAndScale(page);
+    const canvas = page.locator('.lumora-viewport canvas');
+    const box = (await canvas.boundingBox())!;
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+
+    // 基准画面 A：Escape 清选（点击画布角落可能命中地面对象）→ 无 gizmo、缩放 1
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(150);
+    const shotA = await canvas.screenshot();
+
+    // 重新选中 → 拖动开始：立方体随指针实时缩放（预览生效，画面变化）
+    await page.getByTestId('tree-row-sample-cube').click();
+    await page.waitForTimeout(150);
+    await page.mouse.move(cx, cy - 100);
+    await page.mouse.down();
+    for (let i = 1; i <= 4; i += 1) {
+      await page.mouse.move(cx, cy - 100 - i * 2);
+    }
+    await page.waitForTimeout(120);
+    const shotB = await canvas.screenshot();
+    expect(shotB.equals(shotA)).toBe(false);
+
+    // 提交 → 一步历史；撤销精确回 1、重做精确恢复提交值
+    await page.mouse.up();
+    const scaleValue = await page.getByTestId('inspector-scale-0').inputValue();
+    expect(scaleValue).not.toBe('1');
+    await expect(page.getByTestId('inspector-axis-0')).toHaveValue('0');
+    await page.getByTestId('undo').click();
+    await expect(page.getByTestId('inspector-scale-0')).toHaveValue('1');
+    await expect(page.getByTestId('inspector-axis-0')).toHaveValue('0');
+    await page.getByTestId('redo').click();
+    await expect(page.getByTestId('inspector-scale-0')).toHaveValue(scaleValue);
+    await expect(page.getByTestId('inspector-axis-0')).toHaveValue('0');
+
+    // 中断路径（Escape）：先归位缩放使 gizmo 手柄回到已知位置
+    for (const axis of ['0', '1', '2']) {
+      await page.getByTestId(`inspector-scale-${axis}`).fill('1');
+      await page.getByTestId(`inspector-scale-${axis}`).press('Enter');
+    }
+    await page.waitForTimeout(150);
+    const shotA2 = await canvas.screenshot(); // 拖动前：gizmo、缩放 1
+
+    await page.mouse.move(cx, cy - 100);
+    await page.mouse.down();
+    await page.mouse.move(cx, cy - 104);
+    await page.waitForTimeout(120);
+    const shotB2 = await canvas.screenshot(); // 预览中：画面已变化
+    expect(shotB2.equals(shotA2)).toBe(false);
+
+    // Escape 回滚：节点回到拖动前缩放；中断不产生历史。
+    // Escape 同时清除了选择（属性面板显示「未选择对象」），先重新选中再断言数值
+    await page.keyboard.press('Escape');
+    await page.mouse.up();
+    await page.waitForTimeout(150);
+    await page.getByTestId('tree-row-sample-cube').click();
+    await page.waitForTimeout(150);
+    await expect(page.getByTestId('inspector-scale-0')).toHaveValue('1');
+    // 回滚后画面与拖动前逐像素一致（Escape 清选，重新选中后对比）
+    const shotC2 = await canvas.screenshot();
+    expect(shotC2.equals(shotA2)).toBe(true);
+
+    // 中断拖动未入历史：撤销耗尽后缩放仍是 1
+    await undoUntilDisabled(page);
+    await expect(page.getByTestId('inspector-scale-0')).toHaveValue('1');
+  });
+
+  test('AC4 生产路径：16:9 画幅逐像素对齐、辅助线重合、50mm 已知点投影', async ({ page }) => {
+    // 注入确定性探针项目：50mm 相机位于 (0,2,10) 平视 -Z，红色探针盒位于已知点。
+    // 相机视图把渲染区域收窄到 16:9 画幅并保持投影纵横比 → 探针顶面中心应
+    // 精确投影到预期像素：NDC x=0.25、NDC y=(1-2)/(10·tan(50mm FOV/2))=-0.4167
+    const fovDeg = (2 * Math.atan(24 / 2 / 50) * 180) / Math.PI;
+    const halfH = 10 * Math.tan((fovDeg * Math.PI) / 360);
+    const halfW = (halfH * 16) / 9;
+    const probeX = halfW * 0.25;
+    await page.evaluate(
+      ({ fovDeg: fov, probeX: px }) => {
+        const project = {
+          uri: 'lumora://probe-project',
+          name: '投影探针',
+          schemaVersion: 2,
+          createdAt: new Date().toISOString(),
+          revision: 0,
+          settings: { fps: 24, aspect: [16, 9] },
+          activeSceneId: 'scene-1',
+          scenes: [
+            {
+              id: 'scene-1',
+              name: '主场景',
+              rootObjectIds: ['probe-camera', 'probe-box', 'probe-light'],
+              activeCameraId: 'probe-camera',
+            },
+          ],
+          objects: [
+            {
+              id: 'probe-camera',
+              type: 'camera',
+              name: '探针相机',
+              parentId: null,
+              transform: { position: [0, 2, 10], rotation: [0, 0, 0], scale: [1, 1, 1] },
+              visible: true,
+              locked: false,
+              camera: {
+                projection: 'perspective',
+                focalLength: 50,
+                fov,
+                sensorWidth: 36,
+                sensorHeight: 24,
+                near: 0.1,
+                far: 200,
+                aspect: null,
+              },
+            },
+            {
+              id: 'probe-box',
+              type: 'primitive',
+              name: '探针盒',
+              parentId: null,
+              transform: { position: [px, 0.5, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+              visible: true,
+              locked: false,
+              geometry: { kind: 'box' },
+              material: { color: '#ff0000' },
+            },
+            {
+              id: 'probe-light',
+              type: 'light',
+              name: '主光',
+              parentId: null,
+              transform: { position: [4, 8, 4], rotation: [0, 0, 0], scale: [1, 1, 1] },
+              visible: true,
+              locked: false,
+              light: { kind: 'directional', color: '#ffffff', intensity: 1.4 },
+            },
+          ],
+          assets: [],
+        };
+        localStorage.setItem('lumora.demo.last-export', JSON.stringify(project));
+      },
+      { fovDeg, probeX },
+    );
+    await page.reload();
+    await page.getByTestId('reopen-last-export').click();
+    await expect(page.getByTestId('tree-row-probe-box')).toBeVisible();
+
+    // 进入相机视图：画幅矩形与辅助线由同一 fitRect 计算，应逐像素重合
+    await page.getByTestId('view-mode-select').selectOption('probe-camera');
+    await expect(page.getByTestId('lumora-guides')).toBeVisible();
+    await page.waitForTimeout(400);
+
+    const canvas = page.locator('.lumora-viewport canvas');
+    const canvasBox = (await canvas.boundingBox())!;
+    const guidesBox = (await page.getByTestId('lumora-guides').boundingBox())!;
+    await hideOverlays(page, '.lumora-viewport-toolbar');
+    await hideOverlays(page, '.lumora-guides');
+    const shot = await canvas.screenshot();
+    await showOverlays(page, '.lumora-viewport-toolbar');
+    await showOverlays(page, '.lumora-guides');
+
+    // 逐像素扫描画幅边界（letterbox 纯黑，画幅内为场景背景 #14161f）→ 精确 16:9
+    const png = decodePng(shot);
+    const frame = scanFrameBounds(png);
+    const frameW = frame.maxX - frame.minX + 1;
+    const frameH = frame.maxY - frame.minY + 1;
+    expect(frameW / frameH).toBeCloseTo(16 / 9, 2);
+
+    // 辅助线 DOM 矩形与 WebGL 画幅重合（同一 fitRect 计算；CSS 高度含小数时
+    // gl.viewport 整数截断致画幅边界 ±1px 偏差，允许 1px 容差）
+    const guideX = guidesBox.x - canvasBox.x;
+    const guideY = guidesBox.y - canvasBox.y;
+    expect(Math.abs(guideX - frame.minX)).toBeLessThanOrEqual(1);
+    expect(Math.abs(guideY - frame.minY)).toBeLessThanOrEqual(1);
+    expect(Math.abs(guidesBox.width - frameW)).toBeLessThanOrEqual(1);
+    expect(Math.abs(guidesBox.height - frameH)).toBeLessThanOrEqual(1);
+
+    // 50mm 已知点投影：探针盒顶面中心（NDC (0.25, -0.4167)）落在亮红像素上
+    const px = frame.minX + ((0.25 + 1) / 2) * frameW;
+    const py = frame.minY + ((1 + 1 / 2.4) / 2) * frameH; // (1-2)/2.4 = -0.4167
+    let hit = false;
+    for (let dy = -3; dy <= 3 && !hit; dy += 1) {
+      for (let dx = -3; dx <= 3; dx += 1) {
+        const [r, g, b] = pngPixel(png, Math.round(px + dx), Math.round(py + dy));
+        if (r > 150 && g < 90 && b < 90) {
+          hit = true;
+          break;
+        }
+      }
+    }
+    expect(hit).toBe(true);
+
+    // 负向对照：画幅右上空区（NDC (0.5, 0.5)）非红（背景 #14161f）
+    const [nr, ng, nb] = pngPixel(png, Math.round(frame.minX + 0.75 * frameW), Math.round(frame.minY + 0.25 * frameH));
+    expect(nr).toBeLessThan(90);
+    expect(ng).toBeLessThan(90);
+    expect(nb).toBeLessThan(90);
+  });
 });

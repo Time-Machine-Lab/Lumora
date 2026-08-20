@@ -7,7 +7,15 @@ import type { Result } from '../src/editor/scene-editor';
 import { createSampleProject } from '../src/scene/sample-project';
 import type { Project } from '../src/scene/types';
 
-const PAYLOAD_MIB = Number(process.env.DIAGNOSE_PAYLOAD_MIB ?? 50);
+// 诊断用例依赖 Node 运行时全局（vitest），但不引入 @types/node 依赖：
+// 以带类型的 globalThis 访问 process/gc，测试文件即可通过根级 tsc 检查。
+const nodeGlobals = globalThis as typeof globalThis & {
+  process?: { env: Record<string, string | undefined>; memoryUsage?: () => { heapUsed: number } };
+  gc?: () => void;
+};
+const env = nodeGlobals.process?.env ?? {};
+const DIAGNOSE = env.DIAGNOSE === '1';
+const PAYLOAD_MIB = Number(env.DIAGNOSE_PAYLOAD_MIB ?? 50);
 
 function ok<T>(result: Result<T>): T {
   if (!result.ok) throw new Error(`expected ok, got: ${result.error.message}`);
@@ -35,10 +43,11 @@ function projectWithBigAsset(): Project {
 }
 
 function heapUsed(): number {
-  return process.memoryUsage().heapUsed;
+  const memory = nodeGlobals.process?.memoryUsage;
+  return memory ? memory().heapUsed : 0;
 }
 
-const gc = typeof globalThis.gc === 'function' ? (globalThis.gc as () => void) : null;
+const gc = typeof nodeGlobals.gc === 'function' ? nodeGlobals.gc : null;
 
 /** 旧策略：begin 克隆 + commit 双序列化（评审指出的历史缺陷），纯内存模拟 */
 function measureLegacy(project: Project, _objectId: string) {
@@ -66,7 +75,7 @@ function measureCurrent(project: Project, objectId: string) {
   return { beginMs, commitMs };
 }
 
-describe.runIf(process.env.DIAGNOSE === '1')('P0-7 大载荷拖动诊断（DIAGNOSE=1）', () => {
+describe.runIf(DIAGNOSE)('P0-7 大载荷拖动诊断（DIAGNOSE=1）', () => {
   it(`payload ${PAYLOAD_MIB}MiB：引用策略在 begin/commit 均优于克隆+序列化，且不放大堆占用`, () => {
     gc?.();
     const project = projectWithBigAsset();

@@ -12,7 +12,12 @@ interface PropertiesPanelProps {
 const DEG = 180 / Math.PI;
 const RAD = Math.PI / 180;
 
-/** 数值字段：提交时校验（拒绝 NaN/Infinity，核心层兜底），非法输入回退并提示 */
+/**
+ * 数值字段：提交时校验（拒绝 NaN/Infinity，核心层兜底），非法输入回退并提示。
+ * ref 镜像 draft：Escape→blur 同帧取消不提交（blur 同步触发，state 尚未刷新，
+ * 闭包若直接读 state 会把已编辑值提交出去）；外部值更新（提交生效/撤销重做/
+ * 切换对象）时放弃未提交草稿，回显最新值。
+ */
 function NumberField({
   label,
   value,
@@ -29,10 +34,18 @@ function NumberField({
   onCommit: (value: number) => void;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
+  const draftRef = useRef<string | null>(null);
+  const setDraftBoth = (value: string | null) => {
+    draftRef.current = value;
+    setDraft(value);
+  };
+  useEffect(() => {
+    setDraftBoth(null);
+  }, [value]);
   const display = draft ?? String(Number(value.toFixed(4)));
   const commit = () => {
-    const raw = draft;
-    setDraft(null);
+    const raw = draftRef.current;
+    setDraftBoth(null);
     if (raw === null) return;
     const parsed = Number.parseFloat(raw);
     if (!Number.isFinite(parsed)) {
@@ -49,12 +62,13 @@ function NumberField({
         step={step}
         data-testid={testId}
         value={display}
-        onChange={(e) => setDraft(e.target.value)}
+        onChange={(e) => setDraftBoth(e.target.value)}
         onBlur={commit}
         onKeyDown={(e) => {
           if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
           if (e.key === 'Escape') {
-            setDraft(null);
+            // 先清 ref（同步）再 blur：blur 的 commit 读到 null → 取消提交
+            setDraftBoth(null);
             (e.target as HTMLInputElement).blur();
           }
         }}

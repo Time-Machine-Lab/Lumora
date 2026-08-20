@@ -13,6 +13,33 @@ export function pngPixel(png: RgbaPng, x: number, y: number): [number, number, n
 }
 
 /**
+ * 扫描非纯黑像素的边界矩形（相机视图 letterbox：黑边外、画幅内）。
+ * marginY：跳过首尾几行 —— CSS 高度含小数时（如 697.5px）画布整数缓冲比
+ * CSS 框矮，元素截图顶部会露出约 0.5px 页面背景色残条，逐像素扫描会把它
+ * 误判成画幅内容；画幅在竖向始终内嵌（黑边上下各数百 px），跳过 2 行无损。
+ */
+export function scanFrameBounds(
+  png: RgbaPng,
+  marginY = 2,
+): { minX: number; minY: number; maxX: number; maxY: number } {
+  let minX = png.width;
+  let minY = png.height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = marginY; y < png.height - marginY; y += 1) {
+    for (let x = 0; x < png.width; x += 1) {
+      const index = (y * png.width + x) * 4;
+      if (png.data[index]! === 0 && png.data[index + 1]! === 0 && png.data[index + 2]! === 0) continue;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+/**
  * 依赖零的 PNG 解码（Playwright 截图：RGBA8、非隔行，filter 五种类型全支持）。
  * 用于逐像素验证 letterbox 黑边等渲染结果。
  */

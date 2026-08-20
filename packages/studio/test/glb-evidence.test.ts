@@ -52,8 +52,28 @@ function stubBlobFetch(gate?: Promise<void>): void {
   });
 }
 
-function makeFile(name: string, bytes: Uint8Array): File {
-  return new File([new Uint8Array(bytes)], name, { type: 'model/gltf-binary' });
+function makeFile(name: string, bytes: Uint8Array, type = 'model/gltf-binary'): File {
+  return new File([new Uint8Array(bytes)], name, { type });
+}
+
+/**
+ * 把真实 GLB 拆成 .gltf + 外部 .bin（glTF 2.0 容器规范）：
+ * GLB 的 BIN 缓冲在 JSON 中无 uri（隐含指向 BIN chunk），注入外部引用
+ * 使多文件 .gltf 拆分成立；bin 数据从 BIN chunk 头之后开始。
+ */
+function splitGlb(glb: Uint8Array): { gltfText: string; bin: Uint8Array } {
+  const view = new DataView(glb.buffer, glb.byteOffset, glb.byteLength);
+  if (view.getUint32(0, true) !== 0x46546c67) throw new Error('not a glb');
+  const jsonLength = view.getUint32(12, true);
+  if (view.getUint32(16, true) !== 0x4e4f534a) throw new Error('unexpected first chunk');
+  const jsonBytes = glb.subarray(20, 20 + jsonLength);
+  const json = JSON.parse(new TextDecoder().decode(jsonBytes).trimEnd()) as {
+    buffers?: { uri?: string; byteLength?: number }[];
+  };
+  json.buffers = json.buffers ?? [];
+  json.buffers[0] = { ...(json.buffers[0] ?? {}), uri: 'car.bin' };
+  const binStart = 28 + jsonLength; // 12 头 + JSON chunk(8 头 + 数据) + BIN chunk 头
+  return { gltfText: JSON.stringify(json), bin: glb.subarray(binStart) };
 }
 
 afterEach(() => {
@@ -427,7 +447,7 @@ describe('第二轮修复：同 hash 统一引用、项目级缓存引用、会�
     const importing = importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
     // 同一会话内新建并切换到场景 B：目标场景已变更
     const added = editor.addScene('场景 B');
-    expect(added.ok).toBe(true);
+    if (!added.ok) throw new Error(`addScene 失败: ${added.error.message}`);
     release();
     const result = await importing;
 
@@ -486,3 +506,139 @@ function okStudioDelete(editor: SceneEditor): void {
   const result = editor.deleteSelection();
   if (!result.ok) throw new Error(`expected delete ok, got: ${result.error.message}`);
 }
+
+describe('第三轮修复：生命周期 settle 清理与 .gltf 多文件', () => {
+  it('M1 重开 hydrate 期间关闭项目：解析 settle 后立即清理，不依赖后续 sweep', async () => {
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stubBlobFetch();
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    const cache = new AssetCache();
+    const imported = await importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    const hash = editor.getProject()!.assets[0]!.hash;
+
+    // 模拟重开：序列化项目 → 关闭旧会话 → 新编辑器 + 新缓存 hydrate（解析挂起）
+    const serialized = JSON.parse(JSON.stringify(editor.getProject())) as Project;
+    editor.reset();
+    const reopened = new SceneEditor();
+    reopened.openProject(serialized);
+    const freshCache = new AssetCache();
+    stubBlobFetch(gate); // 之后的解析全部挂在门后
+    // 注意：spy 必须在最后一次 stubBlobFetch 之后创建（spyOn 每次包新 mock）
+    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
+    const seeds = ensureCacheSeeded(freshCache, serialized);
+    expect(seeds).toHaveLength(1);
+
+    // hydrate 挂起期间关闭项目：解析中的条目标记待释放，条目本身仍在
+    reopened.reset();
+    freshCache.sweep(null);
+    expect(freshCache.has(hash)).toBe(true);
+
+    release();
+    await Promise.all(seeds);
+    // settle 后立即清理（无需再次 sweep）并 revoke object URL
+    expect(freshCache.has(hash)).toBe(false);
+    expect(revokeSpy).toHaveBeenCalled();
+  });
+
+  it('M1 导入解析期间卸载（dispose）：取消提交、无晚到写入、整体清理', async () => {
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stubBlobFetch();
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    const cache = new AssetCache();
+    const hash = await hashBytes(new Uint8Array(FIXTURE));
+
+    stubBlobFetch(gate);
+    const importing = importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
+    // 组件卸载：runtime.dispose → editor.dispose() + cache.dispose()
+    editor.dispose();
+    cache.dispose();
+    expect(cache.has(hash)).toBe(false); // 整体释放立即清理解析中条目
+    release();
+    const result = await importing;
+
+    // 会话失效：导入取消，无任何提交/历史/对象
+    // （dispose 落在文件读取等待期间 → acquire 以「缓存已释放」拒绝；
+    //  若落在解析后提交前 → 以「项目已切换」拒绝 —— 两种都是正确取消路径）
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.message).toMatch(/项目已切换|缓存已释放/);
+    expect(editor.getProject()).toBeNull();
+    expect(editor.getHistoryState().canUndo).toBe(false);
+    // 后续写入一律拒绝（无晚到写入）
+    expect(editor.addObject(createGroupObject()).ok).toBe(false);
+    // dispose 后的 acquire 直接拒绝
+    await expect(
+      cache.acquire(hash, FIXTURE.buffer as ArrayBuffer, 'model/gltf-binary'),
+    ).rejects.toThrow('缓存已释放');
+  });
+
+  it('M3 .gltf 多文件：外部 .bin 依赖映射、组合哈希去重、缺依赖失败、重开重建', async () => {
+    stubBlobFetch();
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    const cache = new AssetCache();
+
+    // 把真实 GLB 拆成 .gltf + 外部 .bin；主文件放在数组末尾（按扩展名识别）
+    const { gltfText, bin } = splitGlb(FIXTURE);
+    const gltfBytes = new TextEncoder().encode(gltfText);
+    const gltfFile = makeFile('car.gltf', gltfBytes, 'model/gltf+json');
+    const binFile = makeFile('car.bin', bin, 'application/octet-stream');
+    const imported = await importModelFile(editor, cache, [binFile, gltfFile]);
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+
+    const asset = editor.getProject()!.assets[0]!;
+    expect(asset.mime).toBe('model/gltf+json');
+    expect(asset.parts).toHaveLength(1);
+    expect(asset.parts![0]!.path).toBe('car.bin');
+    expect(asset.parts![0]!.payload.length).toBeGreaterThan(0);
+    // 组合内容哈希 ≠ 仅主文件的哈希：依赖字节参与去重
+    const mainOnlyHash = await hashBytes(gltfBytes);
+    expect(asset.hash).not.toBe(mainOnlyHash);
+
+    // 内容真实可挂载：外部 BIN 经 blob URL 映射后解析出几何
+    const root = buildScene(editor.getProject()!, 16 / 9);
+    const modelNode = findNode(root, imported.objectId)!;
+    attachModelContent(modelNode, cache.get(asset.hash)!.gltf!);
+    const body = modelNode.getObjectByName('BodyMesh') as THREE.Mesh;
+    expect(body.geometry?.attributes.position.count).toBeGreaterThan(0);
+
+    // 同内容再导入 → 去重（依赖一致 → 组合哈希一致）
+    const again = await importModelFile(editor, cache, [gltfFile, binFile]);
+    expect(again.ok).toBe(true);
+    if (!again.ok) return;
+    expect(again.deduped).toBe(true);
+    expect(editor.getProject()!.assets).toHaveLength(1);
+
+    // 缺少依赖 → 失败，不产生历史与缓存条目
+    const missing = await importModelFile(editor, cache, [gltfFile]);
+    expect(missing.ok).toBe(false);
+    if (missing.ok) return;
+    expect(missing.error.message).toContain('缺少依赖文件');
+    expect(editor.getHistoryState().canUndo).toBe(true); // 只有导入两步历史，缺依赖失败无新历史
+    expect(cache.has(mainOnlyHash)).toBe(false);
+
+    // 重开：仅凭项目 JSON（payload + parts）重建依赖映射并解析
+    const serialized = JSON.parse(JSON.stringify(editor.getProject())) as Project;
+    const freshCache = new AssetCache();
+    const seeds = ensureCacheSeeded(freshCache, serialized);
+    expect(seeds).toHaveLength(1);
+    await Promise.all(seeds);
+    const reopened = buildScene(serialized, 16 / 9);
+    const reopenedNode = findNode(reopened, imported.objectId)!;
+    attachModelContent(reopenedNode, freshCache.get(asset.hash)!.gltf!);
+    expect(
+      (reopenedNode.getObjectByName('BodyMesh') as THREE.Mesh).geometry.attributes.position.count,
+    ).toBeGreaterThan(0);
+  });
+});

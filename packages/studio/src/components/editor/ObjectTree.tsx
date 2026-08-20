@@ -50,14 +50,20 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
   /** 单一 roving focus：树内任意时刻只有一个 tab 停靠点（最后聚焦/选中的行） */
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const rowRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const rowRefs = useRef<Record<string, HTMLElement | null>>({});
 
-  // 外部选择变化（视口拾取等）时，停靠点跟随选中行
+  // 外部选择变化（视口拾取等）时，停靠点跟随选中行——但仅当目标行仍可见：
+  // 折叠/跨场景过滤后选择可能含不可见行，跟随前校验，否则回退可见行（树首）
   useEffect(() => {
-    if (selection.length > 0 && (focusedId === null || !selection.includes(focusedId))) {
+    if (focusedId !== null && !flatRows.includes(focusedId)) {
+      const fallback = selection[0] ?? flatRows[0] ?? null;
+      if (fallback !== null && flatRows.includes(fallback)) setFocusedId(fallback);
+      else setFocusedId(null);
+    } else if (focusedId === null && selection.length > 0 && flatRows.includes(selection[0]!)) {
       setFocusedId(selection[0]!);
     }
-  }, [selection, focusedId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- flatRows 由 project/expanded 推导，依赖以原始状态为准
+  }, [selection, focusedId, project, expanded]);
 
   if (!project) return null;
   const scene = project.scenes.find((s) => s.id === project.activeSceneId) ?? project.scenes[0];
@@ -133,8 +139,15 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
     }
   };
 
-  // 单一 tab 停靠点：最后聚焦的行（未聚焦时回退选中行/树首行，键盘用户可进入）
-  const activeRowId = focusedId ?? selection[0] ?? flatRows[0] ?? null;
+  // 单一 tab 停靠点：最后聚焦的行（未聚焦时回退选中行/树首行，键盘用户可进入）；
+  // 停靠点必须落在可见行内——不可见（折叠/跨场景）则沿链回退，避免整树 tabindex=-1
+  const rowVisible = (id: string | null | undefined): id is string =>
+    id !== null && id !== undefined && flatRows.includes(id);
+  const activeRowId = rowVisible(focusedId)
+    ? focusedId
+    : rowVisible(selection[0])
+      ? selection[0]!
+      : flatRows[0] ?? null;
   const rowTabIndex = (id: string) => (activeRowId === id ? 0 : -1);
 
   const handleDrop = (targetId: string) => {
@@ -146,9 +159,10 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
     if (!result.ok) showToast(result.error.message, 'error');
   };
 
-  const handleImportFile = async (file: File | undefined) => {
-    if (!file) return;
-    const result = await importModelFile(editor, cache, file);
+  // 多文件选择：.gltf 与外部 .bin/纹理一起选中；单个文件（工具栏入口）同样适用
+  const handleImportFile = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const result = await importModelFile(editor, cache, Array.from(files));
     if (result.ok) {
       showToast(`已导入模型「${result.asset.name}」${result.deduped ? '（内容相同，资源已复用）' : ''}`, 'success');
     } else {
@@ -216,10 +230,11 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
         <input
           ref={fileInputRef}
           type="file"
-          accept=".glb,.gltf,model/gltf-binary,model/gltf+json"
+          multiple
+          accept=".glb,.gltf,.bin,model/gltf-binary,model/gltf+json,application/octet-stream,image/png,image/jpeg,image/webp,image/gif"
           style={{ display: 'none' }}
           data-testid="model-file-input"
-          onChange={(e) => void handleImportFile(e.target.files?.[0])}
+          onChange={(e) => void handleImportFile(e.target.files)}
         />
       </div>
       <div className="lumora-tree__list" role="tree" aria-multiselectable="true">
@@ -293,7 +308,7 @@ function TreeNode({
   dropTargetId: string | null;
   setDropTargetId: (id: string | null) => void;
   handleDrop: (targetId: string) => void;
-  rowRefs: React.RefObject<Record<string, HTMLDivElement | null>>;
+  rowRefs: React.RefObject<Record<string, HTMLElement | null>>;
   getRowTabIndex: (id: string) => number;
   onRowKeyDown: (object: SceneObjectData, event: React.KeyboardEvent) => void;
   setFocusedId: (id: string | null) => void;
@@ -306,6 +321,9 @@ function TreeNode({
   const isDragOver = dropTargetId === object.id;
 
   const select = (event: React.MouseEvent) => {
+    // 子行点击冒泡至父 treeitem：目标位于本行自己的 group 子容器内时交由子行处理
+    const group = (event.currentTarget as HTMLElement).querySelector('.lumora-tree__group');
+    if (event.target !== event.currentTarget && group?.contains(event.target as Node)) return;
     setFocusedId(object.id);
     if (event.ctrlKey || event.metaKey) {
       const next = new Set(editor.getSelection());
@@ -326,46 +344,54 @@ function TreeNode({
   };
 
   return (
-    <div className="lumora-tree__node-wrap">
+    <li
+      role="treeitem"
+      aria-level={depth + 1}
+      aria-selected={isSelected}
+      aria-expanded={children.length > 0 ? isExpanded : undefined}
+      data-testid={`tree-row-${object.id}`}
+      className={`lumora-tree__node${isDragOver ? ' lumora-tree-row--drop-target' : ''}`}
+      tabIndex={getRowTabIndex(object.id)}
+      ref={(el) => {
+        rowRefs.current[object.id] = el;
+      }}
+      // 行内键盘操作（重命名输入、按钮）不得被行导航拦截：仅行自身按键触发
+      onKeyDown={(event) => {
+        if (event.target === event.currentTarget) onRowKeyDown(object, event);
+      }}
+      onClick={select}
+      onDoubleClick={(event) => {
+        // 与 select 相同的冒泡守卫：子行双击交由子行处理
+        const group = (event.currentTarget as HTMLElement).querySelector('.lumora-tree__group');
+        if (event.target !== event.currentTarget && group?.contains(event.target as Node)) return;
+        if (renamingId === object.id) return;
+        setRenamingId(object.id);
+      }}
+      onDragStart={(e) => {
+        e.stopPropagation();
+        setDragId(object.id);
+      }}
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setDropTargetId(object.id);
+      }}
+      onDragLeave={() => {
+        if (dropTargetId === object.id) setDropTargetId(null);
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        handleDrop(object.id);
+      }}
+      onDragEnd={() => {
+        setDragId(null);
+        setDropTargetId(null);
+      }}
+    >
       <div
-        role="treeitem"
-        aria-level={depth + 1}
-        aria-selected={isSelected}
-        aria-expanded={children.length > 0 ? isExpanded : undefined}
-        data-testid={`tree-row-${object.id}`}
-        className={`lumora-tree-row${isSelected ? ' lumora-tree-row--selected' : ''}${isDragOver ? ' lumora-tree-row--drop-target' : ''}`}
+        className={`lumora-tree-row${isSelected ? ' lumora-tree-row--selected' : ''}`}
         style={{ paddingLeft: 6 + depth * 16 }}
-        draggable
-        tabIndex={getRowTabIndex(object.id)}
-        ref={(el) => {
-          rowRefs.current[object.id] = el;
-        }}
-        onKeyDown={(event) => onRowKeyDown(object, event)}
-        onClick={select}
-        onDoubleClick={() => {
-          setRenamingId(object.id);
-        }}
-        onDragStart={(e) => {
-          e.stopPropagation();
-          setDragId(object.id);
-        }}
-        onDragOver={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          setDropTargetId(object.id);
-        }}
-        onDragLeave={() => {
-          if (dropTargetId === object.id) setDropTargetId(null);
-        }}
-        onDrop={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          handleDrop(object.id);
-        }}
-        onDragEnd={() => {
-          setDragId(null);
-          setDropTargetId(null);
-        }}
       >
         <button
           type="button"
@@ -450,8 +476,8 @@ function TreeNode({
           </button>
         </span>
       </div>
-      {isExpanded && (
-        <div role="group">
+      {isExpanded && children.length > 0 && (
+        <ul role="group" className="lumora-tree__group">
           {children.map((child) => (
             <TreeNode
               key={child.id}
@@ -476,8 +502,8 @@ function TreeNode({
               setFocusedId={setFocusedId}
             />
           ))}
-        </div>
+        </ul>
       )}
-    </div>
+    </li>
   );
 }

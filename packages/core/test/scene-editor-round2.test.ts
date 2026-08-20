@@ -4,6 +4,7 @@ import type { Result } from '../src/editor/scene-editor';
 import { createCameraObject, createModelObject, createPrimitiveObject } from '../src/scene/create';
 import { createSampleProject } from '../src/scene/sample-project';
 import { findObject } from '../src/scene/scene-graph';
+import type { TransformData } from '../src/scene/types';
 
 function makeEditor() {
   const editor = new SceneEditor();
@@ -30,8 +31,8 @@ function makeAsset(name = 'character.glb') {
   } as const;
 }
 
-const NOOP_TRANSFORM = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] } as const;
-const MOVED_TRANSFORM = { position: [1, 1, 1], rotation: [0, 0, 0], scale: [1, 1, 1] } as const;
+const NOOP_TRANSFORM: TransformData = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] };
+const MOVED_TRANSFORM: TransformData = { position: [1, 1, 1], rotation: [0, 0, 0], scale: [1, 1, 1] };
 
 describe('SceneEditor：P0-1 同 hash 重复导入统一引用有效资源', () => {
   it('调用方携带不同 assetId 时，对象统一指向首个有效资源；删除其一不影响另一实例', () => {

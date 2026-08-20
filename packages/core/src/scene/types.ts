@@ -83,6 +83,13 @@ export interface ProjectSettings {
   aspect: [number, number];
 }
 
+/** 多文件 .gltf 的外部依赖（.bin/纹理）：路径按 gltf JSON 相对 URI，载荷 base64 */
+export interface AssetPartData {
+  path: string;
+  mime: string;
+  payload: string;
+}
+
 export interface AssetData {
   id: string;
   kind: 'gltf';
@@ -96,6 +103,8 @@ export interface AssetData {
   storageRef: string;
   /** 模型字节的 base64 载荷：随项目 JSON 持久化，重开项目/重做后据此重建内容缓存 */
   payload?: string;
+  /** 多文件 .gltf 的外部依赖字节；主载荷为 gltf JSON 本身 */
+  parts?: AssetPartData[];
   createdAt: string;
 }
 

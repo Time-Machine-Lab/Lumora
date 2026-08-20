@@ -11,6 +11,7 @@ export type { EventMap } from './events/event-map';
 export { createSampleProject } from './scene/sample-project';
 export type {
   AssetData,
+  AssetPartData,
   CameraData,
   GeometryData,
   LightData,
