@@ -155,6 +155,40 @@ describe('硬约束 3：同 hash generation 隔离', () => {
     retained!.release();
   });
 
+  it('T10 多文件 .gltf loader reject：撤销主 URL 与全部依赖 URL、移出 map，同一失败传播给全部 lease', async () => {
+    const loader = vi.fn(() => Promise.reject(new Error('boom')));
+    const cache = new ContentCache({ loader });
+    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
+    // format 'gltf' 的 acquire 会把主字节当 JSON 解析并重写相对 URI，必须传有效 gltf JSON
+    const mainBytes = new TextEncoder().encode(
+      JSON.stringify({
+        asset: { version: '2.0' },
+        scenes: [{ nodes: [0] }],
+        nodes: [{ name: 'Root' }],
+        buffers: [{ uri: 'mesh.bin' }],
+        images: [{ uri: 'diffuse.png' }],
+      }),
+    ).buffer as ArrayBuffer;
+    const parts = [
+      { path: 'mesh.bin', mime: 'application/octet-stream', bytes: new Uint8Array([1, 2]).buffer as ArrayBuffer },
+      { path: 'diffuse.png', mime: 'image/png', bytes: new Uint8Array([3, 4]).buffer as ArrayBuffer },
+    ];
+    const a = cache.acquire('h', mainBytes, { format: 'gltf', parts });
+    const b = cache.acquire('h', mainBytes, { format: 'gltf', parts }); // 同一 entry 两个 lease
+
+    const failureA = await a.content.catch((e: Error) => e);
+    const failureB = await b.content.catch((e: Error) => e);
+    expect((failureA as Error).message).toBe('boom');
+    expect((failureB as Error).message).toBe('boom'); // 共享 promise：同一失败
+    expect(cache.has('h')).toBe(false);
+    expect(cache.retain('h')).toBeNull();
+    expect(revokeSpy).toHaveBeenCalledTimes(3); // 主 URL + 2 个依赖 URL 全部撤销
+    expect(() => {
+      a.release();
+      b.release();
+    }).not.toThrow();
+  });
+
   it('T9 discard 只在末 lease 时判死刑：同 hash 新会话仍持租用时条目存活', async () => {
     const gltf = makeGltf();
     const cache = new ContentCache({ loader: vi.fn(async () => gltf) });

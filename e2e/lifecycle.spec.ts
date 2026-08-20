@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { MINIMAL_GLB } from './helpers/glb';
 
 test.beforeEach(async ({ page }) => {
   await page.goto('/');
@@ -38,6 +39,35 @@ test('卸载组件释放运行时，重新挂载后一切恢复可用', async ({
   await expect(page.getByTestId('lumora-studio')).toBeVisible();
   await page.getByTestId('open-sample-project').click();
   await expect(page.getByTestId('event-log')).toContainText('项目已打开: 示例项目');
+});
+
+test('导入模型后立即卸载：dispose 清理已加载内容，重新挂载后一切可用（P4）', async ({ page }) => {
+  await page.getByTestId('open-sample-project').click();
+  await expect(page.getByTestId('tree-row-sample-group')).toBeVisible();
+  await page.getByTestId('toolbar-model-file-input').setInputFiles({
+    name: 'dispose-me.glb',
+    mimeType: 'model/gltf-binary',
+    buffer: MINIMAL_GLB,
+  });
+  await expect(page.getByTestId('lumora-toasts')).toContainText('已导入模型');
+
+  // 内容已加载后立即卸载运行时：dispose 原子清理，无报错、无残留
+  await page.getByTestId('studio-mount-toggle').click();
+  await expect(page.getByTestId('lumora-studio')).not.toBeVisible();
+  await expect(page.getByTestId('studio-placeholder')).toBeVisible();
+  await expect(page.getByTestId('event-log')).toContainText('运行时已释放');
+
+  // 重新挂载：再次打开项目一切可用
+  await page.getByTestId('studio-mount-toggle').click();
+  await expect(page.getByTestId('lumora-studio')).toBeVisible();
+  await page.getByTestId('open-sample-project').click();
+  await expect(page.getByTestId('tree-row-sample-group')).toBeVisible();
+  await page.getByTestId('toolbar-model-file-input').setInputFiles({
+    name: 'dispose-me.glb',
+    mimeType: 'model/gltf-binary',
+    buffer: MINIMAL_GLB,
+  });
+  await expect(page.getByTestId('lumora-toasts')).toContainText('已导入模型');
 });
 
 test('面板渲染抛错由错误边界隔离，壳层不受影响且可经边界禁用插件', async ({ page }) => {

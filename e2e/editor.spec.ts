@@ -2,28 +2,7 @@ import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
 import type { Download, Page } from '@playwright/test';
 import { decodePng, pngPixel, scanFrameBounds } from './helpers/png';
-
-/** 生成最小合法 GLB（仅 JSON chunk，无缓冲）：{asset, scenes, nodes} */
-function buildGlb(json: Record<string, unknown>): Buffer {
-  const jsonText = JSON.stringify(json);
-  const pad = (4 - (jsonText.length % 4)) % 4;
-  const jsonBytes = Buffer.concat([Buffer.from(jsonText, 'utf8'), Buffer.alloc(pad, 0x20)]);
-  const total = 12 + 8 + jsonBytes.length;
-  const header = Buffer.alloc(12);
-  header.writeUInt32LE(0x46546c67, 0); // 'glTF'
-  header.writeUInt32LE(2, 4);
-  header.writeUInt32LE(total, 8);
-  const chunkHeader = Buffer.alloc(8);
-  chunkHeader.writeUInt32LE(jsonBytes.length, 0);
-  chunkHeader.writeUInt32LE(0x4e4f534a, 4); // 'JSON'
-  return Buffer.concat([header, chunkHeader, jsonBytes]);
-}
-
-const MINIMAL_GLB = buildGlb({
-  asset: { version: '2.0' },
-  scenes: [{ nodes: [0] }],
-  nodes: [{ name: 'EmptyRoot' }],
-});
+import { MINIMAL_GLB } from './helpers/glb';
 
 /** 真实 GLB 夹具：嵌套节点 + 共享材质（CarRoot → BodyMesh + 4×WheelMesh，BIN chunk） */
 const FIXTURE_GLB = fileURLToPath(new URL('../packages/studio/test/fixtures/nested-mesh.glb', import.meta.url));
@@ -170,6 +149,65 @@ test('GLB 导入解析失败：提示错误，不产生对象', async ({ page })
   });
   await expect(page.getByTestId('lumora-toasts')).toContainText('模型解析失败');
   await expect(page.locator('.lumora-tree-row', { hasText: 'broken' })).toHaveCount(0);
+});
+
+test('浏览器 MIME 误报：.gltf 以 application/json 上报仍按扩展名决议导入（格式决议，P4）', async ({ page }) => {
+  const gltfJson = JSON.stringify({
+    asset: { version: '2.0' },
+    scenes: [{ nodes: [0] }],
+    nodes: [{ name: 'JsonRoot' }],
+  });
+  await page.getByTestId('toolbar-model-file-input').setInputFiles({
+    name: 'misreported.gltf',
+    mimeType: 'application/json',
+    buffer: Buffer.from(gltfJson, 'utf8'),
+  });
+  await expect(page.getByTestId('lumora-toasts')).toContainText('已导入模型');
+  await expect(page.locator('.lumora-tree-row', { hasText: 'misreported' })).toBeVisible();
+  // 资源以 .gltf 格式持久化，模型对象可选中
+  await page.locator('.lumora-tree-row', { hasText: 'misreported' }).click();
+  await expect(page.getByTestId('inspector-model')).toContainText('misreported.gltf');
+});
+
+test('对象树键盘导航：Arrow/Home/End/Enter 沿可见行 roving focus，折叠后跳过子级（P4）', async ({ page }) => {
+  const row = (id: string) => page.getByTestId(`tree-row-${id}`);
+  // 点击只选择不移焦（鼠标路径）；键盘路径经 Tab 落入 roving tabindex 停靠点
+  await row('sample-group').click();
+  await row('sample-group').focus();
+  await expect(row('sample-group')).toBeFocused();
+
+  // 展开的 group → 首个可见子级；连续 ArrowDown 沿深度优先可见序
+  await page.keyboard.press('ArrowDown');
+  await expect(row('sample-cube')).toBeFocused();
+  await expect(page.getByTestId('inspector-name')).toHaveValue('立方体');
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('ArrowDown');
+  await expect(row('sample-cone')).toBeFocused();
+  await expect(page.getByTestId('inspector-name')).toHaveValue('圆锥');
+
+  await page.keyboard.press('End'); // 最后一个可见行
+  await expect(row('sample-camera')).toBeFocused();
+  await expect(page.getByTestId('inspector-name')).toHaveValue('主摄像机');
+  await page.keyboard.press('Home');
+  await expect(row('sample-group')).toBeFocused();
+
+  // ArrowLeft 折叠 group（有子级且展开）；再 ArrowDown 跳过子级直达下一个根
+  await page.keyboard.press('ArrowLeft');
+  await expect(row('sample-cube')).not.toBeVisible();
+  await page.keyboard.press('ArrowDown');
+  await expect(row('sample-ground')).toBeFocused();
+
+  // ArrowRight 展开；再 ArrowRight 移到首个可见子级
+  await page.keyboard.press('ArrowUp');
+  await expect(row('sample-group')).toBeFocused();
+  await page.keyboard.press('ArrowRight');
+  await expect(row('sample-cube')).toBeVisible();
+  await page.keyboard.press('ArrowRight');
+  await expect(row('sample-cube')).toBeFocused();
+
+  // Enter：显式选中当前行
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('inspector-name')).toHaveValue('立方体');
 });
 
 test('场景切换器与视图工具条：Gizmo 模式/空间切换即时生效', async ({ page }) => {
