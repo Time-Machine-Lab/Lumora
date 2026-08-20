@@ -3,7 +3,8 @@ export type { LumoraStudioHandle, LumoraStudioProps } from './components/LumoraS
 export { EditorViewport } from './components/editor/EditorViewport';
 export { ObjectTree } from './components/editor/ObjectTree';
 export { PropertiesPanel } from './components/editor/PropertiesPanel';
-export { AssetCache } from './components/editor/asset-cache';
+export { ContentCache } from './components/editor/content-cache';
+export type { CacheLease, CachePartFile, CacheFormat } from './components/editor/content-cache';
 export { importModelFile } from './components/editor/model-import';
 export { buildScene, syncScene } from './components/editor/scene-builder';
 export { PanelErrorBoundary } from './components/panels/PanelErrorBoundary';

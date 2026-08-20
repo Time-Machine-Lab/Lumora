@@ -5,8 +5,8 @@ import { OrbitControls, TransformControls } from '@react-three/drei';
 import * as THREE from 'three';
 import { findObject, fitRect, getReachableIds } from '@lumora/core';
 import type { Project, SceneEditor, TransformData, ViewState } from '@lumora/core';
-import { ensureCacheSeeded } from './asset-cache';
-import type { AssetCache } from './asset-cache';
+import { resolveFormat } from './content-cache';
+import type { CacheLease, ContentCache } from './content-cache';
 import { applyTransform, attachModelContent, buildScene, disposeNode, findNode, syncScene } from './scene-builder';
 import { showToast } from './toasts';
 
@@ -15,7 +15,7 @@ interface EditorViewportProps {
   project: Project | null;
   selection: string[];
   view: ViewState;
-  cache: AssetCache;
+  cache: ContentCache;
 }
 
 /** 沿父链找到最近的对象 id（GLB 内容网格挂在模型组下，需要向上追溯） */
@@ -30,7 +30,7 @@ function findObjectId(object: THREE.Object3D): string | null {
 
 /**
  * 3D 视口：
- * - 场景树由项目数据增量同步（scene-builder），模型内容经 AssetCache 挂载
+ * - 场景树由项目数据增量同步（scene-builder），模型内容经 ContentCache lease 挂载
  * - Gizmo 拖动 = beginTransform/commitTransform 一步历史；局部/世界空间可切换
  * - 导演视图全容器拾取；相机视图 letterbox 到项目画幅（gl viewport/scissor
  *   传 CSS 像素，three 内部按 pixelRatio 换算），三分线/安全框以 DOM 覆盖层
@@ -179,7 +179,7 @@ function SceneContent({
 }: {
   rootRef: React.MutableRefObject<THREE.Group | null>;
   project: Project | null;
-  cache: AssetCache;
+  cache: ContentCache;
 }) {
   const scene = useThree((s) => s.scene);
   const prevProjectRef = useRef<Project | null>(null);
@@ -212,32 +212,48 @@ function SceneContent({
     prevProjectRef.current = project;
   }, [project, scene, rootRef]);
 
-  // 模型内容挂载（已解析立即挂；解析中的内容就绪后回调挂载）。
+  // 模型内容挂载：渲染消费者在使用期持有 lease（禁止裸资源旁路）——
+  // 每个模型资源 retain 或 seed 一张 lease；content 就绪后把克隆内容挂到占位节点；
+  // 项目变更/卸载时释放全部 lease，由缓存按引用关系 + lease 计数决定清理。
   // 缓存缺失且资源带持久化载荷时同步启动重建（项目重开/撤销后重做恢复内容）
   useEffect(() => {
     const root = rootRef.current;
     if (!root || !project) return;
-    ensureCacheSeeded(cache, project);
-    const cancels: (() => void)[] = [];
+    const leases: CacheLease[] = [];
+    const seenHashes = new Set<string>();
     for (const object of project.objects) {
       if (object.type !== 'model' || !object.assetId) continue;
       const asset = project.assets.find((a) => a.id === object.assetId);
-      if (!asset) continue;
-      const cached = cache.get(asset.hash);
-      if (cached?.gltf) {
-        const node = findNode(root, object.id);
-        if (node) attachModelContent(node, cached.gltf);
-      } else if (cache.has(asset.hash)) {
-        cancels.push(
-          cache.onContentReady(asset.hash, (gltf) => {
-            const node = findNode(root, object.id);
-            if (node) attachModelContent(node, gltf);
-          }),
-        );
+      if (!asset || seenHashes.has(asset.hash)) continue;
+      seenHashes.add(asset.hash);
+      let lease: CacheLease | null = null;
+      if (cache.has(asset.hash)) {
+        lease = cache.retain(asset.hash);
+      } else if (asset.payload) {
+        try {
+          lease = cache.seed(asset.hash, asset.payload, {
+            format: asset.format ?? resolveFormat(asset.name, asset.mime),
+            parts: asset.parts ?? [],
+          });
+        } catch {
+          // 缓存已释放（卸载竞态）：渲染消费者随之卸载，无需再挂内容
+          lease = null;
+        }
       }
+      if (!lease) continue;
+      leases.push(lease);
+      // findNode 按对象 id 查找；此处映射 hash → 首个引用该 hash 的模型对象节点
+      const objectId = object.id;
+      void lease.content.then(
+        (gltf) => {
+          const node = findNode(root, objectId);
+          if (node) attachModelContent(node, gltf);
+        },
+        () => undefined,
+      );
     }
     return () => {
-      for (const cancel of cancels) cancel();
+      for (const lease of leases) lease.release();
     };
   }, [project, cache, rootRef]);
 

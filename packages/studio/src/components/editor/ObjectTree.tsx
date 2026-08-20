@@ -7,7 +7,7 @@ import {
   findObject,
 } from '@lumora/core';
 import type { Project, SceneEditor, SceneObjectData } from '@lumora/core';
-import type { AssetCache } from './asset-cache';
+import type { ContentCache } from './content-cache';
 import { importModelFile } from './model-import';
 import { showToast } from './toasts';
 
@@ -15,7 +15,7 @@ interface ObjectTreeProps {
   editor: SceneEditor;
   project: Project | null;
   selection: string[];
-  cache: AssetCache;
+  cache: ContentCache;
 }
 
 const TYPE_LABEL: Record<SceneObjectData['type'], string> = {

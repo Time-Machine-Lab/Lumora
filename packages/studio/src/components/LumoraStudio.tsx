@@ -12,7 +12,7 @@ import { EditorViewport } from './editor/EditorViewport';
 import { ObjectTree } from './editor/ObjectTree';
 import { PropertiesPanel } from './editor/PropertiesPanel';
 import { ToastHost, showToast } from './editor/toasts';
-import { AssetCache } from './editor/asset-cache';
+import { ContentCache } from './editor/content-cache';
 import '../lumora.css';
 
 export interface LumoraStudioProps {
@@ -48,8 +48,8 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   const editorState = useSceneEditor(runtime.editor);
   const { project } = editorState;
 
-  const cacheRef = useRef<AssetCache | null>(null);
-  if (!cacheRef.current) cacheRef.current = new AssetCache();
+  const cacheRef = useRef<ContentCache | null>(null);
+  if (!cacheRef.current) cacheRef.current = new ContentCache();
   const cache = cacheRef.current;
 
   const [pluginManagerOpen, setPluginManagerOpen] = useState(false);

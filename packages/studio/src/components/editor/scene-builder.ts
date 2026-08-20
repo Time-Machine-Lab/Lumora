@@ -15,7 +15,7 @@ const PRIMITIVE_GEOMETRIES: Record<string, () => THREE.BufferGeometry> = {
   plane: () => new THREE.PlaneGeometry(1, 1),
 };
 
-/** 是否位于 GLB 内容子树内（内容网格由 AssetCache 按引用计数持有，不在场景树中处置） */
+/** 是否位于 GLB 内容子树内（内容网格由 ContentCache 按 lease 引用持有，不在场景树中处置） */
 function isInsideContent(object: THREE.Object3D): boolean {
   let current: THREE.Object3D | null = object;
   while (current) {
@@ -28,7 +28,7 @@ function isInsideContent(object: THREE.Object3D): boolean {
 /**
  * 递归释放几何/材质/纹理（撤销删除或重建节点时避免 GPU 泄漏）。
  * GLB 内容子树跳过：同一资源可被多个模型实例共享（clone 共享几何/材质），
- * 资源归 AssetCache 所有，最后一个引用释放时才 dispose（共享资源不会被
+ * 资源归 ContentCache 所有，最后一个 lease 释放时才 dispose（共享资源不会被
  * 先删除的实例误杀）。
  */
 export function disposeNode(object: THREE.Object3D): void {

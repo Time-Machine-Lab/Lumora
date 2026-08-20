@@ -94,6 +94,8 @@ export interface AssetData {
   id: string;
   kind: 'gltf';
   name: string;
+  /** 内容格式（重开项目时据此重建缓存，不依赖运行期 MIME）；旧数据缺省时按名称/MIME 决议 */
+  format?: 'gltf' | 'glb';
   mime: string;
   /** 内容哈希（SHA-256 hex），用于去重 */
   hash: string;

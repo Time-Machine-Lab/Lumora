@@ -4,7 +4,8 @@ import { readFileSync } from 'node:fs';
 import * as THREE from 'three';
 import { createGroupObject, createModelObject, createSampleProject, hashBytes, SceneEditor } from '@lumora/core';
 import type { AssetData, Project } from '@lumora/core';
-import { AssetCache, ensureCacheSeeded } from '../src/components/editor/asset-cache';
+import { ContentCache, resolveFormat } from '../src/components/editor/content-cache';
+import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { importModelFile } from '../src/components/editor/model-import';
 import {
   attachModelContent,
@@ -57,6 +58,32 @@ function makeFile(name: string, bytes: Uint8Array, type = 'model/gltf-binary'): 
 }
 
 /**
+ * 重开/重做场景：按项目载荷重建缓存。与渲染消费者（SceneContent）语义一致：
+ * seed 签发 lease → content 就绪后释放 lease（内容经项目引用存活，后续 sweep/retain 续租）。
+ */
+function seedProjectCache(cache: ContentCache, project: Project): Promise<GLTF>[] {
+  const seeds: Promise<GLTF>[] = [];
+  for (const asset of project.assets) {
+    if (!asset.payload) continue;
+    const lease = cache.seed(asset.hash, asset.payload, {
+      format: asset.format ?? resolveFormat(asset.name, asset.mime),
+      parts: asset.parts ?? [],
+    });
+    seeds.push(lease.content.finally(() => lease.release()));
+  }
+  return seeds;
+}
+
+/** 渲染消费者语义：retain lease → 等内容就绪 → 挂载 → 释放 lease */
+async function attachCachedContent(cache: ContentCache, hash: string, node: THREE.Object3D): Promise<void> {
+  const lease = cache.retain(hash);
+  if (!lease) throw new Error(`缓存无内容：${hash}`);
+  const gltf = await lease.content;
+  attachModelContent(node, gltf);
+  lease.release();
+}
+
+/**
  * 把真实 GLB 拆成 .gltf + 外部 .bin（glTF 2.0 容器规范）：
  * GLB 的 BIN 缓冲在 JSON 中无 uri（隐含指向 BIN chunk），注入外部引用
  * 使多文件 .gltf 拆分成立；bin 数据从 BIN chunk 头之后开始。
@@ -86,7 +113,7 @@ describe('真实 GLB 证据：持久化、原子性、共享资源、多场景�
     stubBlobFetch();
     const editor = new SceneEditor();
     editor.openProject(createSampleProject());
-    const cache = new AssetCache();
+    const cache = new ContentCache();
 
     const imported = await importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
     expect(imported.ok).toBe(true);
@@ -104,15 +131,15 @@ describe('真实 GLB 证据：持久化、原子性、共享资源、多场景�
     // 模拟重开：全新编辑器 + 全新缓存，只凭项目 JSON（载荷）重建内容
     const reopened = new SceneEditor();
     reopened.openProject(serialized);
-    const freshCache = new AssetCache();
+    const freshCache = new ContentCache();
     expect(freshCache.has(asset.hash)).toBe(false);
-    const seeds = ensureCacheSeeded(freshCache, serialized);
+    const seeds = seedProjectCache(freshCache, serialized);
     expect(seeds).toHaveLength(1);
     await Promise.all(seeds);
 
     const root = buildScene(serialized, 16 / 9);
     const modelNode = findNode(root, imported.objectId)!;
-    attachModelContent(modelNode, freshCache.get(asset.hash)!.gltf!);
+    await attachCachedContent(freshCache, asset.hash, modelNode);
 
     // 嵌套节点结构完整
     const carRoot = modelNode.getObjectByName('CarRoot');
@@ -139,7 +166,7 @@ describe('真实 GLB 证据：持久化、原子性、共享资源、多场景�
     stubBlobFetch();
     const editor = new SceneEditor();
     editor.openProject(createSampleProject());
-    const cache = new AssetCache();
+    const cache = new ContentCache();
 
     const imported = await importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
     expect(imported.ok).toBe(true);
@@ -163,14 +190,14 @@ describe('真实 GLB 证据：持久化、原子性、共享资源、多场景�
     project = editor.getProject()!;
     expect(project.assets).toHaveLength(1);
     expect(project.objects.find((o) => o.id === imported.objectId)).toBeDefined();
-    const seeds = ensureCacheSeeded(cache, project);
+    const seeds = seedProjectCache(cache, project);
     expect(seeds).toHaveLength(1);
     await Promise.all(seeds);
     expect(cache.has(hash)).toBe(true);
 
     const root = buildScene(project, 16 / 9);
     const modelNode = findNode(root, imported.objectId)!;
-    attachModelContent(modelNode, cache.get(hash)!.gltf!);
+    await attachCachedContent(cache, hash, modelNode);
     expect(modelNode.getObjectByName('BodyMesh')).not.toBeNull();
     expect(modelNode.getObjectByName(PLACEHOLDER_HINT)).toBeUndefined();
   });
@@ -179,7 +206,7 @@ describe('真实 GLB 证据：持久化、原子性、共享资源、多场景�
     stubBlobFetch();
     const editor = new SceneEditor();
     editor.openProject(createSampleProject());
-    const cache = new AssetCache();
+    const cache = new ContentCache();
     const badBytes = new Uint8Array([0x01, 0x02, 0x03]);
 
     const result = await importModelFile(editor, cache, makeFile('bad.glb', badBytes));
@@ -194,7 +221,7 @@ describe('真实 GLB 证据：持久化、原子性、共享资源、多场景�
     stubBlobFetch();
     const editor = new SceneEditor();
     editor.openProject(createSampleProject());
-    const cache = new AssetCache();
+    const cache = new ContentCache();
 
     const first = await importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
     const second = await importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
@@ -208,8 +235,8 @@ describe('真实 GLB 证据：持久化、原子性、共享资源、多场景�
     const root = buildScene(project, 16 / 9);
     const nodeA = findNode(root, first.objectId)!;
     const nodeB = findNode(root, second.objectId)!;
-    attachModelContent(nodeA, cache.get(hash)!.gltf!);
-    attachModelContent(nodeB, cache.get(hash)!.gltf!);
+    await attachCachedContent(cache, hash, nodeA);
+    await attachCachedContent(cache, hash, nodeB);
     const bodyA = nodeA.getObjectByName('BodyMesh') as THREE.Mesh;
     const bodyB = nodeB.getObjectByName('BodyMesh') as THREE.Mesh;
     expect(bodyA.geometry).toBe(bodyB.geometry);
@@ -281,7 +308,7 @@ describe('第二轮修复：同 hash 统一引用、项目级缓存引用、会�
     stubBlobFetch();
     const editor = new SceneEditor();
     editor.openProject(createSampleProject());
-    const cache = new AssetCache();
+    const cache = new ContentCache();
 
     const imported = await importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
     expect(imported.ok).toBe(true);
@@ -331,7 +358,7 @@ describe('第二轮修复：同 hash 统一引用、项目级缓存引用、会�
     stubBlobFetch();
     const editor = new SceneEditor();
     editor.openProject(createSampleProject());
-    const cache = new AssetCache();
+    const cache = new ContentCache();
 
     const imported = await importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
     expect(imported.ok).toBe(true);
@@ -349,8 +376,8 @@ describe('第二轮修复：同 hash 统一引用、项目级缓存引用、会�
     const root = buildScene(editor.getProject()!, 16 / 9);
     const nodeA = findNode(root, imported.objectId)!;
     const nodeB = findNode(root, copyId)!;
-    attachModelContent(nodeA, cache.get(hash)!.gltf!);
-    attachModelContent(nodeB, cache.get(hash)!.gltf!);
+    await attachCachedContent(cache, hash, nodeA);
+    await attachCachedContent(cache, hash, nodeB);
     const bodyA = nodeA.getObjectByName('BodyMesh') as THREE.Mesh;
     const bodyB = nodeB.getObjectByName('BodyMesh') as THREE.Mesh;
     expect(bodyA.geometry).toBe(bodyB.geometry);
@@ -370,7 +397,7 @@ describe('第二轮修复：同 hash 统一引用、项目级缓存引用、会�
     // 副本内容仍可从缓存挂载（项目全量 model/asset 关系才是引用依据）
     const rootAfter = buildScene(afterDelete, 16 / 9);
     const copyNode = findNode(rootAfter, copyId)!;
-    attachModelContent(copyNode, cache.get(hash)!.gltf!);
+    await attachCachedContent(cache, hash, copyNode);
     expect(copyNode.getObjectByName('BodyMesh')).not.toBeNull();
     expect(copyNode.getObjectByName(PLACEHOLDER_HINT)).toBeUndefined();
 
@@ -390,7 +417,7 @@ describe('第二轮修复：同 hash 统一引用、项目级缓存引用、会�
     stubBlobFetch(gate);
     const editor = new SceneEditor();
     editor.openProject(createSampleProject());
-    const cache = new AssetCache();
+    const cache = new ContentCache();
     const hash = await hashBytes(new Uint8Array(FIXTURE));
 
     const importing = importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
@@ -418,7 +445,7 @@ describe('第二轮修复：同 hash 统一引用、项目级缓存引用、会�
     stubBlobFetch(gate);
     const editor = new SceneEditor();
     editor.openProject(createSampleProject());
-    const cache = new AssetCache();
+    const cache = new ContentCache();
     const hash = await hashBytes(new Uint8Array(FIXTURE));
 
     const importing = importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
@@ -441,7 +468,7 @@ describe('第二轮修复：同 hash 统一引用、项目级缓存引用、会�
     stubBlobFetch(gate);
     const editor = new SceneEditor();
     editor.openProject(createSampleProject());
-    const cache = new AssetCache();
+    const cache = new ContentCache();
     const hash = await hashBytes(new Uint8Array(FIXTURE));
 
     const importing = importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
@@ -470,7 +497,7 @@ describe('第二轮修复：同 hash 统一引用、项目级缓存引用、会�
     stubBlobFetch(gate);
     const editor = new SceneEditor();
     editor.openProject(createSampleProject());
-    const cache = new AssetCache();
+    const cache = new ContentCache();
     const hash = await hashBytes(new Uint8Array(FIXTURE));
 
     const importing = importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
@@ -496,7 +523,7 @@ describe('第二轮修复：同 hash 统一引用、项目级缓存引用、会�
     // 内容可正常挂载
     const root = buildScene(editor.getProject()!, 16 / 9);
     const freshNode = findNode(root, freshResult.objectId)!;
-    attachModelContent(freshNode, cache.get(hash)!.gltf!);
+    await attachCachedContent(cache, hash, freshNode);
     expect(freshNode.getObjectByName('BodyMesh')).not.toBeNull();
   });
 });
@@ -516,7 +543,7 @@ describe('第三轮修复：生命周期 settle 清理与 .gltf 多文件', () =
     stubBlobFetch();
     const editor = new SceneEditor();
     editor.openProject(createSampleProject());
-    const cache = new AssetCache();
+    const cache = new ContentCache();
     const imported = await importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
     expect(imported.ok).toBe(true);
     if (!imported.ok) return;
@@ -527,20 +554,24 @@ describe('第三轮修复：生命周期 settle 清理与 .gltf 多文件', () =
     editor.reset();
     const reopened = new SceneEditor();
     reopened.openProject(serialized);
-    const freshCache = new AssetCache();
+    const freshCache = new ContentCache();
     stubBlobFetch(gate); // 之后的解析全部挂在门后
     // 注意：spy 必须在最后一次 stubBlobFetch 之后创建（spyOn 每次包新 mock）
     const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
-    const seeds = ensureCacheSeeded(freshCache, serialized);
-    expect(seeds).toHaveLength(1);
+    const asset = serialized.assets[0]!;
+    const lease = freshCache.seed(asset.hash, asset.payload!, {
+      format: asset.format ?? resolveFormat(asset.name, asset.mime),
+      parts: asset.parts ?? [],
+    });
 
-    // hydrate 挂起期间关闭项目：解析中的条目标记待释放，条目本身仍在
+    // hydrate 挂起期间关闭项目：渲染消费者卸载释放 lease → 清扫判死刑，条目仍在
     reopened.reset();
+    lease.release();
     freshCache.sweep(null);
     expect(freshCache.has(hash)).toBe(true);
 
     release();
-    await Promise.all(seeds);
+    await lease.content;
     // settle 后立即清理（无需再次 sweep）并 revoke object URL
     expect(freshCache.has(hash)).toBe(false);
     expect(revokeSpy).toHaveBeenCalled();
@@ -554,15 +585,19 @@ describe('第三轮修复：生命周期 settle 清理与 .gltf 多文件', () =
     stubBlobFetch();
     const editor = new SceneEditor();
     editor.openProject(createSampleProject());
-    const cache = new AssetCache();
+    const cache = new ContentCache();
     const hash = await hashBytes(new Uint8Array(FIXTURE));
 
     stubBlobFetch(gate);
     const importing = importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
+    // 等待 acquire 签发（loader 挂在门后，条目处于 loading）
+    await vi.waitFor(() => expect(cache.has(hash)).toBe(true));
     // 组件卸载：runtime.dispose → editor.dispose() + cache.dispose()
     editor.dispose();
     cache.dispose();
-    expect(cache.has(hash)).toBe(false); // 整体释放立即清理解析中条目
+    // dispose 原子撤销全部 lease（不依赖消费者配合）；loader 在途条目保留至
+    // settle，由 settle 处理器独立完成唯一 teardown
+    expect(cache.has(hash)).toBe(true);
     release();
     const result = await importing;
 
@@ -572,21 +607,21 @@ describe('第三轮修复：生命周期 settle 清理与 .gltf 多文件', () =
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.error.message).toMatch(/项目已切换|缓存已释放/);
+    // settle 后 condemned 条目完成唯一 teardown → 整体清理完成
+    expect(cache.has(hash)).toBe(false);
     expect(editor.getProject()).toBeNull();
     expect(editor.getHistoryState().canUndo).toBe(false);
     // 后续写入一律拒绝（无晚到写入）
     expect(editor.addObject(createGroupObject()).ok).toBe(false);
-    // dispose 后的 acquire 直接拒绝
-    await expect(
-      cache.acquire(hash, FIXTURE.buffer as ArrayBuffer, 'model/gltf-binary'),
-    ).rejects.toThrow('缓存已释放');
+    // dispose 后的 acquire 同步拒绝（缓存终态）
+    expect(() => cache.acquire(hash, FIXTURE.buffer as ArrayBuffer, { format: 'glb' })).toThrow('缓存已释放');
   });
 
   it('M3 .gltf 多文件：外部 .bin 依赖映射、组合哈希去重、缺依赖失败、重开重建', async () => {
     stubBlobFetch();
     const editor = new SceneEditor();
     editor.openProject(createSampleProject());
-    const cache = new AssetCache();
+    const cache = new ContentCache();
 
     // 把真实 GLB 拆成 .gltf + 外部 .bin；主文件放在数组末尾（按扩展名识别）
     const { gltfText, bin } = splitGlb(FIXTURE);
@@ -609,7 +644,7 @@ describe('第三轮修复：生命周期 settle 清理与 .gltf 多文件', () =
     // 内容真实可挂载：外部 BIN 经 blob URL 映射后解析出几何
     const root = buildScene(editor.getProject()!, 16 / 9);
     const modelNode = findNode(root, imported.objectId)!;
-    attachModelContent(modelNode, cache.get(asset.hash)!.gltf!);
+    await attachCachedContent(cache, asset.hash, modelNode);
     const body = modelNode.getObjectByName('BodyMesh') as THREE.Mesh;
     expect(body.geometry?.attributes.position.count).toBeGreaterThan(0);
 
@@ -630,13 +665,13 @@ describe('第三轮修复：生命周期 settle 清理与 .gltf 多文件', () =
 
     // 重开：仅凭项目 JSON（payload + parts）重建依赖映射并解析
     const serialized = JSON.parse(JSON.stringify(editor.getProject())) as Project;
-    const freshCache = new AssetCache();
-    const seeds = ensureCacheSeeded(freshCache, serialized);
+    const freshCache = new ContentCache();
+    const seeds = seedProjectCache(freshCache, serialized);
     expect(seeds).toHaveLength(1);
     await Promise.all(seeds);
     const reopened = buildScene(serialized, 16 / 9);
     const reopenedNode = findNode(reopened, imported.objectId)!;
-    attachModelContent(reopenedNode, freshCache.get(asset.hash)!.gltf!);
+    await attachCachedContent(freshCache, asset.hash, reopenedNode);
     expect(
       (reopenedNode.getObjectByName('BodyMesh') as THREE.Mesh).geometry.attributes.position.count,
     ).toBeGreaterThan(0);

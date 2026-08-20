@@ -4,7 +4,7 @@ import type { Project } from '@lumora/core';
 import type { StudioRuntime } from '../runtime/studio-runtime';
 import type { EditorState } from '../hooks/use-scene-editor';
 import { useEventRefresh } from '../hooks/use-event-refresh';
-import type { AssetCache } from './editor/asset-cache';
+import type { ContentCache } from './editor/content-cache';
 import { importModelFile } from './editor/model-import';
 import { showToast } from './editor/toasts';
 
@@ -12,7 +12,7 @@ interface ToolbarProps {
   runtime: StudioRuntime;
   project: Project | null;
   editorState: EditorState;
-  cache: AssetCache;
+  cache: ContentCache;
   onTogglePlugins: () => void;
   onTogglePalette: () => void;
 }

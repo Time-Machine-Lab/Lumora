@@ -9,7 +9,7 @@ import { LumoraStudio } from '../src/components/LumoraStudio';
 import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
 import { ObjectTree } from '../src/components/editor/ObjectTree';
 import { PropertiesPanel } from '../src/components/editor/PropertiesPanel';
-import type { AssetCache } from '../src/components/editor/asset-cache';
+import type { CacheLease, ContentCache } from '../src/components/editor/content-cache';
 import { importModelFile } from '../src/components/editor/model-import';
 import { ToastHost } from '../src/components/editor/toasts';
 import { useSceneEditor } from '../src/hooks/use-scene-editor';
@@ -37,16 +37,22 @@ vi.mock('@react-three/drei', () => ({
   TransformControls: () => null,
 }));
 
-function noopCache(): AssetCache {
+function leaseWith(content: Promise<GLTF>): CacheLease {
+  return { hash: 'noop', generation: 0, content, release: vi.fn() };
+}
+
+function noopCache(): ContentCache {
   return {
-    get: () => null,
-    has: () => false,
-    urlFor: () => '',
-    acquire: vi.fn(async () => ({ scene: new THREE.Group() }) as unknown as GLTF),
+    acquire: vi.fn(() => leaseWith(Promise.resolve({ scene: new THREE.Group() } as unknown as GLTF))),
+    seed: vi.fn(() => leaseWith(Promise.resolve({ scene: new THREE.Group() } as unknown as GLTF))),
+    retain: vi.fn(() => null),
+    has: vi.fn(() => false),
+    isReady: vi.fn(() => false),
+    getInfo: vi.fn(() => null),
+    discard: vi.fn(),
     sweep: vi.fn(),
-    onContentReady: () => () => undefined,
     dispose: vi.fn(),
-  } as unknown as AssetCache;
+  } as unknown as ContentCache;
 }
 
 function makeEditor() {
@@ -59,7 +65,7 @@ function findObject(editor: SceneEditorType, id: string) {
   return editor.getProject()?.objects.find((o) => o.id === id);
 }
 
-function TreeHarness({ editor, cache }: { editor: SceneEditorType; cache: AssetCache }) {
+function TreeHarness({ editor, cache }: { editor: SceneEditorType; cache: ContentCache }) {
   const state = useSceneEditor(editor);
   return (
     <>
@@ -79,7 +85,7 @@ function InspectorHarness({ editor }: { editor: SceneEditorType }) {
   );
 }
 
-function StudioHarness({ editor, cache }: { editor: SceneEditorType; cache: AssetCache }) {
+function StudioHarness({ editor, cache }: { editor: SceneEditorType; cache: ContentCache }) {
   const state = useSceneEditor(editor);
   return (
     <>
@@ -304,9 +310,9 @@ describe('模型导入', () => {
     return file;
   }
 
-  function stubCache(overrides: Partial<AssetCache> = {}): AssetCache {
+  function stubCache(overrides: Partial<ContentCache> = {}): ContentCache {
     const cache = noopCache();
-    return { ...cache, ...overrides } as unknown as AssetCache;
+    return { ...cache, ...overrides } as unknown as ContentCache;
   }
 
   // jsdom 的 crypto.subtle 会拒绝 jsdom 领域的 ArrayBuffer（跨 realm instanceof），
@@ -319,8 +325,7 @@ describe('模型导入', () => {
     useFnvHash();
     const editor = makeEditor();
     const cache = stubCache({
-      acquire: vi.fn(async () => gltfLike),
-      urlFor: () => 'blob:mock',
+      acquire: vi.fn(() => leaseWith(Promise.resolve(gltfLike))),
     });
     const file = makeFile('hero.glb', [1, 2, 3]);
 
@@ -341,9 +346,9 @@ describe('模型导入', () => {
     useFnvHash();
     const editor = makeEditor();
     const cache = stubCache({
-      acquire: vi.fn(async () => {
-        throw new Error('GLTFLoader: 无法解析');
-      }),
+      acquire: vi.fn(() =>
+        leaseWith(Promise.reject(new Error('GLTFLoader: 无法解析'))),
+      ),
     });
     const file = makeFile('bad.glb', [0]);
 
@@ -359,8 +364,7 @@ describe('模型导入', () => {
     useFnvHash();
     const editor = makeEditor();
     const cache = stubCache({
-      acquire: vi.fn(async () => gltfLike),
-      urlFor: () => 'blob:mock',
+      acquire: vi.fn(() => leaseWith(Promise.resolve(gltfLike))),
     });
     const file = makeFile('hero.glb', [1, 2, 3]);
 

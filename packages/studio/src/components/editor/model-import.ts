@@ -1,7 +1,7 @@
 import { createModelObject, findAssetByHash, genId, hashBytes } from '@lumora/core';
 import type { AssetData, AssetPartData, Project, SceneEditor } from '@lumora/core';
-import { collectGltfUris } from './asset-cache';
-import type { AssetCache, CachePartFile } from './asset-cache';
+import { collectGltfUris, resolveFormat } from './content-cache';
+import type { CacheLease, CachePartFile, ContentCache } from './content-cache';
 
 export type ImportModelResult =
   | { ok: true; objectId: string; asset: AssetData; deduped: boolean }
@@ -31,9 +31,9 @@ function toBase64(bytes: ArrayBuffer): string {
   return btoa(binary);
 }
 
-function mimeFor(name: string, fallback: string): string {
-  if (fallback) return fallback;
-  return /\.gltf$/i.test(name) ? 'model/gltf+json' : 'model/gltf-binary';
+/** 格式决议：扩展名优先于浏览器 MIME（application/json/octet-stream 误报时以 .gltf 为准） */
+function formatFor(name: string, mime: string): 'gltf' | 'glb' {
+  return resolveFormat(name, mime);
 }
 
 function isMainName(name: string): boolean {
@@ -61,15 +61,15 @@ function uriBase(uri: string): string {
  * 内容哈希去重 → 解析（解析失败不产生任何历史/资源）→ 资源注册 + 模型对象创建
  * 合并为一步历史（importModel 原子提交；撤销无孤儿资源，重做恢复资源与内容）。
  * 字节以 base64 载荷随项目持久化；.gltf 的外部 .bin/纹理作为 parts 一并持久化，
- * 重开项目/重做后由 AssetCache 从载荷按同一规则重建依赖映射。
+ * 重开项目/重做后由 ContentCache（seed/retain）从载荷按同一规则重建依赖映射。
  * 解析前绑定项目会话与目标场景：解析完成后若会话（打开/关闭项目）或目标场景
- * 已切换，则取消提交并释放缓存内容（缓存引用以项目关系为准，见 AssetCache.sweep）。
+ * 已切换，则取消提交并释放缓存内容（缓存引用以项目关系为准，见 ContentCache.sweep）。
  * 多文件支持：传入数组时以首个 .glb/.gltf 为主文件，其余为外部依赖；
  * 依赖缺失立即失败（不触碰缓存）；组合内容哈希覆盖主文件与全部依赖字节。
  */
 export async function importModelFile(
   editor: SceneEditor,
-  cache: AssetCache,
+  cache: ContentCache,
   file: File | File[],
 ): Promise<ImportModelResult> {
   // 在首个 await 前同步绑定会话与目标场景：调用方（文件选择/拖放）执行期间
@@ -127,9 +127,17 @@ export async function importModelFile(
     ? await hashBytes(new TextEncoder().encode(`${mainHash}|${partsText}`))
     : mainHash;
 
+  const format = formatFor(main.name, main.type);
+  let lease: CacheLease;
   try {
-    await cache.acquire(hash, mainBytes, mimeFor(main.name, main.type), parts);
+    lease = cache.acquire(hash, mainBytes, { format, parts });
   } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+  try {
+    await lease.content;
+  } catch (error) {
+    lease.release();
     return fail(`模型解析失败：${error instanceof Error ? error.message : String(error)}`);
   }
 
@@ -137,8 +145,10 @@ export async function importModelFile(
   const sessionLost = !editor.isCurrentSession(sessionToken);
   const sceneLost = !sessionLost && latest !== null && latest.activeSceneId !== targetSceneId;
   if (sessionLost || sceneLost) {
-    // 新会话尚未引用该内容时释放缓存条目；已被新会话引用（如同 hash 已重新导入）则保留
-    if (!projectReferencesHash(latest, hash)) cache.discard(hash);
+    // 主动放弃 + 判死刑：新会话尚未引用该内容时清理条目；
+    // 已被新会话引用（如同 hash 已重新导入，持独立 lease）则条目继续存活
+    if (!projectReferencesHash(latest, hash)) cache.discard(lease);
+    else lease.release();
     return fail(sessionLost ? '项目已切换，导入已取消' : '目标场景已切换，导入已取消');
   }
 
@@ -152,7 +162,8 @@ export async function importModelFile(
     id: genId('asset'),
     kind: 'gltf',
     name: main.name,
-    mime: mimeFor(main.name, main.type),
+    mime: format === 'gltf' ? 'model/gltf+json' : 'model/gltf-binary',
+    format,
     hash,
     size: main.size + parts.reduce((sum, p) => sum + p.bytes.byteLength, 0),
     source: 'file',
@@ -166,8 +177,13 @@ export async function importModelFile(
   const name = main.name.replace(/\.(glb|gltf)$/i, '') || '模型';
   const created = editor.importModel(asset, createModelObject(asset.id, name));
   if (!created.ok || !created.value) {
+    // 提交失败（如会话恰在解析后关闭）：放弃内容，无引用时立即清理
+    cache.discard(lease);
     return fail(created.ok ? '创建模型对象失败' : created.error.message);
   }
+  // 提交成功：内容已随项目引用存活（sweep 依据 Project 全量关系），导入流程的
+  // lease 使命完成——释放它，渲染消费者（SceneContent）在项目变更后自行 retain
+  lease.release();
   const effective = findAssetByHash(editor.getProject()!, hash)!;
   return { ok: true, objectId: created.value, asset: effective, deduped };
 }
