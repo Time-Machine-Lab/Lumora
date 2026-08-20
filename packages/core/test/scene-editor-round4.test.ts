@@ -155,7 +155,7 @@ describe('P2 硬约束 4：EditorState 边界完整（dispose 终态）', () => 
   it('T7 原子视图：场景切换后机位不可达 → 提交路径内回退导演视图', () => {
     const editor = makeEditor();
     const aSceneId = editor.getProject()!.activeSceneId;
-    const bSceneId = ok(editor.addScene('场景 B'));
+    ok(editor.addScene('场景 B'));
     const camBId = ok(editor.addObject(createCameraObject('B 相机')));
     editor.setViewMode({ cameraObjectId: camBId });
     expect(editor.getView().viewMode).toEqual({ cameraObjectId: camBId });
