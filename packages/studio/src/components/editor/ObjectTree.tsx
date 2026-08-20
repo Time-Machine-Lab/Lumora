@@ -5,11 +5,13 @@ import {
   createLightObject,
   createPrimitiveObject,
   findObject,
+  getDescendantIds,
 } from '@lumora/core';
 import type { Project, SceneEditor, SceneObjectData } from '@lumora/core';
 import type { ContentCache } from './content-cache';
 import { importModelFile } from './model-import';
 import { showToast } from './toasts';
+import { buildTreeOrder } from './tree-order';
 
 interface ObjectTreeProps {
   editor: SceneEditor;
@@ -47,6 +49,7 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTargetId, setDropTargetId] = useState<string | null>(null);
+  const [moveMenuId, setMoveMenuId] = useState<string | null>(null);
   /** 单一 roving focus：树内任意时刻只有一个 tab 停靠点（最后聚焦/选中的行） */
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -76,15 +79,10 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
   // 默认展开（expanded 未记录时视为 true），首次折叠要翻到 false
   const toggleExpanded = (id: string) => setExpanded((prev) => ({ ...prev, [id]: !(prev[id] ?? true) }));
 
-  // 键盘导航用的可见行扁平顺序（roving tabindex 的邻居计算）
-  const flatRows: string[] = [];
-  const collectVisible = (object: SceneObjectData): void => {
-    flatRows.push(object.id);
-    if (expanded[object.id] ?? true) {
-      for (const child of project.objects.filter((o) => o.parentId === object.id)) collectVisible(child);
-    }
-  };
-  for (const root of roots) collectVisible(root);
+  // 树序索引：单次 O(n) 遍历构建（childrenOf/rows/rowIndex），
+  // 键盘导航的可见行顺序与子级查询全部 O(1)（R6-D，取代逐节点 filter 的 O(n²)）
+  const order = buildTreeOrder(project, roots, expanded);
+  const flatRows = order.rows;
 
   const focusRow = (id: string) => {
     setFocusedId(id);
@@ -92,8 +90,8 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
   };
 
   const handleRowKeyDown = (object: SceneObjectData, event: React.KeyboardEvent) => {
-    const index = flatRows.indexOf(object.id);
-    const children = project.objects.filter((o) => o.parentId === object.id);
+    const index = order.rowIndex.get(object.id) ?? -1;
+    const children = order.childrenOf.get(object.id) ?? [];
     const isExpanded = expanded[object.id] ?? true;
     const moveTo = (id: string) => {
       editor.setSelection([id]);
@@ -150,6 +148,12 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
         if (!locking.ok) showToast(locking.error.message, 'error');
         break;
       }
+      case 'm':
+      case 'M':
+        // 「移动到」（键盘等价；触屏走行内按钮）：候选目标 = 可见行 − 自身 − 后代
+        event.preventDefault();
+        setMoveMenuId(object.id);
+        break;
       default:
         break;
     }
@@ -172,6 +176,26 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
     setDragId(null);
     if (!dragged || dragged === targetId) return;
     const result = editor.setParent(dragged, targetId);
+    if (!result.ok) showToast(result.error.message, 'error');
+  };
+
+  // 「移动到」目标候选：可见行，排除自身与后代（getDescendantIds 走已索引的
+  // 可达集，不随候选数增长）；仅菜单打开时计算
+  const moveDescendants =
+    moveMenuId !== null ? new Set(getDescendantIds(project, moveMenuId)) : new Set<string>();
+  const moveCandidates =
+    moveMenuId !== null
+      ? order.rows
+          .filter((id) => id !== moveMenuId && !moveDescendants.has(id))
+          .map((id) => order.byId.get(id))
+          .filter((o): o is SceneObjectData => !!o)
+      : [];
+
+  const commitMove = (targetId: string | null) => {
+    if (moveMenuId === null) return;
+    const movingId = moveMenuId;
+    setMoveMenuId(null);
+    const result = editor.setParent(movingId, targetId);
     if (!result.ok) showToast(result.error.message, 'error');
   };
 
@@ -281,6 +305,11 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
             dropTargetId={dropTargetId}
             setDropTargetId={setDropTargetId}
             handleDrop={handleDrop}
+            childrenOf={order.childrenOf}
+            moveMenuId={moveMenuId}
+            setMoveMenuId={setMoveMenuId}
+            moveCandidates={moveCandidates}
+            commitMove={commitMove}
             rowRefs={rowRefs}
             getRowTabIndex={rowTabIndex}
             onRowKeyDown={handleRowKeyDown}
@@ -308,6 +337,11 @@ function TreeNode({
   dropTargetId,
   setDropTargetId,
   handleDrop,
+  childrenOf,
+  moveMenuId,
+  setMoveMenuId,
+  moveCandidates,
+  commitMove,
   rowRefs,
   getRowTabIndex,
   onRowKeyDown,
@@ -328,12 +362,17 @@ function TreeNode({
   dropTargetId: string | null;
   setDropTargetId: (id: string | null) => void;
   handleDrop: (targetId: string) => void;
+  childrenOf: Map<string, SceneObjectData[]>;
+  moveMenuId: string | null;
+  setMoveMenuId: (id: string | null) => void;
+  moveCandidates: SceneObjectData[];
+  commitMove: (targetId: string | null) => void;
   rowRefs: React.RefObject<Record<string, HTMLElement | null>>;
   getRowTabIndex: (id: string) => number;
   onRowKeyDown: (object: SceneObjectData, event: React.KeyboardEvent) => void;
   setFocusedId: (id: string | null) => void;
 }) {
-  const children = project.objects.filter((o) => o.parentId === object.id);
+  const children = childrenOf.get(object.id) ?? [];
   const isExpanded = expanded[object.id] ?? true;
   const isSelected = selection.includes(object.id);
   const isRenaming = renamingId === object.id;
@@ -372,7 +411,9 @@ function TreeNode({
       data-testid={`tree-row-${object.id}`}
       className={`lumora-tree__node${isDragOver ? ' lumora-tree-row--drop-target' : ''}`}
       draggable
-      tabIndex={getRowTabIndex(object.id)}
+      // 行内重命名期间 treeitem 移出 Tab 顺序（APG treeview）：Tab 离开树，
+      // 而非跳到下一个 treeitem；提交/取消后恢复停靠点
+      tabIndex={isRenaming ? -1 : getRowTabIndex(object.id)}
       ref={(el) => {
         rowRefs.current[object.id] = el;
       }}
@@ -486,6 +527,20 @@ function TreeNode({
           </button>
           <button
             type="button"
+            className="lumora-icon-button"
+            data-testid={`tree-move-${object.id}`}
+            title="移动到"
+            onClick={(e) => {
+              e.stopPropagation();
+              setMoveMenuId(object.id);
+            }}
+            onDoubleClick={(e) => e.stopPropagation()}
+            tabIndex={-1}
+          >
+            移
+          </button>
+          <button
+            type="button"
             className="lumora-icon-button lumora-icon-button--danger"
             data-testid={`tree-delete-${object.id}`}
             title="删除"
@@ -508,6 +563,42 @@ function TreeNode({
             {isDeleteConfirming ? '确认?' : '删'}
           </button>
         </span>
+        {moveMenuId === object.id && (
+          <div
+            className="lumora-menu lumora-menu--tree"
+            role="menu"
+            data-testid="tree-move-menu"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') {
+                e.stopPropagation();
+                setMoveMenuId(null);
+              }
+            }}
+          >
+            <button
+              type="button"
+              className="lumora-menu__item"
+              role="menuitem"
+              data-testid="tree-move-to-root"
+              onClick={() => commitMove(null)}
+            >
+              根节点（场景）
+            </button>
+            {moveCandidates.map((candidate) => (
+              <button
+                key={candidate.id}
+                type="button"
+                className="lumora-menu__item"
+                role="menuitem"
+                data-testid={`tree-move-to-${candidate.id}`}
+                onClick={() => commitMove(candidate.id)}
+              >
+                {candidate.name}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
       {isExpanded && children.length > 0 && (
         <ul role="group" className="lumora-tree__group">
@@ -529,6 +620,11 @@ function TreeNode({
               dropTargetId={dropTargetId}
               setDropTargetId={setDropTargetId}
               handleDrop={handleDrop}
+              childrenOf={childrenOf}
+              moveMenuId={moveMenuId}
+              setMoveMenuId={setMoveMenuId}
+              moveCandidates={moveCandidates}
+              commitMove={commitMove}
               rowRefs={rowRefs}
               getRowTabIndex={getRowTabIndex}
               onRowKeyDown={onRowKeyDown}
