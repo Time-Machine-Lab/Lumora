@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import { StrictMode, createRef } from 'react';
+import { createSampleProject } from '@lumora/core';
 import type { Manifest, PanelContextProps, PluginDescriptor } from '@lumora/core';
 import { LumoraStudio } from '../src/components/LumoraStudio';
 import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
+import { CommandPalette } from '../src/components/CommandPalette';
 
 vi.mock('@react-three/fiber', () => ({
   Canvas: ({ children }: { children?: React.ReactNode }) => (
@@ -194,5 +196,93 @@ describe('LumoraStudio', () => {
     await waitFor(() =>
       expect(screen.queryByTestId('panel-error-fallback')).not.toBeInTheDocument(),
     );
+  });
+
+  it('StrictMode 慢 boot 在最终卸载后不再继续注册插件、不写入初始项目、不上报错误', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const onError = vi.fn();
+    let releaseLoad!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseLoad = resolve;
+    });
+    const slowPlugin: PluginDescriptor = {
+      manifest: { ...GOOD_MANIFEST, id: 'com.test.slow', name: '慢插件' },
+      entry: async () => {
+        await gate;
+        return { default: { activate: (context) => context.contribute({}) } };
+      },
+    };
+    const { unmount } = render(
+      <StrictMode>
+        <LumoraStudio
+          ref={handle}
+          plugins={[slowPlugin, goodPlugin]}
+          hostVersion="0.1.0"
+          initialProject={createSampleProject('lumora://slow', '慢项目')}
+          onError={onError}
+        />
+      </StrictMode>,
+    );
+    const runtime = handle.current!.runtime;
+    // 慢插件加载挂起：后续插件与初始项目都尚未处理
+    await vi.waitFor(() => expect(runtime.host.getPlugin('com.test.slow')?.state).toBe('loading'));
+    expect(runtime.host.getPlugin('com.test.good')).toBeUndefined();
+    expect(runtime.getProject()).toBeNull();
+
+    // 最终卸载：取消标记生效，延迟确认的 dispose 已执行
+    unmount();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // 放行慢入口：晚到的加载/激活不得复活插件、不得继续注册后续插件、
+    // 不得写入初始项目、不得上报宿主错误
+    releaseLoad();
+    await vi.waitFor(() => expect(runtime.host.getPlugin('com.test.slow')).toBeUndefined());
+    expect(runtime.host.getPlugin('com.test.good')).toBeUndefined();
+    expect(runtime.host.listPlugins()).toHaveLength(0);
+    expect(runtime.getProject()).toBeNull();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('命令面板：when() 上下文注入命令所属插件 id，与 execute() 使用同一上下文', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const whenSpy = vi.fn((_context: { pluginId?: string }) => true);
+    const plugin: PluginDescriptor = {
+      manifest: GOOD_MANIFEST,
+      entry: async () => ({
+        default: {
+          activate: (context) =>
+            context.contribute({
+              commands: [
+                {
+                  kind: 'command',
+                  command: {
+                    id: 'com.test.good.when',
+                    title: '条件命令',
+                    when: whenSpy,
+                    execute: () => ({ ok: true }),
+                  },
+                },
+                {
+                  kind: 'command',
+                  command: {
+                    id: 'com.test.good.hidden',
+                    title: '隐藏命令',
+                    when: () => false,
+                    execute: () => ({ ok: true }),
+                  },
+                },
+              ],
+            }),
+        },
+      }),
+    };
+    render(<LumoraStudio ref={handle} plugins={[plugin]} hostVersion="0.1.0" />);
+    await waitFor(() => expect(handle.current!.runtime.host.commands.count()).toBe(2));
+
+    render(<CommandPalette runtime={handle.current!.runtime} onClose={vi.fn()} />);
+    expect(whenSpy).toHaveBeenCalledTimes(1);
+    expect(whenSpy.mock.calls[0]![0].pluginId).toBe('com.test.good');
+    expect(await screen.findByTestId('palette-command-com.test.good.when')).toBeInTheDocument();
+    expect(screen.queryByTestId('palette-command-com.test.good.hidden')).not.toBeInTheDocument();
   });
 });

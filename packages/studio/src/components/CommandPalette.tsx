@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import type { Command, CommandContext } from '@lumora/core';
+import { useEffect, useRef, useState } from 'react';
+import type { Command } from '@lumora/core';
 import type { StudioRuntime } from '../runtime/studio-runtime';
 import { useEventRefresh } from '../hooks/use-event-refresh';
 
@@ -25,22 +25,13 @@ export function CommandPalette({ runtime, onClose }: CommandPaletteProps) {
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  const context: CommandContext = useMemo(
-    () => ({
-      events: runtime.events,
-      commands: runtime.host.commands,
-      services: runtime.host.services,
-      getProject: () => runtime.host.getProject(),
-    }),
-    [runtime],
-  );
-
   // 每次渲染直接读取注册表：命令注册/注销（command:changed）触发的重渲染必须反映最新列表，
-  // 不能依赖 useMemo —— 其依赖（runtime/query/context）在事件触发时不会变化
+  // 不能依赖 useMemo —— 其依赖在事件触发时不会变化。
+  // when() 由 CommandRegistry 统一构造命令所属插件的上下文（pluginId/services 与 execute 一致）
   const keyword = query.trim().toLowerCase();
   const commands = runtime.host.commands
     .list()
-    .filter((command) => (command.when?.(context) ?? true))
+    .filter((command) => runtime.host.commands.isAvailable(command))
     .filter(
       (command) =>
         keyword === '' ||

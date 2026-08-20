@@ -60,33 +60,35 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   }, [runtime]);
 
   // 挂载时一次性启动：注册插件并打开初始项目（与 props 变化解耦，避免重复注册）。
-  // StrictMode 下 effect 会卸载重放：boot 只执行一次，重放仅取消在途启动；
-  // 真正的运行时释放由根节点 ref 回调触发（StrictMode 不会分离 DOM ref）
+  // StrictMode 下 effect 会卸载重放：boot 只执行一次，重放与真实卸载都注册 cleanup，
+  // 取消标记使慢入口在最终卸载后不再继续注册插件或写入初始项目
   const bootStartedRef = useRef(false);
   const cancelBootRef = useRef(false);
   useEffect(() => {
     // 每次 setup 清除取消标记：StrictMode 重放不会永久取消首个 effect 发起的启动
     cancelBootRef.current = false;
-    if (bootStartedRef.current) return;
-    bootStartedRef.current = true;
-    const pluginsRef = plugins;
-    const initialRef = initialProject;
-    const onErrorRef = onError;
-    const boot = async () => {
-      for (const descriptor of pluginsRef) {
-        if (cancelBootRef.current) return;
-        try {
-          await runtime.host.register(descriptor);
-        } catch (error) {
-          onErrorRef?.(error);
+    if (!bootStartedRef.current) {
+      bootStartedRef.current = true;
+      const pluginsRef = plugins;
+      const initialRef = initialProject;
+      const onErrorRef = onError;
+      const boot = async () => {
+        for (const descriptor of pluginsRef) {
+          if (cancelBootRef.current) return;
+          try {
+            await runtime.host.register(descriptor);
+          } catch (error) {
+            onErrorRef?.(error);
+          }
         }
-      }
-      if (!cancelBootRef.current && initialRef) runtime.openProject(initialRef);
-    };
-    void boot();
+        if (!cancelBootRef.current && initialRef) runtime.openProject(initialRef);
+      };
+      void boot();
+    }
     return () => {
       cancelBootRef.current = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 一次性启动，故意与 props 变化解耦
   }, [runtime]);
 
   // 真实卸载时释放运行时。StrictMode 会把 effect 卸载后重放：cleanup 若直接

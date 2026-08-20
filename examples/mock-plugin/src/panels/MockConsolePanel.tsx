@@ -21,7 +21,6 @@ export function MockConsolePanel({ pluginId, project, events, services }: PanelC
     return () => {
       for (const subscription of subscriptions) subscription.dispose();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [events]);
 
   const loadAsset = async () => {

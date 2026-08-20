@@ -1,10 +1,10 @@
-/* eslint-env node */
-// npm 打包/安装冒烟：构建全部包 → npm pack 生成 tarball → 在临时消费工程中
-// 以 tarball 安装（React 19 peer 边界）→ typecheck 并 vite build 消费端
-// （含 @lumora/studio/style.css 导出存在性验证）。
+// npm 打包/安装冒烟：构建全部包 → npm pack 生成 tarball → 在仓库依赖树之外的
+// 临时消费工程中以 tarball 安装（React 19 peer 边界）→ typecheck（skipLibCheck:false）
+// 并 vite build 消费端（含 @lumora/studio/style.css 导出存在性验证与依赖隔离断言）。
 // 失败时退出码非 0；临时目录总是被清理。
 import { execSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -28,8 +28,12 @@ const CONSUMER_DEV_DEPS = [
 
 // Windows 上 os.tmpdir() 可能返回 8.3 短名路径（如 ADMINI~1）且 realpath 无法归一化，
 // 而 vite 内部 realpath 后是长名路径，混用会让 relative 计算出含 .. 的非法 fileName；
-// 因此冒烟目录放在仓库 node_modules 下（长名路径、已被 gitignore）
-const tmp = mkdtempSync(join(root, 'node_modules', '.lumora-smoke-'));
+// homedir() 恒为长名路径，在其下建目录即可得到规范化长路径，且完全位于仓库依赖树之外，
+// Node 不会向上解析到仓库 node_modules
+const tmp = mkdtempSync(join(homedir(), 'AppData', 'Local', 'Temp', 'lumora-smoke-'));
+if (tmp.toLowerCase().startsWith(root.toLowerCase())) {
+  throw new Error('冒烟消费工程不得位于仓库依赖树内');
+}
 const consumerDir = join(tmp, 'consumer');
 mkdirSync(consumerDir, { recursive: true });
 // tarball 放在消费工程内，file: 依赖相对 consumer package.json 解析
@@ -101,6 +105,7 @@ try {
 export default defineConfig({ build: { target: 'es2022' } });
 `);
 
+  // skipLibCheck: false —— 声明文件问题（漏声明依赖等）不得被误放行
   write('tsconfig.json', `{
   "compilerOptions": {
     "target": "ES2022",
@@ -110,7 +115,7 @@ export default defineConfig({ build: { target: 'es2022' } });
     "strict": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "noEmit": true,
-    "skipLibCheck": true
+    "skipLibCheck": false
   },
   "include": ["src"]
 }
@@ -171,7 +176,7 @@ createRoot(document.getElementById('root')!).render(
 
   run('npm install --no-audit --no-fund', { cwd: consumerDir });
 
-  console.log('[smoke] 4/5 验证 style.css 导出真实存在');
+  console.log('[smoke] 4/5 验证 style.css 导出真实存在 + 依赖隔离断言');
   const styleCss = join(consumerDir, 'node_modules', '@lumora', 'studio', 'dist', 'style.css');
   if (!existsSync(styleCss)) {
     throw new Error(`@lumora/studio 安装产物缺少 dist/style.css（exports "./style.css" 指向不存在的文件）`);
@@ -179,6 +184,19 @@ createRoot(document.getElementById('root')!).render(
   const studioPkg = JSON.parse(readFileSync(join(consumerDir, 'node_modules', '@lumora', 'studio', 'package.json'), 'utf8'));
   if (!studioPkg.exports?.['./style.css']) {
     throw new Error('@lumora/studio 安装后 exports 缺少 "./style.css"');
+  }
+  // 依赖隔离：4 个 @lumora 包必须来自本地 tarball 副本，realpath 不得解析到仓库内
+  const consumerResolved = realpathSync(consumerDir);
+  for (const name of PACKAGES) {
+    const shortName = name.replace('@lumora/', '');
+    const pkgJson = join(consumerDir, 'node_modules', '@lumora', shortName, 'package.json');
+    if (!existsSync(pkgJson)) {
+      throw new Error(`安装后缺少 @lumora/${shortName}（依赖隔离断言失败）`);
+    }
+    const resolved = realpathSync(pkgJson);
+    if (!resolved.toLowerCase().startsWith(consumerResolved.toLowerCase())) {
+      throw new Error(`@lumora/${shortName} 解析到消费工程之外: ${resolved}（依赖未隔离，可能被仓库依赖树捕获）`);
+    }
   }
 
   console.log('[smoke] 5/5 typecheck + vite build 消费端');

@@ -119,6 +119,16 @@ export class CommandRegistry {
     return this.entries.get(id)?.pluginId;
   }
 
+  /**
+   * 以命令所属插件的上下文评估可用性（when）。与 execute 使用同一上下文构造，
+   * 保证插件依赖 context.pluginId / services 的 when 判断与执行时一致。
+   */
+  isAvailable(command: Command): boolean {
+    const entry = this.entries.get(command.id);
+    if (!entry) return false;
+    return entry.command.when?.(this.createContext(entry.pluginId)) ?? true;
+  }
+
   list(): Command[] {
     return [...this.entries.values()].map((entry) => entry.command);
   }

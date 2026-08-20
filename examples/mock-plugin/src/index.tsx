@@ -88,6 +88,7 @@ const definition = definePlugin({
             category: 'Lumora Mock',
             execute(_args, commandContext) {
               const project = commandContext.getProject();
+              // eslint-disable-next-line no-console -- 示例插件的演示日志
               console.log(
                 `[com.lumora.mock] ${project ? `当前项目: ${project.name}（${project.objects.length} 个对象）` : '未打开项目'}`,
               );
@@ -136,6 +137,7 @@ const definition = definePlugin({
     });
   },
   deactivate() {
+    // eslint-disable-next-line no-console -- 示例插件的演示日志
     console.log('[com.lumora.mock] 插件已停用，所有贡献项已由宿主回收');
   },
 });
