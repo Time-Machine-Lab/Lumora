@@ -269,7 +269,11 @@ export class PluginHost {
     // registered 事件内若发生停用（disable/deactivate 同步推进代际并接管状态），
     // 立即终止注册链：不再加载/激活，不执行任何插件用户代码。
     // 断言避免 TS 对 record.state 持续收窄（否则其后对 'failed'/'loading' 的比较会被误判为无重叠）
-    if (this.disposedFlag || (record.state as PluginState) !== 'registered') return record.info();
+    if (this.disposedFlag || (record.state as PluginState) !== 'registered') {
+      // 销毁已登记：经公共退出契约与共享宿主销毁完成点一并收敛，不得提前返回在途快照
+      if (this.disposedFlag) await this.settleExit(record);
+      return record.info();
+    }
 
     if (!record.ready) {
       this.fail(record, record.reason ?? '插件未通过校验');
@@ -287,12 +291,17 @@ export class PluginHost {
     const { promise: loadingPromise, operation: loading } = this.loadDefinition(record);
     await loadingPromise;
     const stateAfterLoad = record.state;
-    // 过期注册流只能按取消路径结束（返回当前快照），不启动激活、不加入新代激活
-    if (this.disposedFlag || record.generation !== generation) return record.info();
+    // 过期注册流只能按取消路径结束（返回当前快照），不启动激活、不加入新代激活；
+    // 销毁已登记时经公共退出契约与共享宿主销毁完成点一并收敛
+    if (this.disposedFlag || record.generation !== generation) {
+      if (this.disposedFlag) await this.settleExit(record);
+      return record.info();
+    }
     if (stateAfterLoad === 'activating') {
       // 加载期间重入 enable 已启动同代激活：加入同一完整激活流程，
-      // 等待 active 发布或失败/取消回滚终态，不得提前返回 activating 快照
-      await this.awaitActivationOutcome(record);
+      // 等待 active 发布或失败/取消回滚终态，不得提前返回 activating 快照；
+      // 销毁已登记时经公共退出契约一并收敛
+      await this.settleExit(record);
       return record.info();
     }
     // 加载期间可能被 disable/dispose 接管（状态已离开 loading），晚到加载结果不得改写停用状态；
@@ -302,6 +311,8 @@ export class PluginHost {
       stateAfterLoad !== 'loading' ||
       (record.loading !== null && record.loading !== loading)
     ) {
+      // 销毁已登记时经公共退出契约一并收敛；未销毁时 join 任何在途流程后返回
+      await this.settleExit(record);
       return record.info();
     }
 
@@ -326,8 +337,9 @@ export class PluginHost {
     // 等待激活 settle、暂存清理与 deactivate 钩子全部完成，不提前返回
     await this.deactivateRecord(record, 'disabled');
     // 顺序场景：先 deactivate（inactive）再 disable —— 终态仍收敛为 disabled；
-    // failed 插件停用保持 inactive（保留失败原因，可重新启用重试）
-    if (!wasFailed && record.state === 'inactive') {
+    // failed 插件停用保持 inactive（保留失败原因，可重新启用重试）。
+    // 销毁已登记时生命周期终态落定为 inactive（不再发布状态事件），不得再补发 disabled
+    if (!this.disposedFlag && !wasFailed && record.state === 'inactive') {
       record.state = 'disabled';
       this.emitState(record, 'disabled');
     }
@@ -343,8 +355,9 @@ export class PluginHost {
     const state = record.state;
     if (state === 'active') return;
     if (state === 'activating') {
-      // 激活已在途：加入同一完整激活流程（active 或失败/取消回滚终态），不提前返回
-      await this.awaitActivationOutcome(record);
+      // 激活已在途：加入同一完整激活流程（active 或失败/取消回滚终态），不提前返回；
+      // 销毁已登记时经公共退出契约与共享宿主销毁完成点一并收敛
+      await this.settleExit(record);
       return;
     }
     if (state === 'deactivating') {
@@ -353,7 +366,11 @@ export class PluginHost {
       // deactivating/loading 快照；awaitActivationOutcome 已纳入当前代 loading）
       for (;;) {
         await this.awaitActivationOutcome(record);
-        if (this.disposedFlag) return;
+        if (this.disposedFlag) {
+          // 销毁已登记：经公共退出契约与共享宿主销毁完成点一并收敛
+          await this.settleExit(record);
+          return;
+        }
         const inFlight = record.state;
         if (inFlight === 'deactivating' || inFlight === 'loading') continue;
         break;
@@ -362,7 +379,7 @@ export class PluginHost {
       if (after === 'active') return;
       if (after === 'activating') {
         // 收敛期间终态事件内启动的新激活仍在途：加入同一完整流程
-        await this.awaitActivationOutcome(record);
+        await this.settleExit(record);
         return;
       }
       if (after !== 'inactive' && after !== 'disabled' && after !== 'failed') return;
@@ -376,31 +393,40 @@ export class PluginHost {
       const generation = record.generation;
       const { promise: loadingPromise } = this.loadDefinition(record);
       await loadingPromise;
-      if (this.disposedFlag) return;
+      if (this.disposedFlag) {
+        // 销毁已登记：经公共退出契约与共享宿主销毁完成点一并收敛
+        await this.settleExit(record);
+        return;
+      }
       if (record.generation !== generation) {
-        // 代际已推进（disable/dispose 接管）：本次加载结果整体作废。重新进入统一
-        // 收敛/重驱动路径 —— 持续加入当前代 loading/activation/lifecycle 直到稳定
-        // 终态，再落入公共路径驱动本调用的激活意图。不得以 record.loading === null
-        // 判定新代已稳定：新 loader 可能已完成并进入在途 activation，直接返回会让
-        // 外层 enable 以 activating 快照提前成功（代际复核只证明旧加载作废，
-        // 不证明新代流程已终态）
+        // 代际已推进（disable/dispose 接管）：本次加载结果整体作废。本调用成为当前
+        // 代流程的观察者 —— 只加入当前代 loading/activation/lifecycle 并等待稳定
+        // 结果后直接返回，绝不依据残留 definition 重放已被取消的旧激活意图
+        // （后到 disable 取消在途 enable 契约：新代缓存 definition 后再停用，
+        // 旧调用也不得复活插件）。不得以 record.loading === null 判定新代已稳定：
+        // 新 loader 可能已完成并进入在途 activation，直接返回会让外层 enable 以
+        // activating 快照提前成功（代际复核只证明旧加载作废，不证明新代流程已终态）
         for (;;) {
           await this.awaitActivationOutcome(record);
-          if (this.disposedFlag) return;
+          if (this.disposedFlag) {
+            // 销毁已登记：经公共退出契约与共享宿主销毁完成点一并收敛
+            await this.settleExit(record);
+            return;
+          }
           const inFlight = record.state;
           if (inFlight === 'deactivating' || inFlight === 'loading') continue;
           break;
         }
-        const after = record.state;
-        if (after === 'active') return;
-        if (after === 'activating') {
-          // 收敛期间新代激活仍在途：加入同一完整流程（active 或回滚终态），不提前返回
-          await this.awaitActivationOutcome(record);
-          return;
-        }
+        await this.settleExit(record);
+        return;
       }
       await this.awaitActivationOutcome(record);
-      if (this.disposedFlag || record.state === 'failed') return;
+      if (this.disposedFlag) {
+        // 销毁已登记：经公共退出契约与共享宿主销毁完成点一并收敛
+        await this.settleExit(record);
+        return;
+      }
+      if (record.state === 'failed') return;
       if (!record.definition) return;
     }
     await this.activateRecord(record);
@@ -488,6 +514,20 @@ export class PluginHost {
       }
       return;
     }
+  }
+
+  /**
+   * 公共退出契约：register/enable/activate 及内部激活/失败路径的 owner、joiner、
+   * loading/activation 成功路径与 disposed/过期早退，在宿主销毁登记后统一经此收口。
+   * 顺序固定：先解析本调用持有的本地完成点（如有）—— 驱动生命周期推进，避免环形
+   * 等待；再等待记录级在途流程收敛到稳定终态；最后等待共享宿主销毁完成点（未销毁
+   * 时无操作）。宿主销毁未完成前，公共调用不解析，也不以 loading/activating/
+   * deactivating 过渡态作为成功结果。
+   */
+  private async settleExit(record: PluginRecord, completion?: Deferred<void>): Promise<void> {
+    if (completion) completion.resolve();
+    await this.awaitActivationOutcome(record);
+    if (this.hostDispose) await this.hostDispose;
   }
 
   // ---------- 内部 ----------
@@ -647,17 +687,22 @@ export class PluginHost {
     const state = record.state;
     if (state === 'active') return;
     if (state === 'activating') {
-      // 激活已在途：加入同一完整激活流程（active 或失败/取消回滚终态），不提前返回
-      await this.awaitActivationOutcome(record);
+      // 激活已在途：加入同一完整激活流程（active 或失败/取消回滚终态），不提前返回；
+      // 销毁已登记时经公共退出契约与共享宿主销毁完成点一并收敛
+      await this.settleExit(record);
       return;
     }
     if (state === 'deactivating') {
       // 停用/回滚进行中：等待同一操作完整收敛（含终态事件内新建的激活/加载），
       // 然后落入下方公共路径重新驱动本调用的激活意图 —— 不得 silent success，
-      // 也不得放弃意图（慢 deactivate 期间直接 activate 必须最终激活）
+      // 也不得放弃意图（慢 deactivate 期间直接 activate 必须最终激活）。
+      // 销毁在收敛期间登记：本调用加入共享销毁完成点收敛后返回（不创建激活尝试）
       for (;;) {
         await this.awaitActivationOutcome(record);
-        if (this.disposedFlag) throw new Error('插件宿主已销毁');
+        if (this.disposedFlag) {
+          await this.settleExit(record);
+          return;
+        }
         const inFlight = record.state;
         if (inFlight === 'deactivating' || inFlight === 'loading') continue;
         break;
@@ -666,7 +711,7 @@ export class PluginHost {
       if (after === 'active') return;
       if (after === 'activating') {
         // 收敛期间终态事件内启动的新激活仍在途：加入同一完整流程
-        await this.awaitActivationOutcome(record);
+        await this.settleExit(record);
         return;
       }
       if (after !== 'inactive' && after !== 'disabled' && after !== 'failed') return;
@@ -702,12 +747,10 @@ export class PluginHost {
       record.generation !== attempt.generation ||
       record.state !== 'activating'
     ) {
-      completion.resolve();
-      // 事件内停用已摘除本尝试：owner 加入同一生命周期/新尝试收敛，
-      // 取消的回滚未完成前不得提前返回（取消且 deactivate 挂起场景）；
-      // 销毁已接管时与共享宿主销毁完成点一并收敛，不在销毁清理窗口内提前返回
-      await this.awaitActivationOutcome(record);
-      if (this.hostDispose) await this.hostDispose;
+      // 事件内停用已摘除本尝试：先解析本尝试唯一完成点（驱动生命周期推进，
+      // 避免环形等待），再经公共退出契约收敛 —— 取消的回滚未完成前不提前返回，
+      // 销毁已登记时与共享宿主销毁完成点一并收敛
+      await this.settleExit(record, completion);
       return;
     }
 
@@ -743,10 +786,10 @@ export class PluginHost {
       } catch {
         // 清理失败不影响已推进的停用状态
       }
-      completion.resolve();
-      await this.awaitActivationOutcome(record);
-      // 销毁已接管：与共享宿主销毁完成点一并收敛，不在销毁清理窗口内提前返回
-      if (this.hostDispose) await this.hostDispose;
+      // 先解析本尝试唯一完成点（驱动生命周期推进，避免环形等待），
+      // 再经公共退出契约收敛：事件内停用引发的回滚未完成前不提前返回，
+      // 销毁已登记时与共享宿主销毁完成点一并收敛
+      await this.settleExit(record, completion);
       return;
     }
     record.activation = null;
@@ -758,9 +801,10 @@ export class PluginHost {
     attempt.workflow.resolve();
     // active 事件内启动的停用/销毁已接管（状态离开 active / 宿主销毁）：
     // 加入同一生命周期收敛 —— 事件内慢停用（deactivate 钩子挂起）未完成前，
-    // 本激活调用不得提前返回在途 deactivating 快照
+    // 本激活调用不得提前返回在途 deactivating 快照；销毁已登记时经公共退出
+    // 契约与共享宿主销毁完成点一并收敛
     if (this.disposedFlag || record.state !== 'active') {
-      await this.awaitActivationOutcome(record);
+      await this.settleExit(record);
     }
   }
 
@@ -779,13 +823,10 @@ export class PluginHost {
     error: unknown,
   ): Promise<void> {
     if (this.disposedFlag) {
-      // 销毁已接管：解析本尝试唯一完成点（驱动已发布的生命周期清理），随后加入该
-      // 尝试的完整 workflow 与共享宿主销毁完成点一并收敛 —— 两阶段销毁保证本记录
-      // 的生命周期已在途；不得在本记录清理结束后独立提前返回（宿主仍可能卡在其他
-      // 记录的慢停用，owner 不得以 in-flight 快照提前成功）
-      completion.resolve();
-      await this.awaitActivationOutcome(record);
-      if (this.hostDispose) await this.hostDispose;
+      // 销毁已接管：先解析本尝试唯一完成点（驱动已发布的生命周期清理，避免环形
+      // 等待），再经公共退出契约收敛 —— 两阶段销毁保证本记录的生命周期已在途；
+      // 不得在本记录清理结束后独立提前返回（宿主仍可能卡在其他记录的慢停用）
+      await this.settleExit(record, completion);
       return;
     }
     if (record.activation !== attempt || record.generation !== attempt.generation) {
@@ -795,9 +836,9 @@ export class PluginHost {
       } catch {
         // 清理失败不掩盖过期结论
       }
-      completion.resolve();
-      // 尝试已被生命周期摘除：加入同一生命周期收敛，回滚进行中不提前返回
-      await this.awaitActivationOutcome(record);
+      // 先解析本尝试唯一完成点，再经公共退出契约收敛：尝试已被生命周期摘除，
+      // 回滚进行中不提前返回；销毁在清理期间登记时与共享宿主销毁完成点一并收敛
+      await this.settleExit(record, completion);
       return;
     }
     // 当前尝试：先发布失败生命周期（任何回滚 await 之前），再解析唯一完成点驱动
@@ -814,7 +855,9 @@ export class PluginHost {
     } catch {
       // 生命周期承诺以成功收敛；防御性兜底
     }
-    await this.awaitActivationOutcome(record);
+    // 等待回滚终态发布，并收敛终态事件内重入启动的新激活；
+    // 销毁在回滚期间登记时经公共退出契约与共享宿主销毁完成点一并收敛
+    await this.settleExit(record);
   }
 
   /**
@@ -905,8 +948,6 @@ export class PluginHost {
         }
         record.owned = new DisposableSet();
       }
-      // loading / registered：无活动资源，直接进入终态
-      if (this.disposedFlag) return;
       // 发布终态事件前让旧操作完整 detach：终态事件内的重入（enable 重新激活、
       // failed 后再次停用等）将发布全新的操作/尝试，而不是合并进已消费完 target
       // 的旧操作；终态前已取走 target，并发（非事件）合并的目标仍被消费
@@ -915,6 +956,24 @@ export class PluginHost {
       record.lifecycle = null;
       // 目标终态必由 publishLifecycle 发布；缺省防御避免卡在 deactivating
       if (!target) return;
+      if (this.disposedFlag) {
+        // 销毁已接管：终态仍落定但不再发布状态事件 —— 销毁后返回的公共快照
+        // 不得停留在 deactivating/loading 等过渡态
+        if (target.state === 'failed') {
+          record.state = 'failed';
+          record.reason = target.reason ?? '激活失败';
+          record.error = target.error;
+        } else if (target.state === 'disabled') {
+          record.state = 'disabled';
+        } else {
+          record.state = 'inactive';
+          if (originalState !== 'failed') {
+            record.error = undefined;
+            record.reason = undefined;
+          }
+        }
+        return;
+      }
       if (target.state === 'failed') {
         this.fail(record, target.reason ?? '激活失败', target.error);
       } else if (target.state === 'disabled') {
