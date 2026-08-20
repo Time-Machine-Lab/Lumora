@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "1",
+  "id": "com.lumora.mock",
+  "name": "Mock 示例插件",
+  "version": "0.1.0",
+  "description": "演示 panel / command / toolbar / assetLoader / aiProvider / exporter 六类贡献项",
+  "author": "Lumora Team",
+  "entry": "./dist/index.js",
+  "engine": {
+    "lumora": ">=0.1.0"
+  },
+  "contributes": ["panel", "command", "toolbar", "assetLoader", "aiProvider", "exporter"],
+  "enabled": true
+}

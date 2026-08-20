@@ -1,0 +1,28 @@
+{
+  "name": "@lumora/embedded-host",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lumora 示例嵌入宿主：空白 React/Vite 应用渲染 LumoraStudio，演示 typed event 监听、挂载/卸载资源释放与非法插件提示",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@lumora/core": "0.1.0",
+    "@lumora/mock-plugin": "0.1.0",
+    "@lumora/plugin-sdk": "0.1.0",
+    "@lumora/studio": "0.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  }
+}
