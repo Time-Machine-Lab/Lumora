@@ -216,7 +216,7 @@ describe('R6 URI 规范化（decode / query-fragment 剥离 / dot-segment 归并
     ];
     const createSpy = vi.spyOn(URL, 'createObjectURL');
     let mainBlob: Blob | null = null;
-    const loader = vi.fn(async (url: string) => {
+    const loader = vi.fn(async (_url: string) => {
       // buildLoadableUrl 先建依赖 blob、最后建主 JSON blob；loader 拿到的是主 URL
       const last = createSpy.mock.calls[createSpy.mock.calls.length - 1];
       mainBlob = (last?.[0] as Blob) ?? null;
