@@ -3,7 +3,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { act, createRef } from 'react';
 import * as THREE from 'three';
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { createSampleProject, SceneEditor } from '@lumora/core';
+import { createPrimitiveObject, createSampleProject, SceneEditor } from '@lumora/core';
 import type { AssetData, Project, SceneEditor as SceneEditorType } from '@lumora/core';
 import { LumoraStudio } from '../src/components/LumoraStudio';
 import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
@@ -225,6 +225,24 @@ describe('属性名称输入与键盘可用性（G-9/G-10）', () => {
     expect(findObject(editor, 'sample-light')?.name).toBe('主光');
   });
 
+  it('切换对象时未提交草稿不串对象：数值相同的对象间切换，草稿随对象重置', () => {
+    const editor = makeEditor();
+    const resultA = editor.addObject(createPrimitiveObject('box', 'A'));
+    const resultB = editor.addObject(createPrimitiveObject('box', 'B'));
+    if (!resultA.ok || !resultB.ok) throw new Error('unexpected');
+    const a = resultA.value!;
+    const b = resultB.value!;
+    render(<StudioHarness editor={editor} cache={noopCache()} />);
+    fireEvent.click(screen.getByTestId(`tree-row-${a}`));
+    const x = screen.getByTestId('inspector-axis-0');
+    fireEvent.change(x, { target: { value: '9' } }); // 未 blur：草稿未提交
+    // 两对象位置相同（均为 [0,0,0]）：key={object.id} 保证草稿不跨对象泄漏
+    fireEvent.click(screen.getByTestId(`tree-row-${b}`));
+    expect(screen.getByTestId('inspector-axis-0')).toHaveValue(0);
+    expect(findObject(editor, a)!.transform.position[0]).toBe(0);
+    expect(findObject(editor, b)!.transform.position[0]).toBe(0);
+  });
+
   it('名称输入 Escape 取消草稿：不提交、输入框恢复当前名称', () => {
     const editor = makeEditor();
     render(<StudioHarness editor={editor} cache={noopCache()} />);
@@ -358,6 +376,23 @@ describe('模型导入', () => {
     expect(result.error.message).toContain('模型解析失败');
     expect(editor.getProject()!.assets).toHaveLength(0);
     expect(editor.getProject()!.objects.filter((o) => o.type === 'model')).toHaveLength(0);
+  });
+
+  it('多文件 .gltf 主文件 JSON 损坏：以 Result 失败返回，不触碰缓存', async () => {
+    useFnvHash();
+    const editor = makeEditor();
+    const acquire = vi.fn(() => leaseWith(Promise.resolve(gltfLike)));
+    const cache = stubCache({ acquire });
+    // `{"` 未闭合：collectGltfUris 的 JSON.parse 抛错必须包装为 Result（统一错误契约）
+    const gltfFile = makeFile('broken.gltf', [0x7b, 0x22], 'model/gltf+json');
+    const binFile = makeFile('mesh.bin', [1, 2], 'application/octet-stream');
+
+    const result = await importModelFile(editor, cache, [gltfFile, binFile]);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.message).toContain('gltf JSON 解析失败');
+    expect(editor.getProject()!.assets).toHaveLength(0);
+    expect(acquire).not.toHaveBeenCalled();
   });
 
   it('相同内容重复导入：资源去重，两个对象统一引用同一资产', async () => {

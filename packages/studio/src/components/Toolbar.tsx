@@ -31,9 +31,10 @@ export function Toolbar({
   const editor = runtime.editor;
   const { canUndo, canRedo, undoLabel, redoLabel } = editorState;
 
-  const handleImportFile = async (file: File | undefined) => {
-    if (!file) return;
-    const result = await importModelFile(editor, cache, file);
+  // 全量文件列表交给导入流程：.gltf 与外部 .bin/纹理一起选中时组成多文件导入
+  const handleImportFile = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const result = await importModelFile(editor, cache, Array.from(files));
     if (result.ok) {
       showToast(`已导入模型「${result.asset.name}」${result.deduped ? '（内容相同，资源已复用）' : ''}`, 'success');
     } else {
@@ -102,10 +103,11 @@ export function Toolbar({
         <input
           ref={fileInputRef}
           type="file"
-          accept=".glb,.gltf,model/gltf-binary,model/gltf+json"
+          multiple
+          accept=".glb,.gltf,.bin,model/gltf-binary,model/gltf+json,application/octet-stream,image/png,image/jpeg,image/webp,image/gif"
           style={{ display: 'none' }}
           data-testid="toolbar-model-file-input"
-          onChange={(e) => void handleImportFile(e.target.files?.[0])}
+          onChange={(e) => void handleImportFile(e.target.files)}
         />
         {toolbars.map((item) => {
           const command = runtime.host.commands.get(item.commandId);

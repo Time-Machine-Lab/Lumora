@@ -97,7 +97,13 @@ export async function importModelFile(
   let partsText = '';
   if (partPaths.length > 0) {
     if (!/\.gltf$/i.test(main.name)) return fail('仅 .gltf 支持外部依赖文件');
-    const required = collectGltfUris(mainBytes);
+    let required: string[];
+    try {
+      required = collectGltfUris(mainBytes);
+    } catch {
+      // JSON.parse 抛错：统一 Result 错误契约，不向调用方泄漏未捕获异常
+      return fail('gltf JSON 解析失败（主文件不是有效的 .gltf JSON）');
+    }
     const missing = required.filter(
       (uri) => !partPaths.some((p) => p.path === uri || uriBase(p.path) === uriBase(uri)),
     );
