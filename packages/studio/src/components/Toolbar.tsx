@@ -28,6 +28,7 @@ export function Toolbar({
   useEventRefresh(runtime.events, ['contribution:changed', 'command:changed']);
   const toolbars = runtime.host.contributions.getToolbars();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const dirInputRef = useRef<HTMLInputElement>(null);
   const editor = runtime.editor;
   const { canUndo, canRedo, undoLabel, redoLabel } = editorState;
 
@@ -100,6 +101,16 @@ export function Toolbar({
         >
           导入模型
         </button>
+        <button
+          type="button"
+          className="lumora-button lumora-button--import"
+          data-testid="import-model-dir"
+          disabled={!project}
+          title="整目录选择：.gltf 的外部依赖按目录相对路径导入（嵌套目录/重名文件不丢失路径信息）"
+          onClick={() => dirInputRef.current?.click()}
+        >
+          导入模型目录
+        </button>
         <input
           ref={fileInputRef}
           type="file"
@@ -107,6 +118,18 @@ export function Toolbar({
           accept=".glb,.gltf,.bin,model/gltf-binary,model/gltf+json,application/octet-stream,image/png,image/jpeg,image/webp,image/gif"
           style={{ display: 'none' }}
           data-testid="toolbar-model-file-input"
+          onChange={(e) => void handleImportFile(e.target.files)}
+        />
+        <input
+          ref={dirInputRef}
+          type="file"
+          multiple
+          // 目录选择：浏览器为每个文件填充 webkitRelativePath，
+          // importModelFile 据此保留嵌套目录相对路径（R6，TML-57 第六轮）
+          {...({ webkitdirectory: '' } as Record<string, string>)}
+          accept=".glb,.gltf,.bin,model/gltf-binary,model/gltf+json,application/octet-stream,image/png,image/jpeg,image/webp,image/gif"
+          style={{ display: 'none' }}
+          data-testid="toolbar-model-dir-input"
           onChange={(e) => void handleImportFile(e.target.files)}
         />
         {toolbars.map((item) => {

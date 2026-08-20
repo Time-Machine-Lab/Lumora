@@ -891,6 +891,12 @@ test.describe('第三轮验收：生产路径（AC1/AC3/AC4）', () => {
     await page.getByTestId('reopen-last-export').click();
     await expect(page.getByTestId('tree-row-probe-box')).toBeVisible();
 
+    // 隐藏宿主调试日志面板（340px）：否则 Studio 被压到 940px，340px 宽的画布上
+    // ±1px 整数量化即可让 16:9 比值在 1.7801（340×191）/1.7708（340×192）间翻转，
+    // 恰好落在 toBeCloseTo(16/9, 2) 容差边界上（工具栏换行等任意布局变化都会触发）。
+    // 全宽布局下画幅 680×382，量化噪声 0.0026 远小于容差，比值断言恢复真实精度。
+    await page.addStyleTag({ content: '.host__log { display: none }' });
+
     // 进入相机视图：画幅矩形与辅助线由同一 fitRect 计算，应逐像素重合
     await page.getByTestId('view-mode-select').selectOption('probe-camera');
     await expect(page.getByTestId('lumora-guides')).toBeVisible();
