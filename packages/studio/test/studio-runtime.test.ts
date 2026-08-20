@@ -39,7 +39,8 @@ describe('StudioRuntime：宿主快照与事件总线随编辑器同步（S-3）
     unsubscribe.dispose();
 
     await runtime.dispose();
-    runtime.editor.openProject(createSampleProject());
+    // dispose 为终态：openProject 同步抛错，宿主快照保持空
+    expect(() => runtime.editor.openProject(createSampleProject())).toThrow('编辑器已释放');
     expect(runtime.host.getProject()).toBeNull();
   });
 });

@@ -118,24 +118,23 @@ export class SceneEditor {
   openProject(project: Project): void {
     // 保持传入引用不变（宿主快照契约：getProject() 返回打开时的项目对象）；
     // 单调序号从项目持久化 revision 起步，后续每次应用状态（提交/撤销/重做）严格递增
-    this.project = project;
+    this.assertAlive();
+    this.validateProject(project);
     this.revisionCounter = project.revision;
-    this.selection = [];
-    this.view = { ...DEFAULT_VIEW, guides: { ...DEFAULT_VIEW.guides } };
     this.history.clear();
     this.dragSnapshot = null;
     this.sessionToken += 1;
-    this.emitAll();
+    this.transition(project, { selection: [], resetView: true, seedRevision: true });
+    this.emitHistory();
   }
 
   reset(): void {
-    this.project = null;
-    this.selection = [];
-    this.view = { ...DEFAULT_VIEW, guides: { ...DEFAULT_VIEW.guides } };
+    this.assertAlive();
     this.history.clear();
     this.dragSnapshot = null;
     this.sessionToken += 1;
-    this.emitAll();
+    this.transition(null, { resetView: true });
+    this.emitHistory();
   }
 
   /** 当前会话令牌（异步导入等流程在恢复执行后校验所属会话） */
@@ -149,16 +148,16 @@ export class SceneEditor {
   }
 
   /**
-   * 释放编辑器：runtime 卸载（组件 unmount）时调用。
-   * 使会话失效（在途异步导入校验失败、取消提交）、清空项目/历史并停止发事件；
-   * 之后任何写入都以「未打开项目」拒绝 —— 卸载后不得有晚到写入。
+   * 释放编辑器（不可逆终态）：runtime 卸载（组件 unmount）时调用。
+   * 原子关闭（project/selection/view 一次就位，发出 close 事件）后置终态标记、
+   * 递增会话令牌（在途异步导入校验失败、取消提交）、清空历史并永久关闭事件总线；
+   * 之后一切公开变更器拒绝 —— 卸载后不得有晚到写入。
    */
   dispose(): void {
+    if (this.disposed) return;
+    this.transition(null, { resetView: true });
     this.disposed = true;
     this.sessionToken += 1;
-    this.project = null;
-    this.selection = [];
-    this.view = { ...DEFAULT_VIEW, guides: { ...DEFAULT_VIEW.guides } };
     this.history.clear();
     this.dragSnapshot = null;
     this.events.clear();
@@ -167,6 +166,7 @@ export class SceneEditor {
   // ---------- 选择 ----------
 
   setSelection(ids: string[]): void {
+    if (this.disposed) return;
     const project = this.project;
     // 选择严格限定在活动场景可达集内：跨场景对象不可选中
     const next = project
@@ -209,13 +209,8 @@ export class SceneEditor {
       '切换场景',
       filteredSelection,
     );
-    if (!result.ok) return result;
-    // 相机视图按活动场景隔离：机位不属于新场景 → 回退导演视图（UI 状态，不进历史）
-    if (this.view.viewMode !== 'director') {
-      const cameraId = this.view.viewMode.cameraObjectId;
-      if (!reachable.has(cameraId)) this.setViewMode('director');
-    }
-    return { ok: true };
+    // 机位视图按活动场景隔离：transition 从下一个项目推导（机位不可达 → 导演视图）
+    return result;
   }
 
   setActiveCamera(objectId: string | null): Result {
@@ -280,14 +275,8 @@ export class SceneEditor {
       .map((id) => findObject(project, id)?.parentId)
       .find((pid): pid is string => !!pid);
     const result = this.commit(next, `删除 ${removed} 个对象`, parentId ? [parentId] : []);
+    // 被删机位（含场景归属变化）：transition 从下一个项目推导回退导演视图
     if (!result.ok) return result;
-    // 相机视图按活动场景隔离：被删机位（含场景归属变化）→ 回退导演视图
-    if (this.view.viewMode !== 'director') {
-      const cameraId = this.view.viewMode.cameraObjectId;
-      if (!findObject(next, cameraId) || !isInActiveScene(next, cameraId)) {
-        this.setViewMode('director');
-      }
-    }
     return { ok: true, value: { removed } };
   }
 
@@ -446,6 +435,9 @@ export class SceneEditor {
     if (!isInActiveScene(project, objectId)) return failure('对象不属于活动场景');
     const nextObject = updater(object);
     if (!nextObject) return failure('属性值非法');
+    if (nextObject.id !== object.id || nextObject.type !== object.type) {
+      return failure('结构标识（id/type）不可修改');
+    }
     if (nextObject.transform !== object.transform && object.locked) {
       return failure(`「${object.name}」已锁定，无法变换`);
     }
@@ -522,18 +514,21 @@ export class SceneEditor {
   // ---------- 视口 UI 状态（不进历史） ----------
 
   setTransformMode(mode: TransformMode): void {
+    if (this.disposed) return;
     if (this.view.transformMode === mode) return;
     this.view = { ...this.view, transformMode: mode };
     this.events.emit('view:changed', { view: this.getView() });
   }
 
   setTransformSpace(space: TransformSpace): void {
+    if (this.disposed) return;
     if (this.view.transformSpace === space) return;
     this.view = { ...this.view, transformSpace: space };
     this.events.emit('view:changed', { view: this.getView() });
   }
 
   setViewMode(mode: ViewMode): void {
+    if (this.disposed) return;
     // 机位视图按活动场景隔离：机位不存在/不是相机/不属于活动场景 → 一律回退导演视图
     if (mode !== 'director') {
       const project = this.project;
@@ -554,6 +549,7 @@ export class SceneEditor {
   }
 
   setGuide(kind: 'thirds' | 'safeFrame', enabled: boolean): void {
+    if (this.disposed) return;
     this.view = { ...this.view, guides: { ...this.view.guides, [kind]: enabled } };
     this.events.emit('view:changed', { view: this.getView() });
   }
@@ -613,41 +609,19 @@ export class SceneEditor {
   }
 
   /**
-   * 推入历史并一次性应用 after 快照：project 与 selection 在发出任何事件前
-   * 同时就位，再按固定顺序发 project:changed → selection:changed → history:changed，
-   * 观察者（插件宿主/面板）不会看到「新项目 + 旧场景选择」的跨场景中间态。
+   * 推入历史并原子应用 after：transition 统一完成换入与事件（含视图推导）。
+   * 历史栈保存未盖章 revision 的快照；revision 只由当前应用状态单调生成
+   * （applySnapshot 应用时再取新值），undo/redo 每次应用都严格递增。
    */
   private pushEntry(entry: { label: string; before: EditorSnapshot; after: EditorSnapshot }): void {
-    const after: EditorSnapshot = {
-      project: this.stampRevision(entry.after.project),
-      selection: this.filterSelection(entry.after.project, entry.after.selection),
-    };
-    this.history.push({ ...entry, before: entry.before, after });
-    this.applyState(after);
+    this.history.push({ ...entry, before: entry.before, after: entry.after });
+    this.transition(entry.after.project, { selection: entry.after.selection });
     this.emitHistory();
   }
 
-  /** 应用状态：project 与 selection 原子就位（选择按活动场景可达集过滤）后发事件 */
-  private applyState(snapshot: EditorSnapshot): void {
-    this.project = snapshot.project;
-    this.selection = this.filterSelection(snapshot.project, snapshot.selection);
-    this.events.emit('project:changed', { project: snapshot.project });
-    this.events.emit('selection:changed', { ids: this.getSelection() });
-  }
-
+  /** 撤销/重做：过渡到快照（transition 取新 revision 并重新推导视图） */
   private applySnapshot(snapshot: EditorSnapshot): void {
-    // 应用快照取新 revision（严格单调：undo/redo 每次应用都递增）
-    const project = this.stampRevision(snapshot.project);
-    this.applyState({ project, selection: snapshot.selection });
-    // 快照应用后重验 viewMode：undo/redo 可能把项目恢复到机位不属于活动场景的状态
-    if (this.view.viewMode !== 'director') {
-      const cameraId = this.view.viewMode.cameraObjectId;
-      const camera = findObject(project, cameraId);
-      if (!camera || camera.type !== 'camera' || !isInActiveScene(project, cameraId)) {
-        this.view = { ...this.view, viewMode: 'director' };
-        this.events.emit('view:changed', { view: this.getView() });
-      }
-    }
+    this.transition(snapshot.project, { selection: snapshot.selection });
     this.emitHistory();
   }
 
@@ -656,9 +630,98 @@ export class SceneEditor {
     return ids.filter((id) => findObject(project, id) && isInActiveScene(project, id));
   }
 
-  /** 每次应用状态取新 revision：打开/提交/撤销/重做均单调递增，autosave 可据 revision 去重 */
-  private stampRevision(project: Project): Project {
-    return { ...project, revision: ++this.revisionCounter };
+  /**
+   * 原子应用状态（validate→swap→emit）：项目、选择、视图在发出任何事件前同时就位，
+   * 按固定顺序发 project:changed → selection:changed → view:changed → history:changed。
+   * 观察者（插件宿主/面板）不会看到「新项目 + 旧场景选择/旧机位」的跨场景中间态。
+   * revision 只由当前应用状态单调生成；seedRevision 仅 openProject 从持久化值起步。
+   */
+  private transition(
+    nextProject: Project | null,
+    opts: { selection?: string[]; resetView?: boolean; seedRevision?: boolean } = {},
+  ): void {
+    this.assertAlive();
+    if (nextProject) {
+      this.validateProject(nextProject);
+      if (opts.seedRevision) this.revisionCounter = nextProject.revision;
+      else nextProject = { ...nextProject, revision: ++this.revisionCounter };
+    }
+    this.project = nextProject;
+    this.selection = nextProject ? this.filterSelection(nextProject, opts.selection ?? this.selection) : [];
+    this.view =
+      opts.resetView || !nextProject
+        ? { ...DEFAULT_VIEW, guides: { ...DEFAULT_VIEW.guides } }
+        : this.deriveView(nextProject);
+    this.events.emit('project:changed', { project: nextProject });
+    this.events.emit('selection:changed', { ids: this.getSelection() });
+    this.events.emit('view:changed', { view: this.getView() });
+  }
+
+  /** 机位视图从下一个项目推导：机位不存在/不是相机/不属于活动场景 → 导演视图 */
+  private deriveView(project: Project): ViewState {
+    if (this.view.viewMode === 'director') return this.view;
+    const cameraId = this.view.viewMode.cameraObjectId;
+    const camera = findObject(project, cameraId);
+    if (!camera || camera.type !== 'camera' || !isInActiveScene(project, cameraId)) {
+      return { ...this.view, viewMode: 'director' };
+    }
+    return this.view;
+  }
+
+  /**
+   * 项目结构校验（transition 每次应用前强制）：对象合法性、父子引用与循环、
+   * 根列表一致性（parentId === null ⇔ 恰好出现在一个场景根列表）、
+   * 活动场景与活动机位可达性。不合法即抛错（openProject 同步失败；
+   * 提交路径为编辑器自身不变量的防御性校验）。
+   */
+  private validateProject(project: Project): void {
+    for (const object of project.objects) {
+      // 类型守卫对已类型化对象不会收窄失败分支（never），先取 id 供报错使用
+      const objectId = object.id;
+      if (!isSceneObject(object as unknown)) throw new Error(`对象数据不合法：${objectId}`);
+      if (object.parentId !== null && !findObject(project, object.parentId)) {
+        throw new Error(`对象缺少父级：${objectId}`);
+      }
+    }
+    // 父子循环：沿 parent 链上行，节点重复访问即循环
+    for (const object of project.objects) {
+      const seen = new Set<string>();
+      let cursor: SceneObjectData | undefined = object;
+      while (cursor && cursor.parentId !== null) {
+        if (seen.has(cursor.id)) throw new Error(`父子关系存在循环：${cursor.id}`);
+        seen.add(cursor.id);
+        cursor = findObject(project, cursor.parentId);
+      }
+    }
+    // 根列表一致性：rootObjectIds 引用合法根对象；每个根对象恰好出现一次
+    const rootCount = new Map<string, number>();
+    for (const scene of project.scenes) {
+      for (const rootId of scene.rootObjectIds) {
+        const root = findObject(project, rootId);
+        if (!root || root.parentId !== null) throw new Error(`场景根列表引用非法：${rootId}`);
+        rootCount.set(rootId, (rootCount.get(rootId) ?? 0) + 1);
+      }
+    }
+    for (const object of project.objects) {
+      if (object.parentId === null && !rootCount.has(object.id)) {
+        throw new Error(`孤立根对象：${object.id}`);
+      }
+    }
+    for (const [rootId, count] of rootCount) {
+      if (count > 1) throw new Error(`根对象重复挂载：${rootId}`);
+    }
+    const scene = project.scenes.find((s) => s.id === project.activeSceneId);
+    if (!scene) throw new Error('活动场景不存在');
+    if (scene.activeCameraId !== null) {
+      const camera = findObject(project, scene.activeCameraId);
+      if (!camera || camera.type !== 'camera' || !isInActiveScene(project, scene.activeCameraId)) {
+        throw new Error('活动机位不存在或不属于活动场景');
+      }
+    }
+  }
+
+  private assertAlive(): void {
+    if (this.disposed) throw new Error('编辑器已释放');
   }
 
   /** 拖动前后是否等价：仅比较目标对象三向量（局部比较，不序列化项目） */
@@ -673,13 +736,6 @@ export class SceneEditor {
       ar[0] === br[0] && ar[1] === br[1] && ar[2] === br[2] &&
       as[0] === bs[0] && as[1] === bs[1] && as[2] === bs[2]
     );
-  }
-
-  private emitAll(): void {
-    this.events.emit('project:changed', { project: this.project });
-    this.events.emit('selection:changed', { ids: this.getSelection() });
-    this.events.emit('view:changed', { view: this.getView() });
-    this.emitHistory();
   }
 
   private emitHistory(): void {

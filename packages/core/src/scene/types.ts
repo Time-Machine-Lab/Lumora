@@ -16,6 +16,8 @@ export type PrimitiveKind = 'box' | 'sphere' | 'cone' | 'torus' | 'plane';
 export type SceneObjectType = 'group' | 'model' | 'primitive' | 'light' | 'camera';
 /** 场景对象类型别名（插件 SDK 导出名） */
 export type SceneObjectKind = SceneObjectType;
+/** 场景对象类型全集：运行时成员校验（isSceneObject 与 EditorState 共用） */
+export const SCENE_OBJECT_TYPES = ['group', 'model', 'primitive', 'light', 'camera'] as const;
 
 export interface GeometryData {
   kind: PrimitiveKind;
@@ -131,6 +133,7 @@ export function isSceneObject(obj: unknown): obj is SceneObjectData {
   return (
     typeof o.id === 'string' &&
     typeof o.type === 'string' &&
+    (SCENE_OBJECT_TYPES as readonly string[]).includes(o.type) &&
     typeof o.name === 'string' &&
     (o.parentId === null || typeof o.parentId === 'string') &&
     !!o.transform &&
