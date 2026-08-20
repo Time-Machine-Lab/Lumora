@@ -38,7 +38,7 @@ vi.mock('@react-three/drei', () => ({
 }));
 
 function leaseWith(content: Promise<GLTF>): CacheLease {
-  return { hash: 'noop', generation: 0, content, release: vi.fn() };
+  return { hash: 'noop', generation: 0, content, isReleased: false, release: vi.fn() };
 }
 
 function noopCache(): ContentCache {

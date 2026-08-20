@@ -1,6 +1,6 @@
 import { createModelObject, findAssetByHash, genId, hashBytes } from '@lumora/core';
 import type { AssetData, AssetPartData, Project, SceneEditor } from '@lumora/core';
-import { collectGltfUris, resolveFormat } from './content-cache';
+import { collectGltfUris, resolveFormat, resolvePartPath } from './content-cache';
 import type { CacheLease, CachePartFile, ContentCache } from './content-cache';
 
 export type ImportModelResult =
@@ -52,9 +52,6 @@ function partPathFor(main: File, part: File): string {
     : part.name.replace(/\\/g, '/');
 }
 
-function uriBase(uri: string): string {
-  return uri.split('/').pop() ?? uri;
-}
 
 /**
  * 导入模型文件（GLB 单文件 / GLTF 多文件）：
@@ -104,10 +101,21 @@ export async function importModelFile(
       // JSON.parse 抛错：统一 Result 错误契约，不向调用方泄漏未捕获异常
       return fail('gltf JSON 解析失败（主文件不是有效的 .gltf JSON）');
     }
-    const missing = required.filter(
-      (uri) => !partPaths.some((p) => p.path === uri || uriBase(p.path) === uriBase(uri)),
-    );
-    if (missing.length > 0) return fail(`缺少依赖文件：${missing.join('、')}`);
+    // 规范解析（与缓存 URL 构建共用 resolvePartPath）：精确路径优先、basename 仅
+    // 唯一时兜底、歧义必须失败 —— 预检与构建两处逻辑永不分叉
+    const unresolved = required
+      .map((uri) => ({ uri, resolution: resolvePartPath(uri, partPaths) }))
+      .filter(({ resolution }) => resolution.kind === 'missing' || resolution.kind === 'ambiguous');
+    if (unresolved.length > 0) {
+      const missing = unresolved
+        .filter(({ resolution }) => resolution.kind === 'missing')
+        .map(({ uri }) => uri);
+      const ambiguous = unresolved
+        .filter(({ resolution }) => resolution.kind === 'ambiguous')
+        .map(({ uri }) => uri);
+      if (ambiguous.length > 0) return fail(`依赖文件歧义：${ambiguous.join('、')}`);
+      return fail(`缺少依赖文件：${missing.join('、')}`);
+    }
     const loaded: CachePartFile[] = [];
     const hashes: { path: string; partHash: string }[] = [];
     for (const { file: partFile, path } of partPaths) {

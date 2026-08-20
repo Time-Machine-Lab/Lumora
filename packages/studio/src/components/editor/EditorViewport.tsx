@@ -7,6 +7,7 @@ import { findObject, fitRect, getReachableIds } from '@lumora/core';
 import type { Project, SceneEditor, TransformData, ViewState } from '@lumora/core';
 import { resolveFormat } from './content-cache';
 import type { CacheLease, ContentCache } from './content-cache';
+import { collectModelObjectIds } from './model-content';
 import { applyTransform, attachModelContent, buildScene, disposeNode, findNode, syncScene } from './scene-builder';
 import { showToast } from './toasts';
 
@@ -213,25 +214,25 @@ function SceneContent({
   }, [project, scene, rootRef]);
 
   // 模型内容挂载：渲染消费者在使用期持有 lease（禁止裸资源旁路）——
-  // 每个模型资源 retain 或 seed 一张 lease；content 就绪后把克隆内容挂到占位节点；
-  // 项目变更/卸载时释放全部 lease，由缓存按引用关系 + lease 计数决定清理。
-  // 缓存缺失且资源带持久化载荷时同步启动重建（项目重开/撤销后重做恢复内容）
+  // 按「活动场景内 hash → 全部模型对象 id」映射，统一「先 retain，失败再 seed」：
+  // 条目存活（含 loading）一律复用；仅缺失/判死刑时才从持久化载荷重建（seed）。
+  // 内容就绪后把克隆挂到引用该 hash 的每个节点（Ctrl+D 复制/多对象共享同一资源）。
+  // 异步回调在触碰资源前校验 lease 未释放且效应未重建（卸载/项目切换/缓存释放后
+  // 一律不得再挂载）。项目变更/卸载时释放全部 lease，由缓存按引用关系 + lease
+  // 计数决定清理。
   useEffect(() => {
     const root = rootRef.current;
     if (!root || !project) return;
     const leases: CacheLease[] = [];
-    const seenHashes = new Set<string>();
-    for (const object of project.objects) {
-      if (object.type !== 'model' || !object.assetId) continue;
-      const asset = project.assets.find((a) => a.id === object.assetId);
-      if (!asset || seenHashes.has(asset.hash)) continue;
-      seenHashes.add(asset.hash);
-      let lease: CacheLease | null = null;
-      if (cache.has(asset.hash)) {
-        lease = cache.retain(asset.hash);
-      } else if (asset.payload) {
+    let active = true;
+    for (const [hash, objectIds] of collectModelObjectIds(project)) {
+      const object = project.objects.find((o) => o.id === objectIds[0]!);
+      const asset = object ? project.assets.find((a) => a.id === object.assetId) : undefined;
+      if (!asset) continue;
+      let lease: CacheLease | null = cache.retain(hash);
+      if (!lease && asset.payload) {
         try {
-          lease = cache.seed(asset.hash, asset.payload, {
+          lease = cache.seed(hash, asset.payload, {
             format: asset.format ?? resolveFormat(asset.name, asset.mime),
             parts: asset.parts ?? [],
           });
@@ -242,17 +243,20 @@ function SceneContent({
       }
       if (!lease) continue;
       leases.push(lease);
-      // findNode 按对象 id 查找；此处映射 hash → 首个引用该 hash 的模型对象节点
-      const objectId = object.id;
       void lease.content.then(
         (gltf) => {
-          const node = findNode(root, objectId);
-          if (node) attachModelContent(node, gltf);
+          // 失效守卫：lease 已释放（cleanup/缓存 dispose 撤销）或效应已重建后不再挂载
+          if (!active || lease.isReleased) return;
+          for (const objectId of objectIds) {
+            const node = findNode(root, objectId);
+            if (node) attachModelContent(node, gltf);
+          }
         },
         () => undefined,
       );
     }
     return () => {
+      active = false;
       for (const lease of leases) lease.release();
     };
   }, [project, cache, rootRef]);

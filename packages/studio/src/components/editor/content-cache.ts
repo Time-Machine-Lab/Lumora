@@ -68,6 +68,8 @@ export interface CacheLease {
   readonly generation: number;
   /** 解析结果（与同一 entry 的全部 lease 共享同一 promise，失败同一错误传播） */
   readonly content: Promise<GLTF>;
+  /** 已释放/被撤销（异步回调在触碰资源前必须先校验，防止卸载后晚到挂载） */
+  readonly isReleased: boolean;
   release(): void;
 }
 
@@ -120,21 +122,35 @@ function defaultLoader(url: string): Promise<GLTF> {
 /**
  * 按能力统一释放：Mesh/Points/Line/SkinnedMesh 均带 geometry + material；
  * 材质对象值中的全部纹理（map/normalMap/roughnessMap…）一并释放。
+ * 以 identity Set 遍历完整资源图：GLTF 内同一 geometry/material/texture 可能被
+ * 多个节点共享（DAG），每个 GPU 资源 exactly-once。
  */
 function disposeObject(object: THREE.Object3D): void {
+  const disposedGeometries = new Set<THREE.BufferGeometry>();
+  const disposedMaterials = new Set<THREE.Material>();
+  const disposedTextures = new Set<THREE.Texture>();
   object.traverse((child) => {
     const renderable = child as THREE.Mesh & {
       geometry?: THREE.BufferGeometry;
       material?: THREE.Material | THREE.Material[];
     };
-    renderable.geometry?.dispose();
+    if (renderable.geometry && !disposedGeometries.has(renderable.geometry)) {
+      disposedGeometries.add(renderable.geometry);
+      renderable.geometry.dispose();
+    }
     if (renderable.material) {
       const materials = Array.isArray(renderable.material) ? renderable.material : [renderable.material];
       for (const material of materials) {
+        if (disposedMaterials.has(material)) continue;
+        disposedMaterials.add(material);
         material.dispose();
         for (const value of Object.values(material)) {
           if (value && typeof value === 'object' && 'isTexture' in value) {
-            (value as THREE.Texture).dispose();
+            const texture = value as THREE.Texture;
+            if (!disposedTextures.has(texture)) {
+              disposedTextures.add(texture);
+              texture.dispose();
+            }
           }
         }
       }
@@ -144,6 +160,30 @@ function disposeObject(object: THREE.Object3D): void {
 
 function basename(path: string): string {
   return path.split(/[\\/]/).pop() ?? path;
+}
+
+/**
+ * GLTF URI → 依赖文件 的规范解析（模型导入预检与缓存 URL 构建共用同一规则，
+ * 保证「预检通过 ⇔ 可加载」，消除两处逻辑分叉）：
+ * 精确相对路径优先；basename 仅当唯一时才兜底；0 个命中 = 缺失、>1 个命中 = 歧义，
+ * 两者都必须失败（歧义不得静默取其一）。
+ */
+export type PartResolution<T extends { path: string }> =
+  | { kind: 'exact'; part: T }
+  | { kind: 'unique-basename'; part: T }
+  | { kind: 'missing'; uri: string }
+  | { kind: 'ambiguous'; uri: string };
+
+export function resolvePartPath<T extends { path: string }>(
+  uri: string,
+  parts: readonly T[],
+): PartResolution<T> {
+  const exact = parts.find((p) => p.path === uri);
+  if (exact) return { kind: 'exact', part: exact };
+  const base = basename(uri);
+  const candidates = parts.filter((p) => basename(p.path) === base);
+  if (candidates.length === 1) return { kind: 'unique-basename', part: candidates[0]! };
+  return { kind: candidates.length === 0 ? 'missing' : 'ambiguous', uri };
 }
 
 /**
@@ -167,8 +207,9 @@ export function collectGltfUris(mainBytes: ArrayBuffer): string[] {
 /**
  * 构建可加载的 blob URL：
  * - GLB：主文件字节直接成 blob；
- * - .gltf：外部依赖 URI 重写为 blob URL（缺失依赖抛错），主文件为重写后的 JSON。
- * 返回的主 URL 与全部依赖 URL 都需在释放时 revoke。
+ * - .gltf：外部依赖 URI 按规范解析（resolvePartPath）重写为 blob URL，主文件为重写后的 JSON。
+ * 部分创建失败（缺失/歧义/其他抛错）时完整回滚已创建的全部 URL（含主 URL）后重抛，
+ * 绝不泄漏半成品 URL。返回的主 URL 与全部依赖 URL 都需在释放时 revoke。
  */
 function buildLoadableUrl(
   mainBytes: ArrayBuffer,
@@ -190,28 +231,33 @@ function buildLoadableUrl(
   if (uris.length === 0) {
     return { url: URL.createObjectURL(new Blob([mainBytes], { type: 'model/gltf+json' })), partUrls: [] };
   }
-  const byPath = new Map(parts.map((p) => [p.path, p]));
-  const byBase = new Map(parts.map((p) => [basename(p.path), p]));
+  const created: string[] = [];
   const partUrls: string[] = [];
-  const uriToUrl = new Map<string, string>();
-  for (const uri of uris) {
-    const part = byPath.get(uri) ?? byBase.get(basename(uri));
-    if (!part) throw new Error(`缺少依赖文件：${uri}`);
-    const url = URL.createObjectURL(new Blob([part.bytes], { type: part.mime }));
-    partUrls.push(url);
-    uriToUrl.set(uri, url);
+  try {
+    const uriToUrl = new Map<string, string>();
+    for (const uri of uris) {
+      const resolution = resolvePartPath(uri, parts);
+      if (resolution.kind === 'missing') throw new Error(`缺少依赖文件：${uri}`);
+      if (resolution.kind === 'ambiguous') throw new Error(`依赖文件歧义：${uri}`);
+      const url = URL.createObjectURL(new Blob([resolution.part.bytes], { type: resolution.part.mime }));
+      created.push(url);
+      partUrls.push(url);
+      uriToUrl.set(uri, url);
+    }
+    const rewrite = (list: { uri?: unknown }[] | undefined): { uri?: unknown }[] | undefined =>
+      list?.map((item) =>
+        typeof item.uri === 'string' && uriToUrl.has(item.uri)
+          ? { ...item, uri: uriToUrl.get(item.uri) }
+          : item,
+      );
+    const rewritten = { ...json, buffers: rewrite(json.buffers), images: rewrite(json.images) };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(rewritten)], { type: 'model/gltf+json' }));
+    created.push(url);
+    return { url, partUrls };
+  } catch (error) {
+    for (const url of created) URL.revokeObjectURL(url);
+    throw error;
   }
-  const rewrite = (list: { uri?: unknown }[] | undefined): { uri?: unknown }[] | undefined =>
-    list?.map((item) =>
-      typeof item.uri === 'string' && uriToUrl.has(item.uri)
-        ? { ...item, uri: uriToUrl.get(item.uri) }
-        : item,
-    );
-  const rewritten = { ...json, buffers: rewrite(json.buffers), images: rewrite(json.images) };
-  return {
-    url: URL.createObjectURL(new Blob([JSON.stringify(rewritten)], { type: 'model/gltf+json' })),
-    partUrls,
-  };
 }
 
 export class ContentCache {
@@ -358,23 +404,36 @@ export class ContentCache {
 
   private createEntry(hash: string, bundle: { url: string; partUrls: string[] }): Entry {
     const generation = ++this.generationCounter;
-    const promise = this.loader(bundle.url);
     const entry: Entry = {
       hash,
       generation,
       url: bundle.url,
       partUrls: bundle.partUrls,
       gltf: null,
-      promise,
+      promise: undefined as unknown as Promise<GLTF>,
       leases: new Set(),
       condemned: false,
       torn: false,
     };
     this.entries.set(hash, entry);
-    promise.then(
-      (gltf) => this.settle(entry, gltf, null),
-      (error: unknown) => this.settle(entry, null, error),
-    );
+    let promise: Promise<GLTF>;
+    try {
+      promise = this.loader(bundle.url);
+    } catch (error) {
+      // 同步抛错视同 reject：完整回滚（撤销全部 URL、移出 map），
+      // 共享拒绝传播给全部 lease（与异步 reject 同一失败契约）
+      this.entries.delete(hash);
+      entry.torn = true;
+      this.revoke(entry);
+      promise = Promise.reject(error);
+    }
+    entry.promise = promise;
+    if (!entry.torn) {
+      promise.then(
+        (gltf) => this.settle(entry, gltf, null),
+        (error: unknown) => this.settle(entry, null, error),
+      );
+    }
     return entry;
   }
 

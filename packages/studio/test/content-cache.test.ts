@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import type { Project } from '@lumora/core';
-import { ContentCache, resolveFormat } from '../src/components/editor/content-cache';
+import { ContentCache, resolveFormat, resolvePartPath } from '../src/components/editor/content-cache';
 
 /**
  * P1 ContentCache 状态机测试（TML-57 批准方案）：
@@ -351,6 +351,180 @@ describe('状态机：sweep / discard / settle / seed', () => {
     const retained = cache.retain('h');
     expect(retained).not.toBeNull();
     retained!.release();
+  });
+});
+
+describe('M2 完整资源图析构：共享 geometry/material/texture exactly-once', () => {
+  it('T11 DAG 共享资源只释放一次：两节点共用同一几何/材质/纹理', async () => {
+    const geometry = new THREE.BoxGeometry();
+    const texture = new THREE.Texture();
+    const material = new THREE.MeshStandardMaterial({ map: texture });
+    const loader = vi.fn(async () => {
+      const scene = new THREE.Group();
+      // GLTF 内同一资源可能被多个节点共享（DAG）：identity Set 必须 exactly-once
+      scene.add(new THREE.Mesh(geometry, material));
+      scene.add(new THREE.Mesh(geometry, material));
+      return { scene } as unknown as GLTF;
+    });
+    const cache = new ContentCache({ loader });
+    const lease = cache.acquire('h', BYTES, { format: 'glb' });
+    await lease.content; // 等 settle（析构断言在 release 之后）
+    const geometrySpy = vi.spyOn(geometry, 'dispose');
+    const materialSpy = vi.spyOn(material, 'dispose');
+    const textureSpy = vi.spyOn(texture, 'dispose');
+
+    lease.release();
+    cache.sweep(null);
+    expect(geometrySpy).toHaveBeenCalledTimes(1);
+    expect(materialSpy).toHaveBeenCalledTimes(1);
+    expect(textureSpy).toHaveBeenCalledTimes(1);
+    expect(cache.has('h')).toBe(false);
+  });
+});
+
+describe('M2 失败完整回滚：同步/异步 loader 失败不泄漏条目与 URL', () => {
+  it('T12 loader 同步抛错：撤销全部 URL、移出 map，同一失败传播给全部 lease，迟到 release 幂等', async () => {
+    const loader = vi.fn(() => {
+      throw new Error('sync boom');
+    });
+    const cache = new ContentCache({ loader });
+    const createSpy = vi.spyOn(URL, 'createObjectURL');
+    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
+    const a = cache.acquire('h', BYTES, { format: 'glb' });
+    // 同步失败立即回滚：不产生常驻条目
+    expect(cache.has('h')).toBe(false);
+    const b = cache.acquire('h', BYTES, { format: 'glb' }); // 新 generation 重新加载
+    const failureA = await a.content.catch((e: Error) => e);
+    const failureB = await b.content.catch((e: Error) => e);
+    expect((failureA as Error).message).toBe('sync boom');
+    expect((failureB as Error).message).toBe('sync boom');
+    expect(cache.has('h')).toBe(false);
+    expect(cache.retain('h')).toBeNull();
+    // 每次 acquire 创建与回滚的 URL 成对：无泄漏
+    expect(createSpy.mock.calls.length).toBeGreaterThan(0);
+    expect(revokeSpy.mock.calls.length).toBe(createSpy.mock.calls.length);
+    expect(() => {
+      a.release();
+      b.release();
+    }).not.toThrow();
+  });
+
+  it('T13 部分依赖 URL 创建失败：完整回滚已创建的全部 URL，acquire 同步抛错，无残留条目', () => {
+    const cache = new ContentCache({ loader: vi.fn() });
+    const createSpy = vi.spyOn(URL, 'createObjectURL');
+    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
+    const mainBytes = new TextEncoder().encode(
+      JSON.stringify({
+        asset: { version: '2.0' },
+        scenes: [{ nodes: [0] }],
+        nodes: [{ name: 'Root' }],
+        buffers: [{ uri: 'mesh.bin' }],
+        images: [{ uri: 'diffuse.png' }],
+      }),
+    ).buffer as ArrayBuffer;
+    // 只提供 mesh.bin：diffuse.png 缺失 → 已创建的 mesh.bin URL 必须回滚
+    const parts = [
+      { path: 'mesh.bin', mime: 'application/octet-stream', bytes: new Uint8Array([1, 2]).buffer as ArrayBuffer },
+    ];
+    expect(() => cache.acquire('h', mainBytes, { format: 'gltf', parts })).toThrow('缺少依赖文件：diffuse.png');
+    expect(createSpy).toHaveBeenCalledTimes(1); // 仅 mesh.bin 的 URL
+    expect(revokeSpy).toHaveBeenCalledTimes(1); // 回滚撤销（主 JSON URL 尚未创建）
+    expect(cache.has('h')).toBe(false);
+  });
+
+  it('T14 依赖歧义：同 basename 多候选必须失败，未创建任何 URL', () => {
+    const cache = new ContentCache({ loader: vi.fn() });
+    const createSpy = vi.spyOn(URL, 'createObjectURL');
+    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
+    const mainBytes = new TextEncoder().encode(
+      JSON.stringify({
+        asset: { version: '2.0' },
+        scenes: [{ nodes: [0] }],
+        nodes: [{ name: 'Root' }],
+        buffers: [{ uri: 'mesh.bin' }],
+      }),
+    ).buffer as ArrayBuffer;
+    const parts = [
+      { path: 'a/mesh.bin', mime: 'application/octet-stream', bytes: new Uint8Array([1]).buffer as ArrayBuffer },
+      { path: 'b/mesh.bin', mime: 'application/octet-stream', bytes: new Uint8Array([2]).buffer as ArrayBuffer },
+    ];
+    expect(() => cache.acquire('h', mainBytes, { format: 'gltf', parts })).toThrow('依赖文件歧义：mesh.bin');
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(revokeSpy).not.toHaveBeenCalled();
+    expect(cache.has('h')).toBe(false);
+  });
+
+  it('T15 失败后重试成功：同 hash 新 generation 独立加载（新旧 generation 交错）', async () => {
+    const gltf = makeGltf();
+    const loader = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error('sync boom');
+      })
+      .mockResolvedValueOnce(gltf);
+    const cache = new ContentCache({ loader });
+    const failed = cache.acquire('h', BYTES, { format: 'glb' });
+    await failed.content.catch(() => undefined);
+    const retried = cache.acquire('h', BYTES, { format: 'glb' });
+    const content = await retried.content;
+    expect(content).toBe(gltf);
+    expect(cache.isReady('h')).toBe(true);
+    const disposeSpy = vi.spyOn(geometryOf(gltf), 'dispose');
+    failed.release();
+    retried.release();
+    cache.sweep(null);
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('M2 resolvePartPath 规范解析：精确路径优先、basename 唯一兜底、歧义失败', () => {
+  const parts = [{ path: 'textures/diffuse.png' }, { path: 'assets/mesh.bin' }, { path: 'other/mesh.bin' }];
+
+  it('精确相对路径优先（同 basename 歧义存在时仍命中）', () => {
+    expect(resolvePartPath('assets/mesh.bin', parts)).toEqual({ kind: 'exact', part: parts[1] });
+  });
+
+  it('basename 唯一时兜底命中', () => {
+    expect(resolvePartPath('nested/diffuse.png', parts)).toEqual({ kind: 'unique-basename', part: parts[0] });
+  });
+
+  it('basename 多候选：歧义必须失败，不静默取其一', () => {
+    expect(resolvePartPath('sub/mesh.bin', parts)).toEqual({ kind: 'ambiguous', uri: 'sub/mesh.bin' });
+  });
+
+  it('无任何命中：缺失', () => {
+    expect(resolvePartPath('ghost.xyz', parts)).toEqual({ kind: 'missing', uri: 'ghost.xyz' });
+  });
+});
+
+describe('M2 双实例 lease：条目存活由全部消费者共同决定', () => {
+  it('两消费者持 lease 同享一条目：单方释放条目存活，双方释放后 sweep 清理', async () => {
+    const gltf = makeGltf();
+    const cache = new ContentCache({ loader: vi.fn(async () => gltf) });
+    const consumerA = cache.acquire('h', BYTES, { format: 'glb' });
+    await consumerA.content;
+    const consumerB = cache.retain('h');
+    expect(consumerB).not.toBeNull();
+    expect(consumerB!.generation).toBe(consumerA.generation); // 同一条目
+
+    cache.sweep(null); // 双方仍持租用：条目存活
+    expect(cache.has('h')).toBe(true);
+    consumerA.release();
+    cache.sweep(null); // 仅剩 consumerB：仍存活
+    expect(cache.has('h')).toBe(true);
+    consumerB!.release();
+    cache.sweep(null); // 全部释放：清理
+    expect(cache.has('h')).toBe(false);
+  });
+
+  it('isReleased：dispose 原子撤销后立即为 true，异步回调凭此失效守卫', async () => {
+    const cache = new ContentCache({ loader: vi.fn(async () => makeGltf()) });
+    const lease = cache.acquire('h', BYTES, { format: 'glb' });
+    await lease.content;
+    expect(lease.isReleased).toBe(false);
+    cache.dispose();
+    expect(lease.isReleased).toBe(true);
+    expect(lease.isReleased).toBe(true); // 幂等
   });
 });
 
