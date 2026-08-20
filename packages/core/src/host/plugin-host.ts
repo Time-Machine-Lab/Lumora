@@ -378,8 +378,26 @@ export class PluginHost {
       await loadingPromise;
       if (this.disposedFlag) return;
       if (record.generation !== generation) {
-        const current = record.loading;
-        if (!current || current.generation !== record.generation) return;
+        // 代际已推进（disable/dispose 接管）：本次加载结果整体作废。重新进入统一
+        // 收敛/重驱动路径 —— 持续加入当前代 loading/activation/lifecycle 直到稳定
+        // 终态，再落入公共路径驱动本调用的激活意图。不得以 record.loading === null
+        // 判定新代已稳定：新 loader 可能已完成并进入在途 activation，直接返回会让
+        // 外层 enable 以 activating 快照提前成功（代际复核只证明旧加载作废，
+        // 不证明新代流程已终态）
+        for (;;) {
+          await this.awaitActivationOutcome(record);
+          if (this.disposedFlag) return;
+          const inFlight = record.state;
+          if (inFlight === 'deactivating' || inFlight === 'loading') continue;
+          break;
+        }
+        const after = record.state;
+        if (after === 'active') return;
+        if (after === 'activating') {
+          // 收敛期间新代激活仍在途：加入同一完整流程（active 或回滚终态），不提前返回
+          await this.awaitActivationOutcome(record);
+          return;
+        }
       }
       await this.awaitActivationOutcome(record);
       if (this.disposedFlag || record.state === 'failed') return;
@@ -406,9 +424,12 @@ export class PluginHost {
   }
 
   private async performHostDispose(): Promise<void> {
-    for (const record of this.plugins.values()) {
-      await this.deactivateRecord(record, 'inactive');
-    }
+    // 两阶段销毁：先同步为全部 record 发布生命周期操作（任何 await 之前），再统一等待。
+    // 顺序逐条销毁卡在首个慢停用时，后序插件的失败/晚到分支也能加入已发布的生命周期
+    // 与共享宿主销毁完成点收敛 —— 不得让后序插件以 in-flight 快照提前成功
+    const records = [...this.plugins.values()];
+    const disposals = records.map((record) => this.deactivateRecord(record, 'inactive'));
+    await Promise.all(disposals);
     this.plugins.clear();
     this.contributions.dispose();
     this.commands.dispose();
@@ -683,8 +704,10 @@ export class PluginHost {
     ) {
       completion.resolve();
       // 事件内停用已摘除本尝试：owner 加入同一生命周期/新尝试收敛，
-      // 取消的回滚未完成前不得提前返回（取消且 deactivate 挂起场景）
+      // 取消的回滚未完成前不得提前返回（取消且 deactivate 挂起场景）；
+      // 销毁已接管时与共享宿主销毁完成点一并收敛，不在销毁清理窗口内提前返回
       await this.awaitActivationOutcome(record);
+      if (this.hostDispose) await this.hostDispose;
       return;
     }
 
@@ -722,6 +745,8 @@ export class PluginHost {
       }
       completion.resolve();
       await this.awaitActivationOutcome(record);
+      // 销毁已接管：与共享宿主销毁完成点一并收敛，不在销毁清理窗口内提前返回
+      if (this.hostDispose) await this.hostDispose;
       return;
     }
     record.activation = null;
@@ -754,7 +779,13 @@ export class PluginHost {
     error: unknown,
   ): Promise<void> {
     if (this.disposedFlag) {
+      // 销毁已接管：解析本尝试唯一完成点（驱动已发布的生命周期清理），随后加入该
+      // 尝试的完整 workflow 与共享宿主销毁完成点一并收敛 —— 两阶段销毁保证本记录
+      // 的生命周期已在途；不得在本记录清理结束后独立提前返回（宿主仍可能卡在其他
+      // 记录的慢停用，owner 不得以 in-flight 快照提前成功）
       completion.resolve();
+      await this.awaitActivationOutcome(record);
+      if (this.hostDispose) await this.hostDispose;
       return;
     }
     if (record.activation !== attempt || record.generation !== attempt.generation) {

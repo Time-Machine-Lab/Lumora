@@ -1932,14 +1932,18 @@ describe('PluginHost', () => {
     let changedCount = 0;
     let disabling: Promise<void> | undefined;
     let disablingResolved = false;
+    let countAtDisableReturn = -1;
     host.events.on('contribution:changed', (e) => {
       if (e.pluginId !== 'com.example.plugin') return;
       changedCount += 1;
       // 第一个事件在句柄返回前同步发出：事件内停用，句柄尚未归属任何集合
       if (changedCount === 1) {
         disabling = host.disable('com.example.plugin');
+        // 在 disable() 解析的同一微任务轮次锁定其自身清理完成时点的贡献计数：
+        // disable() 返回前必须已释放全部过期贡献（与 register 侧捕获互补）
         disabling.then(() => {
           disablingResolved = true;
+          countAtDisableReturn = host.contributions.count();
         });
       }
     });
@@ -1972,6 +1976,7 @@ describe('PluginHost', () => {
     expect(changedCount).toBeGreaterThanOrEqual(2);
     await disabling!;
     expect(disablingResolved).toBe(true);
+    expect(countAtDisableReturn).toBe(0);
     expect(host.contributions.count()).toBe(0);
     expect(activate).toHaveBeenCalledTimes(1);
   });
@@ -2120,6 +2125,126 @@ describe('PluginHost', () => {
     expect(host.getPlugin('com.example.plugin')?.state).toBe('active');
     expect(host.commands.has('example.hello')).toBe(true);
     expect(entry).toHaveBeenCalledTimes(2);
+  });
+
+  it('新代 loader 先完成并进入挂起 activation：外层 enable 加入在途激活，旧 loader 后完成不提前返回', async () => {
+    const host = new PluginHost();
+    let releaseOld!: () => void;
+    const oldGate = new Promise<void>((resolve) => {
+      releaseOld = resolve;
+    });
+    let releaseActivation!: () => void;
+    const activationGate = new Promise<void>((resolve) => {
+      releaseActivation = resolve;
+    });
+    const activate = vi.fn((context: PluginContext) => {
+      context.contribute({
+        panels: [
+          { kind: 'panel', id: 'com.example.plugin.panel', title: '示例面板', component: () => null },
+        ],
+        commands: [
+          { kind: 'command', command: { id: 'example.hello', title: '打招呼', execute: () => ({ ok: true }) } },
+        ],
+      });
+      // 贡献同步生效后挂起：activation 在途
+      return activationGate;
+    });
+    const entry = vi
+      .fn()
+      .mockImplementationOnce(async () => {
+        // 旧代 loader：挂起直至测试放行（旧 loader 最后完成）
+        await oldGate;
+        return { default: { activate, deactivate: () => {} } };
+      })
+      .mockImplementationOnce(async () => {
+        // 新代 loader：立即完成，进入挂起的 activation（新 loader 先完成）
+        return { default: { activate, deactivate: () => {} } };
+      });
+    // disabled 终态事件内重入 enable：启动新代 loader
+    host.events.on('plugin:state-changed', (e) => {
+      if (e.state === 'disabled' && e.instanceId === 'com.example.plugin') {
+        void host.enable('com.example.plugin');
+      }
+    });
+    const registering = host.register(descriptor(VALID_MANIFEST, entry));
+    await vi.waitFor(() => expect(entry).toHaveBeenCalledTimes(1));
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('loading');
+    // 外层 enable 在旧加载在途时开始：共享同一加载操作
+    const enabling = host.enable('com.example.plugin');
+    let enablingResolved = false;
+    enabling.then(() => {
+      enablingResolved = true;
+    });
+    // 加载挂起期间停用：disabled 终态事件内重入 enable 启动新代 loader
+    await host.disable('com.example.plugin');
+    // 新 loader 先完成并进入挂起的 activation（旧 loader 仍在途）
+    await vi.waitFor(() => expect(host.getPlugin('com.example.plugin')?.state).toBe('activating'));
+    expect(activate).toHaveBeenCalledTimes(1);
+    // 旧 loader 放行：外层 enable 不得因 record.loading 已清空（新代加载已完成）
+    // 而以 activating 快照提前成功 —— 必须加入新代在途 activation 的同一完整流程
+    releaseOld();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(enablingResolved).toBe(false);
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('activating');
+    // 放行新代 activation：外层 enable 收敛到稳定 active
+    releaseActivation();
+    await enabling;
+    await registering;
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('active');
+    expect(host.commands.has('example.hello')).toBe(true);
+    expect(entry).toHaveBeenCalledTimes(2);
+    expect(activate).toHaveBeenCalledTimes(1);
+  });
+
+  it('多记录销毁：前序慢停用卡住时后序激活失败，owner 与共享销毁完成点一并收敛', async () => {
+    const host = new PluginHost();
+    let releaseDeactivate!: () => void;
+    const deactivateGate = new Promise<void>((resolve) => {
+      releaseDeactivate = resolve;
+    });
+    const deactivateA = vi.fn(() => deactivateGate);
+    // A 先注册并激活：deactivate 挂起（销毁顺序清理时卡在 A）
+    await host.register(
+      descriptor(VALID_MANIFEST, async () => ({ default: definitionOf({ deactivate: deactivateA }) })),
+    );
+    expect(host.getPlugin('com.example.plugin')?.state).toBe('active');
+    // B 后注册且 activation 挂起（随后拒绝）
+    let rejectActivation!: (error: Error) => void;
+    const activationGate = new Promise<void>((_, reject) => {
+      rejectActivation = reject;
+    });
+    const registeringB = host.register(
+      descriptor(
+        { ...VALID_MANIFEST, id: 'com.example.plugin.b' },
+        async () => ({ default: { activate: () => activationGate } }),
+      ),
+    );
+    await vi.waitFor(() => expect(host.getPlugin('com.example.plugin.b')?.state).toBe('activating'));
+    let disposeResolved = false;
+    let bResolved = false;
+    const disposing = host.dispose();
+    disposing.then(() => {
+      disposeResolved = true;
+    });
+    registeringB.then(() => {
+      bResolved = true;
+    });
+    // 销毁卡在 A 的慢停用；B 的 activate 钩子此时拒绝
+    await vi.waitFor(() => expect(deactivateA).toHaveBeenCalledTimes(1));
+    rejectActivation(new Error('boom'));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // B 的 register() 不得以 activating 快照提前成功（宿主销毁仍挂起）
+    expect(bResolved).toBe(false);
+    expect(disposeResolved).toBe(false);
+    // 放行 A：B 的 register 与共享宿主销毁完成点一并收敛
+    releaseDeactivate();
+    await disposing;
+    expect(disposeResolved).toBe(true);
+    await registeringB;
+    expect(bResolved).toBe(true);
+    expect(host.getPlugin('com.example.plugin')?.state).toBeUndefined();
+    expect(host.getPlugin('com.example.plugin.b')?.state).toBeUndefined();
+    expect(host.contributions.count()).toBe(0);
   });
 
   it('慢 deactivate 期间直接 activate：等待收敛后重新驱动激活意图，最终 active', async () => {
