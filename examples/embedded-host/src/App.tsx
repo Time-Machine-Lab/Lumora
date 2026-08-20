@@ -102,6 +102,25 @@ export default function App() {
       <header className="host__bar">
         <h1>Lumora 嵌入宿主示例</h1>
         <div className="host__actions">
+          <button
+            type="button"
+            data-testid="reopen-last-export"
+            onClick={() => {
+              const raw = localStorage.getItem('lumora.demo.last-export');
+              if (!raw) {
+                appendLog('没有可重开的导出（请先在 Studio 中导出场景）');
+                return;
+              }
+              try {
+                const project = JSON.parse(raw);
+                handleRef.current?.runtime.openProject(project);
+              } catch {
+                appendLog('重开失败：导出数据无法解析');
+              }
+            }}
+          >
+            重开上次导出（新运行时）
+          </button>
           <button type="button" data-testid="studio-mount-toggle" onClick={toggleMount}>
             {mounted ? '卸载 Studio（释放资源）' : '重新挂载 Studio'}
           </button>

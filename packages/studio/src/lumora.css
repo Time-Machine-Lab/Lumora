@@ -929,10 +929,12 @@
     border-top: 1px solid var(--lumora-border);
   }
 
-  .lumora-viewport {
+  /* 3D 视口放最前：窄屏上优先保证编辑面可见，树/属性面板后置滚动。
+     排序作用于 .lumora-studio__body 的 flex 子项（main），
+     .lumora-viewport 是 main 内部元素，order 对它无效 */
+  .lumora-studio__viewport {
     min-height: 320px;
     flex: 1;
-    /* 3D 视口放最前：窄屏上优先保证编辑面可见，树/属性面板后置滚动 */
     order: -1;
   }
 }

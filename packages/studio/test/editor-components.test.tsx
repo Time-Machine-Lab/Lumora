@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, createRef } from 'react';
 import * as THREE from 'three';
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { createSampleProject, SceneEditor } from '@lumora/core';
 import type { AssetData, Project, SceneEditor as SceneEditorType } from '@lumora/core';
 import { LumoraStudio } from '../src/components/LumoraStudio';
+import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
 import { ObjectTree } from '../src/components/editor/ObjectTree';
 import { PropertiesPanel } from '../src/components/editor/PropertiesPanel';
 import type { AssetCache } from '../src/components/editor/asset-cache';
@@ -41,8 +43,6 @@ function noopCache(): AssetCache {
     has: () => false,
     urlFor: () => '',
     acquire: vi.fn(async () => ({ scene: new THREE.Group() }) as unknown as GLTF),
-    addRef: vi.fn(),
-    removeRef: vi.fn(),
     sweep: vi.fn(),
     onContentReady: () => () => undefined,
     dispose: vi.fn(),
@@ -315,14 +315,11 @@ describe('模型导入', () => {
     vi.stubGlobal('crypto', { ...globalThis.crypto, subtle: undefined });
   }
 
-  it('导入成功：注册资源、创建模型对象、内容进入缓存引用', async () => {
+  it('导入成功：注册资源、创建模型对象，对象引用与资产一致', async () => {
     useFnvHash();
     const editor = makeEditor();
-    const acquire = vi.fn(async () => gltfLike);
-    const addRef = vi.fn();
     const cache = stubCache({
-      acquire,
-      addRef,
+      acquire: vi.fn(async () => gltfLike),
       urlFor: () => 'blob:mock',
     });
     const file = makeFile('hero.glb', [1, 2, 3]);
@@ -333,8 +330,10 @@ describe('模型导入', () => {
     const project = editor.getProject()!;
     expect(project.assets).toHaveLength(1);
     expect(project.assets[0]!.name).toBe('hero.glb');
-    expect(project.objects.find((o) => o.id === result.objectId)?.type).toBe('model');
-    expect(addRef).toHaveBeenCalledWith(project.assets[0]!.hash, result.objectId);
+    const model = project.objects.find((o) => o.id === result.objectId)!;
+    expect(model.type).toBe('model');
+    expect(model.assetId).toBe(project.assets[0]!.id);
+    expect(result.deduped).toBe(false);
     expect(editor.getSelection()).toEqual([result.objectId]);
   });
 
@@ -356,24 +355,29 @@ describe('模型导入', () => {
     expect(editor.getProject()!.objects.filter((o) => o.type === 'model')).toHaveLength(0);
   });
 
-  it('相同内容重复导入：资源去重，缓存引用两个对象', async () => {
+  it('相同内容重复导入：资源去重，两个对象统一引用同一资产', async () => {
     useFnvHash();
     const editor = makeEditor();
-    const addRef = vi.fn();
     const cache = stubCache({
       acquire: vi.fn(async () => gltfLike),
-      addRef,
       urlFor: () => 'blob:mock',
     });
     const file = makeFile('hero.glb', [1, 2, 3]);
 
     const first = await importModelFile(editor, cache, file);
     const second = await importModelFile(editor, cache, file);
-    expect(first.ok && second.ok).toBe(true);
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!(first.ok && second.ok)) return;
     const project = editor.getProject()!;
     expect(project.assets).toHaveLength(1);
-    expect(project.objects.filter((o) => o.type === 'model')).toHaveLength(2);
-    expect(addRef).toHaveBeenCalledTimes(2);
+    const models = project.objects.filter((o) => o.type === 'model');
+    expect(models).toHaveLength(2);
+    // P0-1：不同 assetId 的同 hash 导入 → 对象统一引用有效资源
+    expect(models[0]!.assetId).toBe(models[1]!.assetId);
+    expect(models[0]!.assetId).toBe(project.assets[0]!.id);
+    expect(second.deduped).toBe(true);
+    expect(first.deduped).toBe(false);
   });
 });
 
@@ -449,5 +453,81 @@ describe('资源释放（无引用释放）', () => {
     editor.setSelection(['model-hero']);
     editor.deleteSelection();
     expect(editor.getProject()!.assets).toHaveLength(0);
+  });
+});
+
+describe('第二轮修复：Inspector 同步与 ARIA 树（P1-10/P1-11）', () => {
+  it('P1-10 外部改名/撤销后名称框同步；编辑中草稿被外部变更丢弃', () => {
+    const editor = makeEditor();
+    editor.setSelection(['sample-cube']);
+    render(<InspectorHarness editor={editor} />);
+
+    // 外部改名（树内重命名/命令面板等非面板路径）→ 面板回显新名称
+    act(() => {
+      editor.updateObjectProps('sample-cube', (o) => ({ ...o, name: '外部改名' }), '重命名');
+    });
+    expect(screen.getByTestId('inspector-name')).toHaveValue('外部改名');
+
+    // 撤销改名 → 面板回退为旧名称
+    act(() => {
+      editor.undo();
+    });
+    expect(screen.getByTestId('inspector-name')).toHaveValue('立方体');
+
+    // 输入草稿后外部改名：草稿被丢弃，回显最新名称（受控草稿随对象名称同步）
+    fireEvent.change(screen.getByTestId('inspector-name'), { target: { value: '我的草稿' } });
+    act(() => {
+      editor.updateObjectProps('sample-cube', (o) => ({ ...o, name: '再次改名' }), '重命名');
+    });
+    expect(screen.getByTestId('inspector-name')).toHaveValue('再次改名');
+    expect(findObject(editor, 'sample-cube')?.name).toBe('再次改名');
+  });
+
+  it('P1-11 对象树：多选容器、层级、单一 roving focus 与 group 结构', () => {
+    const editor = makeEditor();
+    render(<TreeHarness editor={editor} cache={noopCache()} />);
+
+    const tree = screen.getByRole('tree');
+    expect(tree).toHaveAttribute('aria-multiselectable', 'true');
+    expect(screen.getByTestId('tree-row-sample-group')).toHaveAttribute('aria-level', '1');
+    expect(screen.getByTestId('tree-row-sample-cube')).toHaveAttribute('aria-level', '2');
+
+    // 单一 roving focus：有且仅有一个 tabindex=0 的停靠行
+    const tabStops = () =>
+      screen.getAllByRole('treeitem').filter((el) => el.getAttribute('tabindex') === '0');
+    expect(tabStops()).toHaveLength(1);
+
+    // 点击行 → 停靠点跟随该行
+    fireEvent.click(screen.getByTestId('tree-row-sample-sphere'));
+    expect(screen.getByTestId('tree-row-sample-sphere')).toHaveAttribute('tabindex', '0');
+    expect(screen.getByTestId('tree-row-sample-group')).toHaveAttribute('tabindex', '-1');
+    expect(tabStops()).toHaveLength(1);
+
+    // 子行容器是 role=group（完整 ARIA 层级：tree > treeitem > group > treeitem）
+    expect(screen.getAllByRole('group').length).toBeGreaterThanOrEqual(1);
+
+    // 键盘焦点移动与 roving 停靠一致
+    screen.getByTestId('tree-row-sample-cube').focus();
+    fireEvent.keyDown(screen.getByTestId('tree-row-sample-cube'), { key: 'ArrowDown' });
+    expect(screen.getByTestId('tree-row-sample-sphere')).toHaveFocus();
+    expect(screen.getByTestId('tree-row-sample-sphere')).toHaveAttribute('tabindex', '0');
+  });
+});
+
+describe('P1-9 切场景资源释放', () => {
+  it('切换场景释放旧场景节点资源（几何 dispose）', async () => {
+    const handleRef = createRef<LumoraStudioHandle>();
+    render(<LumoraStudio ref={handleRef} hostVersion="0.1.0" />);
+    await screen.findByTestId('lumora-studio');
+    fireEvent.click(screen.getByTestId('open-sample-project'));
+    await waitFor(() => expect(screen.getByTestId('tree-row-sample-group')).toBeInTheDocument());
+    const editor = handleRef.current!.runtime.editor;
+
+    // 立方体几何已随场景树挂载；切换场景时旧树整体释放
+    const disposeSpy = vi.spyOn(THREE.BoxGeometry.prototype, 'dispose');
+    act(() => {
+      editor.addScene('场景 B');
+    });
+    await waitFor(() => expect(disposeSpy).toHaveBeenCalled());
   });
 });

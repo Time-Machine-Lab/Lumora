@@ -1,13 +1,13 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import type { RootState } from '@react-three/fiber';
 import { OrbitControls, TransformControls } from '@react-three/drei';
 import * as THREE from 'three';
-import { findObject, fitRect } from '@lumora/core';
+import { findObject, fitRect, getReachableIds } from '@lumora/core';
 import type { Project, SceneEditor, TransformData, ViewState } from '@lumora/core';
 import { ensureCacheSeeded } from './asset-cache';
 import type { AssetCache } from './asset-cache';
-import { attachModelContent, buildScene, disposeNode, findNode, syncScene } from './scene-builder';
+import { applyTransform, attachModelContent, buildScene, disposeNode, findNode, syncScene } from './scene-builder';
 import { showToast } from './toasts';
 
 interface EditorViewportProps {
@@ -47,7 +47,28 @@ export function EditorViewport({ editor, project, selection, view, cache }: Edit
   const draggingRef = useRef(false);
 
   const aspect = project ? project.settings.aspect[0] / project.settings.aspect[1] : 16 / 9;
-  const cameraView = view.viewMode !== 'director' ? view.viewMode.cameraObjectId : null;
+  // 相机视图按活动场景隔离：仅当机位对象存在且属于活动场景可达集时生效
+  const reachableIds = useMemo(
+    () => (project ? getReachableIds(project, project.activeSceneId) : null),
+    [project],
+  );
+  const cameraView =
+    view.viewMode !== 'director' && project && reachableIds
+      ? findObject(project, view.viewMode.cameraObjectId)?.type === 'camera' &&
+        reachableIds.has(view.viewMode.cameraObjectId)
+        ? view.viewMode.cameraObjectId
+        : null
+      : null;
+
+  // 机位失效（删除、撤销、切场景后不属于活动场景）→ 回退导演视图
+  useEffect(() => {
+    if (!project || view.viewMode === 'director') return;
+    const cameraId = view.viewMode.cameraObjectId;
+    const camera = findObject(project, cameraId);
+    if (!camera || camera.type !== 'camera' || !reachableIds?.has(cameraId)) {
+      editor.setViewMode('director');
+    }
+  }, [project, view.viewMode, reachableIds, editor]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -128,6 +149,7 @@ export function EditorViewport({ editor, project, selection, view, cache }: Edit
           selection={selection}
           view={view}
           rootRef={rootRef}
+          dragging={dragging}
           setDragging={updateDragging}
         />
         {!cameraView && <OrbitControls makeDefault enableDamping enabled={!dragging} />}
@@ -178,7 +200,11 @@ function SceneContent({
     if (current && prevProjectRef.current && !sceneSwitched) {
       syncScene(current, prevProjectRef.current, project, aspect);
     } else {
-      if (current) scene.remove(current);
+      // 切场景（或重建）：旧树节点整体释放，避免跨场景残留 GPU 资源
+      if (current) {
+        scene.remove(current);
+        disposeNode(current);
+      }
       const root = buildScene(project, aspect);
       rootRef.current = root;
       scene.add(root);
@@ -215,9 +241,9 @@ function SceneContent({
     };
   }, [project, cache, rootRef]);
 
-  // 对象删除/撤销后释放无引用的模型内容
+  // 项目变更后按 Project 全量 model→asset 关系清扫缓存（null=关闭项目，全部释放）
   useEffect(() => {
-    if (project) cache.sweep(project);
+    cache.sweep(project);
   }, [project, cache]);
 
   return null;
@@ -259,7 +285,11 @@ function CameraRig({
   return null;
 }
 
-/** letterbox：相机视图把渲染区域收窄到项目画幅，其余区域留黑（辅助线是 DOM，不在 canvas 内） */
+/**
+ * letterbox：相机视图把渲染区域收窄到项目画幅，其余区域留黑（辅助线是 DOM，不在 canvas 内）。
+ * 开启 scissor 后渲染器的 auto-clear 只清画幅矩形，黑边区域会残留上一帧内容，
+ * 因此每次先关闭 scissor 全画布清黑、再画画幅矩形（DPR 1/2 下黑边均为纯黑）。
+ */
 function ViewportLetterbox({ enabled, aspect }: { enabled: boolean; aspect: number }) {
   const gl = useThree((s) => s.gl);
   const size = useThree((s) => s.size);
@@ -270,14 +300,20 @@ function ViewportLetterbox({ enabled, aspect }: { enabled: boolean; aspect: numb
     if (!enabled) {
       gl.setScissorTest(false);
       gl.setViewport(0, 0, width, height);
+      gl.setClearColor('#14161f', 1);
       return;
     }
+    gl.setScissorTest(false);
+    gl.setViewport(0, 0, width, height);
+    gl.setClearColor('#000000', 1);
+    gl.clear();
     const rect = fitRect(width, height, aspect);
     // WebGL 视口原点在左下，fitRect 返回左上坐标
     const y = height - (rect.y + rect.height);
     gl.setViewport(rect.x, y, rect.width, rect.height);
     gl.setScissor(rect.x, y, rect.width, rect.height);
     gl.setScissorTest(true);
+    gl.setClearColor('#14161f', 1);
   });
 
   return null;
@@ -290,6 +326,7 @@ function EditorGizmo({
   selection,
   view,
   rootRef,
+  dragging,
   setDragging,
 }: {
   editor: SceneEditor;
@@ -297,17 +334,51 @@ function EditorGizmo({
   selection: string[];
   view: ViewState;
   rootRef: React.MutableRefObject<THREE.Group | null>;
+  dragging: boolean;
   setDragging: (value: boolean) => void;
 }) {
   const root = rootRef.current;
   const target = selection.length === 1 && project && root ? findNode(root, selection[0]) : null;
   const data = target ? findObject(project!, target.userData.objectId as string) : undefined;
   const locked = !!data?.locked;
+  /** 正常提交路径标记：commit 先置位再收尾 dragging，cleanup 据此区分中断回滚 */
+  const committedRef = useRef(false);
+
+  // 拖动期间的全部中断路径（Hook 必须先于条件返回调用，保证 Hook 顺序稳定）：
+  // Escape / window blur / pointercancel / 组件卸载（Delete 删除、Escape 清选、切对象）。
+  // 中断统一回滚节点到拖动前变换并清理拖动态，不产生历史。
+  useEffect(() => {
+    if (!target || !dragging) return;
+    committedRef.current = false;
+    const initial: TransformData = {
+      position: [target.position.x, target.position.y, target.position.z],
+      rotation: [target.rotation.x, target.rotation.y, target.rotation.z],
+      scale: [target.scale.x, target.scale.y, target.scale.z],
+    };
+    const rollback = () => {
+      applyTransform(target, initial);
+      setDragging(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') rollback();
+    };
+    const onBlur = () => rollback();
+    // pointercancel 只在指针流被中断时触发（捕获丢失/元素被移除），任何指针类型都应回滚
+    const onPointerCancel = () => rollback();
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('blur', onBlur);
+    window.addEventListener('pointercancel', onPointerCancel);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('blur', onBlur);
+      window.removeEventListener('pointercancel', onPointerCancel);
+      if (!committedRef.current) rollback();
+    };
+  }, [dragging, target, setDragging]);
 
   if (!target || locked || !project) return null;
 
   const commit = () => {
-    setDragging(false);
     const objectId = target.userData.objectId as string;
     const transform: TransformData = {
       position: [target.position.x, target.position.y, target.position.z],
@@ -315,6 +386,9 @@ function EditorGizmo({
       scale: [target.scale.x, target.scale.y, target.scale.z],
     };
     const result = editor.commitTransform(objectId, transform);
+    // 仅提交成功才标记正常路径；失败时 cleanup 按中断回滚节点，保持视觉与数据一致
+    committedRef.current = result.ok;
+    setDragging(false);
     if (!result.ok) showToast(result.error.message, 'error');
   };
 
@@ -382,7 +456,15 @@ function ViewportToolbar({
   project: Project | null;
   view: ViewState;
 }) {
-  const cameras = project ? project.objects.filter((o) => o.type === 'camera') : [];
+  // 机位列表按活动场景隔离：只列活动场景可达集内的相机
+  const reachableIds = useMemo(
+    () => (project ? getReachableIds(project, project.activeSceneId) : null),
+    [project],
+  );
+  const cameras =
+    project && reachableIds
+      ? project.objects.filter((o) => o.type === 'camera' && reachableIds.has(o.id))
+      : [];
   const cameraView = view.viewMode !== 'director' ? view.viewMode.cameraObjectId : null;
   return (
     <div

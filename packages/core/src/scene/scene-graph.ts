@@ -52,6 +52,34 @@ export function isInSubtree(project: Project, maybeDescendantId: string, ancesto
   return isInSubtree(project, object.parentId, ancestorId);
 }
 
+/**
+ * 场景可达对象集（场景根 + 全部后代）。selection/相机等按活动场景隔离的判定边界：
+ * 只有可达对象属于该场景，跨场景对象不可选中、不可编辑。
+ */
+export function getReachableIds(project: Project, sceneId: string): Set<string> {
+  const scene = getScene(project, sceneId);
+  const reachable = new Set<string>();
+  if (!scene) return reachable;
+  const childrenOf = new Map<string | null, string[]>();
+  for (const object of project.objects) {
+    const list = childrenOf.get(object.parentId);
+    if (list) list.push(object.id);
+    else childrenOf.set(object.parentId, [object.id]);
+  }
+  const walk = (id: string) => {
+    if (reachable.has(id)) return;
+    reachable.add(id);
+    for (const childId of childrenOf.get(id) ?? []) walk(childId);
+  };
+  for (const rootId of scene.rootObjectIds) walk(rootId);
+  return reachable;
+}
+
+/** 对象是否属于项目活动场景的可达集 */
+export function isInActiveScene(project: Project, objectId: string): boolean {
+  return getReachableIds(project, project.activeSceneId).has(objectId);
+}
+
 export function isValidVec3(v: unknown): v is Vec3 {
   return (
     Array.isArray(v) &&

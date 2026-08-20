@@ -6,7 +6,9 @@ import {
   findAssetByHash,
   findObject,
   getDescendantIds,
+  getReachableIds,
   getScene,
+  isInActiveScene,
   isInSubtree,
   isValidTransform,
   removeAssets,
@@ -79,6 +81,8 @@ export class SceneEditor {
   private history = new HistoryStack<EditorSnapshot>();
   /** beginTransform 捕获的拖动前快照 */
   private dragSnapshot: EditorSnapshot | null = null;
+  /** 会话令牌：openProject/reset 时递增；异步流程据此绑定所属项目会话 */
+  private sessionToken = 0;
 
   getProject(): Project | null {
     return this.project;
@@ -110,17 +114,31 @@ export class SceneEditor {
   openProject(project: Project): void {
     this.project = project;
     this.selection = [];
+    this.view = { ...DEFAULT_VIEW, guides: { ...DEFAULT_VIEW.guides } };
     this.history.clear();
     this.dragSnapshot = null;
+    this.sessionToken += 1;
     this.emitAll();
   }
 
   reset(): void {
     this.project = null;
     this.selection = [];
+    this.view = { ...DEFAULT_VIEW, guides: { ...DEFAULT_VIEW.guides } };
     this.history.clear();
     this.dragSnapshot = null;
+    this.sessionToken += 1;
     this.emitAll();
+  }
+
+  /** 当前会话令牌（异步导入等流程在恢复执行后校验所属会话） */
+  getSessionToken(): number {
+    return this.sessionToken;
+  }
+
+  /** token 是否仍为当前会话 */
+  isCurrentSession(token: number): boolean {
+    return token === this.sessionToken;
   }
 
   dispose(): void {
@@ -131,7 +149,10 @@ export class SceneEditor {
 
   setSelection(ids: string[]): void {
     const project = this.project;
-    const next = project ? ids.filter((id) => findObject(project, id)) : [];
+    // 选择严格限定在活动场景可达集内：跨场景对象不可选中
+    const next = project
+      ? ids.filter((id) => findObject(project, id) && isInActiveScene(project, id))
+      : [];
     if (next.length === this.selection.length && next.every((id, i) => id === this.selection[i])) return;
     this.selection = next;
     this.events.emit('selection:changed', { ids: this.getSelection() });
@@ -161,7 +182,22 @@ export class SceneEditor {
     if (!project) return failure('未打开项目');
     if (!getScene(project, sceneId)) return failure('场景不存在');
     if (project.activeSceneId === sceneId) return { ok: true };
-    return this.commit({ ...project, activeSceneId: sceneId }, '切换场景');
+    // 同一历史快照内，选择与场景切换原子一致：快照 after.selection 与活动场景同步
+    const reachable = getReachableIds(project, sceneId);
+    const filteredSelection = this.selection.filter((id) => reachable.has(id));
+    const result = this.commit(
+      { ...project, activeSceneId: sceneId },
+      '切换场景',
+      filteredSelection,
+    );
+    if (!result.ok) return result;
+    this.setSelection(filteredSelection);
+    // 相机视图按活动场景隔离：机位不属于新场景 → 回退导演视图（UI 状态，不进历史）
+    if (this.view.viewMode !== 'director') {
+      const cameraId = this.view.viewMode.cameraObjectId;
+      if (!reachable.has(cameraId)) this.setViewMode('director');
+    }
+    return { ok: true };
   }
 
   setActiveCamera(objectId: string | null): Result {
@@ -206,7 +242,8 @@ export class SceneEditor {
     if (!project) return failure('未打开项目');
     const ids = new Set<string>();
     for (const id of this.selection) {
-      if (findObject(project, id)) {
+      // 归属校验（防御）：选择已按活动场景过滤，此处再确认对象属于活动场景
+      if (findObject(project, id) && isInActiveScene(project, id)) {
         ids.add(id);
         for (const descendant of getDescendantIds(project, id)) ids.add(descendant);
       }
@@ -226,6 +263,13 @@ export class SceneEditor {
     const result = this.commit(next, `删除 ${removed} 个对象`, parentId ? [parentId] : []);
     if (!result.ok) return result;
     this.setSelection(parentId ? [parentId] : []);
+    // 相机视图按活动场景隔离：被删机位（含场景归属变化）→ 回退导演视图
+    if (this.view.viewMode !== 'director') {
+      const cameraId = this.view.viewMode.cameraObjectId;
+      if (!findObject(next, cameraId) || !isInActiveScene(next, cameraId)) {
+        this.setViewMode('director');
+      }
+    }
     return { ok: true, value: { removed } };
   }
 
@@ -236,6 +280,7 @@ export class SceneEditor {
     const roots = this.selection.filter(
       (id) =>
         findObject(project, id) &&
+        isInActiveScene(project, id) &&
         !this.selection.some((other) => other !== id && isInSubtree(project, id, other)),
     );
     if (roots.length === 0) return { ok: true, value: { ids: [] } };
@@ -280,6 +325,7 @@ export class SceneEditor {
     if (!project) return failure('未打开项目');
     const object = findObject(project, objectId);
     if (!object) return failure('对象不存在');
+    if (!isInActiveScene(project, objectId)) return failure('对象不属于活动场景');
     if (object.locked) return failure(`「${object.name}」已锁定，无法变更层级`);
     if (parentId !== null) {
       const parent = findObject(project, parentId);
@@ -321,15 +367,21 @@ export class SceneEditor {
     if (!project) return failure('未打开项目');
     const object = findObject(project, objectId);
     if (!object) return failure('对象不存在');
+    if (!isInActiveScene(project, objectId)) return failure('对象不属于活动场景');
     if (!isValidTransform(transform)) return failure('数值非法（不允许 NaN/Infinity）');
     if (object.locked) return failure(`「${object.name}」已锁定，无法变换`);
     return this.commit(updateObject(project, objectId, (o) => ({ ...o, transform })), label);
   }
 
-  /** 一次 Gizmo 拖动：捕获拖动前快照 */
+  /**
+   * 一次 Gizmo 拖动：捕获拖动前快照。
+   * 项目为不可变数据（每次变更产生新 Project，旧引用永不改变），
+   * 因此直接持有引用即可作为拖动前状态——不做结构化克隆，
+   * 避免复制/序列化完整二进制 payload（大模型历史步骤与撤销无重负担）。
+   */
   beginTransform(): void {
     const project = this.project;
-    if (project) this.dragSnapshot = { project: structuredClone(project), selection: [...this.selection] };
+    if (project) this.dragSnapshot = { project, selection: [...this.selection] };
   }
 
   /** 拖动结束提交：应用最终变换并推入历史（无变化则不推，AC：一次拖动一步） */
@@ -338,6 +390,7 @@ export class SceneEditor {
     if (!project) return failure('未打开项目');
     const object = findObject(project, objectId);
     if (!object) return failure('对象不存在');
+    if (!isInActiveScene(project, objectId)) return failure('对象不属于活动场景');
     if (!isValidTransform(transform)) return failure('数值非法（不允许 NaN/Infinity）');
     if (object.locked) {
       this.dragSnapshot = null;
@@ -346,7 +399,8 @@ export class SceneEditor {
     const next = updateObject(project, objectId, (o) => ({ ...o, transform }));
     const before = this.dragSnapshot ?? { project, selection: [...this.selection] };
     this.dragSnapshot = null;
-    if (this.sameProject(before.project, next)) return { ok: true };
+    // 局部比较（仅目标对象三向量），不做整项目 JSON 序列化
+    if (this.sameTransform(before.project, next, objectId)) return { ok: true };
     this.pushEntry({ label, before, after: { project: next, selection: [...this.selection] } });
     return { ok: true };
   }
@@ -361,6 +415,7 @@ export class SceneEditor {
     if (!project) return failure('未打开项目');
     const object = findObject(project, objectId);
     if (!object) return failure('对象不存在');
+    if (!isInActiveScene(project, objectId)) return failure('对象不属于活动场景');
     const nextObject = updater(object);
     if (!nextObject) return failure('属性值非法');
     if (nextObject.transform !== object.transform && object.locked) {
@@ -376,7 +431,9 @@ export class SceneEditor {
   setVisible(ids: string[], visible: boolean): Result {
     const project = this.requireProject();
     if (!project) return failure('未打开项目');
-    const idSet = new Set(ids);
+    // 归属校验（防御）：只影响活动场景内的对象
+    const idSet = new Set(ids.filter((id) => isInActiveScene(project, id)));
+    if (idSet.size === 0) return { ok: true };
     const next = {
       ...project,
       objects: project.objects.map((o) => (idSet.has(o.id) ? { ...o, visible } : o)),
@@ -387,7 +444,9 @@ export class SceneEditor {
   setLocked(ids: string[], locked: boolean): Result {
     const project = this.requireProject();
     if (!project) return failure('未打开项目');
-    const idSet = new Set(ids);
+    // 归属校验（防御）：只影响活动场景内的对象
+    const idSet = new Set(ids.filter((id) => isInActiveScene(project, id)));
+    if (idSet.size === 0) return { ok: true };
     const next = {
       ...project,
       objects: project.objects.map((o) => (idSet.has(o.id) ? { ...o, locked } : o)),
@@ -415,19 +474,22 @@ export class SceneEditor {
     if (!scene) return failure('场景不存在');
     const existing = findAssetByHash(project, asset.hash);
     const effectiveAsset = existing ?? asset;
+    // 同 hash 重复导入统一引用有效资源：无论调用方带什么 assetId，
+    // 落库对象一律指向实际生效的资源（可能是已存在的去重资源）
+    const normalizedObject: SceneObjectData = { ...object, assetId: effectiveAsset.id };
     const scenes = project.scenes.map((s) =>
-      s.id === scene.id ? { ...s, rootObjectIds: [...s.rootObjectIds, object.id] } : s,
+      s.id === scene.id ? { ...s, rootObjectIds: [...s.rootObjectIds, normalizedObject.id] } : s,
     );
     const next: Project = {
       ...project,
       scenes,
-      objects: [...project.objects, object],
+      objects: [...project.objects, normalizedObject],
       assets: existing ? project.assets : [...project.assets, effectiveAsset],
     };
-    const result = this.commit(next, `导入模型 ${object.name}`, [object.id]);
+    const result = this.commit(next, `导入模型 ${normalizedObject.name}`, [normalizedObject.id]);
     if (!result.ok) return result;
-    this.setSelection([object.id]);
-    return { ok: true, value: object.id };
+    this.setSelection([normalizedObject.id]);
+    return { ok: true, value: normalizedObject.id };
   }
 
   // ---------- 视口 UI 状态（不进历史） ----------
@@ -517,8 +579,11 @@ export class SceneEditor {
 
   private applySnapshot(snapshot: EditorSnapshot): void {
     this.project = snapshot.project;
+    // 快照选择同样按快照所属活动场景过滤（历史快照与场景切换原子一致）
     const alive = new Set(snapshot.project.objects.map((o) => o.id));
-    const selection = snapshot.selection.filter((id) => alive.has(id));
+    const selection = snapshot.selection.filter(
+      (id) => alive.has(id) && isInActiveScene(snapshot.project, id),
+    );
     this.selection = selection;
     this.events.emit('project:changed', { project: snapshot.project });
     this.events.emit('selection:changed', { ids: this.getSelection() });
@@ -529,8 +594,18 @@ export class SceneEditor {
     return { ...project, revision: project.revision + 1 };
   }
 
-  private sameProject(a: Project, b: Project): boolean {
-    return JSON.stringify(a) === JSON.stringify(b);
+  /** 拖动前后是否等价：仅比较目标对象三向量（局部比较，不序列化项目） */
+  private sameTransform(a: Project, b: Project, objectId: string): boolean {
+    const aObject = findObject(a, objectId);
+    const bObject = findObject(b, objectId);
+    if (!aObject || !bObject) return false;
+    const { position: ap, rotation: ar, scale: as } = aObject.transform;
+    const { position: bp, rotation: br, scale: bs } = bObject.transform;
+    return (
+      ap[0] === bp[0] && ap[1] === bp[1] && ap[2] === bp[2] &&
+      ar[0] === br[0] && ar[1] === br[1] && ar[2] === br[2] &&
+      as[0] === bs[0] && as[1] === bs[1] && as[2] === bs[2]
+    );
   }
 
   private emitAll(): void {

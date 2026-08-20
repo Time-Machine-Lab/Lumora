@@ -2,8 +2,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import * as THREE from 'three';
-import { createGroupObject, createSampleProject, hashBytes, SceneEditor } from '@lumora/core';
-import type { Project } from '@lumora/core';
+import { createGroupObject, createModelObject, createSampleProject, hashBytes, SceneEditor } from '@lumora/core';
+import type { AssetData, Project } from '@lumora/core';
 import { AssetCache, ensureCacheSeeded } from '../src/components/editor/asset-cache';
 import { importModelFile } from '../src/components/editor/model-import';
 import {
@@ -28,14 +28,16 @@ const FIXTURE = new Uint8Array(readFileSync(new URL('./fixtures/nested-mesh.glb'
  */
 const blobStore = new Map<string, Blob>();
 let blobSeq = 0;
-function stubBlobFetch(): void {
+/** gate 可选：挂起 fetch，把 GLB 解析挡在门后，用于模拟解析期间会话/场景切换 */
+function stubBlobFetch(gate?: Promise<void>): void {
   vi.spyOn(URL, 'createObjectURL').mockImplementation((blob: Blob | MediaSource) => {
     const url = `blob:fixture-${blobSeq++}`;
     if (blob instanceof Blob) blobStore.set(url, blob);
     return url;
   });
   vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
-  vi.stubGlobal('fetch', (input: string | Request) => {
+  vi.stubGlobal('fetch', async (input: string | Request) => {
+    if (gate) await gate;
     const url = typeof input === 'string' ? input : input.url;
     const blob = blobStore.get(url);
     if (!blob) return Promise.reject(new Error(`fetch failed: ${url}`));
@@ -253,3 +255,234 @@ describe('真实 GLB 证据：持久化、原子性、共享资源、多场景�
     expect(reachable.has('sample-cube')).toBe(true);
   });
 });
+
+describe('第二轮修复：同 hash 统一引用、项目级缓存引用、会话绑定', () => {
+  it('P0-1 不同 assetId 同 hash 的导入统一引用有效资源，去重内容不被误解析', async () => {
+    stubBlobFetch();
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    const cache = new AssetCache();
+
+    const imported = await importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    const hash = editor.getProject()!.assets[0]!.hash;
+
+    // 另一导入器携带不同 assetId 的同 hash 内容：虚假载荷 + 不同 id
+    const dupAsset: AssetData = {
+      id: 'asset-manual-dup',
+      kind: 'gltf',
+      name: 'car-copy.glb',
+      mime: 'model/gltf-binary',
+      hash,
+      size: FIXTURE.length,
+      source: 'file',
+      storageRef: '',
+      payload: 'AAAA', // 去重短路：载荷绝不参与解析
+      createdAt: '2026-01-01',
+    };
+    const created = editor.importModel(dupAsset, createModelObject(dupAsset.id, 'car-copy'));
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+
+    const project = editor.getProject()!;
+    expect(project.assets).toHaveLength(1);
+    const models = project.objects.filter((o) => o.type === 'model');
+    expect(models).toHaveLength(2);
+    // 规范化：两个对象都指向有效资源（首个导入的资产 id），而非重复导入器携带的 id
+    expect(models[0]!.assetId).toBe(project.assets[0]!.id);
+    expect(models[1]!.assetId).toBe(project.assets[0]!.id);
+    expect(models[1]!.assetId).not.toBe('asset-manual-dup');
+    expect(created.value).toBe(models[1]!.id);
+
+    // 删除第一个实例：有效资源仍被第二个实例引用 → 资源保留
+    editor.setSelection([imported.objectId]);
+    okStudioDelete(editor);
+    expect(editor.getProject()!.assets).toHaveLength(1);
+    expect(editor.getProject()!.objects.filter((o) => o.type === 'model')).toHaveLength(1);
+
+    // 撤销：两个实例与唯一资源全部恢复
+    editor.undo();
+    expect(editor.getProject()!.assets).toHaveLength(1);
+    expect(editor.getProject()!.objects.filter((o) => o.type === 'model')).toHaveLength(2);
+  });
+
+  it('P0-2 Ctrl+D 复制后删除原件：缓存以项目关系为准，副本仍持有内容', async () => {
+    stubBlobFetch();
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    const cache = new AssetCache();
+
+    const imported = await importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    const project = editor.getProject()!;
+    const hash = project.assets[0]!.hash;
+
+    // Ctrl+D 复制：两个 model 引用同一资源，选择移到副本
+    const duplicated = editor.duplicateSelection();
+    expect(duplicated.ok).toBe(true);
+    if (!duplicated.ok) return;
+    const copyId = duplicated.value!.ids[0]!;
+    expect(editor.getProject()!.objects.filter((o) => o.type === 'model')).toHaveLength(2);
+
+    const root = buildScene(editor.getProject()!, 16 / 9);
+    const nodeA = findNode(root, imported.objectId)!;
+    const nodeB = findNode(root, copyId)!;
+    attachModelContent(nodeA, cache.get(hash)!.gltf!);
+    attachModelContent(nodeB, cache.get(hash)!.gltf!);
+    const bodyA = nodeA.getObjectByName('BodyMesh') as THREE.Mesh;
+    const bodyB = nodeB.getObjectByName('BodyMesh') as THREE.Mesh;
+    expect(bodyA.geometry).toBe(bodyB.geometry);
+    const disposeSpy = vi.spyOn(bodyB.geometry, 'dispose');
+
+    // 删除原件（旧实现的引用计数会在这一步把缓存内容释放掉）
+    editor.setSelection([imported.objectId]);
+    okStudioDelete(editor);
+    const afterDelete = editor.getProject()!;
+    const remaining = afterDelete.objects.filter((o) => o.type === 'model');
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]!.id).toBe(copyId);
+    cache.sweep(afterDelete);
+    expect(cache.has(hash)).toBe(true);
+    expect(disposeSpy).not.toHaveBeenCalled();
+
+    // 副本内容仍可从缓存挂载（项目全量 model/asset 关系才是引用依据）
+    const rootAfter = buildScene(afterDelete, 16 / 9);
+    const copyNode = findNode(rootAfter, copyId)!;
+    attachModelContent(copyNode, cache.get(hash)!.gltf!);
+    expect(copyNode.getObjectByName('BodyMesh')).not.toBeNull();
+    expect(copyNode.getObjectByName(PLACEHOLDER_HINT)).toBeUndefined();
+
+    // 删除副本：项目不再引用 → 缓存释放 GPU 资源
+    editor.setSelection([copyId]);
+    okStudioDelete(editor);
+    cache.sweep(editor.getProject()!);
+    expect(cache.has(hash)).toBe(false);
+    expect(disposeSpy).toHaveBeenCalled();
+  });
+
+  it('P0-3 解析期间切换项目：取消提交、不污染新项目、缓存条目释放', async () => {
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stubBlobFetch(gate);
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    const cache = new AssetCache();
+    const hash = await hashBytes(new Uint8Array(FIXTURE));
+
+    const importing = importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
+    // 解析挂起期间打开另一个项目（新会话）
+    editor.openProject(createSampleProject());
+    release();
+    const result = await importing;
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.message).toContain('项目已切换');
+    // 新项目未被污染：无资源、无模型对象、无历史
+    expect(editor.getProject()!.assets).toHaveLength(0);
+    expect(editor.getProject()!.objects.find((o) => o.type === 'model')).toBeUndefined();
+    expect(editor.getHistoryState().canUndo).toBe(false);
+    // 缓存条目已释放（新会话未引用该内容）
+    expect(cache.has(hash)).toBe(false);
+  });
+
+  it('P0-3 解析期间关闭项目：取消提交并释放缓存', async () => {
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stubBlobFetch(gate);
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    const cache = new AssetCache();
+    const hash = await hashBytes(new Uint8Array(FIXTURE));
+
+    const importing = importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
+    editor.reset();
+    release();
+    const result = await importing;
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.message).toContain('项目已切换');
+    expect(editor.getProject()).toBeNull();
+    expect(cache.has(hash)).toBe(false);
+  });
+
+  it('P0-3 解析期间切换目标场景：取消提交、缓存释放、切换历史不受影响', async () => {
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stubBlobFetch(gate);
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    const cache = new AssetCache();
+    const hash = await hashBytes(new Uint8Array(FIXTURE));
+
+    const importing = importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
+    // 同一会话内新建并切换到场景 B：目标场景已变更
+    const added = editor.addScene('场景 B');
+    expect(added.ok).toBe(true);
+    release();
+    const result = await importing;
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.message).toContain('目标场景已切换');
+    // 场景切换历史保留（addScene 一步），导入未产生新历史
+    const project = editor.getProject()!;
+    expect(project.activeSceneId).toBe(added.value);
+    expect(project.assets).toHaveLength(0);
+    expect(project.objects.filter((o) => o.type === 'model')).toHaveLength(0);
+    expect(cache.has(hash)).toBe(false);
+  });
+
+  it('P0-3 解析期间同内容已在新会话导入：共享条目保留，旧会话取消不释放新会话的内容', async () => {
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stubBlobFetch(gate);
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    const cache = new AssetCache();
+    const hash = await hashBytes(new Uint8Array(FIXTURE));
+
+    const importing = importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
+    // 新会话导入同内容：命中同一条解析条目（waiters > 1）
+    editor.openProject(createSampleProject());
+    const fresh = importModelFile(editor, cache, makeFile('car.glb', FIXTURE));
+    release();
+    const results = await Promise.all([importing, fresh]);
+
+    expect(results[0]!.ok).toBe(false);
+    if (results[0]!.ok) return;
+    expect((results[0] as { error: Error }).error.message).toContain('项目已切换');
+    expect(results[1]!.ok).toBe(true);
+    if (!results[1]!.ok) return;
+    const freshResult = results[1] as { ok: true; objectId: string };
+    // 新会话的导入正常提交；旧会话取消不得释放被新会话等待/引用的共享条目
+    expect(editor.getProject()!.assets).toHaveLength(1);
+    expect(editor.getProject()!.objects.filter((o) => o.type === 'model')).toHaveLength(1);
+    expect(cache.has(hash)).toBe(true);
+    // 后续清扫以项目引用为准：条目被引用 → 保留
+    cache.sweep(editor.getProject()!);
+    expect(cache.has(hash)).toBe(true);
+    // 内容可正常挂载
+    const root = buildScene(editor.getProject()!, 16 / 9);
+    const freshNode = findNode(root, freshResult.objectId)!;
+    attachModelContent(freshNode, cache.get(hash)!.gltf!);
+    expect(freshNode.getObjectByName('BodyMesh')).not.toBeNull();
+  });
+});
+
+/** 删除当前选择；失败即抛错（断言辅助） */
+function okStudioDelete(editor: SceneEditor): void {
+  const result = editor.deleteSelection();
+  if (!result.ok) throw new Error(`expected delete ok, got: ${result.error.message}`);
+}

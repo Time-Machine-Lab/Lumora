@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { findObject, focalLengthToFovDeg } from '@lumora/core';
 import type { Project, SceneEditor, SceneObjectData, Vec3 } from '@lumora/core';
 import { showToast } from './toasts';
@@ -61,6 +61,51 @@ function NumberField({
       />
       {unit && <span className="lumora-field__unit">{unit}</span>}
     </label>
+  );
+}
+
+/**
+ * 名称输入：受控草稿，随 object.id / object.name 同步（切换对象、外部改名、
+ * 撤销/重做后回显最新名称）。ref 镜像 draft，保证 Escape→blur 同帧取消不提交。
+ */
+function NameField({
+  object,
+  onCommit,
+}: {
+  object: SceneObjectData;
+  onCommit: (name: string) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const draftRef = useRef<string | null>(null);
+  const setDraftBoth = (value: string | null) => {
+    draftRef.current = value;
+    setDraft(value);
+  };
+  useEffect(() => {
+    setDraftBoth(null);
+  }, [object.id, object.name]);
+  const commit = () => {
+    const raw = draftRef.current;
+    setDraftBoth(null);
+    if (raw === null) return;
+    onCommit(raw);
+  };
+  return (
+    <input
+      key={object.id}
+      className="lumora-inspector__name"
+      data-testid="inspector-name"
+      value={draft ?? object.name}
+      onChange={(e) => setDraftBoth(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+        if (e.key === 'Escape') {
+          setDraftBoth(null);
+          (e.target as HTMLInputElement).blur();
+        }
+      }}
+    />
   );
 }
 
@@ -143,21 +188,7 @@ export function PropertiesPanel({ editor, project, selection }: PropertiesPanelP
       ) : (
         <div className="lumora-inspector__body">
           <header className="lumora-inspector__header">
-            <input
-              key={object.id}
-              className="lumora-inspector__name"
-              data-testid="inspector-name"
-              defaultValue={object.name}
-              onBlur={(e) => commitName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
-                if (e.key === 'Escape') {
-                  // 取消草稿：恢复为对象当前名称
-                  (e.target as HTMLInputElement).value = object.name;
-                  (e.target as HTMLInputElement).blur();
-                }
-              }}
-            />
+            <NameField object={object} onCommit={commitName} />
             <span className="lumora-state">{TYPE_LABEL[object.type]}</span>
             {object.locked && (
               <span className="lumora-state lumora-state--active" data-testid="inspector-locked">

@@ -4,16 +4,16 @@ import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import type { Project } from '@lumora/core';
 
 /**
- * GLB/GLTF 内容缓存：按内容哈希索引，引用计数随模型对象增减，
- * 最后一个引用消失时释放 object URL 与 GPU 资源（几何/材质）。
+ * GLB/GLTF 内容缓存：按内容哈希索引。
+ * 引用关系不在此处维护——以 Project 全量 model→asset 关系为准（sweep 时重建），
+ * 覆盖复制（Ctrl+D）、撤销/重做、外部改名等一切对象变更路径；
+ * 项目不再引用且内容已就绪的条目释放 object URL 与 GPU 资源（几何/材质）。
  */
 interface CacheEntry {
   hash: string;
   url: string;
   gltf: GLTF | null;
   promise: Promise<GLTF>;
-  /** 引用该内容的模型对象 id 集合 */
-  refs: Set<string>;
 }
 
 export interface CachedModel {
@@ -42,6 +42,8 @@ function disposeObject(object: THREE.Object3D): void {
 export class AssetCache {
   private entries = new Map<string, CacheEntry>();
   private readyListeners = new Map<string, Set<(gltf: GLTF) => void>>();
+  /** 正在等待解析结果的消费者计数：并发导入复用同一条目时，不得释放仍被等待的内容 */
+  private waiters = new Map<string, number>();
 
   get(hash: string): CachedModel | null {
     const entry = this.entries.get(hash);
@@ -59,16 +61,29 @@ export class AssetCache {
   /** 获取（或首次加载）模型内容；解析失败时回滚缓存并抛出错误 */
   acquire(hash: string, file: File): Promise<GLTF> {
     const existing = this.entries.get(hash);
-    if (existing) return existing.promise;
-    return this.createEntry(hash, URL.createObjectURL(file));
+    const promise = existing ? existing.promise : this.createEntry(hash, URL.createObjectURL(file));
+    this.trackWaiter(hash, promise);
+    return promise;
   }
 
   /** 从持久化字节重建内容（项目重开/重做后缓存已释放的场景） */
   seed(hash: string, bytes: ArrayBuffer | Uint8Array<ArrayBuffer>): Promise<GLTF> {
     const existing = this.entries.get(hash);
-    if (existing) return existing.promise;
-    const blob = new Blob([bytes], { type: 'model/gltf-binary' });
-    return this.createEntry(hash, URL.createObjectURL(blob));
+    const promise = existing
+      ? existing.promise
+      : this.createEntry(hash, URL.createObjectURL(new Blob([bytes], { type: 'model/gltf-binary' })));
+    this.trackWaiter(hash, promise);
+    return promise;
+  }
+
+  private trackWaiter(hash: string, promise: Promise<GLTF>): void {
+    this.waiters.set(hash, (this.waiters.get(hash) ?? 0) + 1);
+    const decrement = (): void => {
+      const next = (this.waiters.get(hash) ?? 1) - 1;
+      if (next <= 0) this.waiters.delete(hash);
+      else this.waiters.set(hash, next);
+    };
+    promise.then(decrement, decrement);
   }
 
   private createEntry(hash: string, url: string): Promise<GLTF> {
@@ -79,7 +94,7 @@ export class AssetCache {
       this.fireReady(hash, gltf);
       return gltf;
     });
-    this.entries.set(hash, { hash, url, gltf: null, promise, refs: new Set() });
+    this.entries.set(hash, { hash, url, gltf: null, promise });
     promise.catch(() => {
       this.entries.delete(hash);
       URL.revokeObjectURL(url);
@@ -87,47 +102,42 @@ export class AssetCache {
     return promise;
   }
 
-  addRef(hash: string, objectId: string): void {
-    this.entries.get(hash)?.refs.add(objectId);
-  }
-
-  removeRef(objectId: string): void {
-    for (const [hash, entry] of this.entries) {
-      if (entry.refs.delete(objectId) && entry.refs.size === 0) {
-        this.entries.delete(hash);
-        this.readyListeners.delete(hash);
-        URL.revokeObjectURL(entry.url);
-        if (entry.gltf) disposeObject(entry.gltf.scene);
-      }
-    }
-  }
-
-  /** 项目变更后清理：对象已不存在（删除/撤销删除/撤销导入）的引用全部释放 */
-  sweep(project: Project): void {
-    const alive = new Set(project.objects.map((o) => o.id));
-    const dead: string[] = [];
-    for (const entry of this.entries) {
-      for (const ref of entry[1].refs) {
-        if (!alive.has(ref)) dead.push(ref);
-      }
-    }
-    for (const objectId of dead) this.removeRef(objectId);
-    // 无引用的孤立条目（如撤销导入后重做、经 ensureCacheSeeded 恢复的资源
-    // 未登记 refs）：项目中也无对象引用时释放，避免泄漏
+  /**
+   * 项目变更后清理：引用集从 Project 全量 model→asset 关系重建，
+   * 与 UI 路径（复制/删除/撤销/重做/改名）无关。
+   * project 为 null（关闭/切换项目）时释放全部内容；
+   * 解析中的条目（gltf 未就绪）保留——可能是进行中的导入，
+   * 解析完成后若无项目引用，下次 sweep 释放。
+   */
+  sweep(project: Project | null): void {
     const referencedHashes = new Set<string>();
-    for (const object of project.objects) {
-      if (!object.assetId) continue;
-      const asset = project.assets.find((a) => a.id === object.assetId);
-      if (asset) referencedHashes.add(asset.hash);
-    }
-    for (const [hash, entry] of this.entries) {
-      if (entry.refs.size === 0 && !referencedHashes.has(hash)) {
-        this.entries.delete(hash);
-        this.readyListeners.delete(hash);
-        URL.revokeObjectURL(entry.url);
-        if (entry.gltf) disposeObject(entry.gltf.scene);
+    if (project) {
+      for (const object of project.objects) {
+        if (!object.assetId) continue;
+        const asset = project.assets.find((a) => a.id === object.assetId);
+        if (asset) referencedHashes.add(asset.hash);
       }
     }
+    for (const [hash, entry] of [...this.entries]) {
+      const keepLoading = project !== null && !entry.gltf;
+      if (!referencedHashes.has(hash) && !keepLoading) this.release(hash);
+    }
+  }
+
+  /** 主动丢弃条目（导入会话切换的取消路径）：无条件释放 */
+  discard(hash: string): void {
+    this.release(hash);
+  }
+
+  private release(hash: string): void {
+    const entry = this.entries.get(hash);
+    if (!entry) return;
+    // 仍有消费者等待解析结果（旧会话取消导入时新会话可能已复用同一条目）→ 推迟释放，下次清扫执行
+    if ((this.waiters.get(hash) ?? 0) > 0) return;
+    this.entries.delete(hash);
+    this.readyListeners.delete(hash);
+    URL.revokeObjectURL(entry.url);
+    if (entry.gltf) disposeObject(entry.gltf.scene);
   }
 
   /** 内容就绪回调；已就绪立即触发。返回取消函数 */
@@ -149,12 +159,7 @@ export class AssetCache {
   }
 
   dispose(): void {
-    for (const entry of this.entries.values()) {
-      URL.revokeObjectURL(entry.url);
-      if (entry.gltf) disposeObject(entry.gltf.scene);
-    }
-    this.entries.clear();
-    this.readyListeners.clear();
+    for (const hash of [...this.entries.keys()]) this.release(hash);
   }
 
   private fireReady(hash: string, gltf: GLTF): void {

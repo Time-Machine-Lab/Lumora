@@ -64,11 +64,11 @@ const definition = definePlugin({
             async execute(_args, commandContext) {
               const project = commandContext.getProject();
               if (!project) return { ok: false, error: new Error('没有打开的项目可导出') };
-              const data = JSON.stringify(
-                { uri: project.uri, name: project.name, objects: project.objects, assets: project.assets },
-                null,
-                2,
-              );
+              // 全量项目 JSON（场景/设置/活动场景/资源 base64 载荷均在列）：
+              // 宿主「重开上次导出」按钮据此在全新运行时中恢复项目；
+              // localStorage 仅用于示例宿主的跨运行时重开演示
+              const data = JSON.stringify(project, null, 2);
+              localStorage.setItem('lumora.demo.last-export', data);
               const blob = new Blob([data], { type: 'application/json' });
               const url = URL.createObjectURL(blob);
               const anchor = document.createElement('a');

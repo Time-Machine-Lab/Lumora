@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
-import type { Download } from '@playwright/test';
+import type { Download, Page } from '@playwright/test';
+import { decodePng, pngPixel } from './helpers/png';
 
 /** 生成最小合法 GLB（仅 JSON chunk，无缓冲）：{asset, scenes, nodes} */
 function buildGlb(json: Record<string, unknown>): Buffer {
@@ -149,6 +150,16 @@ test('GLB 导入：解析挂载成功，同内容重复导入去重（FR-003）'
   await page.getByTestId('toolbar-model-file-input').setInputFiles(file);
   await expect(page.getByTestId('lumora-toasts')).toContainText('资源已复用');
   await expect(page.locator('.lumora-tree-row', { hasText: 'hero' })).toHaveCount(2);
+
+  // P0-1：导出验证两个模型统一引用同一资源（去重规范化，无视第二次导入携带的 assetId）
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByTestId('toolbar-com.lumora.mock.toolbar.export').click();
+  const exported = JSON.parse(await readDownload(await downloadPromise));
+  const models = exported.objects.filter((o: { type: string }) => o.type === 'model');
+  expect(models).toHaveLength(2);
+  expect(exported.assets).toHaveLength(1);
+  expect(models[0].assetId).toBe(exported.assets[0].id);
+  expect(models[1].assetId).toBe(exported.assets[0].id);
 });
 
 test('GLB 导入解析失败：提示错误，不产生对象', async ({ page }) => {
@@ -315,4 +326,229 @@ test.describe('G-10 验收：窄屏布局', () => {
     await page.getByTestId('inspector-name').press('Enter');
     await expect(page.getByTestId('tree-row-sample-group')).toContainText('窄屏示例组');
   });
+});
+
+test('P0 真实流程：导入 → 变换 → 导出 → 全新运行时重开（数据一致）', async ({ page }) => {
+  await page.getByTestId('toolbar-model-file-input').setInputFiles(FIXTURE_GLB);
+  await expect(page.getByTestId('lumora-toasts')).toContainText('已导入模型');
+  const row = page.locator('.lumora-tree-row', { hasText: 'nested-mesh' });
+  await expect(row).toBeVisible();
+
+  // 变换：X 位置设为 2.25
+  await row.click();
+  await page.getByTestId('inspector-axis-0').fill('2.25');
+  await page.getByTestId('inspector-axis-0').press('Enter');
+  await expect(page.getByTestId('inspector-axis-0')).toHaveValue('2.25');
+
+  // 导出：全量项目 JSON（场景/设置/资源载荷）写入 localStorage 供宿主重开
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByTestId('toolbar-com.lumora.mock.toolbar.export').click();
+  const exported = JSON.parse(await readDownload(await downloadPromise));
+  expect(exported.scenes.length).toBeGreaterThanOrEqual(1);
+  expect(exported.assets).toHaveLength(1);
+  expect(await page.evaluate(() => localStorage.getItem('lumora.demo.last-export'))).not.toBeNull();
+
+  // 全新运行时重开：reload 清空当前 Studio 会话，宿主按钮以导出 JSON 重建项目
+  await page.reload();
+  await expect(page.getByTestId('lumora-studio')).toBeVisible();
+  await page.getByTestId('reopen-last-export').click();
+  const reopenedRow = page.locator('.lumora-tree-row', { hasText: 'nested-mesh' });
+  await expect(reopenedRow).toBeVisible();
+
+  // 数据一致：对象与变换恢复；视图状态复位为导演视图
+  await reopenedRow.click();
+  await expect(page.getByTestId('inspector-axis-0')).toHaveValue('2.25');
+  await expect(page.getByTestId('view-mode-select')).toHaveValue('director');
+
+  // 模型内容从持久化载荷重建：再次导出载荷仍在（真实几何字节未被丢弃）
+  const reExportPromise = page.waitForEvent('download');
+  await page.getByTestId('toolbar-com.lumora.mock.toolbar.export').click();
+  const reopened = JSON.parse(await readDownload(await reExportPromise));
+  expect(reopened.assets).toHaveLength(1);
+  expect(reopened.assets[0].payload.length).toBeGreaterThan(1000);
+});
+
+test('P0-2 复制后删除原件：副本保留、资源不释放、导出仍含资源', async ({ page }) => {
+  await page.getByTestId('toolbar-model-file-input').setInputFiles(FIXTURE_GLB);
+  await expect(page.getByTestId('lumora-toasts')).toContainText('已导入模型');
+  const row = page.locator('.lumora-tree-row', { hasText: 'nested-mesh' });
+  await expect(row).toHaveCount(1);
+
+  // Ctrl+D 复制：两行（选择在副本）
+  await row.click();
+  await page.keyboard.press('Control+d');
+  await expect(page.locator('.lumora-tree-row', { hasText: 'nested-mesh' })).toHaveCount(2);
+
+  // 删除原件（第一行）→ 副本仍在
+  await page.locator('.lumora-tree-row', { hasText: 'nested-mesh' }).first().click();
+  await page.keyboard.press('Delete');
+  await expect(page.locator('.lumora-tree-row', { hasText: 'nested-mesh' })).toHaveCount(1);
+
+  // 导出：一个模型对象 + 资源保留（缓存引用以项目关系为准，未被误释放）
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByTestId('toolbar-com.lumora.mock.toolbar.export').click();
+  const exported = JSON.parse(await readDownload(await downloadPromise));
+  const models = exported.objects.filter((o: { type: string }) => o.type === 'model');
+  expect(models).toHaveLength(1);
+  expect(exported.assets).toHaveLength(1);
+  expect(models[0].assetId).toBe(exported.assets[0].id);
+});
+
+/** 立方体移到原点并切换到缩放 Gizmo（手柄居中于 canvas，正上方约 100px） */
+async function centerCubeAndScale(page: Page): Promise<void> {
+  await page.getByTestId('tree-row-sample-cube').click();
+  for (const axis of ['0', '1', '2']) {
+    await page.getByTestId(`inspector-axis-${axis}`).fill('0');
+    await page.getByTestId(`inspector-axis-${axis}`).press('Enter');
+  }
+  await page.waitForTimeout(300); // 等 canvas 重排 gizmo 到新位置
+  await page.getByTestId('gizmo-mode-scale').click();
+  await page.waitForTimeout(200);
+}
+
+async function startDrag(page: Page): Promise<void> {
+  const canvas = page.locator('.lumora-viewport canvas');
+  const box = (await canvas.boundingBox())!;
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  await page.mouse.move(cx, cy - 100);
+  await page.mouse.down();
+  await page.mouse.move(cx, cy - 104);
+}
+
+/** 撤销直到按钮禁用（轴输入产生的历史步数不定：目标值可能等于当前值而无提交） */
+async function undoUntilDisabled(page: Page): Promise<void> {
+  for (let i = 0; i < 5; i += 1) {
+    if (!(await page.getByTestId('undo').isEnabled())) break;
+    await page.getByTestId('undo').click();
+  }
+  await expect(page.getByTestId('undo')).toBeDisabled();
+}
+
+test('P0-6 Gizmo 中断：Escape 回滚变换、不产生历史、拖动态清理', async ({ page }) => {
+  await centerCubeAndScale(page);
+  await startDrag(page);
+  // 拖动中按 Escape：节点回滚到拖动前缩放
+  await page.keyboard.press('Escape');
+  await page.mouse.up();
+  // Escape 同时清空选择 → 重新选中立方体验证数据未变
+  await page.getByTestId('tree-row-sample-cube').click();
+  await expect(page.getByTestId('inspector-scale-0')).toHaveValue('1');
+  // 中断的拖动不产生历史：撤销只回退轴输入，耗尽后按钮禁用
+  await undoUntilDisabled(page);
+  await expect(page.getByTestId('inspector-scale-0')).toHaveValue('1');
+});
+
+test('P0-6 Gizmo 中断：window blur 回滚并清理拖动态', async ({ page }) => {
+  await centerCubeAndScale(page);
+  await startDrag(page);
+  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+  await page.mouse.up();
+  await page.getByTestId('tree-row-sample-cube').click();
+  await expect(page.getByTestId('inspector-scale-0')).toHaveValue('1');
+  await undoUntilDisabled(page);
+  await expect(page.getByTestId('inspector-scale-0')).toHaveValue('1');
+});
+
+test('P0-6 Gizmo 中断：pointercancel 回滚并清理拖动态', async ({ page }) => {
+  await centerCubeAndScale(page);
+  await startDrag(page);
+  await page.evaluate(() => window.dispatchEvent(new PointerEvent('pointercancel')));
+  await page.mouse.up();
+  await page.getByTestId('tree-row-sample-cube').click();
+  await expect(page.getByTestId('inspector-scale-0')).toHaveValue('1');
+  await undoUntilDisabled(page);
+  await expect(page.getByTestId('inspector-scale-0')).toHaveValue('1');
+});
+
+test('P0-6 Gizmo 中断：Delete 删除对象时拖动态清理、无残留状态', async ({ page }) => {
+  await centerCubeAndScale(page);
+  await startDrag(page);
+  await page.keyboard.press('Delete');
+  await page.mouse.up();
+  // 对象已删除（一步历史）
+  await expect(page.getByTestId('tree-row-sample-cube')).not.toBeVisible();
+  await expect(page.getByTestId('undo')).toBeEnabled();
+  // 拖动态已清理：选择其他对象可正常编辑
+  await page.getByTestId('tree-row-sample-ground').click();
+  await expect(page.getByTestId('inspector-name')).toHaveValue('地面');
+});
+
+test('P0-4 多场景相机/选择隔离：机位按场景过滤，切场景回退导演视图', async ({ page }) => {
+  // 导出示例项目（写入 localStorage），注入第二个场景与 B 相机
+  const seedDownload = page.waitForEvent('download');
+  await page.getByTestId('toolbar-com.lumora.mock.toolbar.export').click();
+  await readDownload(await seedDownload);
+  await page.evaluate(() => {
+    const project = JSON.parse(localStorage.getItem('lumora.demo.last-export')!);
+    const cam = project.objects.find((o: { id: string }) => o.id === 'sample-camera');
+    const camB = { ...cam, id: 'cam-b', name: 'B 相机' };
+    project.objects.push(camB);
+    project.scenes.push({ id: 'scene-b', name: '场景 B', rootObjectIds: ['cam-b'], activeCameraId: 'cam-b' });
+    localStorage.setItem('lumora.demo.last-export', JSON.stringify(project));
+  });
+  await page.reload();
+  await page.getByTestId('reopen-last-export').click();
+  await expect(page.getByTestId('tree-row-sample-group')).toBeVisible();
+
+  // 场景 A：机位选项只有 sample-camera
+  const modeSelect = page.getByTestId('view-mode-select');
+  await expect(modeSelect.locator('option')).toHaveText(['导演视图', '相机 · 主摄像机']);
+
+  // 切到场景 B：树只含 B 相机，机位选项只有 cam-b
+  await page.getByTestId('scene-switcher').selectOption('scene-b');
+  await expect(page.getByTestId('tree-row-cam-b')).toBeVisible();
+  await expect(modeSelect.locator('option')).toHaveText(['导演视图', '相机 · B 相机']);
+  await expect(page.locator('.lumora-tree-row--selected')).toHaveCount(0);
+
+  // 场景 B 中查看 B 相机：辅助线出现
+  await modeSelect.selectOption('cam-b');
+  await expect(page.getByTestId('lumora-guides')).toBeVisible();
+
+  // 切回场景 A：B 相机不属于 A → 视图自动回退导演视图
+  await page.getByTestId('scene-switcher').selectOption('scene-1');
+  await expect(page.getByTestId('tree-row-cam-b')).not.toBeVisible();
+  await expect(page.getByTestId('lumora-guides')).not.toBeVisible();
+  await expect(modeSelect).toHaveValue('director');
+
+  // 选择随场景过滤：A 中无跨场景选择残留
+  await page.getByTestId('tree-row-sample-camera').click();
+  await expect(page.locator('.lumora-tree-row--selected')).toHaveCount(1);
+  await page.getByTestId('scene-switcher').selectOption('scene-b');
+  await expect(page.locator('.lumora-tree-row--selected')).toHaveCount(0);
+});
+
+test.describe('P0-8 letterbox 黑边像素验收', () => {
+  for (const dpr of [1, 2]) {
+    test.describe(`DPR=${dpr}`, () => {
+      test.use({ deviceScaleFactor: dpr });
+
+      test('相机视图黑边纯黑、画幅内渲染场景', async ({ page }) => {
+        await page.getByTestId('view-mode-select').selectOption('sample-camera');
+        await expect(page.getByTestId('lumora-guides')).toBeVisible();
+        await page.waitForTimeout(400);
+        await hideOverlays(page, '.lumora-viewport-toolbar');
+        await hideOverlays(page, '.lumora-guides');
+        const shot = await page.locator('.lumora-viewport canvas').screenshot();
+        await showOverlays(page, '.lumora-viewport-toolbar');
+        await showOverlays(page, '.lumora-guides');
+
+        const png = decodePng(shot);
+        const midX = Math.floor(png.width / 2);
+        const midY = Math.floor(png.height / 2);
+        const isBlack = (p: [number, number, number, number]) => p[0] === 0 && p[1] === 0 && p[2] === 0;
+        const edges = [
+          pngPixel(png, 2, midY), // 左
+          pngPixel(png, png.width - 3, midY), // 右
+          pngPixel(png, midX, 2), // 上
+          pngPixel(png, midX, png.height - 3), // 下
+        ];
+        // 16:9 画幅在容器内上下或左右留边：对应边缘对必须为纯黑
+        expect(edges.filter(isBlack).length).toBeGreaterThanOrEqual(2);
+        // 画幅内渲染非黑（场景背景 #14161f 或对象）
+        const center = pngPixel(png, midX, midY);
+        expect(center[0] + center[1] + center[2]).toBeGreaterThan(10);
+      });
+    });
+  }
 });

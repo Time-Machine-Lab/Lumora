@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   createCameraObject,
   createGroupObject,
@@ -47,8 +47,17 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTargetId, setDropTargetId] = useState<string | null>(null);
+  /** 单一 roving focus：树内任意时刻只有一个 tab 停靠点（最后聚焦/选中的行） */
+  const [focusedId, setFocusedId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const rowRefs = useRef<Record<string, HTMLDivElement | null>>({});
+
+  // 外部选择变化（视口拾取等）时，停靠点跟随选中行
+  useEffect(() => {
+    if (selection.length > 0 && (focusedId === null || !selection.includes(focusedId))) {
+      setFocusedId(selection[0]!);
+    }
+  }, [selection, focusedId]);
 
   if (!project) return null;
   const scene = project.scenes.find((s) => s.id === project.activeSceneId) ?? project.scenes[0];
@@ -71,7 +80,10 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
   };
   for (const root of roots) collectVisible(root);
 
-  const focusRow = (id: string) => rowRefs.current[id]?.focus();
+  const focusRow = (id: string) => {
+    setFocusedId(id);
+    rowRefs.current[id]?.focus();
+  };
 
   const handleRowKeyDown = (object: SceneObjectData, event: React.KeyboardEvent) => {
     const index = flatRows.indexOf(object.id);
@@ -121,9 +133,9 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
     }
   };
 
-  // 行内无选择时树首行也作为 tab 停靠点，键盘用户可进入
-  const rowTabIndex = (id: string) =>
-    selection.includes(id) ? 0 : selection.length === 0 && flatRows[0] === id ? 0 : -1;
+  // 单一 tab 停靠点：最后聚焦的行（未聚焦时回退选中行/树首行，键盘用户可进入）
+  const activeRowId = focusedId ?? selection[0] ?? flatRows[0] ?? null;
+  const rowTabIndex = (id: string) => (activeRowId === id ? 0 : -1);
 
   const handleDrop = (targetId: string) => {
     setDropTargetId(null);
@@ -210,7 +222,7 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
           onChange={(e) => void handleImportFile(e.target.files?.[0])}
         />
       </div>
-      <div className="lumora-tree__list" role="tree">
+      <div className="lumora-tree__list" role="tree" aria-multiselectable="true">
         {roots.length === 0 && (
           <div className="lumora-tree__empty" data-testid="tree-empty">
             场景为空 —— 点击「＋ 添加」创建对象
@@ -237,6 +249,7 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
             rowRefs={rowRefs}
             getRowTabIndex={rowTabIndex}
             onRowKeyDown={handleRowKeyDown}
+            setFocusedId={setFocusedId}
           />
         ))}
       </div>
@@ -263,6 +276,7 @@ function TreeNode({
   rowRefs,
   getRowTabIndex,
   onRowKeyDown,
+  setFocusedId,
 }: {
   editor: SceneEditor;
   project: Project;
@@ -282,6 +296,7 @@ function TreeNode({
   rowRefs: React.RefObject<Record<string, HTMLDivElement | null>>;
   getRowTabIndex: (id: string) => number;
   onRowKeyDown: (object: SceneObjectData, event: React.KeyboardEvent) => void;
+  setFocusedId: (id: string | null) => void;
 }) {
   const children = project.objects.filter((o) => o.parentId === object.id);
   const isExpanded = expanded[object.id] ?? true;
@@ -291,6 +306,7 @@ function TreeNode({
   const isDragOver = dropTargetId === object.id;
 
   const select = (event: React.MouseEvent) => {
+    setFocusedId(object.id);
     if (event.ctrlKey || event.metaKey) {
       const next = new Set(editor.getSelection());
       if (next.has(object.id)) next.delete(object.id);
@@ -313,6 +329,7 @@ function TreeNode({
     <div className="lumora-tree__node-wrap">
       <div
         role="treeitem"
+        aria-level={depth + 1}
         aria-selected={isSelected}
         aria-expanded={children.length > 0 ? isExpanded : undefined}
         data-testid={`tree-row-${object.id}`}
@@ -433,30 +450,34 @@ function TreeNode({
           </button>
         </span>
       </div>
-      {isExpanded &&
-        children.map((child) => (
-          <TreeNode
-            key={child.id}
-            editor={editor}
-            project={project}
-            object={child}
-            depth={depth + 1}
-            selection={selection}
-            expanded={expanded}
-            toggleExpanded={toggleExpanded}
-            renamingId={renamingId}
-            setRenamingId={setRenamingId}
-            deleteConfirmId={deleteConfirmId}
-            setDeleteConfirmId={setDeleteConfirmId}
-            setDragId={setDragId}
-            dropTargetId={dropTargetId}
-            setDropTargetId={setDropTargetId}
-            handleDrop={handleDrop}
-            rowRefs={rowRefs}
-            getRowTabIndex={getRowTabIndex}
-            onRowKeyDown={onRowKeyDown}
-          />
-        ))}
+      {isExpanded && (
+        <div role="group">
+          {children.map((child) => (
+            <TreeNode
+              key={child.id}
+              editor={editor}
+              project={project}
+              object={child}
+              depth={depth + 1}
+              selection={selection}
+              expanded={expanded}
+              toggleExpanded={toggleExpanded}
+              renamingId={renamingId}
+              setRenamingId={setRenamingId}
+              deleteConfirmId={deleteConfirmId}
+              setDeleteConfirmId={setDeleteConfirmId}
+              setDragId={setDragId}
+              dropTargetId={dropTargetId}
+              setDropTargetId={setDropTargetId}
+              handleDrop={handleDrop}
+              rowRefs={rowRefs}
+              getRowTabIndex={getRowTabIndex}
+              onRowKeyDown={onRowKeyDown}
+              setFocusedId={setFocusedId}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
