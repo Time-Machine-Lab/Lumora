@@ -184,15 +184,22 @@ class TrackedEventBridge implements PluginEventBus {
  * 另有共享完成点（active 发布或回滚终态发布后 settle），register/enable/activate
  * 遇到 activating 时加入同一 promise，不提前返回快照。贡献注册句柄始终绑定
  * 创建它的尝试：registry 在句柄返回前同步发出事件，返回后复核 generation/
- * attempt identity，过期句柄立即释放并纳入该尝试的完成，绝不并入当前代 owned。
- * 等待收敛：owner 与所有 joiner 等待在途尝试/生命周期后重新检查状态，循环加入
- * 终态事件内新建的激活，直到本次 register/enable 意图达到稳定终态。加载身份
- * 事件前捕获：register 在调用可能同步发布 loading 事件的逻辑前捕获代际，
- * loadDefinition 返回其实际创建的加载操作身份，恢复后只按该身份校验。激活
- * 取消、失败回滚与停用收敛为同一生命周期操作，disable/deactivate/dispose
+ * attempt identity，过期句柄归入该尝试的 pending 集合 —— 其 disposal 由尝试
+ * completion 驱动、由生命周期显式等待（非 fire-and-forget），register()/
+ * disable()/dispose() 不会在贡献项清理完成前返回；绝不并入当前代 owned。
+ * 等待收敛：owner 与所有 joiner 等待在途尝试/生命周期/当前代加载后重新检查
+ * 状态，循环加入终态事件内新建的激活与加载，直到本次 register/enable/activate
+ * 意图达到稳定终态；active 发布后重新复核并加入事件内新建的生命周期；直接
+ * activate 遇 deactivating 时等待收敛后重新驱动激活意图，不 silent success。
+ * 加载身份事件前捕获：register 在调用可能同步发布 loading 事件的逻辑前捕获
+ * 代际，loadDefinition 返回其实际创建的加载操作身份，恢复后只按该身份校验。
+ * 激活取消、失败回滚与停用收敛为同一生命周期操作，disable/deactivate/dispose
  * 等待同一操作；激活失败先发布并认领失败生命周期、再执行回滚，回滚清理事件
  * 内的 disable 合并进同一操作且 disabled 优先于旧失败终态；终态事件发布前旧
  * 操作完整 detach，事件内重入的新激活失败进入独立生命周期并完成自身回滚。
+ * 销毁 publish-first：dispose 先登记销毁状态与共享完成点再启动真实清理，所有
+ * 并发/二次 dispose 等待同一清理；销毁开始后 register/enable/activate 明确
+ * 拒绝，绝不创建孤立激活尝试。
  */
 export class PluginHost {
   readonly hostVersion: string;
@@ -205,6 +212,8 @@ export class PluginHost {
   private readonly onError: (error: unknown) => void;
   private project: Project | null = null;
   private disposedFlag = false;
+  /** 销毁的真实清理完成点：publish-first 登记，所有并发/二次 dispose 等待同一清理 */
+  private hostDispose: Promise<void> | null = null;
   /** 缺 id 非法 Manifest 的内部记录键自增序号（展示 id 仍为 '<unknown>'） */
   private unknownSequence = 0;
 
@@ -301,6 +310,7 @@ export class PluginHost {
   }
 
   async activate(id: string): Promise<void> {
+    if (this.disposedFlag) throw new Error('插件宿主已销毁');
     const record = this.requireRecord(id);
     await this.activateRecord(record);
   }
@@ -324,6 +334,8 @@ export class PluginHost {
   }
 
   async enable(instanceId: string): Promise<void> {
+    // 销毁开始后明确拒绝新的启用意图：不得在销毁清理期间创建孤立激活尝试
+    if (this.disposedFlag) throw new Error('插件宿主已销毁');
     const record = this.requireRecord(instanceId);
     if (!record.ready) {
       throw new Error(`插件 "${instanceId}" 不可启用（${record.reason ?? '未通过校验'}）`);
@@ -336,11 +348,15 @@ export class PluginHost {
       return;
     }
     if (state === 'deactivating') {
-      // 停用进行中：等待同一操作完整收敛 —— 循环加入终态事件内新建的激活/生命周期，
-      // 直到本次 enable 意图不再处于在途状态（不得提前返回 deactivating 快照）
-      while (record.state === 'deactivating') {
+      // 停用进行中：等待同一操作完整收敛 —— 循环加入终态事件内新建的激活/加载/
+      // 生命周期，直到本次 enable 意图不再处于在途状态（不得提前返回
+      // deactivating/loading 快照；awaitActivationOutcome 已纳入当前代 loading）
+      for (;;) {
         await this.awaitActivationOutcome(record);
         if (this.disposedFlag) return;
+        const inFlight = record.state;
+        if (inFlight === 'deactivating' || inFlight === 'loading') continue;
+        break;
       }
       const after = record.state;
       if (after === 'active') return;
@@ -353,18 +369,43 @@ export class PluginHost {
     }
     if (!record.definition) {
       // enabled:false 注册的插件首次启用时才加载入口（loadDefinition 按代共享，只加载一次）。
-      // 记录进入时的代际：加载期间若被 disable（代际推进），晚到的加载结果不得改写停用状态
+      // 记录进入时的代际：加载期间若被 disable（代际推进），晚到的加载结果不得改写停用状态。
+      // 但若停用收敛的终态事件内已启动当前代新加载（disabled 事件内重入 enable，同一激活
+      // 意图的延续），则共享该加载并收敛到稳定终态 —— 不得仅因本调用捕获的代际过期而
+      // 提前返回 loading 快照（统一收敛状态机纳入当前代 loading operation）
       const generation = record.generation;
       const { promise: loadingPromise } = this.loadDefinition(record);
       await loadingPromise;
-      if (record.state === 'failed' || !record.definition || record.generation !== generation) return;
+      if (this.disposedFlag) return;
+      if (record.generation !== generation) {
+        const current = record.loading;
+        if (!current || current.generation !== record.generation) return;
+      }
+      await this.awaitActivationOutcome(record);
+      if (this.disposedFlag || record.state === 'failed') return;
+      if (!record.definition) return;
     }
     await this.activateRecord(record);
   }
 
   async dispose(): Promise<void> {
-    if (this.disposedFlag) return;
+    if (this.disposedFlag) {
+      // 二次/并发 dispose：等待首轮真实清理的同一共享完成点，不得独立提前 resolve
+      return this.hostDispose ?? Promise.resolve();
+    }
+    // publish-first：先登记销毁状态与共享完成点（任何真实清理 await 之前），
+    // 再启动清理 —— 销毁窗口内并发/重入的 dispose 全部等待同一真实清理
     this.disposedFlag = true;
+    const deferred = createDeferred<void>();
+    this.hostDispose = deferred.promise;
+    void this.performHostDispose().then(
+      () => deferred.resolve(),
+      (error) => deferred.reject(error),
+    );
+    return deferred.promise;
+  }
+
+  private async performHostDispose(): Promise<void> {
     for (const record of this.plugins.values()) {
       await this.deactivateRecord(record, 'inactive');
     }
@@ -391,7 +432,9 @@ export class PluginHost {
    * 等待在途激活的完整流程结果：active 发布或失败/取消回滚的终态发布后返回。
    * register/enable/activate 遇到 activating 时加入同一完成，不提前返回快照。
    * 循环收敛：每次等待后重新检查状态 —— 终态事件内重入启动的新激活/新生命周期
-   * 继续加入，直到本次调用意图达到稳定终态（无在途尝试、无在途生命周期）。
+   * 继续加入，直到本次调用意图达到稳定终态（无在途尝试、无在途生命周期、
+   * 无当前代在途加载）。loading 只在代际相符时等待：异代加载是已被取消的
+   * 废弃操作，其身份不复用、结果整体丢弃，等待它不构成任何调用意图。
    */
   private async awaitActivationOutcome(record: PluginRecord): Promise<void> {
     for (;;) {
@@ -410,6 +453,15 @@ export class PluginHost {
           await lifecycle.promise;
         } catch {
           // 生命周期承诺以成功收敛；防御性兜底
+        }
+        continue;
+      }
+      const loading = record.loading;
+      if (loading && loading.generation === record.generation) {
+        try {
+          await loading.deferred.promise;
+        } catch {
+          // 加载承诺不拒绝（加载失败走 fail 状态路径）；防御性兜底
         }
         continue;
       }
@@ -565,6 +617,9 @@ export class PluginHost {
    * 过期尝试只能清理自身资源，不得修改新一代的 generation/pending/终态。
    */
   private async activateRecord(record: PluginRecord): Promise<void> {
+    // 销毁开始后不得创建孤立激活尝试（register/enable/activate 入口已拒绝；此处是
+    // 内部路径的同一防线 —— 尝试必须能被生命周期收敛，销毁不发布新生命周期）
+    if (this.disposedFlag) throw new Error('插件宿主已销毁');
     if (!record.ready || !record.definition) {
       throw new Error(`插件 "${record.id}" 无法激活（${record.reason ?? '定义缺失'}）`);
     }
@@ -575,7 +630,26 @@ export class PluginHost {
       await this.awaitActivationOutcome(record);
       return;
     }
-    if (state === 'deactivating') return;
+    if (state === 'deactivating') {
+      // 停用/回滚进行中：等待同一操作完整收敛（含终态事件内新建的激活/加载），
+      // 然后落入下方公共路径重新驱动本调用的激活意图 —— 不得 silent success，
+      // 也不得放弃意图（慢 deactivate 期间直接 activate 必须最终激活）
+      for (;;) {
+        await this.awaitActivationOutcome(record);
+        if (this.disposedFlag) throw new Error('插件宿主已销毁');
+        const inFlight = record.state;
+        if (inFlight === 'deactivating' || inFlight === 'loading') continue;
+        break;
+      }
+      const after = record.state;
+      if (after === 'active') return;
+      if (after === 'activating') {
+        // 收敛期间终态事件内启动的新激活仍在途：加入同一完整流程
+        await this.awaitActivationOutcome(record);
+        return;
+      }
+      if (after !== 'inactive' && after !== 'disabled' && after !== 'failed') return;
+    }
 
     // 本尝试的唯一完成点（身份不变）：钩子 settle、晚到返回值清理与暂存清理全部收敛于此；
     // workflow 为完整激活流程的完成点：active 发布或失败/取消回滚终态发布后 settle，
@@ -657,6 +731,12 @@ export class PluginHost {
     this.emitState(record, 'active');
     completion.resolve();
     attempt.workflow.resolve();
+    // active 事件内启动的停用/销毁已接管（状态离开 active / 宿主销毁）：
+    // 加入同一生命周期收敛 —— 事件内慢停用（deactivate 钩子挂起）未完成前，
+    // 本激活调用不得提前返回在途 deactivating 快照
+    if (this.disposedFlag || record.state !== 'active') {
+      await this.awaitActivationOutcome(record);
+    }
   }
 
   /**
@@ -862,11 +942,15 @@ export class PluginHost {
         }
         const contributed = this.contributions.contribute(record.id, bundle);
         // registry 在句柄返回前同步发出 contribution:changed：事件内停用会推进代际
-        // 并摘除本尝试 —— 返回后必须复核身份，过期句柄立即释放（同步清理，释放失败
-        // 不掩盖停用结果），绝不并入当前代 owned（停用流程只清理本尝试的 pending，
-        // 并入即遗留停用后仍可见的资源）
+        // 并摘除本尝试 —— 返回后必须复核身份。过期句柄归入创建它的尝试的 pending
+        // 集合：该集合的 disposal 由尝试 completion 驱动、由生命周期显式等待
+        // （非 fire-and-forget），register()/disable()/dispose() 不会在多项贡献项
+        // 清理完成前返回；绝不并入当前代 owned（停用流程只清理本尝试的 pending，
+        // 并入即遗留停用后仍可见的资源）。复核窗口内 completion 必然未 settle
+        // （唯一 settle 点都在本回调返回后的调用栈中），pending 的 dispose 必然
+        // 未启动，加入后必被显式等待
         if (this.disposedFlag || record.generation !== attempt.generation) {
-          void Promise.resolve(contributed.dispose()).catch(() => undefined);
+          attempt.pending.add(contributed);
           return contributed;
         }
         // 激活完成后的动态贡献并入当前 owned（record.activation 已清空），停用时一并清理
