@@ -1,18 +1,46 @@
+import { useRef } from 'react';
 import { createSampleProject } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import type { StudioRuntime } from '../runtime/studio-runtime';
+import type { EditorState } from '../hooks/use-scene-editor';
 import { useEventRefresh } from '../hooks/use-event-refresh';
+import type { AssetCache } from './editor/asset-cache';
+import { importModelFile } from './editor/model-import';
+import { showToast } from './editor/toasts';
 
 interface ToolbarProps {
   runtime: StudioRuntime;
   project: Project | null;
+  editorState: EditorState;
+  cache: AssetCache;
   onTogglePlugins: () => void;
   onTogglePalette: () => void;
 }
 
-export function Toolbar({ runtime, project, onTogglePlugins, onTogglePalette }: ToolbarProps) {
+export function Toolbar({
+  runtime,
+  project,
+  editorState,
+  cache,
+  onTogglePlugins,
+  onTogglePalette,
+}: ToolbarProps) {
   useEventRefresh(runtime.events, ['contribution:changed', 'command:changed']);
   const toolbars = runtime.host.contributions.getToolbars();
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const editor = runtime.editor;
+  const { canUndo, canRedo, undoLabel, redoLabel } = editorState;
+
+  const handleImportFile = async (file: File | undefined) => {
+    if (!file) return;
+    const result = await importModelFile(editor, cache, file);
+    if (result.ok) {
+      showToast(`已导入模型「${result.asset.name}」${result.deduped ? '（内容相同，资源已复用）' : ''}`, 'success');
+    } else {
+      showToast(result.error.message, 'error');
+    }
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
 
   return (
     <header className="lumora-toolbar" data-testid="lumora-toolbar">
@@ -35,6 +63,50 @@ export function Toolbar({ runtime, project, onTogglePlugins, onTogglePalette }: 
         >
           关闭项目
         </button>
+        <span className="lumora-toolbar__sep" />
+        <button
+          type="button"
+          className="lumora-button"
+          data-testid="undo"
+          disabled={!canUndo || !project}
+          title={undoLabel ? `撤销：${undoLabel}` : '撤销'}
+          onClick={() => {
+            const result = editor.undo();
+            if (!result.ok) showToast(result.error.message, 'error');
+          }}
+        >
+          撤销
+        </button>
+        <button
+          type="button"
+          className="lumora-button"
+          data-testid="redo"
+          disabled={!canRedo || !project}
+          title={redoLabel ? `重做：${redoLabel}` : '重做'}
+          onClick={() => {
+            const result = editor.redo();
+            if (!result.ok) showToast(result.error.message, 'error');
+          }}
+        >
+          重做
+        </button>
+        <button
+          type="button"
+          className="lumora-button lumora-button--import"
+          data-testid="import-model"
+          disabled={!project}
+          onClick={() => fileInputRef.current?.click()}
+        >
+          导入模型
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".glb,.gltf,model/gltf-binary,model/gltf+json"
+          style={{ display: 'none' }}
+          data-testid="toolbar-model-file-input"
+          onChange={(e) => void handleImportFile(e.target.files?.[0])}
+        />
         {toolbars.map((item) => {
           const command = runtime.host.commands.get(item.commandId);
           return (

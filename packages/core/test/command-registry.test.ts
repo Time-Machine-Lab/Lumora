@@ -3,7 +3,7 @@ import { CommandRegistry } from '../src/commands/command-registry';
 import type { Command } from '../src/commands/command-registry';
 import { TypedEventEmitter } from '../src/events/typed-event-emitter';
 import type { EventMap } from '../src/events/event-map';
-import { createSampleProject } from '../src/project';
+import { createSampleProject } from '../src/scene/sample-project';
 
 function makeCommand(overrides: Partial<Command> = {}): Command {
   return {

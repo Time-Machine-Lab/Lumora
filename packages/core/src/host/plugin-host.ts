@@ -7,7 +7,7 @@ import { checkEngineCompatibility } from '../manifest/engine';
 import { validateManifest } from '../manifest/validate';
 import type { Manifest } from '../manifest/validate';
 import { createPluginServices, type PluginServices } from '../services';
-import type { Project } from '../project';
+import type { Project } from '../scene/types';
 import type {
   PluginContext,
   PluginDefinition,

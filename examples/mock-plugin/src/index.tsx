@@ -65,7 +65,7 @@ const definition = definePlugin({
               const project = commandContext.getProject();
               if (!project) return { ok: false, error: new Error('没有打开的项目可导出') };
               const data = JSON.stringify(
-                { uri: project.uri, name: project.name, objects: project.objects },
+                { uri: project.uri, name: project.name, objects: project.objects, assets: project.assets },
                 null,
                 2,
               );

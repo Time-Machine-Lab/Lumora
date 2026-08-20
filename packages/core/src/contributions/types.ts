@@ -2,7 +2,7 @@ import type { ComponentType } from 'react';
 import type { CommandRegistry } from '../commands/command-registry';
 import type { EventMap } from '../events/event-map';
 import type { TypedEventEmitter } from '../events/typed-event-emitter';
-import type { Project } from '../project';
+import type { Project } from '../scene/types';
 import type { PluginServices } from '../services';
 
 export const CONTRIBUTION_KINDS = [

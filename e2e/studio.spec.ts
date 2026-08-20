@@ -6,7 +6,7 @@ test.beforeEach(async ({ page }) => {
 
 test('壳层渲染：工具栏、场景视图、Mock 插件面板与工具栏贡献项', async ({ page }) => {
   await expect(page.getByTestId('lumora-studio')).toBeVisible();
-  await expect(page.getByTestId('lumora-scene')).toBeVisible();
+  await expect(page.getByTestId('lumora-viewport')).toBeVisible();
   await expect(page.getByTestId('panel-tab-com.lumora.mock.panel.console')).toBeVisible();
   await expect(page.getByTestId('toolbar-com.lumora.mock.toolbar.export')).toBeVisible();
 });
@@ -16,11 +16,26 @@ test('打开示例项目：project:opened 事件进入宿主日志，面板展�
   await page.getByTestId('open-sample-project').click();
   await expect(page.getByTestId('studio-empty-hint')).not.toBeVisible();
   await expect(page.getByTestId('event-log')).toContainText('项目已打开: 示例项目');
-  await expect(page.getByTestId('mock-console-panel')).toContainText('示例项目，3 个对象');
+  await expect(page.getByTestId('mock-console-panel')).toContainText('示例项目，7 个对象');
   // 关闭项目发出 project:closed
   await page.getByTestId('close-project').click();
   await expect(page.getByTestId('event-log')).toContainText('项目已关闭');
   await expect(page.getByTestId('studio-empty-hint')).toBeVisible();
+});
+
+test('宿主快照实时同步：编辑与撤销后插件面板对象数跟随（S-3）', async ({ page }) => {
+  await page.getByTestId('open-sample-project').click();
+  const panel = page.getByTestId('mock-console-panel');
+  await expect(panel).toContainText('示例项目，7 个对象');
+
+  // 编辑（添加对象）后宿主快照刷新，面板读到最新对象数
+  await page.getByTestId('add-object').click();
+  await page.getByTestId('add-立方体').click();
+  await expect(panel).toContainText('示例项目，8 个对象');
+
+  // 撤销后快照回落
+  await page.getByTestId('undo').click();
+  await expect(panel).toContainText('示例项目，7 个对象');
 });
 
 test('命令面板（Ctrl+K）可过滤并执行 Mock 插件命令', async ({ page }) => {

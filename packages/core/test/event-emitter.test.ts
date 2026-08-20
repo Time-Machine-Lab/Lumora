@@ -1,26 +1,22 @@
 import { describe, expect, it, vi } from 'vitest';
 import { TypedEventEmitter } from '../src/events/typed-event-emitter';
+import { createSampleProject } from '../src/scene/sample-project';
 import type { EventMap } from '../src/events/event-map';
 
 type Bus = TypedEventEmitter<EventMap>;
+
+const projectA = createSampleProject('lumora://a', 'A');
+const projectB = createSampleProject('lumora://b', 'B');
 
 describe('TypedEventEmitter', () => {
   it('on/emit 传递载荷，返回的 Disposable 可移除订阅', () => {
     const bus: Bus = new TypedEventEmitter();
     const handler = vi.fn();
     const sub = bus.on('project:opened', handler);
-    bus.emit('project:opened', {
-      uri: 'lumora://a',
-      name: 'A',
-      project: { uri: 'lumora://a', name: 'A', objects: [], createdAt: '2026-01-01' },
-    });
+    bus.emit('project:opened', { uri: 'lumora://a', name: 'A', project: projectA });
     expect(handler).toHaveBeenCalledTimes(1);
     sub.dispose();
-    bus.emit('project:opened', {
-      uri: 'lumora://b',
-      name: 'B',
-      project: { uri: 'lumora://b', name: 'B', objects: [], createdAt: '2026-01-01' },
-    });
+    bus.emit('project:opened', { uri: 'lumora://b', name: 'B', project: projectB });
     expect(handler).toHaveBeenCalledTimes(1);
   });
 
@@ -41,11 +37,7 @@ describe('TypedEventEmitter', () => {
       throw new Error('boom');
     });
     bus.on('project:opened', ok);
-    const payload = {
-      uri: 'x',
-      name: 'x',
-      project: { uri: 'x', name: 'x', objects: [], createdAt: '2026-01-01' },
-    };
+    const payload = { uri: 'x', name: 'x', project: projectA };
     expect(() => bus.emit('project:opened', payload)).not.toThrow();
     expect(ok).toHaveBeenCalledWith(payload);
     expect(onError).toHaveBeenCalledWith('project:opened', expect.any(Error));

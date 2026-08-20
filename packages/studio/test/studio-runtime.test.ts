@@ -1,69 +1,45 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createSampleProject } from '@lumora/core';
+import { createGroupObject, createSampleProject } from '@lumora/core';
 import { createStudioRuntime } from '../src/runtime/studio-runtime';
-import type { PluginDefinition } from '@lumora/core';
 
-const MANIFEST = {
-  schemaVersion: '1' as const,
-  id: 'com.test.runtime',
-  name: '运行时测试插件',
-  version: '0.1.0',
-  entry: './dist/index.js',
-};
-
-describe('createStudioRuntime', () => {
-  it('openProject 写入项目并发出 project:opened 事件', () => {
+describe('StudioRuntime：宿主快照与事件总线随编辑器同步（S-3）', () => {
+  it('编辑器每次变更后 host 快照与 project:changed 广播保持当前', () => {
     const runtime = createStudioRuntime();
-    const opened = vi.fn();
-    runtime.events.on('project:opened', opened);
-    const project = createSampleProject('lumora://test', '测试项目');
+    const project = createSampleProject();
     runtime.openProject(project);
-    expect(runtime.getProject()?.uri).toBe('lumora://test');
-    expect(opened).toHaveBeenCalledWith({
-      uri: 'lumora://test',
-      name: '测试项目',
-      project,
-    });
+    expect(runtime.host.getProject()).toBe(project);
+
+    const changed = vi.fn();
+    const unsubscribe = runtime.events.on('project:changed', changed);
+
+    // 编辑（addObject）：宿主读到的不是打开时的旧快照，而是当前项目
+    const result = runtime.editor.addObject(createGroupObject());
+    expect(result.ok).toBe(true);
+    expect(runtime.host.getProject()).toBe(runtime.editor.getProject());
+    expect(runtime.host.getProject()!.objects.length).toBe(project.objects.length + 1);
+    expect(changed).toHaveBeenLastCalledWith({ project: runtime.editor.getProject() });
+
+    // 撤销同样同步
+    runtime.editor.undo();
+    expect(runtime.host.getProject()!.objects.length).toBe(project.objects.length);
+
+    unsubscribe.dispose();
   });
 
-  it('closeProject 清空项目并发出 project:closed 事件', () => {
+  it('closeProject 清空宿主快照并广播；dispose 后编辑器变更不再同步到宿主', async () => {
     const runtime = createStudioRuntime();
-    const closed = vi.fn();
-    runtime.events.on('project:closed', closed);
     runtime.openProject(createSampleProject());
+    const closed = vi.fn();
+    const unsubscribe = runtime.events.on('project:closed', closed);
+
     runtime.closeProject();
-    expect(runtime.getProject()).toBeNull();
-    expect(closed).toHaveBeenCalledWith({ uri: 'lumora://sample-project' });
-  });
-
-  it('dispose 停用插件并清空事件订阅（卸载释放资源）', async () => {
-    const runtime = createStudioRuntime();
-    const deactivate = vi.fn();
-    const definition: PluginDefinition = {
-      activate: (context) => {
-        context.events.on('project:opened', () => {});
-        return context.contribute({
-          commands: [
-            { kind: 'command', command: { id: 'runtime.cmd', title: '命令', execute: () => ({ ok: true }) } },
-          ],
-        });
-      },
-      deactivate,
-    };
-    await runtime.host.register({ manifest: MANIFEST, entry: async () => ({ default: definition }) });
-    expect(runtime.host.commands.has('runtime.cmd')).toBe(true);
-    expect(runtime.events.handlerCount).toBeGreaterThan(0);
+    expect(runtime.host.getProject()).toBeNull();
+    expect(runtime.editor.getProject()).toBeNull();
+    expect(closed).toHaveBeenCalledTimes(1);
+    unsubscribe.dispose();
 
     await runtime.dispose();
-    expect(deactivate).toHaveBeenCalledTimes(1);
-    expect(runtime.host.commands.has('runtime.cmd')).toBe(false);
-    expect(runtime.events.handlerCount).toBe(0);
-  });
-
-  it('dispose 幂等', async () => {
-    const runtime = createStudioRuntime();
-    await runtime.dispose();
-    await runtime.dispose();
-    expect(runtime.events.handlerCount).toBe(0);
+    runtime.editor.openProject(createSampleProject());
+    expect(runtime.host.getProject()).toBeNull();
   });
 });

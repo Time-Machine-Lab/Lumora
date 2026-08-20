@@ -3,7 +3,7 @@ import type { PluginCommands } from '../commands/command-registry';
 import type { EventMap } from '../events/event-map';
 import type { ContributionBundle, ContributionKind } from '../contributions/types';
 import type { Manifest } from '../manifest/validate';
-import type { Project } from '../project';
+import type { Project } from '../scene/types';
 import type { PluginServices } from '../services';
 
 export type PluginState =

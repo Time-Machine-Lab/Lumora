@@ -1,5 +1,5 @@
 import type { Asset, AiChatRequest, ExportResult } from './contributions/types';
-import type { Project } from './project';
+import type { Project } from './scene/types';
 
 export interface AssetService {
   load(uri: string): Promise<Asset>;

@@ -10,7 +10,8 @@ export function MockConsolePanel({ pluginId, project, events, services }: PanelC
   const [log, setLog] = useState<string[]>([]);
   const [assetInfo, setAssetInfo] = useState<string | null>(null);
   const [exportInfo, setExportInfo] = useState<string | null>(null);
-  useEventRefresh(events, ['project:opened', 'project:closed']);
+  // project:changed：编辑器每次变更（编辑/撤销/重做）后宿主广播，面板实时反映当前快照
+  useEventRefresh(events, ['project:opened', 'project:closed', 'project:changed']);
 
   useEffect(() => {
     const appendLog = (line: string) => setLog((lines) => [...lines.slice(-19), line]);

@@ -1,6 +1,11 @@
 export { LumoraStudio } from './components/LumoraStudio';
 export type { LumoraStudioHandle, LumoraStudioProps } from './components/LumoraStudio';
-export { SceneView } from './components/SceneView';
+export { EditorViewport } from './components/editor/EditorViewport';
+export { ObjectTree } from './components/editor/ObjectTree';
+export { PropertiesPanel } from './components/editor/PropertiesPanel';
+export { AssetCache } from './components/editor/asset-cache';
+export { importModelFile } from './components/editor/model-import';
+export { buildScene, syncScene } from './components/editor/scene-builder';
 export { PanelErrorBoundary } from './components/panels/PanelErrorBoundary';
 export { createStudioRuntime } from './runtime/studio-runtime';
 export type { StudioRuntime, StudioRuntimeOptions } from './runtime/studio-runtime';

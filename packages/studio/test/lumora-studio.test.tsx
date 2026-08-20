@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import { StrictMode, createRef } from 'react';
+import * as THREE from 'three';
 import { createSampleProject } from '@lumora/core';
 import type { Manifest, PanelContextProps, PluginDescriptor } from '@lumora/core';
 import { LumoraStudio } from '../src/components/LumoraStudio';
@@ -11,10 +12,23 @@ vi.mock('@react-three/fiber', () => ({
   Canvas: ({ children }: { children?: React.ReactNode }) => (
     <div data-testid="mock-canvas">{children}</div>
   ),
+  useThree: (selector?: (state: unknown) => unknown) => {
+    const state = {
+      scene: new THREE.Group(),
+      set: () => undefined,
+      camera: new THREE.PerspectiveCamera(),
+      gl: { setViewport: () => undefined, setScissor: () => undefined, setScissorTest: () => undefined },
+      size: { width: 800, height: 600 },
+      viewport: { dpr: 1 },
+    };
+    return selector ? selector(state) : state;
+  },
+  useFrame: () => undefined,
 }));
 
 vi.mock('@react-three/drei', () => ({
   OrbitControls: () => null,
+  TransformControls: () => null,
 }));
 
 function TestPanel(props: PanelContextProps) {

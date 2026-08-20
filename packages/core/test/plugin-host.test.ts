@@ -9,7 +9,7 @@ import type {
   PluginState,
 } from '../src/host/types';
 import type { Command, CommandContext } from '../src/commands/command-registry';
-import { createSampleProject } from '../src/project';
+import { createSampleProject } from '../src/scene/sample-project';
 import type { Manifest } from '../src/manifest/validate';
 
 const VALID_MANIFEST: Manifest = {

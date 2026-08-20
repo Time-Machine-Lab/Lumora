@@ -104,3 +104,18 @@ body {
   color: #b9c0cf;
   word-break: break-all;
 }
+
+/* 窄屏：日志面板移到 Studio 下方，Studio 获得完整宽度（Studio 自身
+   有 ≤900px 的三栏纵向堆叠规则，容器过窄时其内部布局无法成立） */
+@media (max-width: 900px) {
+  .host__layout {
+    flex-direction: column;
+  }
+
+  .host__log {
+    width: 100%;
+    height: 150px;
+    border-left: none;
+    border-top: 1px solid #2a2e3a;
+  }
+}

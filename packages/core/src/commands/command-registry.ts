@@ -1,7 +1,7 @@
 import { disposable, type Disposable } from '../disposable';
 import type { EventMap } from '../events/event-map';
 import { TypedEventEmitter } from '../events/typed-event-emitter';
-import type { Project } from '../project';
+import type { Project } from '../scene/types';
 import type { PluginServices } from '../services';
 
 /** 命令上下文的事件订阅面：只暴露订阅能力，不暴露 emit/dispose，插件无法操纵宿主总线 */

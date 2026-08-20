@@ -7,9 +7,74 @@ export { TypedEventEmitter } from './events/typed-event-emitter';
 export type { EventHandler, TypedEventEmitterOptions } from './events/typed-event-emitter';
 export type { EventMap } from './events/event-map';
 
-// 项目
-export { createSampleProject } from './project';
-export type { Project, SceneObjectData, SceneObjectKind } from './project';
+// 场景数据模型（Project v2）
+export { createSampleProject } from './scene/sample-project';
+export type {
+  AssetData,
+  CameraData,
+  GeometryData,
+  LightData,
+  LightKind,
+  MaterialData,
+  PrimitiveKind,
+  Project,
+  ProjectSettings,
+  SceneData,
+  SceneObjectData,
+  SceneObjectKind,
+  SceneObjectType,
+  TransformData,
+  Vec3,
+} from './scene/types';
+export { isSceneObject } from './scene/types';
+export {
+  addAsset,
+  collectUnreferencedAssets,
+  findAssetByHash,
+  findObject,
+  getActiveScene,
+  getAssetById,
+  getChildIds,
+  getChildren,
+  getDescendantIds,
+  getScene,
+  getSceneRoots,
+  isFiniteNumber,
+  isInSubtree,
+  isValidTransform,
+  isValidVec3,
+  removeAssets,
+  removeObjects,
+  updateObject,
+  updateObjectById,
+} from './scene/scene-graph';
+export {
+  createCameraObject,
+  createGroupObject,
+  createLightObject,
+  createMaterial,
+  createModelObject,
+  createPrimitiveObject,
+  createScene,
+  defaultName,
+  defaultTransform,
+  genId,
+} from './scene/create';
+export { fnv1aHex, hashBytes } from './scene/assets';
+export { fovDegToFocalLength, focalLengthToFovDeg, fitRect, FULL_FRAME_SENSOR } from './scene/camera-math';
+
+// 历史与场景编辑器
+export { HistoryStack } from './history/history';
+export type { HistoryEntry } from './history/history';
+export { SceneEditor } from './editor/scene-editor';
+export type {
+  EditorEventMap,
+  Result,
+  TransformMode,
+  TransformSpace,
+  ViewMode,
+  ViewState,
+} from './editor/scene-editor';
 
 // Manifest v1
 export { manifestSchema, validateManifest } from './manifest/validate';

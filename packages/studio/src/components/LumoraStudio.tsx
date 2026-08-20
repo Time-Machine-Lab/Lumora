@@ -3,11 +3,16 @@ import type { ReactNode } from 'react';
 import type { PluginDescriptor, Project } from '@lumora/core';
 import { createStudioRuntime } from '../runtime/studio-runtime';
 import type { StudioRuntime } from '../runtime/studio-runtime';
+import { useSceneEditor } from '../hooks/use-scene-editor';
 import { PanelHost } from './panels/PanelHost';
 import { Toolbar } from './Toolbar';
 import { CommandPalette } from './CommandPalette';
 import { PluginManager } from './PluginManager';
-import { SceneView } from './SceneView';
+import { EditorViewport } from './editor/EditorViewport';
+import { ObjectTree } from './editor/ObjectTree';
+import { PropertiesPanel } from './editor/PropertiesPanel';
+import { ToastHost, showToast } from './editor/toasts';
+import { AssetCache } from './editor/asset-cache';
 import '../lumora.css';
 
 export interface LumoraStudioProps {
@@ -17,7 +22,7 @@ export interface LumoraStudioProps {
   /** 挂载后自动打开的项目（同时发出 project:opened 事件） */
   initialProject?: Project;
   onError?: (error: unknown) => void;
-  /** 场景槽位，缺省为内置 Three.js 场景视图 */
+  /** 场景槽位，缺省为内置 3D 场景编辑器视口 */
   scene?: (project: Project | null) => ReactNode;
   className?: string;
 }
@@ -28,8 +33,8 @@ export interface LumoraStudioHandle {
 
 /**
  * 可嵌入的 Lumora Studio 壳层：
- * - 创建并管理插件宿主运行时（事件总线、命令、贡献项）
- * - 卸载时释放全部资源：停用插件、移除订阅、销毁事件总线与 WebGL 场景
+ * - 创建并管理插件宿主运行时与核心场景编辑器（对象树/属性/视口/历史）
+ * - 卸载时释放全部资源：停用插件、移除订阅、销毁事件总线、资源缓存与 WebGL 场景
  */
 export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(function LumoraStudio(
   { plugins = [], hostVersion, initialProject, onError, scene, className },
@@ -40,24 +45,17 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     runtimeRef.current = createStudioRuntime({ hostVersion, onError });
   }
   const runtime = runtimeRef.current;
+  const editorState = useSceneEditor(runtime.editor);
+  const { project } = editorState;
 
-  const [project, setProject] = useState<Project | null>(initialProject ?? null);
+  const cacheRef = useRef<AssetCache | null>(null);
+  if (!cacheRef.current) cacheRef.current = new AssetCache();
+  const cache = cacheRef.current;
+
   const [pluginManagerOpen, setPluginManagerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
 
   useImperativeHandle(ref, () => ({ runtime }), [runtime]);
-
-  // 项目状态跟随运行时事件（外部可通过 handle.runtime.openProject 打开项目）
-  useEffect(() => {
-    const opened = runtime.events.on('project:opened', ({ project: openedProject }) =>
-      setProject(openedProject),
-    );
-    const closed = runtime.events.on('project:closed', () => setProject(null));
-    return () => {
-      opened.dispose();
-      closed.dispose();
-    };
-  }, [runtime]);
 
   // 挂载时一次性启动：注册插件并打开初始项目（与 props 变化解耦，避免重复注册）。
   // StrictMode 下 effect 会卸载重放：boot 只执行一次，重放与真实卸载都注册 cleanup，
@@ -101,46 +99,120 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     return () => {
       mountedRef.current -= 1;
       setTimeout(() => {
-        if (mountedRef.current === 0) void runtime.dispose();
+        if (mountedRef.current === 0) {
+          cache.dispose();
+          void runtime.dispose();
+        }
       }, 0);
     };
-  }, [runtime]);
+  }, [runtime, cache]);
 
-  // Ctrl/Cmd+K 打开命令面板
+  // 编辑器快捷键：撤销/重做/复制/删除/取消选择/Gizmo 模式
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+      const key = event.key.toLowerCase();
+      // 命令面板开关是全局快捷键：面板打开时焦点在其搜索输入框内，需先于输入守卫处理
+      if ((event.ctrlKey || event.metaKey) && key === 'k') {
         event.preventDefault();
         setPaletteOpen((open) => !open);
+        return;
       }
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      const editor = runtime.editor;
+      if ((event.ctrlKey || event.metaKey) && key === 'z') {
+        event.preventDefault();
+        const result = event.shiftKey ? editor.redo() : editor.undo();
+        if (!result.ok) showToast(result.error.message, 'error');
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && key === 'y') {
+        event.preventDefault();
+        const result = editor.redo();
+        if (!result.ok) showToast(result.error.message, 'error');
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && key === 'd') {
+        event.preventDefault();
+        const result = editor.duplicateSelection();
+        if (!result.ok) showToast(result.error.message, 'error');
+        return;
+      }
+      if (event.key === 'Delete' || event.key === 'Backspace') {
+        event.preventDefault();
+        const result = editor.deleteSelection();
+        if (!result.ok) showToast(result.error.message, 'error');
+        return;
+      }
+      if (event.key === 'Escape') {
+        editor.clearSelection();
+        return;
+      }
+      if (event.key === '1') editor.setTransformMode('translate');
+      else if (event.key === '2') editor.setTransformMode('rotate');
+      else if (event.key === '3') editor.setTransformMode('scale');
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  }, [runtime]);
 
   return (
     <div className={`lumora-studio${className ? ` ${className}` : ''}`} data-testid="lumora-studio">
       <Toolbar
         runtime={runtime}
         project={project}
+        editorState={editorState}
+        cache={cache}
         onTogglePlugins={() => setPluginManagerOpen((open) => !open)}
         onTogglePalette={() => setPaletteOpen((open) => !open)}
       />
       <div className="lumora-studio__body">
-        <PanelHost
-          runtime={runtime}
-          project={project}
-          onDisablePlugin={(pluginId) => void runtime.host.disable(pluginId)}
-        />
+        <div className="lumora-studio__sidebar">
+          <ObjectTree
+            editor={runtime.editor}
+            project={project}
+            selection={editorState.selection}
+            cache={cache}
+          />
+          <PanelHost
+            runtime={runtime}
+            project={project}
+            onDisablePlugin={(pluginId) => void runtime.host.disable(pluginId)}
+          />
+        </div>
         <main className="lumora-studio__viewport">
-          {scene ? scene(project) : <SceneView project={project} />}
+          {scene ? (
+            scene(project)
+          ) : (
+            <EditorViewport
+              editor={runtime.editor}
+              project={project}
+              selection={editorState.selection}
+              view={editorState.view}
+              cache={cache}
+            />
+          )}
           {!project && (
             <div className="lumora-studio__empty" data-testid="studio-empty-hint">
               尚未打开项目 —— 点击工具栏「打开示例项目」
             </div>
           )}
         </main>
+        <PropertiesPanel
+          editor={runtime.editor}
+          project={project}
+          selection={editorState.selection}
+        />
       </div>
+      <ToastHost />
       {pluginManagerOpen && <PluginManager runtime={runtime} onClose={() => setPluginManagerOpen(false)} />}
       {paletteOpen && <CommandPalette runtime={runtime} onClose={() => setPaletteOpen(false)} />}
     </div>

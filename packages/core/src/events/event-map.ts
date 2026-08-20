@@ -1,4 +1,4 @@
-import type { Project } from '../project';
+import type { Project } from '../scene/types';
 import type { PluginState } from '../host/types';
 
 /** 平台级类型化事件表；插件可经索引签名发射自定义事件 */
@@ -11,5 +11,7 @@ export interface EventMap {
   'command:executed': { id: string; ok: boolean; error?: unknown };
   'project:opened': { uri: string; name: string; project: Project };
   'project:closed': { uri: string };
+  /** 项目内容每次变更（编辑/撤销/重做）后广播；null 表示项目已关闭 */
+  'project:changed': { project: Project | null };
   [event: string]: unknown;
 }

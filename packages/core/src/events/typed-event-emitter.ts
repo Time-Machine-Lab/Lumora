@@ -82,6 +82,12 @@ export class TypedEventEmitter<E extends Record<string, unknown>> implements Dis
     return count + this.anyHandlers.size;
   }
 
+  /** 清空处理器但保持总线可用（区别于 dispose 的永久销毁） */
+  clear(): void {
+    this.handlers.clear();
+    this.anyHandlers.clear();
+  }
+
   dispose(): void {
     this.disposedFlag = true;
     this.handlers.clear();
