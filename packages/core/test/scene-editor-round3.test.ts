@@ -85,7 +85,7 @@ describe('SceneEditor 第三轮：原子应用与事件序（P-9）', () => {
     editor.events.on('project:changed', ({ project }) => {
       order.push('project:changed');
       // 项目已含新场景且选择已过滤为空：观察者不会看到「新项目 + 旧场景选择」
-      expect(project.scenes.some((s) => s.name === '场景 B')).toBe(true);
+      expect(project!.scenes.some((s) => s.name === '场景 B')).toBe(true);
       expect(editor.getSelection()).toEqual([]);
     });
     editor.events.on('selection:changed', () => {
@@ -168,7 +168,7 @@ describe('SceneEditor 第三轮：dispose 后无晚到写入（P-9）', () => {
       storageRef: '',
       createdAt: '2026-01-01',
     };
-    editor.importModel(asset, { id: 'obj-x', type: 'model', name: 'x', parentId: null, transform: MOVED });
+    editor.importModel(asset, { id: 'obj-x', type: 'model', name: 'x', parentId: null, transform: MOVED, visible: true, locked: false });
     editor.dispose();
 
     expect(editor.getProject()).toBeNull();
@@ -179,7 +179,9 @@ describe('SceneEditor 第三轮：dispose 后无晚到写入（P-9）', () => {
     expect(editor.addObject(createGroupObject()).ok).toBe(false);
     expect(editor.setTransform('sample-cube', MOVED).ok).toBe(false);
     expect(editor.deleteSelection().ok).toBe(false);
-    expect(editor.importModel(asset, { id: 'obj-y', type: 'model', name: 'y', parentId: null, transform: MOVED }).ok).toBe(false);
+    expect(
+      editor.importModel(asset, { id: 'obj-y', type: 'model', name: 'y', parentId: null, transform: MOVED, visible: true, locked: false }).ok,
+    ).toBe(false);
     expect(editor.undo().ok).toBe(false);
     expect(editor.redo().ok).toBe(false);
     expect(editor.setParent('sample-cube', null).ok).toBe(false);
