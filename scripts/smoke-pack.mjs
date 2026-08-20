@@ -2,10 +2,12 @@
 // 临时消费工程中以 tarball 安装（React 19 peer 边界）→ typecheck（skipLibCheck:false）
 // 并 vite build 消费端（含 @lumora/studio/style.css 导出存在性验证与依赖隔离断言）。
 // 失败时退出码非 0；临时目录总是被清理。
+// --self-test：边界判定自检（同前缀兄弟临时目录必须判为仓库外）。
 import { execSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import process from 'node:process';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -26,28 +28,70 @@ const CONSUMER_DEV_DEPS = [
   'vite@^6.0.3',
 ];
 
+/**
+ * dir 是否位于 rootDir 内（canonical 判定）：
+ * 双方经 realpathSync.native 归一化（展开 Windows 8.3 短名，如 ADMINI~1 → Administrator），
+ * 再用 path.relative + 路径段判断 —— 同前缀兄弟目录（<base>/lumora-smoke-x vs <base>/lumora）
+ * 落在根外；POSIX 大小写敏感，不做大小写折叠。
+ */
+const isInside = (dir, rootDir) => {
+  const rel = relative(realpathSync.native(rootDir), realpathSync.native(dir));
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+};
+
+const isSelfTest = process.argv.includes('--self-test');
+if (isSelfTest) {
+  const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'lumora-boundary-')));
+  try {
+    const repo = join(base, 'lumora');
+    const sibling = join(base, 'lumora-smoke-x');
+    const consumer = join(repo, 'consumer');
+    const other = join(base, 'other');
+    // 判定基于已存在的真实路径（realpath 归一化），各用例目录都先创建
+    mkdirSync(consumer, { recursive: true });
+    mkdirSync(sibling, { recursive: true });
+    mkdirSync(other, { recursive: true });
+    const cases = [
+      ['仓库自身', isInside(repo, repo), true],
+      ['仓库内部目录', isInside(consumer, repo), true],
+      ['同前缀兄弟临时目录', isInside(sibling, repo), false],
+      ['仓库父目录', isInside(base, repo), false],
+      ['外部目录', isInside(join(base, 'other'), repo), false],
+    ];
+    for (const [name, actual, expected] of cases) {
+      if (actual !== expected) {
+        throw new Error(`边界自检失败: ${name} 期望判定为 ${expected ? '内部' : '外部'}，实际 ${actual ? '内部' : '外部'}`);
+      }
+    }
+    console.log('[smoke] 边界自检通过：同前缀兄弟目录判定为仓库外，仓库内部目录判定为仓库内');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+  process.exit(0);
+}
+
 // 临时目录统一使用跨平台 os.tmpdir()。Windows 上 %TEMP% 可能带 8.3 短名（如 ADMINI~1），
 // 普通 realpathSync 不归一化而 vite 内部会得到长名，混用会让 relative 计算出含 .. 的
 // 非法 fileName；realpathSync.native 能展开短名，把消费工程路径统一成系统长名形式。
 // 消费工程位于仓库依赖树之外，Node 不会向上解析到仓库 node_modules
-let tmp = mkdtempSync(join(tmpdir(), 'lumora-smoke-'));
-tmp = realpathSync.native(tmp);
-if (tmp.toLowerCase().startsWith(root.toLowerCase())) {
-  throw new Error('冒烟消费工程不得位于仓库依赖树内');
-}
-const consumerDir = join(tmp, 'consumer');
-mkdirSync(consumerDir, { recursive: true });
-// tarball 放在消费工程内，file: 依赖相对 consumer package.json 解析
-const tarballDir = join(consumerDir, 'tarballs');
-mkdirSync(tarballDir, { recursive: true });
-
-const write = (relative, content) => {
-  const target = join(consumerDir, relative);
-  mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, content, 'utf8');
-};
-
+let tmp;
 try {
+  tmp = realpathSync.native(mkdtempSync(join(tmpdir(), 'lumora-smoke-')));
+  if (isInside(tmp, root)) {
+    throw new Error('冒烟消费工程不得位于仓库依赖树内（临时目录与仓库路径冲突）');
+  }
+  const consumerDir = join(tmp, 'consumer');
+  mkdirSync(consumerDir, { recursive: true });
+  // tarball 放在消费工程内，file: 依赖相对 consumer package.json 解析
+  const tarballDir = join(consumerDir, 'tarballs');
+  mkdirSync(tarballDir, { recursive: true });
+
+  const write = (relativePath, content) => {
+    const target = join(consumerDir, relativePath);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, content, 'utf8');
+  };
+
   console.log('[smoke] 1/5 构建全部包');
   run('npm run build');
 
@@ -186,17 +230,15 @@ createRoot(document.getElementById('root')!).render(
   if (!studioPkg.exports?.['./style.css']) {
     throw new Error('@lumora/studio 安装后 exports 缺少 "./style.css"');
   }
-  // 依赖隔离：4 个 @lumora 包必须来自本地 tarball 副本，realpath 不得解析到仓库内
-  const consumerResolved = realpathSync(consumerDir);
+  // 依赖隔离：4 个 @lumora 包必须来自本地 tarball 副本，canonical 边界判定不得解析到仓库内
   for (const name of PACKAGES) {
     const shortName = name.replace('@lumora/', '');
     const pkgJson = join(consumerDir, 'node_modules', '@lumora', shortName, 'package.json');
     if (!existsSync(pkgJson)) {
       throw new Error(`安装后缺少 @lumora/${shortName}（依赖隔离断言失败）`);
     }
-    const resolved = realpathSync(pkgJson);
-    if (!resolved.toLowerCase().startsWith(consumerResolved.toLowerCase())) {
-      throw new Error(`@lumora/${shortName} 解析到消费工程之外: ${resolved}（依赖未隔离，可能被仓库依赖树捕获）`);
+    if (!isInside(pkgJson, tmp)) {
+      throw new Error(`@lumora/${shortName} 解析到消费工程之外: ${realpathSync.native(pkgJson)}（依赖未隔离，可能被仓库依赖树捕获）`);
     }
   }
 
@@ -206,5 +248,5 @@ createRoot(document.getElementById('root')!).render(
 
   console.log('[smoke] 通过：pack/install/typecheck/build 全链路正常');
 } finally {
-  rmSync(tmp, { recursive: true, force: true });
+  if (tmp) rmSync(tmp, { recursive: true, force: true });
 }
