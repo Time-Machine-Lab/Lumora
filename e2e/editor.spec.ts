@@ -210,6 +210,111 @@ test('对象树键盘导航：Arrow/Home/End/Enter 沿可见行 roving focus，�
   await expect(page.getByTestId('inspector-name')).toHaveValue('立方体');
 });
 
+test('M3 树行原生拖拽：拖到目标行重设父级，树层级与导出数据一致', async ({ page }) => {
+  // 生产契约：行本身是原生 draggable；真实拖拽（HTML5 DnD）把 sample-cube 拖到 sample-ground
+  await page.getByTestId('tree-row-sample-cube').dragTo(page.getByTestId('tree-row-sample-ground'));
+  // 树层级更新：cube 嵌套进 ground 行下（默认展开可见）
+  await expect(
+    page.locator('[data-testid="tree-row-sample-ground"] [data-testid="tree-row-sample-cube"]'),
+  ).toBeVisible();
+
+  // 导出：parentId 变更持久化（parent 关联进入项目 JSON）
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByTestId('toolbar-com.lumora.mock.toolbar.export').click();
+  const exported = JSON.parse(await readDownload(await downloadPromise));
+  const cube = exported.objects.find((o: { id: string }) => o.id === 'sample-cube');
+  expect(cube.parentId).toBe('sample-ground');
+});
+
+test('M3 APG 单一 Tab 入口：行是唯一 tab 停靠点，Tab 进入/离开树各只一次', async ({ page }) => {
+  const row = (id: string) => page.getByTestId(`tree-row-${id}`);
+  await row('sample-cube').click();
+  await expect(row('sample-cube')).toHaveAttribute('tabindex', '0');
+
+  // 行级 tab 停靠点唯一：仅活动行 tabIndex=0；行内按钮均非 tab 停靠点（APG treeview）
+  const zeroCount = await page
+    .locator('[role="treeitem"]')
+    .evaluateAll((els) => els.filter((el) => (el as HTMLElement).tabIndex === 0).length);
+  expect(zeroCount).toBe(1);
+  for (const testId of ['tree-toggle-sample-cube', 'tree-visible-sample-cube', 'tree-lock-sample-cube', 'tree-delete-sample-cube']) {
+    await expect(page.getByTestId(testId)).toHaveAttribute('tabindex', '-1');
+  }
+
+  // 单一 Tab 入口：从树头部控件（＋添加）Tab 一次即落入活动行，不逐行遍历
+  await page.getByTestId('add-object').focus();
+  await page.keyboard.press('Tab');
+  await expect(row('sample-cube')).toBeFocused();
+
+  // 从活动行再 Tab：直接离开树（行内按钮不拦截）
+  await page.keyboard.press('Tab');
+  const inTree = await page.evaluate(() => {
+    const el = document.activeElement as HTMLElement | null;
+    return el?.closest('[role="treeitem"]') !== null;
+  });
+  expect(inTree).toBe(false);
+});
+
+test('M3 树行键盘动作：V/L 切换可见/锁定，Delete 全局快捷键直接删除（可撤销）', async ({ page }) => {
+  const row = (id: string) => page.getByTestId(`tree-row-${id}`);
+  await row('sample-cube').click();
+  await row('sample-cube').focus();
+
+  // L：锁定（按钮文本翻转为「锁」）；V：隐藏（「隐」）——行内按钮等效快捷键
+  await page.keyboard.press('l');
+  await expect(page.getByTestId('tree-lock-sample-cube')).toHaveText('锁');
+  await page.keyboard.press('v');
+  await expect(page.getByTestId('tree-visible-sample-cube')).toHaveText('隐');
+  await page.keyboard.press('l');
+  await expect(page.getByTestId('tree-lock-sample-cube')).toHaveText('开');
+  // Delete：宿主全局快捷键（选中行上直接删除，撤销可恢复）
+  await page.keyboard.press('Delete');
+  await expect(row('sample-cube')).not.toBeVisible();
+  await page.getByTestId('undo').click();
+  await expect(row('sample-cube')).toBeVisible();
+});
+
+test('M3 按钮双击隔离：双击不绕过删除确认、不触发行重命名、不重复切换', async ({ page }) => {
+  // 双击删除按钮：第一次点击只进入确认态，双击的第二次点击被隔离 → 对象仍在
+  await page.getByTestId('tree-delete-sample-light').dblclick();
+  await expect(page.getByTestId('tree-row-sample-light')).toBeVisible();
+  await expect(page.getByTestId('tree-delete-sample-light')).toHaveText('确认?');
+  // 双击按钮不触发行级 dblclick（不进入重命名）
+  await expect(page.getByTestId('tree-rename-sample-light')).toHaveCount(0);
+  // 单击确认 → 删除
+  await page.getByTestId('tree-delete-sample-light').click();
+  await expect(page.getByTestId('tree-row-sample-light')).not.toBeVisible();
+
+  // 双击可见性按钮：只切换一次（一次双击只产生一步「隐藏」，不因第二次点击回弹）
+  await page.getByTestId('tree-visible-sample-cube').dblclick();
+  await expect(page.getByTestId('tree-visible-sample-cube')).toHaveText('隐');
+  await expect(page.getByTestId('tree-rename-sample-cube')).toHaveCount(0);
+});
+
+test('M3 数值字段 blur-first：点击外部提交草稿、Escape 同帧取消、Enter 提交', async ({ page }) => {
+  await page.getByTestId('tree-row-sample-cube').click();
+  const field = page.getByTestId('inspector-axis-0');
+  await expect(field).toHaveValue('-2.5');
+
+  // 草稿 + 点击树行（blur）→ 提交生效（blur-first，不依赖 Enter）
+  await field.fill('7.5');
+  await page.getByTestId('tree-row-sample-ground').click();
+  await page.getByTestId('tree-row-sample-cube').click();
+  await expect(field).toHaveValue('7.5');
+  // 一步历史：撤销回到原值
+  await page.getByTestId('undo').click();
+  await expect(field).toHaveValue('-2.5');
+
+  // Escape：草稿同帧取消，不提交
+  await field.fill('99');
+  await field.press('Escape');
+  await expect(field).toHaveValue('-2.5');
+
+  // Enter：提交（blur-first 的键盘路径）
+  await field.fill('1.25');
+  await field.press('Enter');
+  await expect(field).toHaveValue('1.25');
+});
+
 test('场景切换器与视图工具条：Gizmo 模式/空间切换即时生效', async ({ page }) => {
   await expect(page.getByTestId('scene-switcher')).toHaveValue('scene-1');
 

@@ -134,6 +134,22 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
         event.preventDefault();
         editor.setSelection([object.id]);
         break;
+      // 行内按钮不参与 Tab 顺序（单一 tab 停靠点 = 行本身，APG treeview）；
+      // 行动作以快捷键等价提供：V/L 切换可见/锁定（Delete 删除沿用宿主全局快捷键）
+      case 'v':
+      case 'V': {
+        event.preventDefault();
+        const visibility = editor.setVisible([object.id], !object.visible);
+        if (!visibility.ok) showToast(visibility.error.message, 'error');
+        break;
+      }
+      case 'l':
+      case 'L': {
+        event.preventDefault();
+        const locking = editor.setLocked([object.id], !object.locked);
+        if (!locking.ok) showToast(locking.error.message, 'error');
+        break;
+      }
       default:
         break;
     }
@@ -193,7 +209,11 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
           type="button"
           className="lumora-button lumora-button--add"
           data-testid="add-object"
-          onClick={() => setAddMenuOpen((open) => !open)}
+          onClick={(e) => {
+            // 双击隔离：快速双击只开一次菜单，不因第二次点击立即关闭
+            if (e.detail > 1) return;
+            setAddMenuOpen((open) => !open);
+          }}
         >
           ＋ 添加
         </button>
@@ -351,6 +371,7 @@ function TreeNode({
       aria-expanded={children.length > 0 ? isExpanded : undefined}
       data-testid={`tree-row-${object.id}`}
       className={`lumora-tree__node${isDragOver ? ' lumora-tree-row--drop-target' : ''}`}
+      draggable
       tabIndex={getRowTabIndex(object.id)}
       ref={(el) => {
         rowRefs.current[object.id] = el;
@@ -399,8 +420,11 @@ function TreeNode({
           data-testid={`tree-toggle-${object.id}`}
           onClick={(e) => {
             e.stopPropagation();
+            if (e.detail > 1) return; // 双击隔离：一次双击只折叠/展开一次
             toggleExpanded(object.id);
           }}
+          onDoubleClick={(e) => e.stopPropagation()}
+          tabIndex={-1} // 单一 tab 停靠点：行内按钮不进 Tab 顺序（APG treeview）
           aria-label={isExpanded ? '折叠' : '展开'}
         >
           {children.length > 0 && (isExpanded ? '▾' : '▸')}
@@ -435,9 +459,12 @@ function TreeNode({
             title={object.visible ? '隐藏' : '显示'}
             onClick={(e) => {
               e.stopPropagation();
+              if (e.detail > 1) return; // 双击隔离：一次双击只切换一次，不产生两步历史
               const result = editor.setVisible([object.id], !object.visible);
               if (!result.ok) showToast(result.error.message, 'error');
             }}
+            onDoubleClick={(e) => e.stopPropagation()}
+            tabIndex={-1}
           >
             {object.visible ? '显' : '隐'}
           </button>
@@ -448,9 +475,12 @@ function TreeNode({
             title={object.locked ? '解锁' : '锁定'}
             onClick={(e) => {
               e.stopPropagation();
+              if (e.detail > 1) return; // 双击隔离：一次双击只切换一次
               const result = editor.setLocked([object.id], !object.locked);
               if (!result.ok) showToast(result.error.message, 'error');
             }}
+            onDoubleClick={(e) => e.stopPropagation()}
+            tabIndex={-1}
           >
             {object.locked ? '锁' : '开'}
           </button>
@@ -461,6 +491,7 @@ function TreeNode({
             title="删除"
             onClick={(e) => {
               e.stopPropagation();
+              if (e.detail > 1) return; // 双击隔离：双击的第二次点击不绕过确认直接删除
               if (!isDeleteConfirming) {
                 setDeleteConfirmId(object.id);
                 return;
@@ -470,6 +501,8 @@ function TreeNode({
               const result = editor.deleteSelection();
               if (!result.ok) showToast(result.error.message, 'error');
             }}
+            onDoubleClick={(e) => e.stopPropagation()}
+            tabIndex={-1}
             onBlur={() => setDeleteConfirmId(null)}
           >
             {isDeleteConfirming ? '确认?' : '删'}
