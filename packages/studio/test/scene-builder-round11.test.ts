@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { createSampleProject, SceneEditor } from '@lumora/core';
+import { createSampleProject } from '@lumora/core';
 import type { Project, SceneObjectData } from '@lumora/core';
 import { attachModelContent, buildScene, findNode } from '../src/components/editor/scene-builder';
 import * as EditorViewportModule from '../src/components/editor/EditorViewport';

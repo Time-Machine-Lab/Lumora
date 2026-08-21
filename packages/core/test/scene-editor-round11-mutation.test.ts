@@ -48,7 +48,6 @@ describe('R11-3 setGuide 同值 no-op：真实变化才推进版本并 emit', ()
 
   it('R11-3-T3 updater 内同值 setGuide 不取消外层事务：外层改名提交成功（RED）', () => {
     const editor = makeEditor();
-    const before = editor.getProject()!.objects.find((o) => o.id === 'sample-cube')!.name;
     const result = editor.updateObjectProps(
       'sample-cube',
       (o) => {
