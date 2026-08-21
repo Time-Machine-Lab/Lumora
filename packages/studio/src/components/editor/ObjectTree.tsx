@@ -553,8 +553,12 @@ function TreeNode({
           <button
             type="button"
             className="lumora-icon-button"
+            id={`tree-move-trigger-${object.id}`}
             data-testid={`tree-move-${object.id}`}
             title="移动到"
+            aria-haspopup="menu"
+            aria-expanded={moveMenuId === object.id}
+            aria-controls={`tree-move-menu-${object.id}`}
             onClick={(e) => {
               e.stopPropagation();
               setMoveMenuId(object.id);
@@ -592,6 +596,8 @@ function TreeNode({
           <div
             className="lumora-menu lumora-menu--tree"
             role="menu"
+            id={`tree-move-menu-${object.id}`}
+            aria-labelledby={`tree-move-trigger-${object.id}`}
             data-testid="tree-move-menu"
             ref={moveMenuRef}
             onClick={(e) => e.stopPropagation()}
