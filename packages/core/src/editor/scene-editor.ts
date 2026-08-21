@@ -371,9 +371,17 @@ export class SceneEditor {
 
     const idMap = new Map<string, string>();
     const runs: SceneObjectData[][] = [];
+    // 一次 childrenOf 索引在全部复制根间共享：替代逐层 project.objects.filter，
+    // 深链不爆栈（迭代栈，R9-M2）
+    const childrenOf = new Map<string | null, string[]>();
+    for (const object of project.objects) {
+      const list = childrenOf.get(object.parentId);
+      if (list) list.push(object.id);
+      else childrenOf.set(object.parentId, [object.id]);
+    }
     for (const rootId of roots) {
       const run: SceneObjectData[] = [];
-      this.duplicateSubtree(project, rootId, idMap, run);
+      this.duplicateSubtree(project, rootId, idMap, run, childrenOf);
       runs.push(run);
     }
     const newRootIds = runs.map((run) => run[0]!.id);
@@ -740,24 +748,32 @@ export class SceneEditor {
     };
   }
 
+  /** 复制一棵子树（迭代栈 + 共享 childrenOf 索引，R9-M2）：先序 parent-first、
+   *  子节点按原插入顺序（逆序入栈），6000 层链不爆栈 */
   private duplicateSubtree(
     project: Project,
     rootId: string,
     idMap: Map<string, string>,
     run: SceneObjectData[],
+    childrenOf: Map<string | null, string[]>,
   ): void {
-    const original = findObject(project, rootId);
-    if (!original) return;
-    const copy: SceneObjectData = {
-      ...original,
-      id: genId('obj'),
-      parentId: original.parentId ? (idMap.get(original.parentId) ?? original.parentId) : null,
-      name: `${original.name} 副本`,
-    };
-    idMap.set(rootId, copy.id);
-    run.push(copy);
-    for (const child of project.objects.filter((o) => o.parentId === rootId)) {
-      this.duplicateSubtree(project, child.id, idMap, run);
+    const stack: string[] = [rootId];
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      const original = findObject(project, id);
+      if (!original) continue;
+      const copy: SceneObjectData = {
+        ...original,
+        id: genId('obj'),
+        parentId: original.parentId ? (idMap.get(original.parentId) ?? original.parentId) : null,
+        name: `${original.name} 副本`,
+      };
+      idMap.set(id, copy.id);
+      run.push(copy);
+      const children = childrenOf.get(id);
+      if (children) {
+        for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]!);
+      }
     }
   }
 

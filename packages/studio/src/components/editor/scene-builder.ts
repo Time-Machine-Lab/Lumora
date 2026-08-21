@@ -34,30 +34,23 @@ const PRIMITIVE_GEOMETRIES: Record<string, () => THREE.BufferGeometry> = {
   plane: () => new THREE.PlaneGeometry(1, 1),
 };
 
-/** 是否位于 GLB 内容子树内（内容网格由 ContentCache 按 lease 引用持有，不在场景树中处置） */
-function isInsideContent(object: THREE.Object3D): boolean {
-  let current: THREE.Object3D | null = object;
-  while (current) {
-    if (readMark(current.userData, CONTENT_MARK)) return true;
-    current = current.parent;
-  }
-  return false;
-}
-
 /**
- * 递归释放几何/材质/纹理（撤销删除或重建节点时避免 GPU 泄漏）。
+ * 释放几何/材质/纹理（撤销删除或重建节点时避免 GPU 泄漏）。
  * GLB 内容子树跳过：同一资源可被多个模型实例共享（clone 共享几何/材质），
  * 资源归 ContentCache 所有，最后一个 lease 释放时才 dispose（共享资源不会被
  * 先删除的实例误杀）。
- * 迭代栈替代 THREE 递归 traverse：深层链不爆栈（R8-7）。
+ * 迭代栈替代 THREE 递归 traverse：深层链不爆栈（R8-7）；insideContent 状态
+ * 随栈帧线程化（子节点继承父的标记或自身带 CONTENT_MARK），O(1) 内容归属判断，
+ * 替代逐节点的 parent 链扫描（R9-M2）。
  */
-export function disposeNode(object: THREE.Object3D): void {
-  const stack: THREE.Object3D[] = [object];
+export function disposeNode(object: THREE.Object3D, insideContent = false): void {
+  const stack: { node: THREE.Object3D; insideContent: boolean }[] = [{ node: object, insideContent }];
   while (stack.length > 0) {
-    const child = stack.pop()!;
-    if (child instanceof THREE.Mesh && !isInsideContent(child)) {
-      child.geometry?.dispose();
-      const materials = Array.isArray(child.material) ? child.material : [child.material];
+    const { node, insideContent: inherited } = stack.pop()!;
+    const inside = inherited || !!readMark(node.userData, CONTENT_MARK);
+    if (node instanceof THREE.Mesh && !inside) {
+      node.geometry?.dispose();
+      const materials = Array.isArray(node.material) ? node.material : [node.material];
       for (const material of materials) {
         material.dispose();
         for (const value of Object.values(material)) {
@@ -67,7 +60,28 @@ export function disposeNode(object: THREE.Object3D): void {
         }
       }
     }
-    for (let i = child.children.length - 1; i >= 0; i--) stack.push(child.children[i]!);
+    for (let i = node.children.length - 1; i >= 0; i--) {
+      stack.push({ node: node.children[i]!, insideContent: inside });
+    }
+  }
+}
+
+/**
+ * 节点身份键（R9-M2）：type 之外，light.kind / camera.projection / assetId
+ * 变化同样构成身份分叉——旧类型/旧资源节点必须整棵重建，不得复用
+ */
+function nodeIdentityKey(data: SceneObjectData): string {
+  switch (data.type) {
+    case 'group':
+      return 'group';
+    case 'primitive':
+      return 'primitive';
+    case 'light':
+      return `light:${data.light?.kind ?? ''}`;
+    case 'camera':
+      return `camera:${data.camera?.projection ?? ''}`;
+    case 'model':
+      return `model:${data.assetId ?? ''}`;
   }
 }
 
@@ -122,6 +136,7 @@ export function buildObject(data: SceneObjectData, aspect: number): THREE.Object
   node.name = data.name;
   node.userData.objectId = data.id;
   node.userData.type = data.type;
+  node.userData.identityKey = nodeIdentityKey(data);
   node.userData.geometryKind = data.geometry?.kind;
   node.userData.color = data.material?.color ?? data.light?.color;
   node.userData.intensity = data.light?.intensity;
@@ -195,6 +210,38 @@ export function buildScene(project: Project, aspect: number): THREE.Group {
   return root;
 }
 
+/** 由对象数据迭代构建整棵子树（身份分叉重建用，R9-M2）：共享 childrenOf 索引、
+ *  深链不爆栈；子树内节点按 next 数据重建，无需再走 applyObjectData */
+function buildSubtree(
+  object: SceneObjectData,
+  childrenOf: Map<string | null, string[]>,
+  byId: Map<string, SceneObjectData>,
+  aspect: number,
+): THREE.Object3D {
+  const root = buildObject(object, aspect);
+  const stack: { object: SceneObjectData; parent: THREE.Object3D }[] = [];
+  const children = childrenOf.get(object.id);
+  if (children) {
+    for (let i = children.length - 1; i >= 0; i--) {
+      const child = byId.get(children[i]!);
+      if (child) stack.push({ object: child, parent: root });
+    }
+  }
+  while (stack.length > 0) {
+    const { object: childObject, parent } = stack.pop()!;
+    const node = buildObject(childObject, aspect);
+    parent.add(node);
+    const grandChildren = childrenOf.get(childObject.id);
+    if (grandChildren) {
+      for (let i = grandChildren.length - 1; i >= 0; i--) {
+        const grand = byId.get(grandChildren[i]!);
+        if (grand) stack.push({ object: grand, parent: node });
+      }
+    }
+  }
+  return root;
+}
+
 export function findNode(root: THREE.Object3D, objectId: string): THREE.Object3D | null {
   // 迭代先序搜索（R8-7）：与 THREE traverse 同序（自身在前、子节点按序），深树不爆栈
   const stack: THREE.Object3D[] = [root];
@@ -260,13 +307,23 @@ function applyObjectData(node: THREE.Object3D, data: SceneObjectData, aspect: nu
 }
 
 /**
- * 增量同步：对比前后项目，把对象变更应用到已构建的场景树（R8-4）：
- * - 先建全部缺失/身份分叉节点、再统一挂载：恢复数组为 child-first 时
- *   子节点先建，父节点虽尚不存在也不再被永久跳过（旧实现 continue）；
- * - type/assetId 变化视为身份分叉，整节点重建，不残留旧类型/旧资源内容；
- * - 挂载时父节点必已在表中；数据异常（父节点彻底不存在）时挂到根自愈。
+ * 增量同步：对比前后项目，把对象变更应用到已构建的场景树（R8-4 / R9-M2）：
+ * - 第一遍：身份分叉（identityKey 变化 = type/light.kind/camera.projection/
+ *   assetId）自顶向下整体重建子树——只处理 topmost 分叉，子分叉随父重建，
+ *   不重复处置；重建的模型 id 收集进 rebuiltModelIds 供内容重新挂载；
+ * - 第二/三遍：先建全部缺失节点再统一挂载（恢复数组 child-first 不永久跳过）；
+ * - 第四遍：既有节点数据更新（不含挂靠）；
+ * - 第五遍：无条件 coordination——每个可达节点的实际父必须等于数据父
+ *   （覆盖分叉重建后未变化子节点的重挂与普通重挂靠）；
+ * - 第六遍：不可达节点收尾——从 root 视角遍历，首个不可达节点即该子树
+ *   topmost，单次 disposeNode 整棵释放并跳过子树（消除逐节点重复处置）。
  */
-export function syncScene(root: THREE.Group, previous: Project, next: Project, aspect: number): void {
+export function syncScene(
+  root: THREE.Group,
+  previous: Project,
+  next: Project,
+  aspect: number,
+): { rebuiltModelIds: string[] } {
   const idToNode = new Map<string, THREE.Object3D>();
   // 迭代遍历替代 root.traverse（THREE 递归）：深树不爆栈（R8-7）
   const traverseStack: THREE.Object3D[] = [root];
@@ -278,56 +335,114 @@ export function syncScene(root: THREE.Group, previous: Project, next: Project, a
   const prevById = new Map(previous.objects.map((o) => [o.id, o]));
   // 只同步活动场景可达对象：其他场景的编辑/新建/删除不进入当前视口（多场景隔离）
   const nextReachable = getReachableObjectIds(next);
+  const byId = new Map(next.objects.map((o) => [o.id, o]));
+  const childrenOf = new Map<string | null, string[]>();
+  for (const object of next.objects) {
+    const list = childrenOf.get(object.parentId);
+    if (list) list.push(object.id);
+    else childrenOf.set(object.parentId, [object.id]);
+  }
+  const rebuiltModelIds: string[] = [];
 
-  // 第一遍：创建全部缺失节点；身份分叉（type/assetId 变化）的旧节点整节点释放重建
+  // 第一遍：身份分叉 → topmost 整体重建子树
   const created: { node: THREE.Object3D; parentId: string | null }[] = [];
   for (const object of next.objects) {
     if (!nextReachable.has(object.id)) continue;
     const node = idToNode.get(object.id);
-    if (
-      node &&
-      (node.userData.type !== object.type ||
-        (object.type === 'model' && node.userData.assetId !== object.assetId))
-    ) {
-      node.parent?.remove(node);
-      disposeNode(node);
-      idToNode.delete(object.id);
+    if (!node) continue;
+    if (node.userData.identityKey === nodeIdentityKey(object)) continue;
+    // topmost 判定：THREE 侧祖先若也身份分叉 → 由祖先重建覆盖，本节点跳过
+    let covered = false;
+    let ancestor = node.parent;
+    while (ancestor && ancestor !== root) {
+      const ancestorId = ancestor.userData.objectId as string | undefined;
+      if (ancestorId) {
+        const ancestorObject = byId.get(ancestorId);
+        if (
+          ancestorObject &&
+          nextReachable.has(ancestorId) &&
+          ancestor.userData.identityKey !== nodeIdentityKey(ancestorObject)
+        ) {
+          covered = true;
+          break;
+        }
+      }
+      ancestor = ancestor.parent;
     }
-    if (!idToNode.has(object.id)) {
-      const createdNode = buildObject(object, aspect);
-      idToNode.set(object.id, createdNode);
-      created.push({ node: createdNode, parentId: object.parentId ?? null });
+    if (covered) continue;
+    // 整棵子树重建：释放旧子树（内容子树跳过处置）、索引删除全部旧节点、重建
+    node.parent?.remove(node);
+    disposeNode(node);
+    const removal: THREE.Object3D[] = [node];
+    while (removal.length > 0) {
+      const child = removal.pop()!;
+      const childId = child.userData.objectId as string | undefined;
+      if (childId) idToNode.delete(childId);
+      for (let i = child.children.length - 1; i >= 0; i--) removal.push(child.children[i]!);
     }
+    const rebuilt = buildSubtree(object, childrenOf, byId, aspect);
+    idToNode.set(object.id, rebuilt);
+    created.push({ node: rebuilt, parentId: object.parentId ?? null });
+    if (object.type === 'model') rebuiltModelIds.push(object.id);
   }
 
-  // 第二遍：统一挂载 —— 父节点要么早已存在、要么本遍已创建，全部可解析
+  // 第二遍：创建全部缺失节点（父节点要么早已存在、要么本遍已创建，全部可解析）
+  for (const object of next.objects) {
+    if (!nextReachable.has(object.id)) continue;
+    if (idToNode.has(object.id)) continue;
+    const createdNode = buildObject(object, aspect);
+    idToNode.set(object.id, createdNode);
+    created.push({ node: createdNode, parentId: object.parentId ?? null });
+  }
+
+  // 第三遍：统一挂载
   for (const { node, parentId } of created) {
     const parentNode = parentId ? idToNode.get(parentId) : null;
     (parentNode ?? root).add(node);
   }
 
-  // 第三遍：既有节点的重挂靠与数据更新
+  // 第四遍：既有节点数据更新（挂靠统一由 coordination 收口）
   for (const object of next.objects) {
     if (!nextReachable.has(object.id)) continue;
     const node = idToNode.get(object.id);
     if (!node) continue;
     const prev = prevById.get(object.id);
-    if (prev) {
-      if (prev.parentId !== object.parentId) {
-        // 数据为局部变换，重挂靠直接用 add 保持局部变换不变
-        const parentNode = object.parentId ? idToNode.get(object.parentId) : null;
-        if (parentNode) parentNode.add(node);
-        else if (!object.parentId) root.add(node);
-      }
-      if (JSON.stringify(prev) !== JSON.stringify(object)) {
-        applyObjectData(node, object, aspect);
-      }
+    if (prev && JSON.stringify(prev) !== JSON.stringify(object)) {
+      applyObjectData(node, object, aspect);
     }
   }
-  for (const [id, node] of idToNode) {
-    if (!nextReachable.has(id)) {
+
+  // 第五遍：无条件 coordination —— 实际父必须等于数据父。分叉重建后子节点
+  // 仍挂在已释放的旧父实例下（数据 parentId 未变，第四遍不会触发），
+  // 旧父不在 idToNode → expected 解析为新父 → add 自动重挂
+  for (const object of next.objects) {
+    if (!nextReachable.has(object.id)) continue;
+    const node = idToNode.get(object.id);
+    if (!node) continue;
+    const expectedParent = object.parentId ? idToNode.get(object.parentId) ?? root : root;
+    if (node.parent !== expectedParent) {
+      expectedParent.add(node);
+    }
+  }
+
+  // 第六遍：不可达节点收尾 —— 从 root 遍历，首个不可达节点即 topmost：
+  // 单次 disposeNode 整棵释放并跳过其子树（无重复处置）；无 objectId 的内部
+  // 节点（内容子树/占位符）随父保留，不下处置
+  const removalStack: THREE.Object3D[] = [root];
+  while (removalStack.length > 0) {
+    const node = removalStack.pop()!;
+    const objectId = node.userData.objectId as string | undefined;
+    if (objectId && nextReachable.has(objectId)) {
+      for (let i = node.children.length - 1; i >= 0; i--) removalStack.push(node.children[i]!);
+      continue;
+    }
+    if (objectId) {
       node.parent?.remove(node);
       disposeNode(node);
+      continue;
     }
+    for (let i = node.children.length - 1; i >= 0; i--) removalStack.push(node.children[i]!);
   }
+
+  return { rebuiltModelIds };
 }

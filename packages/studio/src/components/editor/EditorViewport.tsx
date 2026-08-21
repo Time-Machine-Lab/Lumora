@@ -189,6 +189,8 @@ function SceneContent({
   // 会话代：openProject/reset 自增会话令牌；令牌变化 = 新项目会话，强制全量重建，
   // 否则复用 ID 的项目切换会把旧类型/旧资源节点保留下来（R8-4）
   const sessionRef = useRef(editor.getSessionToken());
+  // 内容挂载代：身份分叉重建的模型（rebuiltModelIds）需要重新挂载内容（R9-M2）
+  const [contentVersion, setContentVersion] = useState(0);
 
   useEffect(() => {
     const current = rootRef.current;
@@ -207,7 +209,8 @@ function SceneContent({
     const sceneSwitched = prevProjectRef.current && prevProjectRef.current.activeSceneId !== project.activeSceneId;
     const newSession = session !== sessionRef.current;
     if (current && prevProjectRef.current && !sceneSwitched && !newSession) {
-      syncScene(current, prevProjectRef.current, project, aspect);
+      const { rebuiltModelIds } = syncScene(current, prevProjectRef.current, project, aspect);
+      if (rebuiltModelIds.length > 0) setContentVersion((v) => v + 1);
     } else {
       // 切场景/新会话（或重建）：旧树节点整体释放，避免跨场景残留 GPU 资源
       if (current) {
@@ -268,7 +271,9 @@ function SceneContent({
       active = false;
       for (const lease of leases) lease.release();
     };
-  }, [project, cache, rootRef]);
+    // contentVersion：身份分叉重建的模型（rebuiltModelIds）需要重新挂载内容；
+    // attachModelContent 幂等（已有内容子树直接返回），全量重跑安全
+  }, [project, cache, rootRef, contentVersion]);
 
   // 项目变更后按 Project 全量 model→asset 关系清扫缓存（null=关闭项目，全部释放）
   useEffect(() => {
