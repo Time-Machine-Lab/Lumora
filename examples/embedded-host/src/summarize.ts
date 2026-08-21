@@ -6,8 +6,14 @@
  * - 嵌套对象仅按 path/schema 级字段白名单展开（白名单外对象固定 [对象]，
  *   数组只报长度或展开白名单项），不调用 Object.keys，工作量与对象宽度无关
  * - 每个声明字段读取前先做可捕获异常的 own-property 检查，缺失/失败跳过或占位
+ * - 事件名或分隔符耗尽预算后立即返回，不再触碰 event/payload
+ * - 截断时恒以 … 结尾：每次写入前先为省略号预留 1 字符，
+ *   转义收缩按未转义片段边界进行，不会切断转义序列
+ * - Error 判定为有界检查（@@toStringTag 至多读取一次，零原型链遍历），
+ *   且仅在已知 error 字段路径执行；message 单次读取
  * - 所有文本（字符串、Error.message、Symbol 描述、事件名）统一转义
- *   \r \n U+2028 U+2029 后再进入预算，转义只作用于实际输出的片段
+ *   \r \n U+2028 U+2029 后再进入预算；所有动态字符串统一经同一
+ *   base64 判定入口进入文本写入
  * - base64 资产内容按路径（payload 字段）直接掩码；内容启发式仅兜底且有界采样
  * - getter/Proxy/revoked Proxy/异常形状一律容错（safeIsArray、readLength 校验、
  *   Error.message 类型校验），摘要永不抛错
@@ -60,6 +66,8 @@ function escapeControl(text: string): string {
 
 class LineWriter {
   private readonly parts: string[] = [];
+  /** 与 parts 平行的未转义片段：截断回收时按原始边界裁剪，不切断转义序列 */
+  private readonly raws: string[] = [];
   private chars = SUMMARY_CHAR_BUDGET;
   private nodes = SUMMARY_NODE_BUDGET;
   private doneFlag = false;
@@ -68,18 +76,24 @@ class LineWriter {
     return this.doneFlag;
   }
 
-  /** 写入文本：只对实际输出的片段转义并消费预算；超限时预留省略号空间后截断 */
+  /**
+   * 写入文本：只对实际输出的片段转义并消费预算。
+   * 先为省略号预留 1 字符（room = chars - 1），保证未终止时恒有 chars >= 1，
+   * 截断时总有空间补 …；转义放大长度时按超额量收缩原始片段，不切断转义序列。
+   */
   write(text: string): void {
     if (this.doneFlag) return;
-    let raw = text.length > this.chars ? text.slice(0, Math.max(0, this.chars - ELLIPSIS.length)) : text;
+    const room = this.chars - ELLIPSIS.length;
+    let raw = text.length > room ? text.slice(0, Math.max(0, room)) : text;
     let safe = escapeControl(raw);
-    while (safe.length > this.chars && raw.length > 0) {
+    while (safe.length > room && raw.length > 0) {
       // 转义会放大长度：按超额量收缩原始片段，保证不切断转义序列
-      raw = raw.slice(0, Math.max(0, raw.length - (safe.length - this.chars)));
+      raw = raw.slice(0, Math.max(0, raw.length - (safe.length - room)));
       safe = escapeControl(raw);
     }
     this.chars -= safe.length;
     this.parts.push(safe);
+    this.raws.push(raw);
     if (raw.length < text.length) this.truncate();
   }
 
@@ -94,11 +108,33 @@ class LineWriter {
     return true;
   }
 
+  /**
+   * 截断并终止：末尾恒补 …。
+   * 预留不变量下 chars >= 1（need <= 0）必然成立，回收分支仅为兜底：
+   * 若未来写入路径破坏预留，则按最后未转义片段的完整边界回收字符，
+   * 一次回收可能释放整个转义单元。
+   */
   truncate(): void {
     if (this.doneFlag) return;
     this.doneFlag = true;
-    if (this.chars > 0) {
+    let need = ELLIPSIS.length - this.chars;
+    while (need > 0 && this.raws.length > 0) {
+      const raw = this.raws[this.raws.length - 1] ?? '';
+      const take = Math.min(need, raw.length);
+      const newRaw = raw.slice(0, raw.length - take);
+      this.chars += escapeControl(raw).length - escapeControl(newRaw).length;
+      need = ELLIPSIS.length - this.chars;
+      if (newRaw.length > 0) {
+        this.raws[this.raws.length - 1] = newRaw;
+        this.parts[this.parts.length - 1] = escapeControl(newRaw);
+      } else {
+        this.raws.pop();
+        this.parts.pop();
+      }
+    }
+    if (need <= 0) {
       this.parts.push(ELLIPSIS);
+      this.raws.push(ELLIPSIS);
       this.chars = 0;
     }
   }
@@ -146,23 +182,50 @@ function readLength(value: unknown[]): number {
   return typeof length === 'number' && Number.isInteger(length) && length >= 0 ? length : -1;
 }
 
+/**
+ * 有界 Error 判定：只沿原型链检查至多两层（value 的原型与其原型），
+ * 命中 Error 及其标准子类原型即视为 Error。instanceof 会遍历整条原型链
+ * 直至 null（循环 getPrototypeOf Proxy 可触发海量 trap），本检查在
+ * 循环 Proxy 上至多触发 2 次 trap；revoked Proxy 抛错被捕获。
+ */
 function isError(value: object): boolean {
   try {
-    return value instanceof Error;
+    const proto = Object.getPrototypeOf(value);
+    if (proto === null) return false;
+    if (isErrorPrototype(proto)) return true;
+    const parent = Object.getPrototypeOf(proto);
+    return parent !== null && isErrorPrototype(parent);
   } catch {
     return false;
   }
+}
+
+/** Error 及其标准子类的原型（身份比较，无属性访问、无 trap） */
+function isErrorPrototype(proto: object): boolean {
+  return (
+    proto === Error.prototype ||
+    proto === TypeError.prototype ||
+    proto === RangeError.prototype ||
+    proto === SyntaxError.prototype ||
+    proto === ReferenceError.prototype ||
+    proto === EvalError.prototype ||
+    proto === URIError.prototype ||
+    proto === AggregateError.prototype
+  );
 }
 
 export function formatLogLine(event: string, payload: unknown): string {
   const writer = new LineWriter();
   writer.write(event);
   writer.write(' ');
+  // 事件名或分隔符耗尽预算：立即返回，不再触碰 event/payload
+  if (writer.done) return writer.value;
   writePayload(event, payload, writer);
   return writer.value;
 }
 
 function writePayload(event: string, payload: unknown, writer: LineWriter): void {
+  if (writer.done) return;
   const fields = hasOwnKey(KNOWN_EVENT_FIELDS as object, event) ? KNOWN_EVENT_FIELDS[event] : undefined;
   if (!fields || payload === null || typeof payload !== 'object') {
     writeUnknownPayload(payload, writer);
@@ -196,10 +259,6 @@ function writeUnknownPayload(payload: unknown, writer: LineWriter): void {
   }
   switch (typeof payload) {
     case 'string': {
-      if (isBase64Like(payload)) {
-        writer.write(`[base64: ${payload.length} 字符]`);
-        return;
-      }
       writeString(writer, payload);
       return;
     }
@@ -246,10 +305,6 @@ function writeValue(writer: LineWriter, value: unknown, path: string): void {
         writer.write(`[base64: ${value.length} 字符]`);
         return;
       }
-      if (isBase64Like(value)) {
-        writer.write(`[base64: ${value.length} 字符]`);
-        return;
-      }
       writeString(writer, value);
       return;
     }
@@ -274,7 +329,8 @@ function writeValue(writer: LineWriter, value: unknown, path: string): void {
         writer.write('[数据]');
         return;
       }
-      if (isError(value)) {
+      // Error 判定只在已知 error 字段路径执行；其余任意对象不再被检查，零 trap 访问
+      if (path === 'error' && isError(value)) {
         writeError(writer, value as Error);
         return;
       }
@@ -369,7 +425,7 @@ function writeSymbol(writer: LineWriter, symbol: symbol): void {
     return;
   }
   writer.write('[Symbol: ');
-  writeBoundedText(writer, description, SUMMARY_STRING_LIMIT);
+  writeTextContent(writer, description);
   writer.write(']');
 }
 
@@ -386,14 +442,26 @@ function writeError(writer: LineWriter, error: Error): void {
     return;
   }
   writer.write('[Error: ');
-  writeBoundedText(writer, message, SUMMARY_STRING_LIMIT);
+  writeTextContent(writer, message);
   writer.write(']');
 }
 
 function writeString(writer: LineWriter, value: string): void {
   writer.write('"');
-  writeBoundedText(writer, value, SUMMARY_STRING_LIMIT);
+  writeTextContent(writer, value);
   writer.write('"');
+}
+
+/**
+ * 统一动态文本入口：字符串、Error.message、Symbol 描述共用同一
+ * 有界 base64 判定 + 有界文本写入，不再有绕过掩码的路径。
+ */
+function writeTextContent(writer: LineWriter, text: string): void {
+  if (isBase64Like(text)) {
+    writer.write(`[base64: ${text.length} 字符]`);
+    return;
+  }
+  writeBoundedText(writer, text, SUMMARY_STRING_LIMIT);
 }
 
 /** 有界文本：先取定长片段（不构造完整文本）再按片段写入 */

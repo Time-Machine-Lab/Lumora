@@ -42,6 +42,80 @@ describe('formatLogLine：完整日志行共享预算', () => {
     expect(out).toBe('e'.repeat(SUMMARY_CHAR_BUDGET - 6) + ' "bbb…');
     expectBounded(out);
   });
+
+  it('事件名耗尽预算后立即返回：不再触碰 payload（复审第 1 项）', () => {
+    let getCount = 0;
+    let ownKeysCount = 0;
+    let descriptorCount = 0;
+    let protoCount = 0;
+    const spy = new Proxy(
+      { a: 1 },
+      {
+        get(target, prop, receiver) {
+          getCount++;
+          return Reflect.get(target, prop, receiver);
+        },
+        ownKeys(target) {
+          ownKeysCount++;
+          return Reflect.ownKeys(target);
+        },
+        getOwnPropertyDescriptor(target, prop) {
+          descriptorCount++;
+          return Reflect.getOwnPropertyDescriptor(target, prop);
+        },
+        getPrototypeOf() {
+          protoCount++;
+          return Object.prototype;
+        },
+      },
+    );
+    const out = formatLogLine('e'.repeat(100_000), spy);
+    expect(getCount).toBe(0);
+    expect(ownKeysCount).toBe(0);
+    expect(descriptorCount).toBe(0);
+    expect(protoCount).toBe(0);
+    expect(out).toBe('e'.repeat(SUMMARY_CHAR_BUDGET - 1) + '…');
+    expect(out.length).toBe(SUMMARY_CHAR_BUDGET);
+    expectBounded(out);
+  });
+
+  it('4096 字符事件名耗尽预算：数组 Proxy 的 length 不被读取（复审第 1 项）', () => {
+    let getCount = 0;
+    const arr = new Proxy([1, 2, 3], {
+      get(target, prop, receiver) {
+        getCount++;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const out = formatLogLine('e'.repeat(SUMMARY_CHAR_BUDGET), arr);
+    expect(getCount).toBe(0);
+    expect(out).toBe('e'.repeat(SUMMARY_CHAR_BUDGET - 1) + '…');
+    expect(out.length).toBe(SUMMARY_CHAR_BUDGET);
+    expectBounded(out);
+  });
+});
+
+describe('formatLogLine：截断一律以 … 结尾（复审第 2 项）', () => {
+  it('4095 字符事件名：分隔符被吞但省略号保留', () => {
+    const out = formatLogLine('e'.repeat(SUMMARY_CHAR_BUDGET - 1), { a: 1 });
+    expect(out).toBe('e'.repeat(SUMMARY_CHAR_BUDGET - 1) + '…');
+    expect(out.length).toBe(SUMMARY_CHAR_BUDGET);
+    expectBounded(out);
+  });
+
+  it('4096 字符事件名：整个 payload 被吞但省略号保留', () => {
+    const out = formatLogLine('e'.repeat(SUMMARY_CHAR_BUDGET), { a: 1 });
+    expect(out).toBe('e'.repeat(SUMMARY_CHAR_BUDGET - 1) + '…');
+    expect(out.length).toBe(SUMMARY_CHAR_BUDGET);
+    expectBounded(out);
+  });
+
+  it('转义扩容导致收缩：末尾整段被回收，输出恰为预算上限且以 … 结尾', () => {
+    const out = formatLogLine('\n'.repeat(100) + 'a'.repeat(3996), null);
+    expect(out).toBe('\\n'.repeat(100) + 'a'.repeat(SUMMARY_CHAR_BUDGET - 201) + '…');
+    expect(out.length).toBe(SUMMARY_CHAR_BUDGET);
+    expectBounded(out);
+  });
 });
 
 describe('formatLogLine：无通用枚举，仅白名单字段访问（复审第 1、3 项）', () => {
@@ -72,9 +146,10 @@ describe('formatLogLine：无通用枚举，仅白名单字段访问（复审第
     expectBounded(out);
   });
 
-  it('未知嵌套对象固定 [对象]：ownKeys/get/getOwnPropertyDescriptor 零访问（复审第 1 项）', () => {
+  it('未知嵌套对象固定 [对象]：ownKeys/get/getOwnPropertyDescriptor 零访问（复审第 1、4 项）', () => {
     let descriptorCount = 0;
     let getCount = 0;
+    let ownKeysCount = 0;
     const wide = new Proxy(
       Object.fromEntries(Array.from({ length: 10_000 }, (_, i) => [`k${i}`, i])),
       {
@@ -83,6 +158,7 @@ describe('formatLogLine：无通用枚举，仅白名单字段访问（复审第
           return Reflect.getOwnPropertyDescriptor(target, prop);
         },
         ownKeys() {
+          ownKeysCount++;
           throw new Error('ownKeys 不应被调用');
         },
         get(target, prop, receiver) {
@@ -92,6 +168,7 @@ describe('formatLogLine：无通用枚举，仅白名单字段访问（复审第
       },
     );
     const out = sumState(wide);
+    expect(ownKeysCount).toBe(0);
     expect(descriptorCount).toBe(0);
     expect(getCount).toBe(0);
     expect(out).toContain('state: [对象]');
@@ -198,6 +275,29 @@ describe('formatLogLine：Proxy/异常形状一律不抛错（复审第 2 项）
     expectBounded(out);
   });
 
+  it('循环 getPrototypeOf Proxy：Error 判定有界，trap 次数有界（复审第 1 项）', () => {
+    let protoCount = 0;
+    const evil = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          protoCount++;
+          return evil;
+        },
+      },
+    );
+    // 任意对象路径（state）：不执行 Error 判定，零 trap 访问
+    expect(sumState(evil)).toContain('state: [对象]');
+    expect(protoCount).toBe(0);
+    // 已知 error 字段路径：有界原型检查（至多 2 层），trap 次数有界
+    expect(sumError(evil)).toContain('error: [对象]');
+    expect(protoCount).toBeLessThanOrEqual(2);
+    // 未知事件 payload 路径：同样有界
+    expect(formatLogLine('plugin:custom', evil)).toBe('plugin:custom [对象]');
+    expect(protoCount).toBeLessThanOrEqual(4);
+    expectBounded(sumState(evil));
+  });
+
   it('Proxy 数组（白名单项）：length 与各下标只读一次，抛错项标 [取值失败]', () => {
     let getCount = 0;
     const arr = new Proxy([{ id: 'a', payload: 'A'.repeat(500) }, { id: 'b' }, { id: 'c' }], {
@@ -268,6 +368,29 @@ describe('formatLogLine：base64 内容掩码', () => {
   it('短字符串不做掩码（阈值 200）', () => {
     expect(sumState('a'.repeat(100))).toContain('"a');
     expectBounded(sumState('a'.repeat(100)));
+  });
+
+  it('Error.message 中的超长 base64 被掩码（复审第 3 项）', () => {
+    const out = sumError(new Error('A'.repeat(2_800_000)));
+    expect(out).toContain('[Error: [base64: 2800000 字符]]');
+    expect(out).not.toContain('A'.repeat(50));
+    expectBounded(out);
+  });
+
+  it('Error.message 为已知 base64（全零字节）被掩码（复审第 3 项）', () => {
+    const message = Buffer.alloc(4096).toString('base64'); // 前缀全为 'A'
+    expect(message).toMatch(/^A{64}/);
+    const out = sumError(new Error(message));
+    expect(out).toContain('[Error: [base64: 5464 字符]]');
+    expect(out).not.toContain(message.slice(0, 120));
+    expectBounded(out);
+  });
+
+  it('Symbol 描述中的超长 base64 被掩码（复审第 3 项）', () => {
+    const out = sumState(Symbol('A'.repeat(2_800_000)));
+    expect(out).toContain('[Symbol: [base64: 2800000 字符]]');
+    expect(out).not.toContain('A'.repeat(50));
+    expectBounded(out);
   });
 });
 
