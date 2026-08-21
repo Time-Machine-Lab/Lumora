@@ -7,6 +7,16 @@ import type { Project, SceneObjectData, TransformData } from '@lumora/core';
 export const PLACEHOLDER_NAME = 'model-placeholder';
 const CONTENT_NAME = '__glb-content__';
 
+/**
+ * 内部所有权标记（R8-5）：占位框/内容子树归属一律查 userData Symbol——
+ * 名称是用户可编辑的（导入文件名、对象重命名），同名即判定所有权会让
+ * 用户 GLB 或对象名伪造标记：'model-placeholder' 模型组被当占位框移除、
+ * '__glb-content__' 组被当已有内容导致永不挂载、同名普通对象释放被跳过。
+ * Symbol 不可能被用户数据携带（clone(true) 的 userData JSON 拷贝也不含 Symbol）。
+ */
+const PLACEHOLDER_MARK = Symbol('lumora.model-placeholder');
+const CONTENT_MARK = Symbol('lumora.model-content');
+
 const PRIMITIVE_GEOMETRIES: Record<string, () => THREE.BufferGeometry> = {
   box: () => new THREE.BoxGeometry(1, 1, 1),
   sphere: () => new THREE.SphereGeometry(0.6, 24, 24),
@@ -19,7 +29,7 @@ const PRIMITIVE_GEOMETRIES: Record<string, () => THREE.BufferGeometry> = {
 function isInsideContent(object: THREE.Object3D): boolean {
   let current: THREE.Object3D | null = object;
   while (current) {
-    if (current.name === CONTENT_NAME) return true;
+    if (current.userData[CONTENT_MARK]) return true;
     current = current.parent;
   }
   return false;
@@ -90,6 +100,7 @@ export function buildObject(data: SceneObjectData, aspect: number): THREE.Object
         new THREE.MeshBasicMaterial({ color: '#7a6bff', wireframe: true, transparent: true, opacity: 0.7 }),
       );
       placeholder.name = PLACEHOLDER_NAME;
+      placeholder.userData[PLACEHOLDER_MARK] = true;
       group.add(placeholder);
       node = group;
       break;
@@ -111,14 +122,19 @@ export function buildObject(data: SceneObjectData, aspect: number): THREE.Object
 
 /** 用已解析的 GLB 内容替换模型占位框（克隆副本，支持同一资源多处引用） */
 export function attachModelContent(node: THREE.Object3D, gltf: GLTF): void {
-  if (node.getObjectByName(CONTENT_NAME)) return;
-  const placeholder = node.getObjectByName(PLACEHOLDER_NAME);
+  // 占位框/内容都是模型组的直接子节点：只查直接子节点与 Symbol 标记，
+  // 用户 GLB 内或对象名里的同名节点（'model-placeholder'/'__glb-content__'）
+  // 不可能被误判为内部结构（R8-5）
+  if (node.children.some((c) => c.userData[CONTENT_MARK])) return;
+  const placeholder = node.children.find((c) => c.userData[PLACEHOLDER_MARK]);
   if (placeholder) {
-    placeholder.removeFromParent();
+    node.remove(placeholder);
     disposeNode(placeholder);
   }
   const clone = gltf.scene.clone(true);
   clone.name = CONTENT_NAME;
+  // clone(true) 对 userData 做 JSON 拷贝（Symbol 键被丢弃），须在克隆后补标
+  clone.userData[CONTENT_MARK] = true;
   node.add(clone);
 }
 
