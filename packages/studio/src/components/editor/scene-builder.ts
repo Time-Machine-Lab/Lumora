@@ -41,23 +41,24 @@ export function isOwnedNode(node: THREE.Object3D): boolean {
 }
 
 /**
- * 内容边界上方首个品牌节点（R11-2 拾取边界统一）：内容子树整体透明——
- * 完整走父链，遇 CONTENT_MARK 丢弃其下全部候选（内容根自身与内容后代
- * 即使反射伪造品牌也不解析），只返回边界上方品牌节点；未跨边界时保持
- * 「最近品牌」原语义。注意必须先遍历再决议：伪造品牌的内容后代在触达
- * 内容根前若逐层即返会被接受。
+ * 内容边界上方最近品牌节点（R11-2/R12-2 拾取边界统一）：内容子树整体透明——
+ * 完整走父链，遇任意 CONTENT_MARK 清空其下全部候选（内容根自身与内容后代
+ * 即使反射伪造品牌也不解析），走到根后再决议，循环内不返回——嵌套内容
+ * 边界下伪造品牌在触达外层边界（会清空候选）前若即返会被接受（R12-2
+ * 攻击链：outerContent > 伪造B > innerContent > hit 曾返回 'B'）。
+ * 语义：最近有效品牌定格（候选只在「最近」处冻结一次）+ 任意内容边界清空
+ * + 根处决议 ⇒ 最终候选 = 最外层内容边界上方最近品牌；objectId 非字符串
+ * 的品牌（反射伪造）不冻结、不采纳。
  */
 export function resolveOwnedIdAboveContent(object: THREE.Object3D): string | null {
   let current: THREE.Object3D | null = object;
-  let crossed = false;
   let candidate: string | null = null;
   while (current) {
     if (isContentNode(current)) {
-      crossed = true;
-      candidate = null; // 丢弃其下候选（含最近品牌）
-    } else if (isOwnedNode(current)) {
-      if (crossed) return current.userData.objectId as string; // 边界上方首个品牌
-      if (candidate === null) candidate = current.userData.objectId as string; // 最近品牌（首个定格）
+      candidate = null; // 任意内容边界：清空其下全部候选
+    } else if (isOwnedNode(current) && candidate === null) {
+      const objectId = current.userData.objectId;
+      if (typeof objectId === 'string') candidate = objectId; // 最近有效品牌定格
     }
     current = current.parent;
   }
