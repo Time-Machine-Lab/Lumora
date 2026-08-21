@@ -228,11 +228,15 @@ export function relativePosixPath(mainPath: string, partPath: string): string {
 }
 
 /**
- * URI 侧规范化（R8-10 + R9-M3 #10）：先剥离 query/fragment，再按路径段逐个
- * percent-decode，最后归并 dot-segment（. / ..），返回段数组——解码后的 %2F
- * 保留为本段内字面（不充当分隔符），段边界不因 join 丢失。GLTF 相对 URI 是
- * 编码形态，与解码形态的依赖文件实体路径分属两侧，不能共用同一规范化——
- * 统一 decode 会让实体文件名中的字面 % 序列假命中（R8-10）。
+ * URI 侧规范化（R8-10 + R9-M3 #10 + R10-M3 #10）：先剥离 query/fragment，再按
+ * 路径段逐个 percent-decode，最后归并 dot-segment（. / ..），返回段数组——
+ * 解码后的 %2F 保留为本段内字面（不充当分隔符），段边界不因 join 丢失。
+ * GLTF 相对 URI 是编码形态，与解码形态的依赖文件实体路径分属两侧，不能共用
+ * 同一规范化——统一 decode 会让实体文件名中的字面 % 序列假命中（R8-10）。
+ * '..' 归并为 stack-preserving（R10）：内部 '..' 消费前一段（RFC 3986 §5.2.4
+ * 的栈语义）；前导 '..' 链保留——相对路径是「自 main 目录上溯」的形态，
+ * 深度信息在比较中必须有效（对 RFC 有意偏离：此处不是对 base URI 的引用
+ * 解析，而是深度可区分的相对路径比较）。
  */
 function normalizeUriSegments(raw: string): string[] {
   const queryIndex = raw.search(/[?#]/);
@@ -248,7 +252,9 @@ function normalizeUriSegments(raw: string): string[] {
     }
     if (decoded === '.' || decoded === '') continue;
     if (decoded === '..') {
-      if (out.length > 0) out.pop();
+      const top = out[out.length - 1];
+      if (top !== undefined && top !== '..') out.pop();
+      else out.push('..');
       continue;
     }
     out.push(decoded);
@@ -257,8 +263,10 @@ function normalizeUriSegments(raw: string): string[] {
 }
 
 /**
- * 实体路径侧规范化（R8-10）：只归并 dot-segment，不做任何 percent-decode——
- * 文件名是解码后的现实，字面 % 序列必须按字面保留，不得与编码 URI 假命中。
+ * 实体路径侧规范化（R8-10 + R10-M3 #10）：只归并 dot-segment，不做任何
+ * percent-decode——文件名是解码后的现实，字面 % 序列必须按字面保留，不得与
+ * 编码 URI 假命中。'..' 归并与 URI 侧同为 stack-preserving（前导 .. 链保留），
+ * 两侧深度语义一致。
  */
 function normalizeEntityPathSegments(path: string): string[] {
   const segments = path.split('/');
@@ -266,7 +274,9 @@ function normalizeEntityPathSegments(path: string): string[] {
   for (const segment of segments) {
     if (segment === '.' || segment === '') continue;
     if (segment === '..') {
-      if (out.length > 0) out.pop();
+      const top = out[out.length - 1];
+      if (top !== undefined && top !== '..') out.pop();
+      else out.push('..');
       continue;
     }
     out.push(segment);
