@@ -68,6 +68,20 @@ interface EditorSnapshot {
   selection: string[];
 }
 
+/**
+ * 事务基线（R9-M1）：入口最开始时捕获的项目引用 + 会话/纪元。
+ * 外部窗口（输入对象克隆、updater 回调、transform 数组元素读取）后必须
+ * guardReentry 复验：dispose 或任何状态换入（嵌套提交/嵌套 openProject）都
+ * 使本次操作失效——不得移动历史、不得覆盖内层结果、不得复活已释放编辑器。
+ * project 可为 null：openProject 在首次打开（尚无项目）时同样需要基线复验。
+ */
+interface Baseline {
+  project: Project | null;
+  selection: string[];
+  epoch: number;
+  session: number;
+}
+
 function failure(message: string): Result<never> {
   return { ok: false, error: new Error(message) };
 }
@@ -152,13 +166,17 @@ export class SceneEditor {
     // 全部就绪后才一次性提交 project/history/session/revision；
     // 任何一步失败（DataCloneError/校验失败）都不触碰既有状态。
     this.assertAlive();
-    const epoch = this.stateEpoch;
-    const session = this.sessionToken;
+    const baseline: Baseline = {
+      project: this.project,
+      selection: [...this.selection],
+      epoch: this.stateEpoch,
+      session: this.sessionToken,
+    };
     const owned = this.own(project); // clone 先行：校验与冻结都在编辑器自有副本上进行
     // 输入对象 getter 可能在 structuredClone 期间副作用地释放/重入编辑器（R8）：
     // 克隆后复验终态，不得复活已释放编辑器或覆盖内层 openProject 结果
-    this.assertAlive();
-    if (this.sessionToken !== session || this.stateEpoch !== epoch) return;
+    const reentered = this.guardReentry(baseline);
+    if (reentered) throw reentered.error;
     this.validateProject(owned);
     this.swapState(owned, [], { resetView: true });
     this.revisionCounter = owned.revision;
@@ -227,11 +245,13 @@ export class SceneEditor {
   // ---------- 场景操作（历史可撤销） ----------
 
   addScene(name: string): Result<string> {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
     const scene = { id: genId('scene'), name: name || '场景', rootObjectIds: [], activeCameraId: null };
     // after.selection 默认沿用当前选择，pushEntry 按新场景可达集过滤（空场景 → 空选择）
     const result = this.commit(
+      baseline,
       { ...project, scenes: [...project.scenes, scene], activeSceneId: scene.id },
       `新建场景 ${scene.name}`,
     );
@@ -240,14 +260,16 @@ export class SceneEditor {
   }
 
   setActiveScene(sceneId: string): Result {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
     if (!getScene(project, sceneId)) return failure('场景不存在');
     if (project.activeSceneId === sceneId) return { ok: true };
     // 同一历史快照内，选择与场景切换原子一致：快照 after.selection 与活动场景同步
     const reachable = getReachableIds(project, sceneId);
-    const filteredSelection = this.selection.filter((id) => reachable.has(id));
+    const filteredSelection = baseline.selection.filter((id) => reachable.has(id));
     const result = this.commit(
+      baseline,
       { ...project, activeSceneId: sceneId },
       '切换场景',
       filteredSelection,
@@ -257,8 +279,9 @@ export class SceneEditor {
   }
 
   setActiveCamera(objectId: string | null): Result {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
     const scene = project.scenes.find((s) => s.id === project.activeSceneId);
     if (!scene) return failure('场景不存在');
     if (objectId !== null) {
@@ -271,14 +294,18 @@ export class SceneEditor {
     const scenes = project.scenes.map((s) =>
       s.id === scene.id ? { ...s, activeCameraId: objectId } : s,
     );
-    return this.commit({ ...project, scenes }, '设置机位');
+    return this.commit(baseline, { ...project, scenes }, '设置机位');
   }
 
   /** 新增对象（挂到当前场景根部并选中） */
   addObject(object: SceneObjectData): Result<string> {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
     const owned = this.own(object); // 无条件克隆为编辑器自有数据（R6）
+    // 输入对象 getter 可能 dispose/嵌套 openProject（R9-M1）：克隆后复验基线
+    const reentered = this.guardReentry(baseline);
+    if (reentered) return reentered;
     if (!isSceneObject(owned) || owned.parentId !== null) return failure('对象数据不合法');
     const scene = project.scenes.find((s) => s.id === project.activeSceneId);
     if (!scene) return failure('场景不存在');
@@ -286,6 +313,7 @@ export class SceneEditor {
       s.id === scene.id ? { ...s, rootObjectIds: [...s.rootObjectIds, owned.id] } : s,
     );
     const result = this.commit(
+      baseline,
       { ...project, scenes, objects: [...project.objects, owned] },
       `创建 ${owned.name}`,
       [owned.id],
@@ -296,10 +324,11 @@ export class SceneEditor {
 
   /** 删除选中对象（含子树）；子树含锁定对象时拒绝（FR-002） */
   deleteSelection(): Result<{ removed: number }> {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
     const ids = new Set<string>();
-    for (const id of this.selection) {
+    for (const id of baseline.selection) {
       // 归属校验（防御）：选择已按活动场景过滤，此处再确认对象属于活动场景
       if (findObject(project, id) && isInActiveScene(project, id)) {
         ids.add(id);
@@ -315,10 +344,10 @@ export class SceneEditor {
     let next = removeObjects(project, ids);
     const unreferenced = new Set(collectUnreferencedAssets(next).map((a) => a.id));
     next = removeAssets(next, unreferenced);
-    const parentId = this.selection
+    const parentId = baseline.selection
       .map((id) => findObject(project, id)?.parentId)
       .find((pid): pid is string => !!pid);
-    const result = this.commit(next, `删除 ${removed} 个对象`, parentId ? [parentId] : []);
+    const result = this.commit(baseline, next, `删除 ${removed} 个对象`, parentId ? [parentId] : []);
     // 被删机位（含场景归属变化）：transition 从下一个项目推导回退导演视图
     if (!result.ok) return result;
     return { ok: true, value: { removed } };
@@ -328,9 +357,10 @@ export class SceneEditor {
    *  选择先去重（R8-8）：重复 root 会产生第二个副本 run，而 indexOf 只取
    *  首个下标 → 副本被丢弃但 ID 仍进返回列表（指向不存在的对象）。 */
   duplicateSelection(): Result<{ ids: string[] }> {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
-    const selection = this.dedupeSelection(this.selection);
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
+    const selection = this.dedupeSelection(baseline.selection);
     const roots = selection.filter(
       (id) =>
         findObject(project, id) &&
@@ -367,15 +397,16 @@ export class SceneEditor {
         )
       : project.scenes;
 
-    const result = this.commit({ ...project, objects, scenes }, `复制 ${newRootIds.length} 个对象`, newRootIds);
+    const result = this.commit(baseline, { ...project, objects, scenes }, `复制 ${newRootIds.length} 个对象`, newRootIds);
     if (!result.ok) return result;
     return { ok: true, value: { ids: newRootIds } };
   }
 
   /** 调整父子层级；拒绝父子循环与锁定对象（FR-002 异常处理） */
   setParent(objectId: string, parentId: string | null): Result {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
     const object = findObject(project, objectId);
     if (!object) return failure('对象不存在');
     if (!isInActiveScene(project, objectId)) return failure('对象不属于活动场景');
@@ -403,6 +434,7 @@ export class SceneEditor {
       const scene = project.scenes.find((s) => s.id === project.activeSceneId);
       if (scene) {
         return this.commit(
+          baseline,
           {
             ...next,
             scenes: scenes.map((s) =>
@@ -413,20 +445,29 @@ export class SceneEditor {
         );
       }
     }
-    return this.commit({ ...next, scenes }, `调整「${object.name}」层级`);
+    return this.commit(baseline, { ...next, scenes }, `调整「${object.name}」层级`);
   }
 
   /** 设置变换（数值属性编辑 / 数值输入提交），拒绝非法数值与锁定对象 */
   setTransform(objectId: string, transform: TransformData, label = '设置变换'): Result {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
     const object = findObject(project, objectId);
     if (!object) return failure('对象不存在');
     if (!isInActiveScene(project, objectId)) return failure('对象不属于活动场景');
-    if (!isValidTransform(transform)) return failure('数值非法（不允许 NaN/Infinity）');
     if (object.locked) return failure(`「${object.name}」已锁定，无法变换`);
-    // 克隆数组为编辑器自有数据：调用方事后改 transform 不影响状态（R6）
-    return this.commit(updateObject(project, objectId, (o) => ({ ...o, transform: this.ownTransform(transform) })), label);
+    // 先复制外部数组为自有数据、再复验基线：元素 getter 的副作用窗口必须先被捕获
+    // （getter 内 dispose/嵌套提交后不得用旧基线继续提交），再对自有副本做数值校验
+    const ownedTransform = this.ownTransform(transform);
+    const reentered = this.guardReentry(baseline);
+    if (reentered) return reentered;
+    if (!isValidTransform(ownedTransform)) return failure('数值非法（不允许 NaN/Infinity）');
+    return this.commit(
+      baseline,
+      updateObject(project, objectId, (o) => ({ ...o, transform: ownedTransform })),
+      label,
+    );
   }
 
   /**
@@ -442,30 +483,35 @@ export class SceneEditor {
 
   /** 拖动结束提交：应用最终变换并推入历史（无变化则不推，AC：一次拖动一步） */
   commitTransform(objectId: string, transform: TransformData, label = '变换对象'): Result {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
     const object = findObject(project, objectId);
     if (!object) return failure('对象不存在');
     if (!isInActiveScene(project, objectId)) return failure('对象不属于活动场景');
-    if (!isValidTransform(transform)) return failure('数值非法（不允许 NaN/Infinity）');
     if (object.locked) {
       this.dragSnapshot = null;
       return failure(`「${object.name}」已锁定，无法变换`);
     }
-    const next = updateObject(project, objectId, (o) => ({ ...o, transform: this.ownTransform(transform) }));
+    // 先复制外部数组为自有数据、再复验基线：元素 getter 的副作用窗口必须先被捕获
+    const ownedTransform = this.ownTransform(transform);
+    const reentered = this.guardReentry(baseline);
+    if (reentered) return reentered;
+    if (!isValidTransform(ownedTransform)) return failure('数值非法（不允许 NaN/Infinity）');
+    const next = updateObject(project, objectId, (o) => ({ ...o, transform: ownedTransform }));
     const before = this.dragSnapshot;
     this.dragSnapshot = null;
-    const current: EditorSnapshot = { project, selection: [...this.selection] };
+    const current: EditorSnapshot = { project, selection: [...baseline.selection] };
     // 拖动事务绑定基准：拖动期间项目被其他操作变更（并发编辑/撤销/重做）时，
     // 不得吞并并发编辑 —— 基于当前项目重建仅含本次 transform 的历史项
     // （并发编辑仍留在历史中，undo 时两者分开回退）
     if (before && before.project !== project) {
       if (this.sameTransform(project, next, objectId)) return { ok: true };
-      return this.commitEntry(label, current, next, current.selection);
+      return this.commitEntry(label, current, next, current.selection, baseline);
     }
     // 局部比较（仅目标对象三向量），不做整项目 JSON 序列化
     if (this.sameTransform(before?.project ?? project, next, objectId)) return { ok: true };
-    return this.commitEntry(label, before ?? current, next, current.selection);
+    return this.commitEntry(label, before ?? current, next, current.selection, baseline);
   }
 
   /**
@@ -478,17 +524,16 @@ export class SceneEditor {
     updater: (object: SceneObjectData) => SceneObjectData | null,
     label: string,
   ): Result {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
     const object = findObject(project, objectId);
     if (!object) return failure('对象不存在');
     if (!isInActiveScene(project, objectId)) return failure('对象不属于活动场景');
-    const epoch = this.stateEpoch;
-    const session = this.sessionToken;
     // 外部回调可能 dispose/嵌套提交/openProject：回调后必须复验基线（R8），
     // 否则外层会把已释放编辑器复活、或用回调前的旧快照覆盖内层结果
     const nextObject = updater(structuredClone(object));
-    const reentered = this.verifyBaseline(project, epoch, session);
+    const reentered = this.guardReentry(baseline);
     if (reentered) return reentered;
     if (!nextObject) return failure('属性值非法');
     if (nextObject.id !== object.id || nextObject.type !== object.type) {
@@ -507,14 +552,15 @@ export class SceneEditor {
     // 不就地冻结调用方对象（R6）；返回对象 getter 也可能副作用变更编辑器（R8），
     // 克隆后再次复验基线
     const owned = this.own(nextObject);
-    const reenteredClone = this.verifyBaseline(project, epoch, session);
+    const reenteredClone = this.guardReentry(baseline);
     if (reenteredClone) return reenteredClone;
-    return this.commit(updateObject(project, objectId, () => owned), label);
+    return this.commit(baseline, updateObject(project, objectId, () => owned), label);
   }
 
   setVisible(ids: string[], visible: boolean): Result {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
     // 归属校验（防御）：只影响活动场景内的对象
     const idSet = new Set(ids.filter((id) => isInActiveScene(project, id)));
     if (idSet.size === 0) return { ok: true };
@@ -522,12 +568,13 @@ export class SceneEditor {
       ...project,
       objects: project.objects.map((o) => (idSet.has(o.id) ? { ...o, visible } : o)),
     };
-    return this.commit(next, visible ? '显示对象' : '隐藏对象');
+    return this.commit(baseline, next, visible ? '显示对象' : '隐藏对象');
   }
 
   setLocked(ids: string[], locked: boolean): Result {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
     // 归属校验（防御）：只影响活动场景内的对象
     const idSet = new Set(ids.filter((id) => isInActiveScene(project, id)));
     if (idSet.size === 0) return { ok: true };
@@ -535,34 +582,32 @@ export class SceneEditor {
       ...project,
       objects: project.objects.map((o) => (idSet.has(o.id) ? { ...o, locked } : o)),
     };
-    return this.commit(next, locked ? '锁定对象' : '解锁对象');
+    return this.commit(baseline, next, locked ? '锁定对象' : '解锁对象');
   }
 
   /** 注册资源并按哈希去重；作为一步历史（撤销导入时资源一并移除，无孤儿资源） */
   registerAsset(asset: AssetData): Result<{ asset: AssetData; deduped: boolean }> {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
     const existing = findAssetByHash(project, asset.hash);
     if (existing) return { ok: true, value: { asset: existing, deduped: true } };
-    const epoch = this.stateEpoch;
-    const session = this.sessionToken;
     const owned = this.own(asset); // 无条件克隆为编辑器自有数据（R6）
-    const reentered = this.verifyBaseline(project, epoch, session); // 克隆 getter 副作用（R8）
+    const reentered = this.guardReentry(baseline); // 克隆 getter 副作用（R8）
     if (reentered) return reentered;
-    const result = this.commit(addAsset(project, owned), `注册资源 ${owned.name}`);
+    const result = this.commit(baseline, addAsset(project, owned), `注册资源 ${owned.name}`);
     if (!result.ok) return result;
     return { ok: true, value: { asset: owned, deduped: false } };
   }
 
   /** 导入模型 = 注册资源 + 创建模型对象，作为一步历史 */
   importModel(asset: AssetData, object: SceneObjectData): Result<string> {
-    const project = this.requireProject();
-    if (!project) return failure('未打开项目');
-    const epoch = this.stateEpoch;
-    const session = this.sessionToken;
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project;
     const ownedAsset = this.own(asset);
     const ownedObject = this.own(object); // 无条件克隆为编辑器自有数据（R6）
-    const reentered = this.verifyBaseline(project, epoch, session); // 克隆 getter 副作用（R8）
+    const reentered = this.guardReentry(baseline); // 克隆 getter 副作用（R8）
     if (reentered) return reentered;
     if (!isSceneObject(ownedObject) || ownedObject.parentId !== null) return failure('对象数据不合法');
     const scene = project.scenes.find((s) => s.id === project.activeSceneId);
@@ -581,7 +626,7 @@ export class SceneEditor {
       objects: [...project.objects, normalizedObject],
       assets: existing ? project.assets : [...project.assets, effectiveAsset],
     };
-    const result = this.commit(next, `导入模型 ${normalizedObject.name}`, [normalizedObject.id]);
+    const result = this.commit(baseline, next, `导入模型 ${normalizedObject.name}`, [normalizedObject.id]);
     if (!result.ok) return result;
     return { ok: true, value: normalizedObject.id };
   }
@@ -648,10 +693,36 @@ export class SceneEditor {
 
   // ---------- 内部 ----------
 
-  private requireProject(): Project | null {
-    // 已释放的编辑器没有项目：一切写入都以「未打开项目」拒绝（无晚到提交）
-    if (this.disposed) return null;
-    return this.project;
+  /**
+   * 入口事务基线捕获（R9-M1）：disposed/无项目时返回 null（一切写入都以
+   * 「未打开项目」拒绝，无晚到提交）。所有公开写入口先 beginIngress 捕获
+   * {project, epoch, session}，外部窗口（克隆/回调/getter）后 guardReentry 复验。
+   */
+  private beginIngress(): Baseline | null {
+    if (this.disposed || !this.project) return null;
+    return {
+      project: this.project,
+      selection: [...this.selection],
+      epoch: this.stateEpoch,
+      session: this.sessionToken,
+    };
+  }
+
+  /**
+   * 基线复验（R9-M1，幂等）：编辑器被 dispose、会话切换或任何状态换入
+   * （嵌套提交/嵌套 openProject/undo/redo 的 swapState）都使本次操作失效——
+   * 不得移动历史、不得覆盖内层结果、不得复活已释放编辑器。
+   */
+  private guardReentry(baseline: Baseline): Result<never> | null {
+    if (this.disposed) return failure('编辑器已释放');
+    if (
+      this.sessionToken !== baseline.session ||
+      this.stateEpoch !== baseline.epoch ||
+      this.project !== baseline.project
+    ) {
+      return failure('编辑器状态已变更，操作被取消');
+    }
+    return null;
   }
 
   /** 公开 ingress 的统一收口：克隆为编辑器自有数据再递归冻结（R6）。
@@ -690,23 +761,30 @@ export class SceneEditor {
     }
   }
 
-  private commit(project: Project, label: string, afterSelection?: string[]): Result {
-    const before: EditorSnapshot = { project: this.project!, selection: [...this.selection] };
-    return this.commitEntry(label, before, project, afterSelection ?? this.selection);
+  private commit(baseline: Baseline, project: Project, label: string, afterSelection?: string[]): Result {
+    const reentered = this.guardReentry(baseline);
+    if (reentered) return reentered;
+    const before: EditorSnapshot = { project: baseline.project!, selection: [...baseline.selection] };
+    return this.commitEntry(label, before, project, afterSelection ?? baseline.selection, baseline);
   }
 
   /**
-   * 原子提交：stamp（校验 + 单调 revision + 冻结）→ 推入历史 → 换入 → 发事件。
-   * 候选状态校验失败时抛错被转换为失败结果，状态与历史游标均保持原样。
-   * 事件按固定顺序 project → selection → view → history 发出，观察者不会看到
-   * 「新项目 + 旧场景选择/旧机位」的跨场景中间态。
+   * 原子提交：背止复验 → stamp（校验 + 单调 revision + 冻结）→ 推入历史 →
+   * 换入 → 发事件。候选状态校验失败时抛错被转换为失败结果，状态与历史游标
+   * 均保持原样。事件按固定顺序 project → selection → view → history 发出，
+   * 观察者不会看到「新项目 + 旧场景选择/旧机位」的跨场景中间态。
    */
   private commitEntry(
     label: string,
     before: EditorSnapshot,
     afterProject: Project,
     afterSelection: string[],
+    baseline: Baseline,
   ): Result {
+    // 背止（R9-M1）：提交时刻再次复验基线——入口内的任何外部窗口（嵌套提交的
+    // swapState 已使 epoch 递增）或 dispose 都会在这里被拦截，杜绝晚到提交
+    const reentered = this.guardReentry(baseline);
+    if (reentered) return reentered;
     let stamped: Project;
     try {
       stamped = this.stampAndFreeze(afterProject);
@@ -724,14 +802,18 @@ export class SceneEditor {
     return { ok: true };
   }
 
-  /** 撤销/重做：peek 目标 → 盖章（失败时游标不动、状态不变）→ 游标提交 → 换入 → 发事件 */
+  /** 撤销/重做：peek 目标 → 盖章（失败时游标不动、状态不变）→ 复验 → 游标提交 → 换入 → 发事件 */
   private applyHistorySnapshot(snapshot: EditorSnapshot, move: 'undo' | 'redo'): Result {
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
     let stamped: Project;
     try {
       stamped = this.stampAndFreeze({ ...snapshot.project });
     } catch (error) {
       return failure(error instanceof Error ? error.message : '应用历史快照失败');
     }
+    const reentered = this.guardReentry(baseline);
+    if (reentered) return reentered;
     if (move === 'undo') this.history.commitUndo();
     else this.history.commitRedo();
     this.swapState(stamped, snapshot.selection);
@@ -888,16 +970,6 @@ export class SceneEditor {
 
   private assertAlive(): void {
     if (this.disposed) throw new Error('编辑器已释放');
-  }
-
-  /** 外部回调/克隆后的基线复验（R8）：编辑器被 dispose、会话切换或任何状态换入
-   *  都使本次操作失效——不得移动历史、不得覆盖内层结果、不得复活已释放编辑器。 */
-  private verifyBaseline(project: Project, epoch: number, session: number): Result<never> | null {
-    if (this.disposed) return failure('编辑器已释放');
-    if (this.sessionToken !== session || this.stateEpoch !== epoch || this.project !== project) {
-      return failure('编辑器状态已变更，操作被取消');
-    }
-    return null;
   }
 
   /** 拖动前后是否等价：仅比较目标对象三向量（局部比较，不序列化项目） */

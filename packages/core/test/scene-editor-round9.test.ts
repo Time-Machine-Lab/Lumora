@@ -196,6 +196,7 @@ describe('R9-M1 事务边界：外部 getter 副作用入口探针', () => {
     const PRIVATE_API_LIST = [
       'applyHistorySnapshot',
       'assertAlive',
+      'beginIngress',
       'commit',
       'commitEntry',
       'dedupeSelection',
@@ -204,15 +205,14 @@ describe('R9-M1 事务边界：外部 getter 副作用入口探针', () => {
       'emitHistory',
       'emitProjectEvents',
       'filterSelection',
+      'guardReentry',
       'isReachableFrom',
       'own',
       'ownTransform',
-      'requireProject',
       'sameTransform',
       'stampAndFreeze',
       'swapState',
       'validateProject',
-      'verifyBaseline',
     ];
     const expected = [...PUBLIC_API_LIST, ...PRIVATE_API_LIST].sort();
     const methods = new Set(
