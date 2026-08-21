@@ -28,8 +28,14 @@ import type { Project, SceneObjectData } from '../src/scene/types';
  * 一行委托；T7 直接把幽灵根放入 rootObjectIds（可达集成员但对象不存在）
  * ——删除 existingIds.has 后幽灵根漏过 → T7 红（P4 mutant self-check 守卫）。
  * T9 跨场景过滤、T10 去重保持顺序、T11 孤儿对象（父引用缺失）过滤。
- * RED 形态：本文件在此引用了尚未导出的 filterSelectionIds —— 收集期
- * 模块解析失败，T1-T6 一并暂停（P4 导出后 core full 恢复全绿）。
+ * RED 形态（实测，第十三轮复审复核一致）：vitest（esbuild）把命名导入
+ * 降级为 CJS 属性访问——实际为运行期红（TypeError: filterSelectionIds is
+ * not a function，T7/T9/T10/T11 各一），T1-T6 未暂停、全部保持绿；tsc 侧
+ * 严格 TS2305「has no exported member」编译红成立。P4 导出后 10/10 绿 +
+ * core full 恢复全绿。
+ * 已知备注（记录不修，PM 定案）：T9 未用「函数参数 sceneId 与
+ * project.activeSceneId 不同」的夹具，不能杀死忽略显式参数的未来 mutant；
+ * 当前实现明确使用传入参数，非现存缺陷。
  */
 
 function groupObject(id: string, parentId: string | null, name = id): SceneObjectData {
@@ -82,6 +88,30 @@ function multiSceneCameraProject(sceneCount: number): Project {
     });
   }
   return { ...sample, objects, scenes, activeSceneId: 'scene-0' };
+}
+
+/** 逆序深链：叶在前、根在后（路径压缩最坏情形——objects[0] 回溯整条链
+ *  一次性填充 resolvedRoot，其余节点全部命中缓存 O(1)，摊还 O(N)）；
+ *  相机自身为场景根（rootOf('camera-root') = 'camera-root' ∈ sceneRoots） */
+function deepChainProject(nodeCount: number): Project {
+  const sample = createSampleProject();
+  const objects: SceneObjectData[] = [];
+  for (let i = 0; i < nodeCount; i += 1) {
+    objects.push(groupObject(`node-${i}`, i === nodeCount - 1 ? null : `node-${i + 1}`));
+  }
+  objects.push(cameraObject('camera-root', null));
+  const chainRoot = `node-${nodeCount - 1}`;
+  return {
+    ...sample,
+    objects,
+    scenes: [{
+      id: 'scene-1',
+      name: '主场景',
+      rootObjectIds: [chainRoot, 'camera-root'],
+      activeCameraId: 'camera-root',
+    }],
+    activeSceneId: 'scene-1',
+  };
 }
 
 describe('R13-1 validateProject 多场景机位校验 O(C·N)→O(N)', () => {
@@ -167,6 +197,28 @@ describe('R13-1 validateProject 多场景机位校验 O(C·N)→O(N)', () => {
     expect(() => editor2.openProject(badProject)).toThrow(/机位不属于该场景/);
     expect(editor2.getProject()).toBeNull();
   });
+
+  it('R13-1-T7 深链线性探针：逆序深链 200/400/800 节点 Map#set 增长比 ≤2.1（路径压缩摊还 O(N) 固化）', () => {
+    // 第十三轮复审独立实测：1205/2405/4805，增长比 1.996/1.998（≈6N+5 线性）。
+    // 固化动机：未固化的复杂度结论会回归（R11-1 探针盲区、R13-1 平方分支）。
+    // 若 resolvedRoot 缓存退化（每对象回溯全链）→ ≈N²/2 set → 增长比 ≈4 → 红。
+    // spy 全程覆盖 openProject 的 validateProject 单路径。
+    const counts: number[] = [];
+    for (const n of [200, 400, 800]) {
+      const project = deepChainProject(n); // fixture 先构建，spy 后安装
+      const editor = new SceneEditor();
+      const spy = vi.spyOn(Map.prototype, 'set');
+      editor.openProject(project);
+      counts.push(spy.mock.calls.length);
+      spy.mockRestore();
+
+      expect(editor.getProject()).not.toBeNull(); // 合法深链（含相机自身为根）正常打开
+    }
+    expect(counts[0]!).toBeGreaterThan(0); // 探针自检：防 mock 失效假绿
+    for (let i = 1; i < counts.length; i += 1) {
+      expect(counts[i]! / counts[i - 1]!).toBeLessThanOrEqual(2.1);
+    }
+  }, 60000);
 });
 
 describe('R13-2 filterSelectionIds 纯函数（幽灵根/跨场景/去重/孤儿）', () => {
