@@ -2,7 +2,6 @@
 import { describe, expect, it } from 'vitest';
 import { SceneEditor } from '../src/editor/scene-editor';
 import { createSampleProject } from '../src/scene/sample-project';
-import { findObject } from '../src/scene/scene-graph';
 import type { Project, SceneObjectData } from '../src/scene/types';
 
 /**

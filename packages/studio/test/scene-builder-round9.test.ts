@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, afterEach } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { createSampleProject } from '@lumora/core';
