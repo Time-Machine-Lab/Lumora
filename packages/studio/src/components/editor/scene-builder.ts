@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { getActiveScene } from '@lumora/core';
+import { getActiveScene, getReachableIds } from '@lumora/core';
 import type { Project, SceneObjectData, TransformData } from '@lumora/core';
 
 /** 模型内容未加载时的占位框 */
@@ -49,9 +49,12 @@ function isInsideContent(object: THREE.Object3D): boolean {
  * GLB 内容子树跳过：同一资源可被多个模型实例共享（clone 共享几何/材质），
  * 资源归 ContentCache 所有，最后一个 lease 释放时才 dispose（共享资源不会被
  * 先删除的实例误杀）。
+ * 迭代栈替代 THREE 递归 traverse：深层链不爆栈（R8-7）。
  */
 export function disposeNode(object: THREE.Object3D): void {
-  object.traverse((child) => {
+  const stack: THREE.Object3D[] = [object];
+  while (stack.length > 0) {
+    const child = stack.pop()!;
     if (child instanceof THREE.Mesh && !isInsideContent(child)) {
       child.geometry?.dispose();
       const materials = Array.isArray(child.material) ? child.material : [child.material];
@@ -64,7 +67,8 @@ export function disposeNode(object: THREE.Object3D): void {
         }
       }
     }
-  });
+    for (let i = child.children.length - 1; i >= 0; i--) stack.push(child.children[i]!);
+  }
 }
 
 export function applyTransform(object: THREE.Object3D, transform: TransformData): void {
@@ -147,47 +151,59 @@ export function attachModelContent(node: THREE.Object3D, gltf: GLTF): void {
   node.add(clone);
 }
 
-/** 活动场景可达对象集（场景根 + 全部后代）；多场景隔离的同步边界 */
+/** 活动场景可达对象集（场景根 + 全部后代）；多场景隔离的同步边界（复用 core 迭代实现，R8-7） */
 export function getReachableObjectIds(project: Project): Set<string> {
   const scene = getActiveScene(project);
-  const reachable = new Set<string>();
-  if (!scene) return reachable;
-  const walk = (id: string): void => {
-    if (reachable.has(id)) return;
-    reachable.add(id);
-    for (const child of project.objects.filter((o) => o.parentId === id)) walk(child.id);
-  };
-  for (const rootId of scene.rootObjectIds) walk(rootId);
-  return reachable;
+  if (!scene) return new Set();
+  return getReachableIds(project, scene.id);
 }
 
-/** 从项目数据构建活动场景根节点 */
+/** 从项目数据构建活动场景根节点；迭代栈 + 已见集（R8-7：深层链不爆栈，循环不无限扩张） */
 export function buildScene(project: Project, aspect: number): THREE.Group {
   const root = new THREE.Group();
   root.name = '__scene__';
   const scene = getActiveScene(project);
   if (!scene) return root;
   const byId = new Map(project.objects.map((o) => [o.id, o]));
-  const attach = (object: SceneObjectData, parent: THREE.Object3D): void => {
+  const childrenOf = new Map<string | null, string[]>();
+  for (const object of project.objects) {
+    const list = childrenOf.get(object.parentId);
+    if (list) list.push(object.id);
+    else childrenOf.set(object.parentId, [object.id]);
+  }
+  // 根与子节点均逆序入栈，弹栈后保持原插入顺序（与旧递归实现一致）
+  const stack: { object: SceneObjectData; parent: THREE.Object3D }[] = [];
+  for (let i = scene.rootObjectIds.length - 1; i >= 0; i--) {
+    const object = byId.get(scene.rootObjectIds[i]!);
+    if (object) stack.push({ object, parent: root });
+  }
+  const seen = new Set<string>();
+  while (stack.length > 0) {
+    const { object, parent } = stack.pop()!;
+    if (seen.has(object.id)) continue;
+    seen.add(object.id);
     const node = buildObject(object, aspect);
     parent.add(node);
-    for (const child of project.objects.filter((o) => o.parentId === object.id)) {
-      attach(child, node);
+    const children = childrenOf.get(object.id);
+    if (children) {
+      for (let i = children.length - 1; i >= 0; i--) {
+        const child = byId.get(children[i]!);
+        if (child) stack.push({ object: child, parent: node });
+      }
     }
-  };
-  for (const rootId of scene.rootObjectIds) {
-    const object = byId.get(rootId);
-    if (object) attach(object, root);
   }
   return root;
 }
 
 export function findNode(root: THREE.Object3D, objectId: string): THREE.Object3D | null {
-  let found: THREE.Object3D | null = null;
-  root.traverse((node) => {
-    if (!found && node.userData.objectId === objectId) found = node;
-  });
-  return found;
+  // 迭代先序搜索（R8-7）：与 THREE traverse 同序（自身在前、子节点按序），深树不爆栈
+  const stack: THREE.Object3D[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (node.userData.objectId === objectId) return node;
+    for (let i = node.children.length - 1; i >= 0; i--) stack.push(node.children[i]!);
+  }
+  return null;
 }
 
 function applyObjectData(node: THREE.Object3D, data: SceneObjectData, aspect: number): void {
@@ -252,9 +268,13 @@ function applyObjectData(node: THREE.Object3D, data: SceneObjectData, aspect: nu
  */
 export function syncScene(root: THREE.Group, previous: Project, next: Project, aspect: number): void {
   const idToNode = new Map<string, THREE.Object3D>();
-  root.traverse((node) => {
+  // 迭代遍历替代 root.traverse（THREE 递归）：深树不爆栈（R8-7）
+  const traverseStack: THREE.Object3D[] = [root];
+  while (traverseStack.length > 0) {
+    const node = traverseStack.pop()!;
     if (node.userData.objectId) idToNode.set(node.userData.objectId as string, node);
-  });
+    for (let i = node.children.length - 1; i >= 0; i--) traverseStack.push(node.children[i]!);
+  }
   const prevById = new Map(previous.objects.map((o) => [o.id, o]));
   // 只同步活动场景可达对象：其他场景的编辑/新建/删除不进入当前视口（多场景隔离）
   const nextReachable = getReachableObjectIds(next);

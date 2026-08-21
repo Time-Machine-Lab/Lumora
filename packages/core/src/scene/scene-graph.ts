@@ -56,12 +56,16 @@ export function getDescendantIds(project: Project, id: string): string[] {
   return result;
 }
 
-/** maybeDescendant 是否位于 ancestor 的子树内（含自身） */
+/** maybeDescendant 是否位于 ancestor 的子树内（含自身）；父链迭代上溯 + byId 索引（R8-7） */
 export function isInSubtree(project: Project, maybeDescendantId: string, ancestorId: string): boolean {
-  if (maybeDescendantId === ancestorId) return true;
-  const object = findObject(project, maybeDescendantId);
-  if (!object?.parentId) return false;
-  return isInSubtree(project, object.parentId, ancestorId);
+  const byId = new Map<string, SceneObjectData>();
+  for (const object of project.objects) byId.set(object.id, object);
+  let currentId: string | undefined = maybeDescendantId;
+  while (currentId) {
+    if (currentId === ancestorId) return true;
+    currentId = byId.get(currentId)?.parentId ?? undefined;
+  }
+  return false;
 }
 
 /**
@@ -78,12 +82,18 @@ export function getReachableIds(project: Project, sceneId: string): Set<string> 
     if (list) list.push(object.id);
     else childrenOf.set(object.parentId, [object.id]);
   }
-  const walk = (id: string) => {
-    if (reachable.has(id)) return;
+  // 迭代栈 + 已见集：深层链不爆栈，循环引用不无限扩张（R8-7）
+  const stack: string[] = [];
+  for (let i = scene.rootObjectIds.length - 1; i >= 0; i--) stack.push(scene.rootObjectIds[i]!);
+  while (stack.length > 0) {
+    const id = stack.pop()!;
+    if (reachable.has(id)) continue;
     reachable.add(id);
-    for (const childId of childrenOf.get(id) ?? []) walk(childId);
-  };
-  for (const rootId of scene.rootObjectIds) walk(rootId);
+    const children = childrenOf.get(id);
+    if (children) {
+      for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]!);
+    }
+  }
   return reachable;
 }
 
