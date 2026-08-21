@@ -1,6 +1,6 @@
 import { createModelObject, findAssetByHash, genId, hashBytes } from '@lumora/core';
 import type { AssetData, AssetPartData, Project, SceneEditor } from '@lumora/core';
-import { collectGltfUris, resolveFormat, resolvePartPath } from './content-cache';
+import { collectGltfUris, relativePosixPath, resolveFormat, resolvePartPath } from './content-cache';
 import type { CacheLease, CachePartFile, ContentCache } from './content-cache';
 
 export type ImportModelResult =
@@ -45,13 +45,10 @@ function partPathFor(main: File, part: File): string {
   const raw = (part as File & { webkitRelativePath?: string }).webkitRelativePath ?? '';
   const normalized = raw ? raw.replace(/\\/g, '/') : '';
   if (!normalized) return part.name.replace(/\\/g, '/');
-  const mainDir = ((main as File & { webkitRelativePath?: string }).webkitRelativePath ?? '').replace(/\\/g, '/');
-  const mainDirPrefix = mainDir.includes('/') ? mainDir.slice(0, mainDir.lastIndexOf('/') + 1) : '';
-  if (mainDirPrefix && normalized.startsWith(mainDirPrefix)) return normalized.slice(mainDirPrefix.length);
-  // 主文件目录外的依赖（兄弟分支/上级目录）：以主文件所在目录为基准构造完整
-  // POSIX 相对路径（../ 上溯），不回退 basename——否则丢失目录结构（R8-10）
-  const mainDirSegments = mainDirPrefix ? mainDirPrefix.slice(0, -1).split('/').length : 0;
-  return `${'../'.repeat(mainDirSegments)}${normalized}`;
+  // 主文件目录为基准、按段最长公共前缀（LCP）上溯：主目录内依赖得到段内
+  // 相对路径，目录外依赖以最少 ../ 上溯（不重复 LCP 之上的公共段，R9-M3 #10）
+  const mainPath = ((main as File & { webkitRelativePath?: string }).webkitRelativePath ?? '').replace(/\\/g, '/');
+  return relativePosixPath(mainPath, normalized);
 }
 
 

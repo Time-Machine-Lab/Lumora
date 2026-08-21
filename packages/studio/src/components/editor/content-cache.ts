@@ -211,17 +211,30 @@ function disposeGltf(gltf: GLTF): void {
   if (gltf.scene && !visited.has(gltf.scene)) visit(gltf.scene);
 }
 
-function basename(path: string): string {
-  return path.split(/[\\/]/).pop() ?? path;
+/**
+ * main 文件路径 → part 文件路径 的 POSIX 相对路径（R9-M3 #10）：按两侧路径
+ * segment 的最长公共前缀（LCP）上溯，绝不重复 LCP 之上的公共段。main/part
+ * 均视为文件路径（最后一/多段为文件名与所属目录），目录选择（webkitRelativePath）
+ * 与 gltf JSON 内相对 URI 一一对应。例：main='bundle/models/scene.gltf' +
+ * part='bundle/textures/wood.png'（LCP='bundle'）→ '../textures/wood.png'。
+ */
+export function relativePosixPath(mainPath: string, partPath: string): string {
+  const mainDir = mainPath.replace(/\\/g, '/').split('/').slice(0, -1);
+  const partSegments = partPath.replace(/\\/g, '/').split('/');
+  let lcp = 0;
+  const max = Math.min(mainDir.length, partSegments.length);
+  while (lcp < max && mainDir[lcp] === partSegments[lcp]) lcp += 1;
+  return `${'../'.repeat(mainDir.length - lcp)}${partSegments.slice(lcp).join('/')}`;
 }
 
 /**
- * URI 侧规范化（R8-10，TML-57 第八轮）：先剥离 query/fragment，再按路径段逐个
- * percent-decode（解码后的 %2F 留在本段内、不充当分隔符），最后归并 dot-segment
- * （. / ..）。GLTF 相对 URI 是编码形态，与解码形态的依赖文件实体路径分属两侧，
- * 不能共用同一规范化——统一 decode 会让实体文件名中的字面 % 序列假命中（R8-10）。
+ * URI 侧规范化（R8-10 + R9-M3 #10）：先剥离 query/fragment，再按路径段逐个
+ * percent-decode，最后归并 dot-segment（. / ..），返回段数组——解码后的 %2F
+ * 保留为本段内字面（不充当分隔符），段边界不因 join 丢失。GLTF 相对 URI 是
+ * 编码形态，与解码形态的依赖文件实体路径分属两侧，不能共用同一规范化——
+ * 统一 decode 会让实体文件名中的字面 % 序列假命中（R8-10）。
  */
-function normalizeUri(raw: string): string {
+function normalizeUriSegments(raw: string): string[] {
   const queryIndex = raw.search(/[?#]/);
   const path = queryIndex >= 0 ? raw.slice(0, queryIndex) : raw;
   const segments = path.split('/');
@@ -240,14 +253,14 @@ function normalizeUri(raw: string): string {
     }
     out.push(decoded);
   }
-  return out.join('/');
+  return out;
 }
 
 /**
  * 实体路径侧规范化（R8-10）：只归并 dot-segment，不做任何 percent-decode——
  * 文件名是解码后的现实，字面 % 序列必须按字面保留，不得与编码 URI 假命中。
  */
-function normalizeEntityPath(path: string): string {
+function normalizeEntityPathSegments(path: string): string[] {
   const segments = path.split('/');
   const out: string[] = [];
   for (const segment of segments) {
@@ -258,15 +271,19 @@ function normalizeEntityPath(path: string): string {
     }
     out.push(segment);
   }
-  return out.join('/');
+  return out;
+}
+
+function segmentsEqual(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((segment, index) => segment === b[index]);
 }
 
 /**
  * GLTF URI → 依赖文件 的规范解析（模型导入预检与缓存 URL 构建共用同一规则，
  * 保证「预检通过 ⇔ 可加载」，消除两处逻辑分叉）：
- * 精确相对路径优先（URI 侧 normalizeUri、实体侧 normalizeEntityPath，分别规范化）；
- * basename 仅当唯一时才兜底；0 个命中 = 缺失、>1 个命中 = 歧义，两者都必须失败
- * （歧义不得静默取其一）。
+ * 精确相对路径优先——两侧分别规范化为段数组后按段数组相等判定（%2F 留在段内，
+ * 不充当分隔符）；basename 仅当 URI 最后一段不含解码斜杠时才唯一兜底；0 个命中
+ * = 缺失、>1 个命中 = 歧义，两者都必须失败（歧义不得静默取其一）。
  */
 export type PartResolution<T extends { path: string }> =
   | { kind: 'exact'; part: T }
@@ -278,13 +295,20 @@ export function resolvePartPath<T extends { path: string }>(
   uri: string,
   parts: readonly T[],
 ): PartResolution<T> {
-  const norm = normalizeUri(uri);
-  const exact = parts.find((p) => normalizeEntityPath(p.path) === norm);
+  const norm = normalizeUriSegments(uri);
+  const exact = parts.find((p) => segmentsEqual(normalizeEntityPathSegments(p.path), norm));
   if (exact) return { kind: 'exact', part: exact };
-  const base = basename(norm);
-  const candidates = parts.filter((p) => basename(normalizeEntityPath(p.path)) === base);
-  if (candidates.length === 1) return { kind: 'unique-basename', part: candidates[0]! };
-  return { kind: candidates.length === 0 ? 'missing' : 'ambiguous', uri };
+  // 最后一段含解码斜杠（%2F 编码的子路径）时无 basename 概念，不参与兜底
+  const last = norm[norm.length - 1];
+  if (last !== undefined && !last.includes('/')) {
+    const candidates = parts.filter((p) => {
+      const entitySegments = normalizeEntityPathSegments(p.path);
+      return entitySegments[entitySegments.length - 1] === last;
+    });
+    if (candidates.length === 1) return { kind: 'unique-basename', part: candidates[0]! };
+    return { kind: candidates.length === 0 ? 'missing' : 'ambiguous', uri };
+  }
+  return { kind: 'missing', uri };
 }
 
 /**

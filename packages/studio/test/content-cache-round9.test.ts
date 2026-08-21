@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
-import { resolvePartPath } from '../src/components/editor/content-cache';
+import { relativePosixPath, resolvePartPath } from '../src/components/editor/content-cache';
 
 /**
  * R9-M3 #10 对抗测试（TML-57 第九轮 M3，修复前必须失败）：
@@ -36,9 +36,14 @@ describe('R9-M3 #10 URI 段边界：%2F 不得成为分隔符', () => {
   });
 
   it('R9-10-T3 混合编码/未编码斜杠：%2F 只压平其所在段，不并入相邻段', () => {
-    // 现 HEAD：['sub/dir','mesh.bin'] join → 'sub/dir/mesh.bin' === 实体 → 'exact'
-    const resolution = resolvePartPath('sub%2Fdir/mesh.bin', [part('sub/dir/mesh.bin')]);
-    expect(resolution.kind).toBe('missing');
+    // 现 HEAD：['sub/dir','mesh.bin'] join → 'sub/dir/mesh.bin' === 实体 → 'exact'（错误）；
+    // 修复后：精确匹配按段数组判等不命中；最后一段 'mesh.bin' 无解码斜杠 →
+    // basename 兜底命中两条 → 歧义（不得静默取其一）
+    const resolution = resolvePartPath('sub%2Fdir/mesh.bin', [
+      part('sub/dir/mesh.bin'),
+      part('other/mesh.bin'),
+    ]);
+    expect(resolution.kind).toBe('ambiguous');
   });
 
   it('R9-10-T4 未编码路径与 %20 空格：既有精确匹配语义保持（防过度修复）', () => {
@@ -50,5 +55,29 @@ describe('R9-M3 #10 URI 段边界：%2F 不得成为分隔符', () => {
     expect(resolvePartPath('sub/./mesh.bin', [part('sub/mesh.bin')]).kind).toBe('exact');
     expect(resolvePartPath('sub/../sub/mesh.bin', [part('sub/mesh.bin')]).kind).toBe('exact');
     expect(resolvePartPath('other/name.png', [part('textures/wood.png')]).kind).toBe('missing');
+  });
+});
+
+describe('R9-M3 #10 relativePosixPath：按段最长公共前缀上溯（LCP）', () => {
+  it('R9-10-T5 reviewer 场景：bundle/models + bundle/textures → ../textures/wood.png（LCP=1，上溯 1）', () => {
+    expect(relativePosixPath('bundle/models/scene.gltf', 'bundle/textures/wood.png')).toBe(
+      '../textures/wood.png',
+    );
+  });
+
+  it('R9-10-T6 目录外 LCP=0：完整上溯到根；主目录内：段内相对路径', () => {
+    expect(relativePosixPath('models/scene.gltf', 'textures/wood.png')).toBe('../textures/wood.png');
+    expect(relativePosixPath('models/scene.gltf', 'models/textures/wood.png')).toBe(
+      'textures/wood.png',
+    );
+    expect(relativePosixPath('bundle/scene.gltf', 'bundle/textures/wood.png')).toBe(
+      'textures/wood.png',
+    );
+  });
+
+  it('R9-10-T7 深层 LCP 与主文件无目录边界', () => {
+    expect(relativePosixPath('a/b/c/scene.gltf', 'a/b/wood.png')).toBe('../wood.png');
+    expect(relativePosixPath('a/b/c/scene.gltf', 'a/x.png')).toBe('../../x.png');
+    expect(relativePosixPath('scene.gltf', 'textures/wood.png')).toBe('textures/wood.png');
   });
 });
