@@ -197,9 +197,19 @@ describe('R10-M1 统一事务版本：逐入口 × 快路行为矩阵', () => {
     it('T13 输入 getter 副作用（hash getter dispose）：failure 而非 dedupe ok:true（RED）', () => {
       const editor = makeEditor();
       editor.registerAsset(asset('a1', 'hash-same'));
-      const proxyAsset = sideEffectProxy(asset('a2', 'hash-same'), () => editor.dispose());
+      // 与 R9-M1 一致：输入为普通对象 + getter 属性（structuredClone 会调用 getter；
+      // Proxy 输入本身不可克隆，属于不支持的外来形态）
+      const poisoned = asset('a2', 'hash-same');
+      Object.defineProperty(poisoned, 'hash', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          editor.dispose();
+          return 'hash-same';
+        },
+      });
       // RED：现 HEAD 在 own/guard 前读取 asset.hash → dedupe 快路在已释放编辑器上返回 ok:true
-      const result = editor.registerAsset(proxyAsset);
+      const result = editor.registerAsset(poisoned);
       expect(result.ok).toBe(false);
     });
 
