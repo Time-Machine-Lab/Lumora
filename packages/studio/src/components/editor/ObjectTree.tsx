@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import {
   createCameraObject,
@@ -41,6 +41,11 @@ const ADD_ITEMS: { label: string; create: () => SceneObjectData }[] = [
   { label: '聚光灯', create: () => createLightObject('spot') },
   { label: '摄像机', create: () => createCameraObject() },
 ];
+
+/** 对象 id 的 aria 关联 id 编码：空白替换为下划线——id 属性不得含空白（R10-M3 #6） */
+function enc(id: string): string {
+  return id.replace(/\s+/g, '_');
+}
 
 /** 对象层级树：选择/可见/锁定/重命名/拖拽重排/删除，顶部提供场景切换与添加菜单 */
 export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProps) {
@@ -397,6 +402,8 @@ function TreeNode({
   setFocusedId: (id: string | null) => void;
   focusRow: (id: string) => void;
 }) {
+  // R10-M3 #6：useId 实例命名空间——同一文档多个树实例时 aria 关联 id 全局唯一
+  const instanceNs = useId().replace(/[^a-zA-Z0-9_-]/g, '');
   const children = childrenOf.get(object.id) ?? [];
   const isExpanded = expanded[object.id] ?? true;
   const isSelected = selection.includes(object.id);
@@ -553,12 +560,12 @@ function TreeNode({
           <button
             type="button"
             className="lumora-icon-button"
-            id={`tree-move-trigger-${object.id}`}
+            id={`tree-move-trigger-${instanceNs}-${enc(object.id)}`}
             data-testid={`tree-move-${object.id}`}
             title="移动到"
             aria-haspopup="menu"
             aria-expanded={moveMenuId === object.id}
-            aria-controls={`tree-move-menu-${object.id}`}
+            aria-controls={`tree-move-menu-${instanceNs}-${enc(object.id)}`}
             onClick={(e) => {
               e.stopPropagation();
               setMoveMenuId(object.id);
@@ -596,8 +603,8 @@ function TreeNode({
           <div
             className="lumora-menu lumora-menu--tree"
             role="menu"
-            id={`tree-move-menu-${object.id}`}
-            aria-labelledby={`tree-move-trigger-${object.id}`}
+            id={`tree-move-menu-${instanceNs}-${enc(object.id)}`}
+            aria-labelledby={`tree-move-trigger-${instanceNs}-${enc(object.id)}`}
             data-testid="tree-move-menu"
             ref={moveMenuRef}
             onClick={(e) => e.stopPropagation()}
