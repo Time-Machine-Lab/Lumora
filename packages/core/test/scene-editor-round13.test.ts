@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
-import { SceneEditor } from '../src/editor/scene-editor';
+import { SceneEditor, filterSelectionIds } from '../src/editor/scene-editor';
 import { createSampleProject } from '../src/scene/sample-project';
 import type { Project, SceneObjectData } from '../src/scene/types';
 
@@ -19,6 +19,17 @@ import type { Project, SceneObjectData } from '../src/scene/types';
  * 探针盲区确认（R13-2 设计条件）：R12-1-T6/T7 只计 Array.find/findObject，
  * validateProject 的平方来自 Map#set 重建 childrenOf——在 multiSceneCameraProject
  * 分支上 T6/T7 仍全绿（盲区），由本文件 T1/T2 补位。
+ *
+ * R13-2（第十三轮收敛，P3 test commit——collect-time 编译红）：
+ * R12-1-T8（round11 文件）的 mutant 盲区：其 'ghost' 候选不在可达集，
+ * 删除 existingIds.has 后 T8 仍绿。R13-2 提取纯函数
+ * filterSelectionIds(project, activeSceneId, ids)（getReachableIds +
+ * existingIds 集合 + 内联首次出现去重，R8-8 语义）并让 filterSelection
+ * 一行委托；T7 直接把幽灵根放入 rootObjectIds（可达集成员但对象不存在）
+ * ——删除 existingIds.has 后幽灵根漏过 → T7 红（P4 mutant self-check 守卫）。
+ * T9 跨场景过滤、T10 去重保持顺序、T11 孤儿对象（父引用缺失）过滤。
+ * RED 形态：本文件在此引用了尚未导出的 filterSelectionIds —— 收集期
+ * 模块解析失败，T1-T6 一并暂停（P4 导出后 core full 恢复全绿）。
  */
 
 function groupObject(id: string, parentId: string | null, name = id): SceneObjectData {
@@ -155,5 +166,54 @@ describe('R13-1 validateProject 多场景机位校验 O(C·N)→O(N)', () => {
     const editor2 = new SceneEditor();
     expect(() => editor2.openProject(badProject)).toThrow(/机位不属于该场景/);
     expect(editor2.getProject()).toBeNull();
+  });
+});
+
+describe('R13-2 filterSelectionIds 纯函数（幽灵根/跨场景/去重/孤儿）', () => {
+  it('R13-2-T7 幽灵根过滤主守卫：rootObjectIds 含不存在的根，候选须被存在性判定剔除', () => {
+    // getReachableIds 把幽灵根原样加入可达集（scene-graph.ts：栈内 rootObjectIds
+    // 元素无条件 add）→ 「reachable 成员 ⇒ 真实对象」不成立，必须靠 existingIds
+    // 挡下。R12-1-T8 的 'ghost' 候选不在可达集（mutant 盲区）；本测试幽灵根
+    // 在可达集内，删除 existingIds.has 后幽灵根漏过 → 本测试红（P4 self-check）
+    const project: Project = {
+      ...createSampleProject(),
+      objects: [groupObject('root-a', null)],
+      scenes: [{ id: 'scene-1', name: '主场景', rootObjectIds: ['root-a', 'ghost-root'], activeCameraId: null }],
+      activeSceneId: 'scene-1',
+    };
+    expect(filterSelectionIds(project, 'scene-1', ['root-a', 'ghost-root'])).toEqual(['root-a']);
+  });
+
+  it('R13-2-T9 跨场景过滤：候选属于其他场景可达集，不在活动场景可达集 → 剔除', () => {
+    const project: Project = {
+      ...createSampleProject(),
+      objects: [groupObject('a-root', null), groupObject('b-root', null)],
+      scenes: [
+        { id: 'scene-a', name: '场景A', rootObjectIds: ['a-root'], activeCameraId: null },
+        { id: 'scene-b', name: '场景B', rootObjectIds: ['b-root'], activeCameraId: null },
+      ],
+      activeSceneId: 'scene-a',
+    };
+    expect(filterSelectionIds(project, 'scene-a', ['a-root', 'b-root'])).toEqual(['a-root']);
+  });
+
+  it('R13-2-T10 首次出现去重：重复候选只保留首个（R8-8 顺序语义）', () => {
+    const project: Project = {
+      ...createSampleProject(),
+      objects: [groupObject('root-a', null)],
+      scenes: [{ id: 'scene-1', name: '主场景', rootObjectIds: ['root-a'], activeCameraId: null }],
+      activeSceneId: 'scene-1',
+    };
+    expect(filterSelectionIds(project, 'scene-1', ['root-a', 'root-a'])).toEqual(['root-a']);
+  });
+
+  it('R13-2-T11 孤儿对象过滤：父引用缺失的对象不在任何场景可达集 → 剔除', () => {
+    const project: Project = {
+      ...createSampleProject(),
+      objects: [groupObject('root-a', null), groupObject('orphan', 'missing-parent')],
+      scenes: [{ id: 'scene-1', name: '主场景', rootObjectIds: ['root-a'], activeCameraId: null }],
+      activeSceneId: 'scene-1',
+    };
+    expect(filterSelectionIds(project, 'scene-1', ['root-a', 'orphan'])).toEqual(['root-a']);
   });
 });
