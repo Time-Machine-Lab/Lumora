@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 import {
   createCameraObject,
   createGroupObject,
@@ -54,6 +55,7 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const rowRefs = useRef<Record<string, HTMLElement | null>>({});
+  const moveMenuRef = useRef<HTMLDivElement>(null);
 
   // 外部选择变化（视口拾取等）时，停靠点跟随选中行——但仅当目标行仍可见：
   // 折叠/跨场景过滤后选择可能含不可见行，跟随前校验，否则回退可见行（树首）
@@ -73,6 +75,14 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- flatRows 由 project/expanded 推导，依赖以原始状态为准
   }, [selection, focusedId, project, expanded]);
+
+  // 「移动到」菜单打开时焦点进入首项（APG menu button，R8-9）：
+  // 键盘 M 打开后即可用方向键导航；否则菜单对键盘用户不可达
+  useEffect(() => {
+    if (moveMenuId) {
+      moveMenuRef.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+    }
+  }, [moveMenuId]);
 
   if (!project) return null;
   const scene = project.scenes.find((s) => s.id === project.activeSceneId) ?? project.scenes[0];
@@ -200,9 +210,12 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
   const commitMove = (targetId: string | null) => {
     if (moveMenuId === null) return;
     const movingId = moveMenuId;
-    setMoveMenuId(null);
     const result = editor.setParent(movingId, targetId);
+    // 层级变更使触发行重建：先 flush 掉菜单关闭与项目更新的渲染，
+    // 再落焦点到重建后的行（先落焦点再重建会被丢到 body，R8-9）
+    flushSync(() => setMoveMenuId(null));
     if (!result.ok) showToast(result.error.message, 'error');
+    focusRow(movingId); // APG：菜单选择后焦点返回触发行
   };
 
   // 多文件选择：.gltf 与外部 .bin/纹理一起选中；单个文件（工具栏入口）同样适用
@@ -316,10 +329,12 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
             setMoveMenuId={setMoveMenuId}
             moveCandidates={moveCandidates}
             commitMove={commitMove}
+            moveMenuRef={moveMenuRef}
             rowRefs={rowRefs}
             getRowTabIndex={rowTabIndex}
             onRowKeyDown={handleRowKeyDown}
             setFocusedId={setFocusedId}
+            focusRow={focusRow}
           />
         ))}
       </div>
@@ -348,10 +363,12 @@ function TreeNode({
   setMoveMenuId,
   moveCandidates,
   commitMove,
+  moveMenuRef,
   rowRefs,
   getRowTabIndex,
   onRowKeyDown,
   setFocusedId,
+  focusRow,
 }: {
   editor: SceneEditor;
   project: Project;
@@ -373,10 +390,12 @@ function TreeNode({
   setMoveMenuId: (id: string | null) => void;
   moveCandidates: SceneObjectData[];
   commitMove: (targetId: string | null) => void;
+  moveMenuRef: React.RefObject<HTMLDivElement | null>;
   rowRefs: React.RefObject<Record<string, HTMLElement | null>>;
   getRowTabIndex: (id: string) => number;
   onRowKeyDown: (object: SceneObjectData, event: React.KeyboardEvent) => void;
   setFocusedId: (id: string | null) => void;
+  focusRow: (id: string) => void;
 }) {
   const children = childrenOf.get(object.id) ?? [];
   const isExpanded = expanded[object.id] ?? true;
@@ -574,11 +593,48 @@ function TreeNode({
             className="lumora-menu lumora-menu--tree"
             role="menu"
             data-testid="tree-move-menu"
+            ref={moveMenuRef}
             onClick={(e) => e.stopPropagation()}
+            onBlur={(e) => {
+              // 焦点离开菜单（点击他处/失焦）即关闭
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) setMoveMenuId(null);
+            }}
             onKeyDown={(e) => {
-              if (e.key === 'Escape') {
-                e.stopPropagation();
-                setMoveMenuId(null);
+              // 菜单打开期间吞噬全部按键：Delete/Backspace 等 Studio 全局
+              // 快捷键不落到底层（R8-9）
+              e.stopPropagation();
+              const items = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+              const focusedIndex = items.indexOf(document.activeElement as HTMLElement);
+              switch (e.key) {
+                case 'ArrowDown':
+                  e.preventDefault();
+                  items[Math.min(focusedIndex + 1, items.length - 1)]?.focus();
+                  break;
+                case 'ArrowUp':
+                  e.preventDefault();
+                  items[Math.max(focusedIndex - 1, 0)]?.focus();
+                  break;
+                case 'Home':
+                  e.preventDefault();
+                  items[0]?.focus();
+                  break;
+                case 'End':
+                  e.preventDefault();
+                  items[items.length - 1]?.focus();
+                  break;
+                case 'Escape':
+                  e.preventDefault();
+                  setMoveMenuId(null);
+                  if (moveMenuId !== null) focusRow(moveMenuId);
+                  break;
+                case 'Enter':
+                case ' ':
+                  // 激活 roving focus 当前项（焦点在菜单外时落在首项）
+                  e.preventDefault();
+                  (document.activeElement as HTMLElement | null)?.click();
+                  break;
+                default:
+                  break;
               }
             }}
           >
@@ -586,6 +642,7 @@ function TreeNode({
               type="button"
               className="lumora-menu__item"
               role="menuitem"
+              tabIndex={-1} // 单一 tab 停靠点：菜单项不进 Tab 顺序（APG roving focus，R8-9）
               data-testid="tree-move-to-root"
               onClick={() => commitMove(null)}
             >
@@ -597,6 +654,7 @@ function TreeNode({
                 type="button"
                 className="lumora-menu__item"
                 role="menuitem"
+                tabIndex={-1}
                 data-testid={`tree-move-to-${candidate.id}`}
                 onClick={() => commitMove(candidate.id)}
               >
@@ -631,10 +689,12 @@ function TreeNode({
               setMoveMenuId={setMoveMenuId}
               moveCandidates={moveCandidates}
               commitMove={commitMove}
+              moveMenuRef={moveMenuRef}
               rowRefs={rowRefs}
               getRowTabIndex={getRowTabIndex}
               onRowKeyDown={onRowKeyDown}
               setFocusedId={setFocusedId}
+              focusRow={focusRow}
             />
           ))}
         </ul>

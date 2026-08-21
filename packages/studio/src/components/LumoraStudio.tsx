@@ -54,6 +54,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
 
   const [pluginManagerOpen, setPluginManagerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
 
   useImperativeHandle(ref, () => ({ runtime }), [runtime]);
 
@@ -107,11 +108,15 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     };
   }, [runtime, cache]);
 
-  // 编辑器快捷键：撤销/重做/复制/删除/取消选择/Gizmo 模式
+  // 编辑器快捷键：撤销/重做/复制/删除/取消选择/Gizmo 模式。
+  // 按实例作用域（R8-9）：多个 Studio 实例共存时共享 window 监听，
+  // 无焦点包含校验则每个实例都执行全部快捷键（一个实例内按 Delete
+  // 会删掉其他实例的选择）——只响应按键落在本实例子树内的快捷
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) return;
       const key = event.key.toLowerCase();
-      // 命令面板开关是全局快捷键：面板打开时焦点在其搜索输入框内，需先于输入守卫处理
+      // 命令面板开关先于输入守卫处理：面板打开时焦点在其搜索输入框内，Ctrl+K 仍需能关闭
       if ((event.ctrlKey || event.metaKey) && key === 'k') {
         event.preventDefault();
         setPaletteOpen((open) => !open);
@@ -165,7 +170,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   }, [runtime]);
 
   return (
-    <div className={`lumora-studio${className ? ` ${className}` : ''}`} data-testid="lumora-studio">
+    <div ref={rootRef} className={`lumora-studio${className ? ` ${className}` : ''}`} data-testid="lumora-studio">
       <Toolbar
         runtime={runtime}
         project={project}
