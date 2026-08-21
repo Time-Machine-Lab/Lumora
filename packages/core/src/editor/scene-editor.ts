@@ -993,11 +993,11 @@ export class SceneEditor {
   }
 
   /**
-   * 项目校验（O(n)：对象索引 + 三色 parent 链检测，不做整项目扫描）：
+   * 项目校验（O(n)：对象索引 + 三色 parent 链检测 + 归属根索引，不做整项目扫描）：
    * 完整 schema 与有限数值校验（validateProjectSchema）→ 父引用存在 →
    * 父子循环 → 根列表一致性（parentId === null ⇔ 恰好出现在一个场景根列表）→
-   * 活动场景与活动机位可达性。不合法即抛错（openProject 同步失败；
-   * 提交路径为编辑器自身不变量的防御性校验）。
+   * 活动场景与活动机位可达性（归属索引单次构建，C 个活动机位场景各 O(1)）。
+   * 不合法即抛错（openProject 同步失败；提交路径为编辑器自身不变量的防御性校验）。
    */
   private validateProject(project: Project): void {
     const schemaProblem = validateProjectSchema(project);
@@ -1047,35 +1047,49 @@ export class SceneEditor {
     }
     const scene = project.scenes.find((s) => s.id === project.activeSceneId);
     if (!scene) throw new Error('活动场景不存在');
-    // 所有场景的 activeCameraId 都必须指向本场景可达的相机（R6：非活动场景同样校验）
-    for (const s of project.scenes) {
-      if (s.activeCameraId === null) continue;
-      const camera = byId.get(s.activeCameraId);
-      if (!camera || camera.type !== 'camera') {
-        throw new Error(`场景「${s.name}」的机位不存在或不是相机`);
+    // 所有场景的 activeCameraId 都必须指向本场景可达的相机（R6：非活动场景
+    // 同样校验）。根一致性 ⇒ 无环单父森林中每对象沿父链上溯唯一根、场景子树
+    // 不相交 → 单次构建归属根索引（O(N) 摊还路径压缩）+ 场景根集合，机位校验
+    // 收敛 O(1)（替代每场景 isReachableFrom 全量重建 childrenOf 的 O(C·N)，R13-1）。
+    // 无任何活动机位场景时校验空转，跳过索引构建（R11-1-T1 的 Map#set 24n
+    // 契约：零活动机位项目不得因新增构建引入任何额外 set）
+    if (project.scenes.some((s) => s.activeCameraId !== null)) {
+      const rootOf = new Map<string, string>();
+      const resolvedRoot = new Map<string, string>();
+      for (const object of project.objects) {
+        if (object.parentId === null) {
+          rootOf.set(object.id, object.id);
+          continue;
+        }
+        const path: string[] = [];
+        let cursor: SceneObjectData | undefined = object;
+        let rootId: string | null = null;
+        while (cursor && cursor.parentId !== null) {
+          const cached = resolvedRoot.get(cursor.id);
+          if (cached !== undefined) {
+            rootId = cached;
+            break;
+          }
+          path.push(cursor.id);
+          cursor = byId.get(cursor.parentId);
+        }
+        if (rootId === null && cursor) rootId = cursor.id;
+        for (const id of path) resolvedRoot.set(id, rootId!);
+        rootOf.set(object.id, rootId!);
       }
-      if (!this.isReachableFrom(s.rootObjectIds, project.objects, s.activeCameraId)) {
-        throw new Error(`场景「${s.name}」的机位不属于该场景`);
+      const sceneRoots = new Map<string, Set<string>>();
+      for (const s of project.scenes) sceneRoots.set(s.id, new Set(s.rootObjectIds));
+      for (const s of project.scenes) {
+        if (s.activeCameraId === null) continue;
+        const camera = byId.get(s.activeCameraId);
+        if (!camera || camera.type !== 'camera') {
+          throw new Error(`场景「${s.name}」的机位不存在或不是相机`);
+        }
+        if (!sceneRoots.get(s.id)!.has(rootOf.get(s.activeCameraId)!)) {
+          throw new Error(`场景「${s.name}」的机位不属于该场景`);
+        }
       }
     }
-  }
-
-  /** 从场景根列表出发（DFS，按父级索引）目标是否可达 */
-  private isReachableFrom(roots: string[], objects: SceneObjectData[], target: string): boolean {
-    const childrenOf = new Map<string, string[]>();
-    for (const object of objects) {
-      if (object.parentId === null) continue;
-      const list = childrenOf.get(object.parentId);
-      if (list) list.push(object.id);
-      else childrenOf.set(object.parentId, [object.id]);
-    }
-    const stack = [...roots];
-    while (stack.length > 0) {
-      const id = stack.pop()!;
-      if (id === target) return true;
-      for (const childId of childrenOf.get(id) ?? []) stack.push(childId);
-    }
-    return false;
   }
 
   private assertAlive(): void {
