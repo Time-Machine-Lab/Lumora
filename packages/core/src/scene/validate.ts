@@ -135,10 +135,15 @@ export function validateSceneObjectData(object: unknown): string | null {
       if ((camera[field] as number) <= 0) return `camera.${field} 非法（需为正）`;
     }
     if ((camera.far as number) <= (camera.near as number)) return 'camera.far 非法（需大于 near）';
-    // aspect 联合为 number|null（null 跟随项目画幅）；数组对是历史非法形态，须拒绝
-    if (camera.aspect !== null && typeof camera.aspect !== 'number') return 'camera.aspect 非法';
-    // 正画幅（R8-12）：0/负画幅在画幅计算与投影构造中除零/翻转
-    if (typeof camera.aspect === 'number' && camera.aspect <= 0) return 'camera.aspect 非法（需为正）';
+    // aspect 联合为 number|null（null 跟随项目画幅）；非 null 必须为正有限数：
+    // NaN/±Infinity 让投影矩阵与画幅计算产出 NaN（R9-M3 #5，NaN/∞ 过旧的
+    // typeof 与 <= 0 两条分离条件），0/负画幅在画幅计算与投影构造中除零/翻转（R8-12）
+    if (
+      camera.aspect !== null &&
+      (typeof camera.aspect !== 'number' || !Number.isFinite(camera.aspect) || camera.aspect <= 0)
+    ) {
+      return 'camera.aspect 非法（需为正有限数）';
+    }
   }
   if (o.assetId !== undefined && typeof o.assetId !== 'string') return 'assetId 非法';
   return null;
