@@ -37,9 +37,18 @@ describe('formatLogLine：完整日志行共享预算', () => {
     expectBounded(out);
   });
 
-  it('事件名与 payload 共享预算：事件名近满时 payload 被截断', () => {
-    const out = formatLogLine('e'.repeat(SUMMARY_CHAR_BUDGET - 6), 'b'.repeat(100));
-    expect(out).toBe('e'.repeat(SUMMARY_CHAR_BUDGET - 6) + ' "bbb…');
+  it('事件名与 payload 共享预算：事件名近满时 payload 分派即截断（可观测 Proxy）', () => {
+    let getCount = 0;
+    const arr = new Proxy([1, 2, 3], {
+      get(target, prop, receiver) {
+        getCount++;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const out = formatLogLine('e'.repeat(SUMMARY_CHAR_BUDGET - 6), arr);
+    expect(getCount).toBe(1); // 仅读取一次 length，截断后不再访问
+    expect(out).toBe('e'.repeat(SUMMARY_CHAR_BUDGET - 6) + ' [数组×…');
+    expect(out.length).toBe(SUMMARY_CHAR_BUDGET);
     expectBounded(out);
   });
 
@@ -90,6 +99,36 @@ describe('formatLogLine：完整日志行共享预算', () => {
     const out = formatLogLine('e'.repeat(SUMMARY_CHAR_BUDGET), arr);
     expect(getCount).toBe(0);
     expect(out).toBe('e'.repeat(SUMMARY_CHAR_BUDGET - 1) + '…');
+    expect(out.length).toBe(SUMMARY_CHAR_BUDGET);
+    expectBounded(out);
+  });
+
+  it('4094 字符事件名：分隔符耗尽内容空间、仅余省略号预留位时立即返回（复审第 1 项）', () => {
+    let getCount = 0;
+    const arr = new Proxy([1, 2, 3], {
+      get(target, prop, receiver) {
+        getCount++;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const out = formatLogLine('e'.repeat(SUMMARY_CHAR_BUDGET - 2), arr);
+    expect(getCount).toBe(0); // 数组 Proxy 零访问：length 不被读取
+    expect(out).toBe('e'.repeat(SUMMARY_CHAR_BUDGET - 2) + ' …');
+    expect(out.length).toBe(SUMMARY_CHAR_BUDGET);
+    expectBounded(out);
+  });
+
+  it('4094 字符事件名：对象 Proxy 的原型判定零触发（复审第 1 项）', () => {
+    let protoCount = 0;
+    const spy = new Proxy({}, {
+      getPrototypeOf() {
+        protoCount++;
+        return Object.prototype;
+      },
+    });
+    const out = formatLogLine('e'.repeat(SUMMARY_CHAR_BUDGET - 2), spy);
+    expect(protoCount).toBe(0); // 未进入 payload 分派，getPrototypeOf 零 trap
+    expect(out).toBe('e'.repeat(SUMMARY_CHAR_BUDGET - 2) + ' …');
     expect(out.length).toBe(SUMMARY_CHAR_BUDGET);
     expectBounded(out);
   });
@@ -292,9 +331,10 @@ describe('formatLogLine：Proxy/异常形状一律不抛错（复审第 2 项）
     // 已知 error 字段路径：有界原型检查（至多 2 层），trap 次数有界
     expect(sumError(evil)).toContain('error: [对象]');
     expect(protoCount).toBeLessThanOrEqual(2);
-    // 未知事件 payload 路径：同样有界
+    // 未知事件 payload 路径：不做 Error 判定，固定 [对象]，零 trap 访问（复审第 2 项）
+    const beforeUnknown = protoCount;
     expect(formatLogLine('plugin:custom', evil)).toBe('plugin:custom [对象]');
-    expect(protoCount).toBeLessThanOrEqual(4);
+    expect(protoCount - beforeUnknown).toBe(0);
     expectBounded(sumState(evil));
   });
 
@@ -428,10 +468,19 @@ describe('formatLogLine：所有文本源统一转义控制字符', () => {
 });
 
 describe('formatLogLine：未知事件原始值', () => {
-  it('原始值与错误对象', () => {
+  it('原始值按类型展示；对象固定 [对象]，不做 Error 判定（复审第 2 项）', () => {
+    let protoCount = 0;
+    const spy = new Proxy(new Error('磁盘已满'), {
+      getPrototypeOf() {
+        protoCount++;
+        return Error.prototype;
+      },
+    });
     expect(formatLogLine('plugin:custom', 42)).toBe('plugin:custom 42');
     expect(formatLogLine('plugin:custom', null)).toBe('plugin:custom null');
     expect(formatLogLine('plugin:custom', () => {})).toBe('plugin:custom [function]');
-    expect(formatLogLine('plugin:custom', new Error('磁盘已满'))).toBe('plugin:custom [Error: 磁盘已满]');
+    expect(formatLogLine('plugin:custom', new Error('磁盘已满'))).toBe('plugin:custom [对象]');
+    expect(formatLogLine('plugin:custom', spy)).toBe('plugin:custom [对象]');
+    expect(protoCount).toBe(0); // 未知对象路径不执行原型判定
   });
 });

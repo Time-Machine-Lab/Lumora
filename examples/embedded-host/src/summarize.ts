@@ -6,11 +6,12 @@
  * - 嵌套对象仅按 path/schema 级字段白名单展开（白名单外对象固定 [对象]，
  *   数组只报长度或展开白名单项），不调用 Object.keys，工作量与对象宽度无关
  * - 每个声明字段读取前先做可捕获异常的 own-property 检查，缺失/失败跳过或占位
- * - 事件名或分隔符耗尽预算后立即返回，不再触碰 event/payload
+ * - 事件名或分隔符耗尽预算后立即返回，不再触碰 event/payload；
+ *   剩余内容容量（不含省略号预留位）归零时同样立即截断
  * - 截断时恒以 … 结尾：每次写入前先为省略号预留 1 字符，
  *   转义收缩按未转义片段边界进行，不会切断转义序列
- * - Error 判定为有界检查（@@toStringTag 至多读取一次，零原型链遍历），
- *   且仅在已知 error 字段路径执行；message 单次读取
+ * - Error 判定为有界检查（至多两次 Object.getPrototypeOf + 原型身份比较，
+ *   循环 getPrototypeOf Proxy 至多触发 2 次 trap），且仅在已知 error 字段路径执行
  * - 所有文本（字符串、Error.message、Symbol 描述、事件名）统一转义
  *   \r \n U+2028 U+2029 后再进入预算；所有动态字符串统一经同一
  *   base64 判定入口进入文本写入
@@ -74,6 +75,11 @@ class LineWriter {
 
   get done(): boolean {
     return this.doneFlag;
+  }
+
+  /** 剩余内容容量（不含省略号预留位）：为 0 时已无任何内容空间，仅剩省略号 */
+  remainingContent(): number {
+    return this.chars - ELLIPSIS.length;
   }
 
   /**
@@ -218,14 +224,21 @@ export function formatLogLine(event: string, payload: unknown): string {
   const writer = new LineWriter();
   writer.write(event);
   writer.write(' ');
-  // 事件名或分隔符耗尽预算：立即返回，不再触碰 event/payload
-  if (writer.done) return writer.value;
+  // 事件名或分隔符耗尽预算（含仅余省略号预留位）：立即截断并返回，不再触碰 event/payload
+  if (writer.done || writer.remainingContent() <= 0) {
+    writer.truncate();
+    return writer.value;
+  }
   writePayload(event, payload, writer);
   return writer.value;
 }
 
 function writePayload(event: string, payload: unknown, writer: LineWriter): void {
   if (writer.done) return;
+  if (writer.remainingContent() <= 0) {
+    writer.truncate();
+    return;
+  }
   const fields = hasOwnKey(KNOWN_EVENT_FIELDS as object, event) ? KNOWN_EVENT_FIELDS[event] : undefined;
   if (!fields || payload === null || typeof payload !== 'object') {
     writeUnknownPayload(payload, writer);
@@ -283,10 +296,7 @@ function writeUnknownPayload(payload: unknown, writer: LineWriter): void {
         writeUnknownArray(writer, payload);
         return;
       }
-      if (isError(payload)) {
-        writeError(writer, payload as Error);
-        return;
-      }
+      // Error 判定仅在已知 error 字段路径执行；未知对象固定 [对象]，零 trap 访问
       writer.write('[对象]');
     }
   }
