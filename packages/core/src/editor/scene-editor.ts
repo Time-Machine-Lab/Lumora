@@ -745,6 +745,9 @@ export class SceneEditor {
   setGuide(kind: 'thirds' | 'safeFrame', enabled: boolean): void {
     const baseline = this.captureViewBaseline();
     if (this.guardViewReentry(baseline)) return;
+    // 同值 no-op（R11-3，对齐 setViewMode same 检查）：不推进事务版本、
+    // 不 emit——updater 内嵌套同值调用不背止外层合法提交
+    if (this.view.guides[kind] === enabled) return;
     this.view = { ...this.view, guides: { ...this.view.guides, [kind]: enabled } };
     this.mutationVersion += 1;
     this.events.emit('view:changed', { view: this.getView() });
