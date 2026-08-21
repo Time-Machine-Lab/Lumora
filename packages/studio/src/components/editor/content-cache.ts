@@ -212,19 +212,38 @@ function basename(path: string): string {
 }
 
 /**
- * 统一 URI 规范化（R6，TML-57 第六轮）：percent-decode 路径段、剥离 query/fragment、
- * 归并 dot-segment（. / ..）。GLTF 规范里相对 URI 是编码形态，依赖文件实体路径是
- * 解码形态；两侧都规范化后再比较，编码差异不得造成漏匹配或假缺失。
+ * URI 侧规范化（R8-10，TML-57 第八轮）：先剥离 query/fragment，再按路径段逐个
+ * percent-decode（解码后的 %2F 留在本段内、不充当分隔符），最后归并 dot-segment
+ * （. / ..）。GLTF 相对 URI 是编码形态，与解码形态的依赖文件实体路径分属两侧，
+ * 不能共用同一规范化——统一 decode 会让实体文件名中的字面 % 序列假命中（R8-10）。
  */
 function normalizeUri(raw: string): string {
-  let path = raw;
-  try {
-    path = decodeURIComponent(path);
-  } catch {
-    // 孤立 % 等非法编码序列：按字面路径处理
+  const queryIndex = raw.search(/[?#]/);
+  const path = queryIndex >= 0 ? raw.slice(0, queryIndex) : raw;
+  const segments = path.split('/');
+  const out: string[] = [];
+  for (const segment of segments) {
+    let decoded = segment;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      // 孤立 % 等非法编码序列：按字面段处理
+    }
+    if (decoded === '.' || decoded === '') continue;
+    if (decoded === '..') {
+      if (out.length > 0) out.pop();
+      continue;
+    }
+    out.push(decoded);
   }
-  const queryIndex = path.search(/[?#]/);
-  if (queryIndex >= 0) path = path.slice(0, queryIndex);
+  return out.join('/');
+}
+
+/**
+ * 实体路径侧规范化（R8-10）：只归并 dot-segment，不做任何 percent-decode——
+ * 文件名是解码后的现实，字面 % 序列必须按字面保留，不得与编码 URI 假命中。
+ */
+function normalizeEntityPath(path: string): string {
   const segments = path.split('/');
   const out: string[] = [];
   for (const segment of segments) {
@@ -241,8 +260,9 @@ function normalizeUri(raw: string): string {
 /**
  * GLTF URI → 依赖文件 的规范解析（模型导入预检与缓存 URL 构建共用同一规则，
  * 保证「预检通过 ⇔ 可加载」，消除两处逻辑分叉）：
- * 精确相对路径优先（两侧经 normalizeUri 统一）；basename 仅当唯一时才兜底；
- * 0 个命中 = 缺失、>1 个命中 = 歧义，两者都必须失败（歧义不得静默取其一）。
+ * 精确相对路径优先（URI 侧 normalizeUri、实体侧 normalizeEntityPath，分别规范化）；
+ * basename 仅当唯一时才兜底；0 个命中 = 缺失、>1 个命中 = 歧义，两者都必须失败
+ * （歧义不得静默取其一）。
  */
 export type PartResolution<T extends { path: string }> =
   | { kind: 'exact'; part: T }
@@ -255,10 +275,10 @@ export function resolvePartPath<T extends { path: string }>(
   parts: readonly T[],
 ): PartResolution<T> {
   const norm = normalizeUri(uri);
-  const exact = parts.find((p) => normalizeUri(p.path) === norm);
+  const exact = parts.find((p) => normalizeEntityPath(p.path) === norm);
   if (exact) return { kind: 'exact', part: exact };
   const base = basename(norm);
-  const candidates = parts.filter((p) => basename(normalizeUri(p.path)) === base);
+  const candidates = parts.filter((p) => basename(normalizeEntityPath(p.path)) === base);
   if (candidates.length === 1) return { kind: 'unique-basename', part: candidates[0]! };
   return { kind: candidates.length === 0 ? 'missing' : 'ambiguous', uri };
 }

@@ -47,9 +47,11 @@ function partPathFor(main: File, part: File): string {
   if (!normalized) return part.name.replace(/\\/g, '/');
   const mainDir = ((main as File & { webkitRelativePath?: string }).webkitRelativePath ?? '').replace(/\\/g, '/');
   const mainDirPrefix = mainDir.includes('/') ? mainDir.slice(0, mainDir.lastIndexOf('/') + 1) : '';
-  return mainDirPrefix && normalized.startsWith(mainDirPrefix)
-    ? normalized.slice(mainDirPrefix.length)
-    : part.name.replace(/\\/g, '/');
+  if (mainDirPrefix && normalized.startsWith(mainDirPrefix)) return normalized.slice(mainDirPrefix.length);
+  // 主文件目录外的依赖（兄弟分支/上级目录）：以主文件所在目录为基准构造完整
+  // POSIX 相对路径（../ 上溯），不回退 basename——否则丢失目录结构（R8-10）
+  const mainDirSegments = mainDirPrefix ? mainDirPrefix.slice(0, -1).split('/').length : 0;
+  return `${'../'.repeat(mainDirSegments)}${normalized}`;
 }
 
 
@@ -62,7 +64,8 @@ function partPathFor(main: File, part: File): string {
  * 解析前绑定项目会话与目标场景：解析完成后若会话（打开/关闭项目）或目标场景
  * 已切换，则取消提交并释放缓存内容（缓存引用以项目关系为准，见 ContentCache.sweep）。
  * 多文件支持：传入数组时以首个 .glb/.gltf 为主文件，其余为外部依赖；
- * 依赖缺失立即失败（不触碰缓存）；组合内容哈希覆盖主文件与全部依赖字节。
+ * 依赖缺失/歧义立即失败（不触碰缓存）；只持久化 required URI 实际解析的
+ * 去重依赖集合，组合内容哈希覆盖主文件与该集合的字节。
  */
 export async function importModelFile(
   editor: SceneEditor,
@@ -103,22 +106,27 @@ export async function importModelFile(
     }
     // 规范解析（与缓存 URL 构建共用 resolvePartPath）：精确路径优先、basename 仅
     // 唯一时兜底、歧义必须失败 —— 预检与构建两处逻辑永不分叉
-    const unresolved = required
-      .map((uri) => ({ uri, resolution: resolvePartPath(uri, partPaths) }))
-      .filter(({ resolution }) => resolution.kind === 'missing' || resolution.kind === 'ambiguous');
-    if (unresolved.length > 0) {
-      const missing = unresolved
-        .filter(({ resolution }) => resolution.kind === 'missing')
-        .map(({ uri }) => uri);
-      const ambiguous = unresolved
-        .filter(({ resolution }) => resolution.kind === 'ambiguous')
-        .map(({ uri }) => uri);
-      if (ambiguous.length > 0) return fail(`依赖文件歧义：${ambiguous.join('、')}`);
-      return fail(`缺少依赖文件：${missing.join('、')}`);
-    }
+    const resolutions = required.map((uri) => ({ uri, resolution: resolvePartPath(uri, partPaths) }));
+    const ambiguous = resolutions
+      .filter(({ resolution }) => resolution.kind === 'ambiguous')
+      .map(({ uri }) => uri);
+    if (ambiguous.length > 0) return fail(`依赖文件歧义：${ambiguous.join('、')}`);
+    const missing = resolutions
+      .filter(({ resolution }) => resolution.kind === 'missing')
+      .map(({ uri }) => uri);
+    if (missing.length > 0) return fail(`缺少依赖文件：${missing.join('、')}`);
+    // 只持久化 required URI 实际解析的去重集合（identity Set：同一路径被多次引用
+    // 时命中同一份规范解析）；未引用文件不进 parts、不参与组合哈希（R8-10）
+    const used = new Set(
+      resolutions
+        .map(({ resolution }) =>
+          resolution.kind === 'exact' || resolution.kind === 'unique-basename' ? resolution.part : null,
+        )
+        .filter((part): part is (typeof partPaths)[number] => part !== null),
+    );
     const loaded: CachePartFile[] = [];
     const hashes: { path: string; partHash: string }[] = [];
-    for (const { file: partFile, path } of partPaths) {
+    for (const { file: partFile, path } of used) {
       let bytes: ArrayBuffer;
       try {
         bytes = await partFile.arrayBuffer();
