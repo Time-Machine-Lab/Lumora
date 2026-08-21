@@ -81,11 +81,14 @@ describe('R8-2 外部 updater 终态与原子提交', () => {
       'sample-cube',
       (o) => {
         const next = { ...o, name: '毒返回' };
-        Object.defineProperty(next, 'bomb', {
+        // getter 必须挂在 schema 已知键上（R8-6 严格校验在克隆前拒绝未知键，
+        // 未知键上的 getter 不再能到达 structuredClone，测试场景将不可达）
+        Object.defineProperty(next, 'name', {
           enumerable: true,
+          configurable: true,
           get() {
             editor.dispose();
-            return 'x';
+            return '毒返回';
           },
         });
         return next;
