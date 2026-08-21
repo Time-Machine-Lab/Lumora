@@ -69,7 +69,13 @@ test('?debug=full：输出完整 payload，行为与修复前一致', async ({ p
 
   const logText = await page.getByTestId('event-log').innerText();
   expect(logText).toContain('project:changed');
+  // 完整 payload 行包含整段 base64：已知前缀与尾缀都在日志中，证明载荷完整无截断
+  const GLB_BASE64 = LEAK_CHECK_GLB.toString('base64');
+  expect(logText).toContain(GLB_BASE64.slice(0, 100));
+  expect(logText).toContain(GLB_BASE64.slice(-100));
+  expect(logText).toContain(GLB_BASE64);
   // 完整 payload 行包含整段 base64（远大于摘要上限）
   const maxLine = Math.max(...logText.split('\n').map((line) => line.length));
   expect(maxLine).toBeGreaterThan(1_000_000);
+  expect(maxLine).toBeGreaterThan(GLB_BASE64.length);
 });

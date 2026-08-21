@@ -1,20 +1,22 @@
 /**
  * 事件日志行摘要（TML-87）：事件名与 payload 共享同一字符/节点预算，
- * 产出恒 <= SUMMARY_CHAR_BUDGET 的单行文本。
+ * 产出恒 <= SUMMARY_CHAR_BUDGET 的单行文本，且摘要本身不抛错。
  *
- * - 已知事件按声明字段逐字段摘要，不做顶层反射；未知事件的对象退化为固定占位
- * - 所有文本（字符串、Error.message、键名、Symbol 描述、事件名）统一转义
+ * - 已知事件按声明字段逐字段摘要；未知事件/未知对象一律固定占位，不做任何反射枚举
+ * - 嵌套对象仅按 path/schema 级字段白名单展开（白名单外对象固定 [对象]，
+ *   数组只报长度或展开白名单项），不调用 Object.keys，工作量与对象宽度无关
+ * - 每个声明字段读取前先做可捕获异常的 own-property 检查，缺失/失败跳过或占位
+ * - 所有文本（字符串、Error.message、Symbol 描述、事件名）统一转义
  *   \r \n U+2028 U+2029 后再进入预算，转义只作用于实际输出的片段
  * - base64 资产内容按路径（payload 字段）直接掩码；内容启发式仅兜底且有界采样
- * - 值访问与键枚举受节点预算约束；getter/Proxy/反射失败容错
+ * - getter/Proxy/revoked Proxy/异常形状一律容错（safeIsArray、readLength 校验、
+ *   Error.message 类型校验），摘要永不抛错
  */
 
 export const SUMMARY_CHAR_BUDGET = 4096;
 
 const SUMMARY_STRING_LIMIT = 120;
-const SUMMARY_KEYS_LIMIT = 8;
 const SUMMARY_ITEMS_LIMIT = 8;
-const SUMMARY_DEPTH_LIMIT = 4;
 const SUMMARY_NODE_BUDGET = 64;
 const ELLIPSIS = '…';
 
@@ -30,21 +32,30 @@ const KNOWN_EVENT_FIELDS: Readonly<Record<string, readonly string[]>> = {
   'command:executed': ['id', 'ok', 'error'],
 };
 
+/** 嵌套对象的 path/schema 级字段白名单：白名单外的对象固定 [对象]，不做通用键枚举 */
+const KNOWN_OBJECT_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  project: ['name', 'revision', 'assets'],
+  asset: ['id', 'kind', 'name', 'size', 'payload'],
+};
+
+/** 数组项 schema：父字段名 -> 项字段白名单键 */
+const KNOWN_ARRAY_ITEM_FIELDS: Readonly<Record<string, string>> = {
+  assets: 'asset',
+};
+
 /** 资产内容字段名：按路径直接掩码，不读内容 */
 const ASSET_CONTENT_KEYS = new Set(['payload']);
 
 /** BigInt 分级占位：安全整数范围内显示数值，超出退化为固定占位（避免无界十进制转换） */
 const BIGINT_DISPLAY_LIMIT = 1_000_000_000_000_000_000n;
 
-const CONTROL_ESCAPES: Readonly<Record<string, string>> = {
-  '\r': '\\r',
-  '\n': '\\n',
-  '\u2028': '\\u2028',
-  '\u2029': '\\u2029',
-};
+/** \r \n U+2028 U+2029 统一转义；用 fromCharCode 构造字符类，源码不含不可见行分隔符 */
+const CONTROL_RE = new RegExp(`[\r\n${String.fromCharCode(0x2028)}${String.fromCharCode(0x2029)}]`, 'g');
 
 function escapeControl(text: string): string {
-  return text.replace(/[\r\n\u2028\u2029]/g, (ch) => CONTROL_ESCAPES[ch]);
+  return text.replace(CONTROL_RE, (ch) =>
+    ch === '\r' ? '\\r' : ch === '\n' ? '\\n' : ch === String.fromCharCode(0x2028) ? '\\u2028' : '\\u2029',
+  );
 }
 
 class LineWriter {
@@ -106,6 +117,43 @@ function readKey(record: object, key: string | number): { ok: true; value: unkno
   }
 }
 
+/** 可捕获异常的 own-property 检查；检查失败视为缺失（不触发继承 getter） */
+function hasOwnKey(record: object, field: string): boolean {
+  try {
+    return Object.prototype.hasOwnProperty.call(record, field);
+  } catch {
+    return false;
+  }
+}
+
+/** Array.isArray 在 revoked Proxy 上抛 TypeError，需容错 */
+function safeIsArray(value: unknown): value is unknown[] {
+  try {
+    return Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
+/** 数组长度只接受有限非负整数；读取失败或形状异常返回 -1 */
+function readLength(value: unknown[]): number {
+  let length: unknown;
+  try {
+    length = value.length;
+  } catch {
+    return -1;
+  }
+  return typeof length === 'number' && Number.isInteger(length) && length >= 0 ? length : -1;
+}
+
+function isError(value: object): boolean {
+  try {
+    return value instanceof Error;
+  } catch {
+    return false;
+  }
+}
+
 export function formatLogLine(event: string, payload: unknown): string {
   const writer = new LineWriter();
   writer.write(event);
@@ -115,23 +163,23 @@ export function formatLogLine(event: string, payload: unknown): string {
 }
 
 function writePayload(event: string, payload: unknown, writer: LineWriter): void {
-  const fields = Object.prototype.hasOwnProperty.call(KNOWN_EVENT_FIELDS, event)
-    ? KNOWN_EVENT_FIELDS[event]
-    : undefined;
+  const fields = hasOwnKey(KNOWN_EVENT_FIELDS as object, event) ? KNOWN_EVENT_FIELDS[event] : undefined;
   if (!fields || payload === null || typeof payload !== 'object') {
     writeUnknownPayload(payload, writer);
     return;
   }
-  const record = payload as Record<string, unknown>;
+  const record = payload as object;
   writer.write('{');
   let shown = 0;
   for (const field of fields) {
     if (writer.done) break;
+    // 每个声明字段先 own-property 检查：缺失（含检查失败）跳过，不触碰继承属性
+    if (!hasOwnKey(record, field)) continue;
     if (shown > 0) writer.write(', ');
     const read = readKey(record, field);
     if (read.ok) {
       writer.write(`${field}: `);
-      writeValue(writer, read.value, 0, field);
+      writeValue(writer, read.value, field);
     } else {
       writer.write(`${field}: [取值失败]`);
     }
@@ -172,7 +220,7 @@ function writeUnknownPayload(payload: unknown, writer: LineWriter): void {
       writeSymbol(writer, payload);
       return;
     default: {
-      if (Array.isArray(payload)) {
+      if (safeIsArray(payload)) {
         writeUnknownArray(writer, payload);
         return;
       }
@@ -185,7 +233,7 @@ function writeUnknownPayload(payload: unknown, writer: LineWriter): void {
   }
 }
 
-function writeValue(writer: LineWriter, value: unknown, depth: number, path: string): void {
+function writeValue(writer: LineWriter, value: unknown, path: string): void {
   if (writer.done) return;
   if (!writer.takeNode()) return;
   if (value === null) {
@@ -230,21 +278,75 @@ function writeValue(writer: LineWriter, value: unknown, depth: number, path: str
         writeError(writer, value as Error);
         return;
       }
-      if (Array.isArray(value)) {
-        if (depth >= SUMMARY_DEPTH_LIMIT) {
-          writeUnknownArray(writer, value);
-          return;
-        }
-        writeArray(writer, value, depth);
+      if (safeIsArray(value)) {
+        writeArray(writer, value, path);
         return;
       }
-      if (depth >= SUMMARY_DEPTH_LIMIT) {
+      const fields = hasOwnKey(KNOWN_OBJECT_FIELDS as object, path) ? KNOWN_OBJECT_FIELDS[path] : undefined;
+      if (!fields) {
         writer.write('[对象]');
         return;
       }
-      writeObject(writer, value, depth);
+      writeObjectFields(writer, value as object, fields);
     }
   }
+}
+
+/** 白名单对象：只读声明字段（每字段先 own-property 检查），不做键枚举 */
+function writeObjectFields(writer: LineWriter, record: object, fields: readonly string[]): void {
+  writer.write('{');
+  let shown = 0;
+  for (const field of fields) {
+    if (writer.done) break;
+    if (!hasOwnKey(record, field)) continue;
+    if (shown > 0) writer.write(', ');
+    const read = readKey(record, field);
+    if (read.ok) {
+      writer.write(`${field}: `);
+      writeValue(writer, read.value, field);
+    } else {
+      writer.write(`${field}: [取值失败]`);
+    }
+    shown++;
+  }
+  writer.write('}');
+}
+
+/** 数组：白名单数组展开前 8 项，溢出仅标 …；无白名单的数组只报长度 */
+function writeArray(writer: LineWriter, value: unknown[], path: string): void {
+  const length = readLength(value);
+  if (length < 0) {
+    writer.write('[数组]');
+    return;
+  }
+  const itemKey = hasOwnKey(KNOWN_ARRAY_ITEM_FIELDS as object, path) ? KNOWN_ARRAY_ITEM_FIELDS[path] : undefined;
+  if (!itemKey) {
+    writer.write(`[数组×${length}]`);
+    return;
+  }
+  writer.write('[');
+  const shown = length > SUMMARY_ITEMS_LIMIT ? SUMMARY_ITEMS_LIMIT : length;
+  for (let i = 0; i < shown && !writer.done; i++) {
+    if (i > 0) writer.write(', ');
+    const read = readKey(value, i);
+    if (read.ok) {
+      writeValue(writer, read.value, itemKey);
+    } else {
+      writer.write('[取值失败]');
+    }
+  }
+  if (length > shown && !writer.done) writer.write(', …');
+  writer.write(']');
+}
+
+/** 未知数组：只报长度（经有限非负整数校验），不枚举内容 */
+function writeUnknownArray(writer: LineWriter, value: unknown[]): void {
+  const length = readLength(value);
+  if (length < 0) {
+    writer.write('[数组]');
+    return;
+  }
+  writer.write(`[数组×${length}]`);
 }
 
 function writeBigInt(writer: LineWriter, value: bigint): void {
@@ -271,21 +373,15 @@ function writeSymbol(writer: LineWriter, symbol: symbol): void {
   writer.write(']');
 }
 
-/** 未知事件的数组：只报长度，不枚举内容 */
-function writeUnknownArray(writer: LineWriter, value: unknown[]): void {
-  const length = readLength(value);
-  if (length < 0) {
-    writer.write('[数组]');
-    return;
-  }
-  writer.write(`[数组×${length}]`);
-}
-
 function writeError(writer: LineWriter, error: Error): void {
-  let message: string;
+  let message: unknown;
   try {
     message = error.message;
   } catch {
+    writer.write('[Error]');
+    return;
+  }
+  if (typeof message !== 'string') {
     writer.write('[Error]');
     return;
   }
@@ -308,70 +404,6 @@ function writeBoundedText(writer: LineWriter, text: string, limit: number): void
   }
   writer.write(text.slice(0, limit));
   writer.write(`…(${text.length} 字符)`);
-}
-
-function writeArray(writer: LineWriter, value: unknown[], depth: number): void {
-  const length = readLength(value);
-  if (length < 0) {
-    writer.write('[数组]');
-    return;
-  }
-  writer.write('[');
-  const shown = Math.min(length, SUMMARY_ITEMS_LIMIT);
-  for (let i = 0; i < shown && !writer.done; i++) {
-    if (i > 0) writer.write(', ');
-    const read = readKey(value, i);
-    if (read.ok) {
-      writeValue(writer, read.value, depth + 1, '');
-    } else {
-      writer.write('[取值失败]');
-    }
-  }
-  if (length > shown && !writer.done) writer.write(`, …共 ${length} 项`);
-  writer.write(']');
-}
-
-/** 自身可枚举键（不含继承键）；只读前 KEY_LIMIT+1 个的展示值，不遍历剩余键 */
-function writeObject(writer: LineWriter, record: unknown, depth: number): void {
-  let keys: string[];
-  try {
-    keys = Object.keys(record as object);
-  } catch {
-    writer.write('[对象]');
-    return;
-  }
-  writer.write('{');
-  const shown = Math.min(keys.length, SUMMARY_KEYS_LIMIT);
-  for (let i = 0; i < shown && !writer.done; i++) {
-    if (i > 0) writer.write(', ');
-    const key = keys[i];
-    const boundedKey = key.length > SUMMARY_STRING_LIMIT ? `${key.slice(0, SUMMARY_STRING_LIMIT)}…` : key;
-    const read = readKey(record as object, key);
-    if (read.ok) {
-      writer.write(`${boundedKey}: `);
-      writeValue(writer, read.value, depth + 1, key);
-    } else {
-      writer.write(`${boundedKey}: [取值失败]`);
-    }
-  }
-  if (keys.length > shown && !writer.done) writer.write(`, …共 ${keys.length} 个键`);
-  writer.write('}');
-}
-
-function isError(value: object): boolean {
-  try {
-    return value instanceof Error;
-  } catch {
-    return false;
-  }
-}
-
-function readLength(value: unknown[]): number {
-  try {
-    return value.length;
-  } catch {
-    return -1;
-  }
 }
 
 /** 内容兜底：有界采样前 64 字符，纯 base64 字符集且总长超阈值才掩码 */
