@@ -404,9 +404,12 @@ export class SceneEditor {
       if (list) list.push(object.id);
       else childrenOf.set(object.parentId, [object.id]);
     }
+    // 一次 byId 索引在全部复制根间共享：替代 duplicateSubtree 逐节点 findObject
+    // 全量扫描（复制 n 节点链 ≈ n²/2 次谓词执行，R10-M3 #7）
+    const byId = new Map(project.objects.map((object) => [object.id, object]));
     for (const rootId of roots) {
       const run: SceneObjectData[] = [];
-      this.duplicateSubtree(project, rootId, idMap, run, childrenOf);
+      this.duplicateSubtree(rootId, idMap, run, childrenOf, byId);
       runs.push(run);
     }
     const newRootIds = runs.map((run) => run[0]!.id);
@@ -808,19 +811,20 @@ export class SceneEditor {
     };
   }
 
-  /** 复制一棵子树（迭代栈 + 共享 childrenOf 索引，R9-M2）：先序 parent-first、
-   *  子节点按原插入顺序（逆序入栈），6000 层链不爆栈 */
+  /** 复制一棵子树（迭代栈 + 共享 childrenOf/byId 索引，R9-M2 + R10-M3 #7）：
+   *  先序 parent-first、子节点按原插入顺序（逆序入栈），6000 层链不爆栈；
+   *  原对象经共享 byId 索引取（O(1)），不再逐节点 findObject 全量扫描 */
   private duplicateSubtree(
-    project: Project,
     rootId: string,
     idMap: Map<string, string>,
     run: SceneObjectData[],
     childrenOf: Map<string | null, string[]>,
+    byId: Map<string, SceneObjectData>,
   ): void {
     const stack: string[] = [rootId];
     while (stack.length > 0) {
       const id = stack.pop()!;
-      const original = findObject(project, id);
+      const original = byId.get(id);
       if (!original) continue;
       const copy: SceneObjectData = {
         ...original,
