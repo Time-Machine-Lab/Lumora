@@ -208,7 +208,6 @@ describe('R9-M1 事务边界：外部 getter 副作用入口探针', () => {
       'filterSelection',
       'guardReentry',
       'guardViewReentry',
-      'isReachableFrom',
       'own',
       'ownTransform',
       'sameTransform',
