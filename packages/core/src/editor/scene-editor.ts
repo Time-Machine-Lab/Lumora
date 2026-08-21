@@ -213,10 +213,8 @@ export class SceneEditor {
   setSelection(ids: string[]): void {
     if (this.disposed) return;
     const project = this.project;
-    // 选择严格限定在活动场景可达集内：跨场景对象不可选中
-    const next = project
-      ? ids.filter((id) => findObject(project, id) && isInActiveScene(project, id))
-      : [];
+    // 选择严格限定在活动场景可达集内：跨场景对象不可选中；重复 ID 首次出现去重（R8-8）
+    const next = project ? this.filterSelection(project, ids) : [];
     if (next.length === this.selection.length && next.every((id, i) => id === this.selection[i])) return;
     this.selection = next;
     this.events.emit('selection:changed', { ids: this.getSelection() });
@@ -326,15 +324,18 @@ export class SceneEditor {
     return { ok: true, value: { removed } };
   }
 
-  /** 复制选中对象子树；同一组内的后代不重复复制（FR-002） */
+  /** 复制选中对象子树；同一组内的后代不重复复制（FR-002）。
+   *  选择先去重（R8-8）：重复 root 会产生第二个副本 run，而 indexOf 只取
+   *  首个下标 → 副本被丢弃但 ID 仍进返回列表（指向不存在的对象）。 */
   duplicateSelection(): Result<{ ids: string[] }> {
     const project = this.requireProject();
     if (!project) return failure('未打开项目');
-    const roots = this.selection.filter(
+    const selection = this.dedupeSelection(this.selection);
+    const roots = selection.filter(
       (id) =>
         findObject(project, id) &&
         isInActiveScene(project, id) &&
-        !this.selection.some((other) => other !== id && isInSubtree(project, id, other)),
+        !selection.some((other) => other !== id && isInSubtree(project, id, other)),
     );
     if (roots.length === 0) return { ok: true, value: { ids: [] } };
 
@@ -739,9 +740,24 @@ export class SceneEditor {
     return { ok: true };
   }
 
-  /** 选择按项目活动场景可达集过滤：跨场景/已删除对象不可选中 */
+  /** 首次出现去重（保持顺序）：选择/历史快照中的 ID 不重复（R8-8） */
+  private dedupeSelection(ids: string[]): string[] {
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (const id of ids) {
+      if (!seen.has(id)) {
+        seen.add(id);
+        result.push(id);
+      }
+    }
+    return result;
+  }
+
+  /** 选择按项目活动场景可达集过滤：跨场景/已删除对象不可选中；去重后过滤（R8-8） */
   private filterSelection(project: Project, ids: string[]): string[] {
-    return ids.filter((id) => findObject(project, id) && isInActiveScene(project, id));
+    return this.dedupeSelection(ids).filter(
+      (id) => findObject(project, id) && isInActiveScene(project, id),
+    );
   }
 
   /** 状态换入：项目/选择/视图一次就位（不发事件；事件由调用方按固定顺序发出） */
