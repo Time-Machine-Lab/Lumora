@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { buildGlbWithBin } from './helpers/glb';
+import { SUMMARY_CHAR_BUDGET } from '../examples/embedded-host/src/summarize';
 
 /**
  * TML-87 回归：onAny 不再序列化完整 payload。
@@ -53,9 +54,9 @@ test('默认模式：导入大模型并变换后，事件日志只含摘要，�
   // 摘要行不含已知 base64 载荷前缀，也无超过 150 字符的 base64 连续串
   expect(logText).not.toContain(GLB_BASE64_PREFIX);
   expect(logText.match(/[A-Za-z0-9+/]{150,}/g)).toBeNull();
-  // 最长日志行远小于完整载荷（2MB GLB 的 base64 ≈ 2.7M 字符）
+  // 摘要行不超共享预算（2MB GLB 的 base64 ≈ 2.7M 字符，完整序列化已被杜绝）
   const maxLine = Math.max(...logText.split('\n').map((line) => line.length));
-  expect(maxLine).toBeLessThan(10_000);
+  expect(maxLine).toBeLessThanOrEqual(SUMMARY_CHAR_BUDGET);
   // 50 行保留上限仍生效
   expect(logText.split('\n').length).toBeLessThanOrEqual(50);
 });

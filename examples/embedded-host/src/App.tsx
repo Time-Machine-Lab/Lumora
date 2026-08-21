@@ -3,7 +3,7 @@ import type { PluginDescriptor } from '@lumora/core';
 import { LumoraStudio } from '@lumora/studio';
 import type { LumoraStudioHandle } from '@lumora/studio';
 import mockManifest from '@lumora/mock-plugin/lumora.plugin.json';
-import { summarize } from './summarize';
+import { formatLogLine } from './summarize';
 import './app.css';
 
 const mockPlugin: PluginDescriptor = {
@@ -83,7 +83,7 @@ export default function App() {
     );
     const closed = runtime.events.on('project:closed', () => appendLog('项目已关闭'));
     const anyEvent = runtime.events.onAny((event, payload) =>
-      appendLog(DEBUG_FULL ? `${event} ${JSON.stringify(payload)}` : `${event} ${summarize(payload)}`),
+      appendLog(DEBUG_FULL ? `${event} ${JSON.stringify(payload)}` : formatLogLine(event, payload)),
     );
     return () => {
       opened.dispose();
