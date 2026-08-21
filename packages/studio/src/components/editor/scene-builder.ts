@@ -17,6 +17,15 @@ const CONTENT_NAME = '__glb-content__';
 const PLACEHOLDER_MARK = Symbol('lumora.model-placeholder');
 const CONTENT_MARK = Symbol('lumora.model-content');
 
+/** userData 的 Symbol 索引（THREE 类型为 Record<string, any>：字符串索引签名不容纳 symbol，需加宽） */
+function readMark(userData: Record<string, unknown>, mark: symbol): unknown {
+  return (userData as Record<string | symbol, unknown>)[mark];
+}
+
+function writeMark(userData: Record<string, unknown>, mark: symbol): void {
+  (userData as Record<string | symbol, unknown>)[mark] = true;
+}
+
 const PRIMITIVE_GEOMETRIES: Record<string, () => THREE.BufferGeometry> = {
   box: () => new THREE.BoxGeometry(1, 1, 1),
   sphere: () => new THREE.SphereGeometry(0.6, 24, 24),
@@ -29,7 +38,7 @@ const PRIMITIVE_GEOMETRIES: Record<string, () => THREE.BufferGeometry> = {
 function isInsideContent(object: THREE.Object3D): boolean {
   let current: THREE.Object3D | null = object;
   while (current) {
-    if (current.userData[CONTENT_MARK]) return true;
+    if (readMark(current.userData, CONTENT_MARK)) return true;
     current = current.parent;
   }
   return false;
@@ -100,7 +109,7 @@ export function buildObject(data: SceneObjectData, aspect: number): THREE.Object
         new THREE.MeshBasicMaterial({ color: '#7a6bff', wireframe: true, transparent: true, opacity: 0.7 }),
       );
       placeholder.name = PLACEHOLDER_NAME;
-      placeholder.userData[PLACEHOLDER_MARK] = true;
+      writeMark(placeholder.userData, PLACEHOLDER_MARK);
       group.add(placeholder);
       node = group;
       break;
@@ -125,8 +134,8 @@ export function attachModelContent(node: THREE.Object3D, gltf: GLTF): void {
   // 占位框/内容都是模型组的直接子节点：只查直接子节点与 Symbol 标记，
   // 用户 GLB 内或对象名里的同名节点（'model-placeholder'/'__glb-content__'）
   // 不可能被误判为内部结构（R8-5）
-  if (node.children.some((c) => c.userData[CONTENT_MARK])) return;
-  const placeholder = node.children.find((c) => c.userData[PLACEHOLDER_MARK]);
+  if (node.children.some((c) => readMark(c.userData, CONTENT_MARK))) return;
+  const placeholder = node.children.find((c) => readMark(c.userData, PLACEHOLDER_MARK));
   if (placeholder) {
     node.remove(placeholder);
     disposeNode(placeholder);
@@ -134,7 +143,7 @@ export function attachModelContent(node: THREE.Object3D, gltf: GLTF): void {
   const clone = gltf.scene.clone(true);
   clone.name = CONTENT_NAME;
   // clone(true) 对 userData 做 JSON 拷贝（Symbol 键被丢弃），须在克隆后补标
-  clone.userData[CONTENT_MARK] = true;
+  writeMark(clone.userData, CONTENT_MARK);
   node.add(clone);
 }
 

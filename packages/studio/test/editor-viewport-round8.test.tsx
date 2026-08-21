@@ -8,6 +8,7 @@ import { EditorViewport } from '../src/components/editor/EditorViewport';
 import type { CacheLease, ContentCache } from '../src/components/editor/content-cache';
 import { findNode } from '../src/components/editor/scene-builder';
 import { useSceneEditor } from '../src/hooks/use-scene-editor';
+import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 /**
  * R8-4 对抗测试（TML-57 第八轮复审，修复前必须失败）：
@@ -49,7 +50,8 @@ beforeEach(() => {
 });
 
 function leaseWith(content: Promise<unknown>): CacheLease {
-  return { hash: 'noop', generation: 0, content, isReleased: false, release: vi.fn() };
+  // 缓存内容类型为 Promise<GLTF>：该 stub 不参与模型解析，仅需满足形状
+  return { hash: 'noop', generation: 0, content: content as Promise<GLTF>, isReleased: false, release: vi.fn() };
 }
 
 function noopCache(): ContentCache {
