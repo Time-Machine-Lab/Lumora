@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { createSampleProject } from '@lumora/core';
+import { createSampleProject, SceneEditor } from '@lumora/core';
 import type { Project, SceneObjectData } from '@lumora/core';
 import {
   attachModelContent,
@@ -236,5 +236,90 @@ describe('R10-M2 内容子树所有权隔离：品牌 + CONTENT_MARK 双保险',
     expect(findNode(root, 'fake')).toBeNull();
     expect(resolveObjectId(contentGroup)).toBe('M');
     expect(contentGroup.parent).toBe(node);
+  });
+});
+
+describe('R10-M3 camera 方案 B：schema 拒绝 orthographic（core 域，经 openProject 通道）', () => {
+  /** 仅 projection 为 orthographic、其余字段全合法的项目（无效数据经 cast 构造） */
+  function orthographicProject(): Project {
+    const sample = createSampleProject();
+    const camera = {
+      id: 'cam-ortho',
+      type: 'camera',
+      name: '正交机位',
+      parentId: null,
+      transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      visible: true,
+      locked: false,
+      camera: {
+        projection: 'orthographic',
+        focalLength: 50,
+        fov: 40,
+        sensorWidth: 36,
+        sensorHeight: 24,
+        near: 0.1,
+        far: 1000,
+        aspect: null,
+      },
+    } as unknown as SceneObjectData;
+    return {
+      ...sample,
+      objects: [...sample.objects, camera],
+      scenes: sample.scenes.map((s) => ({ ...s, rootObjectIds: [...s.rootObjectIds, 'cam-ortho'] })),
+    };
+  }
+
+  /** perspective 全参数相机项目（回归基线） */
+  function perspectiveProject(): Project {
+    const sample = createSampleProject();
+    const camera: SceneObjectData = {
+      id: 'cam-1',
+      type: 'camera',
+      name: '机位',
+      parentId: null,
+      transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      visible: true,
+      locked: false,
+      camera: {
+        projection: 'perspective',
+        focalLength: 50,
+        fov: 40,
+        sensorWidth: 36,
+        sensorHeight: 24,
+        near: 0.1,
+        far: 1000,
+        aspect: null,
+      },
+    };
+    return {
+      ...sample,
+      objects: [...sample.objects, camera],
+      scenes: sample.scenes.map((s) => ({ ...s, rootObjectIds: [...s.rootObjectIds, 'cam-1'] })),
+    };
+  }
+
+  it('T1 openProject（validateProjectSchema 原子拒绝）：orthographic 抛错且消息显式（RED）', () => {
+    const editor = new SceneEditor();
+    // RED：现 HEAD orthographic 是合法投影 → openProject 成功、无错误
+    expect(() => editor.openProject(orthographicProject())).toThrow(/orthographic 未支持/);
+  });
+
+  it('T2 拒绝后编辑器状态不变：旧项目保持、revision 不增、会话令牌不变（RED）', () => {
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    const before = editor.getProject()!;
+    const beforeRevision = before.revision;
+    const beforeToken = editor.getSessionToken();
+    // RED：现 HEAD openProject 成功 → 项目被替换、revision 递增
+    expect(() => editor.openProject(orthographicProject())).toThrow();
+    expect(editor.getProject()).toBe(before);
+    expect(editor.getProject()!.revision).toBe(beforeRevision);
+    expect(editor.getSessionToken()).toBe(beforeToken);
+  });
+
+  it('T3 perspective 全参数项目仍通过（回归）', () => {
+    const editor = new SceneEditor();
+    expect(() => editor.openProject(perspectiveProject())).not.toThrow();
+    expect(editor.getProject()!.objects.some((o) => o.id === 'cam-1')).toBe(true);
   });
 });
