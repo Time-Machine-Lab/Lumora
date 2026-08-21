@@ -109,6 +109,8 @@ export class SceneEditor {
   private disposed = false;
   /** 每次应用状态的单调序号（openProject/提交/撤销/重做各取新值） */
   private revisionCounter = 0;
+  /** 状态变迁纪元：任何状态换入（swapState/dispose）递增；外部回调/克隆后据此检测重入 */
+  private stateEpoch = 0;
 
   /** 当前项目（owned immutable：只读冻结引用，不泄露可写引用） */
   getProject(): Project | null {
@@ -150,7 +152,13 @@ export class SceneEditor {
     // 全部就绪后才一次性提交 project/history/session/revision；
     // 任何一步失败（DataCloneError/校验失败）都不触碰既有状态。
     this.assertAlive();
+    const epoch = this.stateEpoch;
+    const session = this.sessionToken;
     const owned = this.own(project); // clone 先行：校验与冻结都在编辑器自有副本上进行
+    // 输入对象 getter 可能在 structuredClone 期间副作用地释放/重入编辑器（R8）：
+    // 克隆后复验终态，不得复活已释放编辑器或覆盖内层 openProject 结果
+    this.assertAlive();
+    if (this.sessionToken !== session || this.stateEpoch !== epoch) return;
     this.validateProject(owned);
     this.swapState(owned, [], { resetView: true });
     this.revisionCounter = owned.revision;
@@ -191,6 +199,7 @@ export class SceneEditor {
     if (this.disposed) return;
     this.disposed = true;
     this.sessionToken += 1;
+    this.stateEpoch += 1;
     this.history.clear();
     this.dragSnapshot = null;
     this.project = null;
@@ -473,7 +482,13 @@ export class SceneEditor {
     const object = findObject(project, objectId);
     if (!object) return failure('对象不存在');
     if (!isInActiveScene(project, objectId)) return failure('对象不属于活动场景');
+    const epoch = this.stateEpoch;
+    const session = this.sessionToken;
+    // 外部回调可能 dispose/嵌套提交/openProject：回调后必须复验基线（R8），
+    // 否则外层会把已释放编辑器复活、或用回调前的旧快照覆盖内层结果
     const nextObject = updater(structuredClone(object));
+    const reentered = this.verifyBaseline(project, epoch, session);
+    if (reentered) return reentered;
     if (!nextObject) return failure('属性值非法');
     if (nextObject.id !== object.id || nextObject.type !== object.type) {
       return failure('结构标识（id/type）不可修改');
@@ -488,8 +503,12 @@ export class SceneEditor {
     const problem = validateSceneObjectData(nextObject);
     if (problem) return failure('属性值非法');
     // 返回对象可能嵌入调用方持有的嵌套结构：克隆为编辑器自有数据后再提交，
-    // 不就地冻结调用方对象（R6）
-    return this.commit(updateObject(project, objectId, () => this.own(nextObject)), label);
+    // 不就地冻结调用方对象（R6）；返回对象 getter 也可能副作用变更编辑器（R8），
+    // 克隆后再次复验基线
+    const owned = this.own(nextObject);
+    const reenteredClone = this.verifyBaseline(project, epoch, session);
+    if (reenteredClone) return reenteredClone;
+    return this.commit(updateObject(project, objectId, () => owned), label);
   }
 
   setVisible(ids: string[], visible: boolean): Result {
@@ -524,7 +543,11 @@ export class SceneEditor {
     if (!project) return failure('未打开项目');
     const existing = findAssetByHash(project, asset.hash);
     if (existing) return { ok: true, value: { asset: existing, deduped: true } };
+    const epoch = this.stateEpoch;
+    const session = this.sessionToken;
     const owned = this.own(asset); // 无条件克隆为编辑器自有数据（R6）
+    const reentered = this.verifyBaseline(project, epoch, session); // 克隆 getter 副作用（R8）
+    if (reentered) return reentered;
     const result = this.commit(addAsset(project, owned), `注册资源 ${owned.name}`);
     if (!result.ok) return result;
     return { ok: true, value: { asset: owned, deduped: false } };
@@ -534,8 +557,12 @@ export class SceneEditor {
   importModel(asset: AssetData, object: SceneObjectData): Result<string> {
     const project = this.requireProject();
     if (!project) return failure('未打开项目');
+    const epoch = this.stateEpoch;
+    const session = this.sessionToken;
     const ownedAsset = this.own(asset);
     const ownedObject = this.own(object); // 无条件克隆为编辑器自有数据（R6）
+    const reentered = this.verifyBaseline(project, epoch, session); // 克隆 getter 副作用（R8）
+    if (reentered) return reentered;
     if (!isSceneObject(ownedObject) || ownedObject.parentId !== null) return failure('对象数据不合法');
     const scene = project.scenes.find((s) => s.id === project.activeSceneId);
     if (!scene) return failure('场景不存在');
@@ -723,6 +750,7 @@ export class SceneEditor {
     selection: string[],
     opts: { resetView?: boolean } = {},
   ): void {
+    this.stateEpoch += 1;
     this.project = project;
     this.selection = project ? this.filterSelection(project, selection) : [];
     this.view = opts.resetView || !project ? freshDefaultView() : this.deriveView(project);
@@ -844,6 +872,16 @@ export class SceneEditor {
 
   private assertAlive(): void {
     if (this.disposed) throw new Error('编辑器已释放');
+  }
+
+  /** 外部回调/克隆后的基线复验（R8）：编辑器被 dispose、会话切换或任何状态换入
+   *  都使本次操作失效——不得移动历史、不得覆盖内层结果、不得复活已释放编辑器。 */
+  private verifyBaseline(project: Project, epoch: number, session: number): Result | null {
+    if (this.disposed) return failure('编辑器已释放');
+    if (this.sessionToken !== session || this.stateEpoch !== epoch || this.project !== project) {
+      return failure('编辑器状态已变更，操作被取消');
+    }
+    return null;
   }
 
   /** 拖动前后是否等价：仅比较目标对象三向量（局部比较，不序列化项目） */
