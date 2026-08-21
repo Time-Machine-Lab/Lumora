@@ -14,8 +14,7 @@ import {
   buildScene,
   disposeNode,
   findNode,
-  isContentNode,
-  isOwnedNode,
+  resolveOwnedIdAboveContent,
   syncScene,
 } from './scene-builder';
 import { showToast } from './toasts';
@@ -29,17 +28,10 @@ interface EditorViewportProps {
 }
 
 /** 沿父链找到最近的对象 id（GLB 内容网格挂在模型组下，需要向上追溯）。
- *  只读品牌节点（R10-M2）：内容子树透明——内容根带 CONTENT_MARK，即使内容
- *  伪造 objectId/brand 也不读取，继续上溯到模型 */
+ *  内容边界统一解析（R11-2）：完整走父链，遇 CONTENT_MARK 丢弃其下全部
+ *  候选（内容后代反射伪造品牌也不劫持拾取），只返回边界上方品牌节点 */
 export function findObjectId(object: THREE.Object3D): string | null {
-  let current: THREE.Object3D | null = object;
-  while (current) {
-    if (!isContentNode(current) && isOwnedNode(current)) {
-      return current.userData.objectId as string;
-    }
-    current = current.parent;
-  }
-  return null;
+  return resolveOwnedIdAboveContent(object);
 }
 
 /**

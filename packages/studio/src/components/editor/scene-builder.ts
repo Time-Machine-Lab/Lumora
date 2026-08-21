@@ -40,6 +40,30 @@ export function isOwnedNode(node: THREE.Object3D): boolean {
   return !!readMark(node.userData, OBJECT_ID_MARK);
 }
 
+/**
+ * 内容边界上方首个品牌节点（R11-2 拾取边界统一）：内容子树整体透明——
+ * 完整走父链，遇 CONTENT_MARK 丢弃其下全部候选（内容根自身与内容后代
+ * 即使反射伪造品牌也不解析），只返回边界上方品牌节点；未跨边界时保持
+ * 「最近品牌」原语义。注意必须先遍历再决议：伪造品牌的内容后代在触达
+ * 内容根前若逐层即返会被接受。
+ */
+export function resolveOwnedIdAboveContent(object: THREE.Object3D): string | null {
+  let current: THREE.Object3D | null = object;
+  let crossed = false;
+  let candidate: string | null = null;
+  while (current) {
+    if (isContentNode(current)) {
+      crossed = true;
+      candidate = null; // 丢弃其下候选（含最近品牌）
+    } else if (isOwnedNode(current)) {
+      if (crossed) return current.userData.objectId as string; // 边界上方首个品牌
+      if (candidate === null) candidate = current.userData.objectId as string; // 最近品牌（首个定格）
+    }
+    current = current.parent;
+  }
+  return candidate;
+}
+
 const PRIMITIVE_GEOMETRIES: Record<string, () => THREE.BufferGeometry> = {
   box: () => new THREE.BoxGeometry(1, 1, 1),
   sphere: () => new THREE.SphereGeometry(0.6, 24, 24),
