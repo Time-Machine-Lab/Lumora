@@ -58,6 +58,12 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
   // 外部选择变化（视口拾取等）时，停靠点跟随选中行——但仅当目标行仍可见：
   // 折叠/跨场景过滤后选择可能含不可见行，跟随前校验，否则回退可见行（树首）
   useEffect(() => {
+    // 项目关闭（project=null）后树序不再存在：先清焦点再返回，
+    // 避免读取早退 return 之后才初始化的 flatRows（TDZ ReferenceError 会卸载整个 Studio）
+    if (!project) {
+      setFocusedId(null);
+      return;
+    }
     if (focusedId !== null && !flatRows.includes(focusedId)) {
       const fallback = selection[0] ?? flatRows[0] ?? null;
       if (fallback !== null && flatRows.includes(fallback)) setFocusedId(fallback);
