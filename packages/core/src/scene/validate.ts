@@ -7,6 +7,40 @@ export const PRIMITIVE_KINDS = ['box', 'sphere', 'cone', 'torus', 'plane'] as co
 export const LIGHT_KINDS = ['directional', 'point', 'spot'] as const;
 export const CAMERA_PROJECTIONS = ['perspective', 'orthographic'] as const;
 
+// ---------- 非 JSON 结构拒绝（R8-6）：Map/Set/Date 冻结壳封堵 ----------
+// deepFreeze 只遍历自有属性：Map/Set 内部槽位（[[MapData]]）与 Date 时间槽位
+// 不在自有属性上，冻结「壳」仍可 .set()/.setTime() —— 持有项目引用的调用方
+// 可无历史地改写编辑器状态。候选载荷必须整树 JSON 纯结构（字面量对象/数组），
+// 任何层级出现 Map/Set/Date/类实例一律拒绝。
+// 未知普通字段保留：round-6 冻结基线要求含自引用未知键（loop）的输入可正常
+// 打开；只要整树是 JSON 纯结构，deepFreeze 即能真正冻结，不产生绕过。
+function findNonJsonPlain(value: unknown, visited: WeakSet<object>): string | null {
+  if (value === null || typeof value !== 'object') return null;
+  if (visited.has(value)) return null;
+  visited.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const problem = findNonJsonPlain(item, visited);
+      if (problem) return problem;
+    }
+    return null;
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    return proto.constructor?.name ?? '非 JSON 结构';
+  }
+  for (const key of Object.keys(value)) {
+    const problem = findNonJsonPlain((value as Record<string, unknown>)[key], visited);
+    if (problem) return problem;
+  }
+  return null;
+}
+
+function assertJsonPlainDeep(value: unknown, label: string): string | null {
+  const bad = findNonJsonPlain(value, new WeakSet());
+  return bad ? `${label}不是 JSON 结构（含不可冻结的 ${bad}）` : null;
+}
+
 function isFiniteVec3(v: unknown): v is Vec3 {
   return (
     Array.isArray(v) &&
@@ -30,6 +64,8 @@ function isString(value: unknown): value is string {
 /** 单个对象的完整校验：返回第一个问题描述；null 表示合法 */
 export function validateSceneObjectData(object: unknown): string | null {
   if (!object || typeof object !== 'object') return '不是对象';
+  const jsonProblem = assertJsonPlainDeep(object, '对象');
+  if (jsonProblem) return jsonProblem;
   const o = object as Partial<SceneObjectData>;
   if (typeof o.id !== 'string' || o.id.length === 0) return 'id 缺失或非法';
   if (typeof o.type !== 'string' || !(SCENE_OBJECT_TYPES as readonly string[]).includes(o.type)) {
@@ -100,6 +136,8 @@ export function validateSceneObjectData(object: unknown): string | null {
 /** 项目完整 schema 校验（不含图结构关系；结构不变量由 SceneEditor.validateProject 负责） */
 export function validateProjectSchema(project: unknown): string | null {
   if (!project || typeof project !== 'object') return '项目不是对象';
+  const jsonProblem = assertJsonPlainDeep(project, '项目');
+  if (jsonProblem) return jsonProblem;
   const p = project as Partial<Project>;
   if (!isString(p.uri) || !isString(p.name)) return 'uri/name 非法';
   if (p.schemaVersion !== 2) return 'schemaVersion 非法';
