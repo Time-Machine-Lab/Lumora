@@ -102,7 +102,11 @@ class LeaseImpl implements CacheLease {
   readonly entry: Entry;
   private released = false;
 
-  constructor(private cache: ContentCache, entry: Entry, content: Promise<GLTF>) {
+  /** 签发实例（R8-11）：discard/release 只接受本实例签发的 lease，异实例一律忽略 */
+  readonly owner: ContentCache;
+
+  constructor(owner: ContentCache, entry: Entry, content: Promise<GLTF>) {
+    this.owner = owner;
     this.entry = entry;
     this.hash = entry.hash;
     this.generation = entry.generation;
@@ -111,7 +115,7 @@ class LeaseImpl implements CacheLease {
   }
 
   release(): void {
-    this.cache.releaseLease(this);
+    this.owner.releaseLease(this);
   }
 
   /** dispose() 原子撤销：之后 release() 为幂等 no-op */
@@ -428,11 +432,13 @@ export class ContentCache {
    * 主动放弃 + 判死刑：导入取消路径。条目无其他 lease 时立即清理；
    * loader 在途则延至 settle（condemned 的唯一 owner 收尾）。
    * 其他 lease 仍在使用时不得判死刑（同 hash 新会话正持租用），只释放自身。
-   * 只认真实 lease 且必须是本条目当前的 live 成员（R6，TML-57 第六轮）：
-   * 已 release/stale 的 lease 无权判死刑（release 后已从 Set 移除，membership 即真伪）。
+   * 只认真实 lease 且必须是本实例签发的（R8-11）：伪造对象与异实例 lease 一律
+   * 忽略——module 级 brand 与 entry membership 都跨实例成立，不校验 owner 则
+   * cacheB.discard(cacheA 的 lease) 会把 A 的条目判死刑（跨实例判死）。
    */
   discard(lease: CacheLease): void {
     if (!(lease instanceof LeaseImpl) || !issuedLeases.has(lease)) return; // 伪造 lease：忽略
+    if (lease.owner !== this) return; // 异实例 lease：忽略（R8-11）
     const impl = lease as LeaseImpl;
     if (impl.entry.leases.has(impl)) {
       // 本 lease 是唯一持有者 → 判死刑；还有其他持有者 → 只释放自身
@@ -495,6 +501,7 @@ export class ContentCache {
   /** LeaseImpl.release() 的内部入口（类内私有，模块内唯一调用方） */
   releaseLease(lease: LeaseImpl): void {
     if (!(lease instanceof LeaseImpl) || !issuedLeases.has(lease)) return; // 伪造 lease：忽略
+    if (lease.owner !== this) return; // 异实例 lease：忽略（R8-11）
     if (lease.isReleased) return; // dispose 后幂等 no-op
     lease.revoke();
     // 从自身 entry 移除（R6，TML-57 第六轮）：不按 hash 查找、无 generation 早退 ——
