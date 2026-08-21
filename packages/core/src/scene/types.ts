@@ -40,7 +40,8 @@ export interface LightData {
 }
 
 export interface CameraData {
-  projection: 'perspective' | 'orthographic';
+  /** 产品范围决定（R10）：orthographic 暂不支持，schema 明确拒绝 */
+  projection: 'perspective';
   /** 焦距（mm），与 fov 联动 */
   focalLength: number;
   /** 垂直视场角（度） */

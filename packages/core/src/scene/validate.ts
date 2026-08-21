@@ -5,7 +5,7 @@ import type { AssetData, Project, SceneObjectData, TransformData, Vec3 } from '.
 
 export const PRIMITIVE_KINDS = ['box', 'sphere', 'cone', 'torus', 'plane'] as const;
 export const LIGHT_KINDS = ['directional', 'point', 'spot'] as const;
-export const CAMERA_PROJECTIONS = ['perspective', 'orthographic'] as const;
+export const CAMERA_PROJECTIONS = ['perspective'] as const;
 
 // ---------- 非 JSON 结构拒绝（R8-6）：Map/Set/Date 冻结壳封堵 ----------
 // deepFreeze 只遍历自有属性：Map/Set 内部槽位（[[MapData]]）与 Date 时间槽位
@@ -114,6 +114,11 @@ export function validateSceneObjectData(object: unknown): string | null {
   }
   if (o.camera !== undefined) {
     const camera = o.camera as unknown as Record<string, unknown>;
+    // 产品范围决定（R10）：orthographic 投影暂不支持（现实现恒建透视相机，
+    // 行为本身已错误）——显式拒绝并说明后续方向，而非落入通用非法分支
+    if (camera.projection === 'orthographic') {
+      return 'camera.projection 非法（orthographic 未支持，仅支持 perspective）';
+    }
     if (
       typeof camera.projection !== 'string' ||
       !(CAMERA_PROJECTIONS as readonly string[]).includes(camera.projection)
