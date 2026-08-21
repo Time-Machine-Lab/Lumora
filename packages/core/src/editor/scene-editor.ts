@@ -118,6 +118,28 @@ function sameTransformData(a: TransformData, b: TransformData): boolean {
   );
 }
 
+/** 选择按给定场景可达集过滤：跨场景/已删除对象不可选中；首次出现去重（R8-8）。
+ *  可达集一次构建共享给全部候选（替代逐 id isInActiveScene 重建索引，
+ *  n 选 k 从 O(n·k) 收敛到 O(n)，R11-1）；存在性判定预建集合 O(1)
+ *  （替代逐候选 findObject 的 O(N) 数组扫描，R12-1——提交路径调用两次
+ *  本函数，旧实现全选平级根 ≈ 4n² 次 find 谓词执行）。
+ *  存在性检查不可省：getReachableIds 会把 rootObjectIds 中的不存在 id
+ *  原样加入可达集（幽灵根），「reachable 成员 ⇒ 真实对象」不成立（R13-2，
+ *  R12-1-T8 的 mutant 盲区由此闭合）。seen 内联与「先 dedupe 后 filter」
+ *  逐位等价。 */
+export function filterSelectionIds(project: Project, activeSceneId: string, ids: string[]): string[] {
+  const reachable = getReachableIds(project, activeSceneId);
+  const existingIds = new Set(project.objects.map((object) => object.id));
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (existingIds.has(id) && reachable.has(id)) result.push(id);
+  }
+  return result;
+}
+
 /**
  * 核心 3D 场景编辑器（框架无关）：
  * - 持有 owned immutable project：openProject 深克隆输入并递归冻结，编辑器外的任何
@@ -937,19 +959,9 @@ export class SceneEditor {
     return result;
   }
 
-  /** 选择按项目活动场景可达集过滤：跨场景/已删除对象不可选中；去重后过滤（R8-8）。
-   *  可达集一次构建共享给全部候选（替代逐 id isInActiveScene 重建索引，
-   *  n 选 k 从 O(n·k) 收敛到 O(n)，R11-1）；存在性判定预建集合 O(1)
-   *  （替代逐候选 findObject 的 O(N) 数组扫描，R12-1——提交路径调用两次
-   *  本函数，旧实现全选平级根 ≈ 4n² 次 find 谓词执行）。
-   *  存在性检查不可省：getReachableIds 会把 rootObjectIds 中的不存在 id
-   *  原样加入可达集（幽灵根），「reachable 成员 ⇒ 真实对象」不成立 */
+  /** 委托纯函数版 filterSelectionIds（R13-2）：活动场景可达集 + 存在性 + 去重 */
   private filterSelection(project: Project, ids: string[]): string[] {
-    const reachable = getReachableIds(project, project.activeSceneId);
-    const existingIds = new Set(project.objects.map((object) => object.id));
-    return this.dedupeSelection(ids).filter(
-      (id) => existingIds.has(id) && reachable.has(id),
-    );
+    return filterSelectionIds(project, project.activeSceneId, ids);
   }
 
   /** 状态换入：项目/选择/视图一次就位（不发事件；事件由调用方按固定顺序发出） */
