@@ -3,6 +3,7 @@ import type { PluginDescriptor } from '@lumora/core';
 import { LumoraStudio } from '@lumora/studio';
 import type { LumoraStudioHandle } from '@lumora/studio';
 import mockManifest from '@lumora/mock-plugin/lumora.plugin.json';
+import { summarize } from './summarize';
 import './app.css';
 
 const mockPlugin: PluginDescriptor = {
@@ -62,6 +63,9 @@ const explodingPlugin: PluginDescriptor = {
 
 const PLUGINS: PluginDescriptor[] = [mockPlugin, brokenManifestPlugin, brokenEnginePlugin, explodingPlugin];
 
+/** 默认只记录事件摘要；?debug=full 时输出完整 payload（大数据量下会产生 GB 级字符串，仅限调试） */
+const DEBUG_FULL = new URLSearchParams(window.location.search).get('debug') === 'full';
+
 export default function App() {
   const [mounted, setMounted] = useState(true);
   const [log, setLog] = useState<string[]>([]);
@@ -73,12 +77,13 @@ export default function App() {
     if (!mounted) return;
     const runtime = handleRef.current?.runtime;
     if (!runtime) return;
+    if (DEBUG_FULL) appendLog('事件日志：完整 payload 模式（?debug=full），大数据量下可能导致严重卡顿');
     const opened = runtime.events.on('project:opened', ({ project }) =>
       appendLog(`项目已打开: ${project.name}`),
     );
     const closed = runtime.events.on('project:closed', () => appendLog('项目已关闭'));
     const anyEvent = runtime.events.onAny((event, payload) =>
-      appendLog(`${event} ${JSON.stringify(payload)}`),
+      appendLog(DEBUG_FULL ? `${event} ${JSON.stringify(payload)}` : `${event} ${summarize(payload)}`),
     );
     return () => {
       opened.dispose();
