@@ -69,7 +69,10 @@ describe('R9-M3 #6 移动菜单 APG 关联', () => {
     // RED：现 HEAD 触发器无任何 aria 属性（getAttribute 均 null）
     expect(trigger.getAttribute('aria-haspopup')).toBe('menu');
     expect(trigger.getAttribute('aria-expanded')).toBe('true');
-    expect(trigger.getAttribute('aria-controls')).toBe('tree-move-menu-sample-cube');
+    // 一致性断言（R10 迁移）：aria-controls 即打开菜单的实际 id，且仍按对象区分
+    const menu = screen.getByTestId('tree-move-menu');
+    expect(trigger.getAttribute('aria-controls')).toBe(menu.getAttribute('id'));
+    expect(trigger.getAttribute('aria-controls')!.endsWith('-sample-cube')).toBe(true);
   });
 
   it('R9-6-T2 菜单：稳定 id 与 aria-labelledby 关联触发器', () => {
@@ -78,11 +81,13 @@ describe('R9-M3 #6 移动菜单 APG 关联', () => {
     openMenu('sample-cube');
 
     const menu = screen.getByTestId('tree-move-menu');
-    // RED：现 HEAD 菜单无 id、无 aria-labelledby（均为 null）
-    expect(menu.getAttribute('id')).toBe('tree-move-menu-sample-cube');
-    expect(menu.getAttribute('aria-labelledby')).toBe('tree-move-trigger-sample-cube');
-    // 双向关联成立：触发器 aria-controls 指向的 id 就是菜单实际 id
+    // RED：现 HEAD 菜单无 id、无 aria-labelledby（均为 null）；
+    // 一致性断言（R10 迁移）：id 带前缀与对象后缀，labelledby 指向触发器实际 id
+    expect(menu.getAttribute('id')).toMatch(/^tree-move-menu-/);
+    expect(menu.getAttribute('id')!.endsWith('-sample-cube')).toBe(true);
     const trigger = screen.getByTestId('tree-move-sample-cube');
+    expect(menu.getAttribute('aria-labelledby')).toBe(trigger.getAttribute('id'));
+    // 双向关联成立：触发器 aria-controls 指向的 id 就是菜单实际 id
     expect(document.getElementById(trigger.getAttribute('aria-controls')!)).toBe(menu);
   });
 
@@ -107,13 +112,17 @@ describe('R9-M3 #6 移动菜单 APG 关联', () => {
 
     const cubeTrigger = screen.getByTestId('tree-move-sample-cube');
     const coneTrigger = screen.getByTestId('tree-move-sample-cone');
-    expect(cubeTrigger.getAttribute('aria-controls')).toBe('tree-move-menu-sample-cube');
-    expect(coneTrigger.getAttribute('aria-controls')).toBe('tree-move-menu-sample-cone');
+    // 一致性断言（R10 迁移）：每行 aria-controls 不同且按各自对象区分
+    const cubeControls = cubeTrigger.getAttribute('aria-controls')!;
+    const coneControls = coneTrigger.getAttribute('aria-controls')!;
+    expect(cubeControls).not.toBe(coneControls);
+    expect(cubeControls.endsWith('-sample-cube')).toBe(true);
+    expect(coneControls.endsWith('-sample-cone')).toBe(true);
 
     openMenu('sample-cone');
-    expect(screen.getByTestId('tree-move-menu').getAttribute('id')).toBe(
-      'tree-move-menu-sample-cone',
-    );
+    const menu = screen.getByTestId('tree-move-menu');
+    expect(menu.getAttribute('id')).toBe(coneControls);
+    expect(menu.getAttribute('aria-labelledby')).toBe(coneTrigger.getAttribute('id'));
     expect(cubeTrigger.getAttribute('aria-expanded')).toBe('false');
     expect(coneTrigger.getAttribute('aria-expanded')).toBe('true');
   });
