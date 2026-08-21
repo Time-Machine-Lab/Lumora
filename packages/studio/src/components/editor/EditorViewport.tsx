@@ -8,7 +8,16 @@ import type { Project, SceneEditor, TransformData, ViewState } from '@lumora/cor
 import { resolveFormat } from './content-cache';
 import type { CacheLease, ContentCache } from './content-cache';
 import { collectModelObjectIds } from './model-content';
-import { applyTransform, attachModelContent, buildScene, disposeNode, findNode, syncScene } from './scene-builder';
+import {
+  applyTransform,
+  attachModelContent,
+  buildScene,
+  disposeNode,
+  findNode,
+  isContentNode,
+  isOwnedNode,
+  syncScene,
+} from './scene-builder';
 import { showToast } from './toasts';
 
 interface EditorViewportProps {
@@ -19,11 +28,15 @@ interface EditorViewportProps {
   cache: ContentCache;
 }
 
-/** 沿父链找到最近的对象 id（GLB 内容网格挂在模型组下，需要向上追溯） */
-function findObjectId(object: THREE.Object3D): string | null {
+/** 沿父链找到最近的对象 id（GLB 内容网格挂在模型组下，需要向上追溯）。
+ *  只读品牌节点（R10-M2）：内容子树透明——内容根带 CONTENT_MARK，即使内容
+ *  伪造 objectId/brand 也不读取，继续上溯到模型 */
+export function findObjectId(object: THREE.Object3D): string | null {
   let current: THREE.Object3D | null = object;
   while (current) {
-    if (current.userData.objectId) return current.userData.objectId as string;
+    if (!isContentNode(current) && isOwnedNode(current)) {
+      return current.userData.objectId as string;
+    }
     current = current.parent;
   }
   return null;

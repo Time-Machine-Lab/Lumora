@@ -16,6 +16,10 @@ const CONTENT_NAME = '__glb-content__';
  */
 const PLACEHOLDER_MARK = Symbol('lumora.model-placeholder');
 const CONTENT_MARK = Symbol('lumora.model-content');
+/** 对象所有权品牌（R10-M2）：buildObject 双写（brand + 保留 userData.objectId
+ * 兼容既有断言）；所有权解析一律只读品牌——原始 objectId 可被用户 GLB extras
+ * 或手工数据伪造，Symbol 不可能被用户数据携带（clone(true) 的 JSON 拷贝不含） */
+const OBJECT_ID_MARK = Symbol('lumora.object-id');
 
 /** userData 的 Symbol 索引（THREE 类型为 Record<string, any>：字符串索引签名不容纳 symbol，需加宽） */
 function readMark(userData: Record<string, unknown>, mark: symbol): unknown {
@@ -24,6 +28,16 @@ function readMark(userData: Record<string, unknown>, mark: symbol): unknown {
 
 function writeMark(userData: Record<string, unknown>, mark: symbol): void {
   (userData as Record<string | symbol, unknown>)[mark] = true;
+}
+
+/** 内容子树判定（R10-M2 受控读口）：模块私有标记不导出，遍历经此读口判定 */
+export function isContentNode(node: THREE.Object3D): boolean {
+  return !!readMark(node.userData, CONTENT_MARK);
+}
+
+/** 对象所有权判定（R10-M2 受控读口）：拾取/同步的所有权解析一律经品牌判定 */
+export function isOwnedNode(node: THREE.Object3D): boolean {
+  return !!readMark(node.userData, OBJECT_ID_MARK);
 }
 
 const PRIMITIVE_GEOMETRIES: Record<string, () => THREE.BufferGeometry> = {
@@ -91,7 +105,7 @@ export function applyTransform(object: THREE.Object3D, transform: TransformData)
   object.scale.set(transform.scale[0], transform.scale[1], transform.scale[2]);
 }
 
-/** 由对象数据构建 THREE 节点；userData.objectId 用于选择/同步 */
+/** 由对象数据构建 THREE 节点；userData.objectId 保留兼容读，所有权解析经品牌（R10-M2） */
 export function buildObject(data: SceneObjectData, aspect: number): THREE.Object3D {
   let node: THREE.Object3D;
   switch (data.type) {
@@ -135,6 +149,7 @@ export function buildObject(data: SceneObjectData, aspect: number): THREE.Object
   }
   node.name = data.name;
   node.userData.objectId = data.id;
+  writeMark(node.userData, OBJECT_ID_MARK);
   node.userData.type = data.type;
   node.userData.identityKey = nodeIdentityKey(data);
   node.userData.geometryKind = data.geometry?.kind;
@@ -211,14 +226,18 @@ export function buildScene(project: Project, aspect: number): THREE.Group {
 }
 
 /** 由对象数据迭代构建整棵子树（身份分叉重建用，R9-M2）：共享 childrenOf 索引、
- *  深链不爆栈；子树内节点按 next 数据重建，无需再走 applyObjectData */
+ *  深链不爆栈；子树内节点按 next 数据重建，无需再走 applyObjectData。
+ *  根与全部后代都登记进 idToNode（R10-M2）：pass-2 不再把已重建后代误判为
+ *  缺失而重复创建 */
 function buildSubtree(
   object: SceneObjectData,
   childrenOf: Map<string | null, string[]>,
   byId: Map<string, SceneObjectData>,
   aspect: number,
+  idToNode: Map<string, THREE.Object3D>,
 ): THREE.Object3D {
   const root = buildObject(object, aspect);
+  idToNode.set(object.id, root);
   const stack: { object: SceneObjectData; parent: THREE.Object3D }[] = [];
   const children = childrenOf.get(object.id);
   if (children) {
@@ -230,6 +249,7 @@ function buildSubtree(
   while (stack.length > 0) {
     const { object: childObject, parent } = stack.pop()!;
     const node = buildObject(childObject, aspect);
+    idToNode.set(childObject.id, node);
     parent.add(node);
     const grandChildren = childrenOf.get(childObject.id);
     if (grandChildren) {
@@ -247,7 +267,9 @@ export function findNode(root: THREE.Object3D, objectId: string): THREE.Object3D
   const stack: THREE.Object3D[] = [root];
   while (stack.length > 0) {
     const node = stack.pop()!;
-    if (node.userData.objectId === objectId) return node;
+    // 内容子树整体跳过（R10-M2 双保险）：不读其 objectId、不下钻——即使伪造品牌
+    if (isContentNode(node)) continue;
+    if (isOwnedNode(node) && node.userData.objectId === objectId) return node;
     for (let i = node.children.length - 1; i >= 0; i--) stack.push(node.children[i]!);
   }
   return null;
@@ -317,6 +339,9 @@ function applyObjectData(node: THREE.Object3D, data: SceneObjectData, aspect: nu
  *   （覆盖分叉重建后未变化子节点的重挂与普通重挂靠）；
  * - 第六遍：不可达节点收尾——从 root 视角遍历，首个不可达节点即该子树
  *   topmost，单次 disposeNode 整棵释放并跳过子树（消除逐节点重复处置）。
+ * 所有权解析一律只读 OBJECT_ID_MARK 品牌（R10-M2）：原始 objectId 可伪造；
+ * 遍历遇 CONTENT_MARK 整体跳过内容子树（glTF extras objectId 不可信，内容
+ * 网格不得被登记/移除/处置）。
  */
 export function syncScene(
   root: THREE.Group,
@@ -329,7 +354,8 @@ export function syncScene(
   const traverseStack: THREE.Object3D[] = [root];
   while (traverseStack.length > 0) {
     const node = traverseStack.pop()!;
-    if (node.userData.objectId) idToNode.set(node.userData.objectId as string, node);
+    if (isContentNode(node)) continue;
+    if (isOwnedNode(node)) idToNode.set(node.userData.objectId as string, node);
     for (let i = node.children.length - 1; i >= 0; i--) traverseStack.push(node.children[i]!);
   }
   const prevById = new Map(previous.objects.map((o) => [o.id, o]));
@@ -355,7 +381,12 @@ export function syncScene(
     let covered = false;
     let ancestor = node.parent;
     while (ancestor && ancestor !== root) {
-      const ancestorId = ancestor.userData.objectId as string | undefined;
+      // 内容节点透明（R10-M2）：不可能参与身份分叉，跳过其数据继续上溯
+      if (isContentNode(ancestor)) {
+        ancestor = ancestor.parent;
+        continue;
+      }
+      const ancestorId = isOwnedNode(ancestor) ? (ancestor.userData.objectId as string) : undefined;
       if (ancestorId) {
         const ancestorObject = byId.get(ancestorId);
         if (
@@ -370,18 +401,17 @@ export function syncScene(
       ancestor = ancestor.parent;
     }
     if (covered) continue;
-    // 整棵子树重建：释放旧子树（内容子树跳过处置）、索引删除全部旧节点、重建
+    // 整棵子树重建：释放旧子树（内容子树跳过处置）、索引删除全部旧品牌节点、重建
     node.parent?.remove(node);
     disposeNode(node);
     const removal: THREE.Object3D[] = [node];
     while (removal.length > 0) {
       const child = removal.pop()!;
-      const childId = child.userData.objectId as string | undefined;
-      if (childId) idToNode.delete(childId);
+      if (isContentNode(child)) continue;
+      if (isOwnedNode(child)) idToNode.delete(child.userData.objectId as string);
       for (let i = child.children.length - 1; i >= 0; i--) removal.push(child.children[i]!);
     }
-    const rebuilt = buildSubtree(object, childrenOf, byId, aspect);
-    idToNode.set(object.id, rebuilt);
+    const rebuilt = buildSubtree(object, childrenOf, byId, aspect, idToNode);
     created.push({ node: rebuilt, parentId: object.parentId ?? null });
     if (object.type === 'model') rebuiltModelIds.push(object.id);
   }
@@ -431,7 +461,10 @@ export function syncScene(
   const removalStack: THREE.Object3D[] = [root];
   while (removalStack.length > 0) {
     const node = removalStack.pop()!;
-    const objectId = node.userData.objectId as string | undefined;
+    // 内容子树整体跳过（R10-M2）：内容网格即使带 extras objectId 也不被当
+    // 不可达对象移除/处置（资源归 ContentCache 所有）
+    if (isContentNode(node)) continue;
+    const objectId = isOwnedNode(node) ? (node.userData.objectId as string) : undefined;
     if (objectId && nextReachable.has(objectId)) {
       for (let i = node.children.length - 1; i >= 0; i--) removalStack.push(node.children[i]!);
       continue;
