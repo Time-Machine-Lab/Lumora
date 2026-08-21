@@ -164,6 +164,16 @@ describe('R8-9 多实例快捷键隔离 + 移动菜单键盘语义', () => {
     expect(document.activeElement).toBe(within(root).getByTestId('tree-row-sample-cube'));
   });
 
+  it('R8-9-T6 单实例嵌入：按键落在实例外（body）仍生效（点击画布后焦点在 body）', async () => {
+    const a = await mountStudio();
+    act(() => {
+      document.body.dispatchEvent(key('k', { ctrlKey: true }));
+    });
+    // RED：严格包含校验下 body 上的按键被忽略，单实例嵌入（最常见形态）的
+    // Ctrl+K/Delete 等快捷键全部失效
+    expect(within(a.root).queryByTestId('command-palette')).not.toBeNull();
+  });
+
   it('R8-9-T5 移动菜单 Escape：关闭并返回焦点到触发行', async () => {
     const { root } = await mountStudio();
     const row = within(root).getByTestId('tree-row-sample-cube');
