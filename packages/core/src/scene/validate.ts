@@ -126,8 +126,19 @@ export function validateSceneObjectData(object: unknown): string | null {
         return `camera.${field} 非法（不允许 NaN/Infinity）`;
       }
     }
+    // 投影参数数值域（R8-12）：fov 限 (0,180)°（≥180 时 tan(fov/2) 发散）、
+    // 焦距/传感器/near 为正、far > near —— 破坏投影值让 three.js 投影矩阵失效
+    if ((camera.fov as number) <= 0 || (camera.fov as number) >= 180) {
+      return 'camera.fov 非法（需 0 < fov < 180）';
+    }
+    for (const field of ['focalLength', 'sensorWidth', 'sensorHeight', 'near']) {
+      if ((camera[field] as number) <= 0) return `camera.${field} 非法（需为正）`;
+    }
+    if ((camera.far as number) <= (camera.near as number)) return 'camera.far 非法（需大于 near）';
     // aspect 联合为 number|null（null 跟随项目画幅）；数组对是历史非法形态，须拒绝
     if (camera.aspect !== null && typeof camera.aspect !== 'number') return 'camera.aspect 非法';
+    // 正画幅（R8-12）：0/负画幅在画幅计算与投影构造中除零/翻转
+    if (typeof camera.aspect === 'number' && camera.aspect <= 0) return 'camera.aspect 非法（需为正）';
   }
   if (o.assetId !== undefined && typeof o.assetId !== 'string') return 'assetId 非法';
   return null;
@@ -150,7 +161,9 @@ export function validateProjectSchema(project: unknown): string | null {
   if (typeof settings.fps !== 'number' || !Number.isFinite(settings.fps) || settings.fps <= 0) {
     return 'settings.fps 非法';
   }
-  if (!isFinitePair(settings.aspect)) return 'settings.aspect 非法';
+  if (!isFinitePair(settings.aspect) || settings.aspect[0] <= 0 || settings.aspect[1] <= 0) {
+    return 'settings.aspect 非法（需为正）';
+  }
   if (!Array.isArray(p.scenes) || p.scenes.length === 0) return 'scenes 缺失';
   const sceneIds = new Set<string>();
   for (const scene of p.scenes) {
