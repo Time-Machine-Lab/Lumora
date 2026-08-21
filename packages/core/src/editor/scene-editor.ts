@@ -386,14 +386,12 @@ export class SceneEditor {
     if (!baseline) return failure('未打开项目');
     const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
     const selection = this.dedupeSelection(baseline.selection);
-    const roots = selection.filter(
-      (id) =>
-        findObject(project, id) &&
-        isInActiveScene(project, id) &&
-        !selection.some((other) => other !== id && isInSubtree(project, id, other)),
-    );
-    if (roots.length === 0) return { ok: true, value: { ids: [] } };
-
+    // 复制根筛选收敛（R11-1 #7）：旧实现对每个选中 id 重建可达集
+    // （isInActiveScene）并逐对重建 byId Map（isInSubtree）→ 平级根全选 O(n³)。
+    // 子树闭包性质：选中对象的祖先链必在活动场景可达集内，故从场景根单次 DFS
+    // 传播「已有选中祖先」即可定根；不可达/不存在的选中 id 天然不进 rootsSet
+    // （保持 findObject + isInActiveScene 过滤语义），selection 原序保序输出。
+    const scene = getScene(project, project.activeSceneId);
     const idMap = new Map<string, string>();
     const runs: SceneObjectData[][] = [];
     // 一次 childrenOf 索引在全部复制根间共享：替代逐层 project.objects.filter，
@@ -407,6 +405,26 @@ export class SceneEditor {
     // 一次 byId 索引在全部复制根间共享：替代 duplicateSubtree 逐节点 findObject
     // 全量扫描（复制 n 节点链 ≈ n²/2 次谓词执行，R10-M3 #7）
     const byId = new Map(project.objects.map((object) => [object.id, object]));
+    const selected = new Set(selection);
+    const rootsSet = new Set<string>();
+    // 已见集防循环引用（与 getReachableIds 同语义）；栈元素 [id, 父链是否含选中对象]
+    const seen = new Set<string>();
+    const stack: Array<[string, boolean]> = (scene?.rootObjectIds ?? []).map((id) => [id, false]);
+    while (stack.length > 0) {
+      const [id, hasSelectedAncestor] = stack.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      if (!byId.has(id)) continue; // 幽灵根：不参与定根（findObject 过滤语义）
+      if (selected.has(id) && !hasSelectedAncestor) rootsSet.add(id);
+      const children = childrenOf.get(id);
+      if (children) {
+        const next = hasSelectedAncestor || selected.has(id);
+        for (let i = children.length - 1; i >= 0; i--) stack.push([children[i]!, next]);
+      }
+    }
+    const roots = selection.filter((id) => rootsSet.has(id));
+    if (roots.length === 0) return { ok: true, value: { ids: [] } };
+
     for (const rootId of roots) {
       const run: SceneObjectData[] = [];
       this.duplicateSubtree(rootId, idMap, run, childrenOf, byId);
@@ -419,14 +437,15 @@ export class SceneEditor {
       .filter((run) => run[0]!.parentId === null)
       .map((run) => run[0]!.id);
 
-    // 副本树紧随原对象之后插入
+    // 副本树紧随原对象之后插入（root→run Map 替代 roots.indexOf，O(1) 每对象）
+    const runsByRoot = new Map<string, SceneObjectData[]>();
+    roots.forEach((id, i) => runsByRoot.set(id, runs[i]!));
     const objects: SceneObjectData[] = [];
     for (const object of project.objects) {
       objects.push(object);
-      const index = roots.indexOf(object.id);
-      if (index >= 0) objects.push(...runs[index]!);
+      const run = runsByRoot.get(object.id);
+      if (run) objects.push(...run);
     }
-    const scene = project.scenes.find((s) => s.id === project.activeSceneId);
     const scenes = scene
       ? project.scenes.map((s) =>
           s.id === scene.id ? { ...s, rootObjectIds: [...s.rootObjectIds, ...rootCopies] } : s,
@@ -915,10 +934,13 @@ export class SceneEditor {
     return result;
   }
 
-  /** 选择按项目活动场景可达集过滤：跨场景/已删除对象不可选中；去重后过滤（R8-8） */
+  /** 选择按项目活动场景可达集过滤：跨场景/已删除对象不可选中；去重后过滤（R8-8）。
+   *  可达集一次构建共享给全部候选（替代逐 id isInActiveScene 重建索引，
+   *  n 选 k 从 O(n·k) 收敛到 O(n)，R11-1） */
   private filterSelection(project: Project, ids: string[]): string[] {
+    const reachable = getReachableIds(project, project.activeSceneId);
     return this.dedupeSelection(ids).filter(
-      (id) => findObject(project, id) && isInActiveScene(project, id),
+      (id) => findObject(project, id) && reachable.has(id),
     );
   }
 
