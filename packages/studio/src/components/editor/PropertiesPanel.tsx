@@ -200,7 +200,7 @@ export function PropertiesPanel({ editor, project, selection }: PropertiesPanelP
           已选择 {objects.length} 个对象 —— 请单选编辑属性
         </div>
       ) : (
-        <div className="lumora-inspector__body">
+        <div className="lumora-inspector__body" key={object.id}>
           <header className="lumora-inspector__header">
             <NameField object={object} onCommit={commitName} />
             <span className="lumora-state">{TYPE_LABEL[object.type]}</span>

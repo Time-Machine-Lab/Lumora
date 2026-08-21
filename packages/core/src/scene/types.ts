@@ -16,6 +16,8 @@ export type PrimitiveKind = 'box' | 'sphere' | 'cone' | 'torus' | 'plane';
 export type SceneObjectType = 'group' | 'model' | 'primitive' | 'light' | 'camera';
 /** 场景对象类型别名（插件 SDK 导出名） */
 export type SceneObjectKind = SceneObjectType;
+/** 场景对象类型全集：运行时成员校验（isSceneObject 与 EditorState 共用） */
+export const SCENE_OBJECT_TYPES = ['group', 'model', 'primitive', 'light', 'camera'] as const;
 
 export interface GeometryData {
   kind: PrimitiveKind;
@@ -38,7 +40,8 @@ export interface LightData {
 }
 
 export interface CameraData {
-  projection: 'perspective' | 'orthographic';
+  /** 产品范围决定（R10）：orthographic 暂不支持，schema 明确拒绝 */
+  projection: 'perspective';
   /** 焦距（mm），与 fov 联动 */
   focalLength: number;
   /** 垂直视场角（度） */
@@ -94,6 +97,8 @@ export interface AssetData {
   id: string;
   kind: 'gltf';
   name: string;
+  /** 内容格式（重开项目时据此重建缓存，不依赖运行期 MIME）；旧数据缺省时按名称/MIME 决议 */
+  format?: 'gltf' | 'glb';
   mime: string;
   /** 内容哈希（SHA-256 hex），用于去重 */
   hash: string;
@@ -129,6 +134,7 @@ export function isSceneObject(obj: unknown): obj is SceneObjectData {
   return (
     typeof o.id === 'string' &&
     typeof o.type === 'string' &&
+    (SCENE_OBJECT_TYPES as readonly string[]).includes(o.type) &&
     typeof o.name === 'string' &&
     (o.parentId === null || typeof o.parentId === 'string') &&
     !!o.transform &&

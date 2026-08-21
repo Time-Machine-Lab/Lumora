@@ -79,7 +79,7 @@ describe('SceneEditor 第三轮：场景归属校验与视图回退（P-9）', (
 });
 
 describe('SceneEditor 第三轮：原子应用与事件序（P-9）', () => {
-  it('提交按固定顺序发 project:changed → selection:changed → history:changed，观察者不见跨场景中间态', () => {
+  it('提交按固定顺序发 project:changed → selection:changed → view:changed → history:changed，观察者不见跨场景中间态', () => {
     const editor = makeEditor();
     const order: string[] = [];
     editor.events.on('project:changed', ({ project }) => {
@@ -92,12 +92,18 @@ describe('SceneEditor 第三轮：原子应用与事件序（P-9）', () => {
       order.push('selection:changed');
       expect(editor.getProject()!.scenes.some((s) => s.name === '场景 B')).toBe(true);
     });
+    editor.events.on('view:changed', ({ view }) => {
+      order.push('view:changed');
+      // 视图由下一个项目推导，事件回调内项目/选择/视图已原子就位
+      expect(editor.getProject()!.scenes.some((s) => s.name === '场景 B')).toBe(true);
+      expect(view.viewMode).toBe('director');
+    });
     editor.events.on('history:changed', () => {
       order.push('history:changed');
     });
 
     ok(editor.addScene('场景 B'));
-    expect(order).toEqual(['project:changed', 'selection:changed', 'history:changed']);
+    expect(order).toEqual(['project:changed', 'selection:changed', 'view:changed', 'history:changed']);
   });
 
   it('revision 每次应用状态严格单调：提交/撤销/重做均递增；持久化 baseline 后仍单调', () => {

@@ -1,21 +1,24 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 import {
   createCameraObject,
   createGroupObject,
   createLightObject,
   createPrimitiveObject,
   findObject,
+  getDescendantIds,
 } from '@lumora/core';
 import type { Project, SceneEditor, SceneObjectData } from '@lumora/core';
-import type { AssetCache } from './asset-cache';
+import type { ContentCache } from './content-cache';
 import { importModelFile } from './model-import';
 import { showToast } from './toasts';
+import { buildTreeOrder } from './tree-order';
 
 interface ObjectTreeProps {
   editor: SceneEditor;
   project: Project | null;
   selection: string[];
-  cache: AssetCache;
+  cache: ContentCache;
 }
 
 const TYPE_LABEL: Record<SceneObjectData['type'], string> = {
@@ -39,6 +42,11 @@ const ADD_ITEMS: { label: string; create: () => SceneObjectData }[] = [
   { label: '摄像机', create: () => createCameraObject() },
 ];
 
+/** 对象 id 的 aria 关联 id 编码：空白替换为下划线——id 属性不得含空白（R10-M3 #6） */
+function enc(id: string): string {
+  return id.replace(/\s+/g, '_');
+}
+
 /** 对象层级树：选择/可见/锁定/重命名/拖拽重排/删除，顶部提供场景切换与添加菜单 */
 export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProps) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
@@ -47,14 +55,22 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTargetId, setDropTargetId] = useState<string | null>(null);
+  const [moveMenuId, setMoveMenuId] = useState<string | null>(null);
   /** 单一 roving focus：树内任意时刻只有一个 tab 停靠点（最后聚焦/选中的行） */
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const rowRefs = useRef<Record<string, HTMLElement | null>>({});
+  const moveMenuRef = useRef<HTMLDivElement>(null);
 
   // 外部选择变化（视口拾取等）时，停靠点跟随选中行——但仅当目标行仍可见：
   // 折叠/跨场景过滤后选择可能含不可见行，跟随前校验，否则回退可见行（树首）
   useEffect(() => {
+    // 项目关闭（project=null）后树序不再存在：先清焦点再返回，
+    // 避免读取早退 return 之后才初始化的 flatRows（TDZ ReferenceError 会卸载整个 Studio）
+    if (!project) {
+      setFocusedId(null);
+      return;
+    }
     if (focusedId !== null && !flatRows.includes(focusedId)) {
       const fallback = selection[0] ?? flatRows[0] ?? null;
       if (fallback !== null && flatRows.includes(fallback)) setFocusedId(fallback);
@@ -64,6 +80,14 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- flatRows 由 project/expanded 推导，依赖以原始状态为准
   }, [selection, focusedId, project, expanded]);
+
+  // 「移动到」菜单打开时焦点进入首项（APG menu button，R8-9）：
+  // 键盘 M 打开后即可用方向键导航；否则菜单对键盘用户不可达
+  useEffect(() => {
+    if (moveMenuId) {
+      moveMenuRef.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+    }
+  }, [moveMenuId]);
 
   if (!project) return null;
   const scene = project.scenes.find((s) => s.id === project.activeSceneId) ?? project.scenes[0];
@@ -76,15 +100,10 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
   // 默认展开（expanded 未记录时视为 true），首次折叠要翻到 false
   const toggleExpanded = (id: string) => setExpanded((prev) => ({ ...prev, [id]: !(prev[id] ?? true) }));
 
-  // 键盘导航用的可见行扁平顺序（roving tabindex 的邻居计算）
-  const flatRows: string[] = [];
-  const collectVisible = (object: SceneObjectData): void => {
-    flatRows.push(object.id);
-    if (expanded[object.id] ?? true) {
-      for (const child of project.objects.filter((o) => o.parentId === object.id)) collectVisible(child);
-    }
-  };
-  for (const root of roots) collectVisible(root);
+  // 树序索引：单次 O(n) 遍历构建（childrenOf/rows/rowIndex），
+  // 键盘导航的可见行顺序与子级查询全部 O(1)（R6-D，取代逐节点 filter 的 O(n²)）
+  const order = buildTreeOrder(project, roots, expanded);
+  const flatRows = order.rows;
 
   const focusRow = (id: string) => {
     setFocusedId(id);
@@ -92,8 +111,8 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
   };
 
   const handleRowKeyDown = (object: SceneObjectData, event: React.KeyboardEvent) => {
-    const index = flatRows.indexOf(object.id);
-    const children = project.objects.filter((o) => o.parentId === object.id);
+    const index = order.rowIndex.get(object.id) ?? -1;
+    const children = order.childrenOf.get(object.id) ?? [];
     const isExpanded = expanded[object.id] ?? true;
     const moveTo = (id: string) => {
       editor.setSelection([id]);
@@ -134,6 +153,28 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
         event.preventDefault();
         editor.setSelection([object.id]);
         break;
+      // 行内按钮不参与 Tab 顺序（单一 tab 停靠点 = 行本身，APG treeview）；
+      // 行动作以快捷键等价提供：V/L 切换可见/锁定（Delete 删除沿用宿主全局快捷键）
+      case 'v':
+      case 'V': {
+        event.preventDefault();
+        const visibility = editor.setVisible([object.id], !object.visible);
+        if (!visibility.ok) showToast(visibility.error.message, 'error');
+        break;
+      }
+      case 'l':
+      case 'L': {
+        event.preventDefault();
+        const locking = editor.setLocked([object.id], !object.locked);
+        if (!locking.ok) showToast(locking.error.message, 'error');
+        break;
+      }
+      case 'm':
+      case 'M':
+        // 「移动到」（键盘等价；触屏走行内按钮）：候选目标 = 可见行 − 自身 − 后代
+        event.preventDefault();
+        setMoveMenuId(object.id);
+        break;
       default:
         break;
     }
@@ -157,6 +198,29 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
     if (!dragged || dragged === targetId) return;
     const result = editor.setParent(dragged, targetId);
     if (!result.ok) showToast(result.error.message, 'error');
+  };
+
+  // 「移动到」目标候选：可见行，排除自身与后代（getDescendantIds 走已索引的
+  // 可达集，不随候选数增长）；仅菜单打开时计算
+  const moveDescendants =
+    moveMenuId !== null ? new Set(getDescendantIds(project, moveMenuId)) : new Set<string>();
+  const moveCandidates =
+    moveMenuId !== null
+      ? order.rows
+          .filter((id) => id !== moveMenuId && !moveDescendants.has(id))
+          .map((id) => order.byId.get(id))
+          .filter((o): o is SceneObjectData => !!o)
+      : [];
+
+  const commitMove = (targetId: string | null) => {
+    if (moveMenuId === null) return;
+    const movingId = moveMenuId;
+    const result = editor.setParent(movingId, targetId);
+    // 层级变更使触发行重建：先 flush 掉菜单关闭与项目更新的渲染，
+    // 再落焦点到重建后的行（先落焦点再重建会被丢到 body，R8-9）
+    flushSync(() => setMoveMenuId(null));
+    if (!result.ok) showToast(result.error.message, 'error');
+    focusRow(movingId); // APG：菜单选择后焦点返回触发行
   };
 
   // 多文件选择：.gltf 与外部 .bin/纹理一起选中；单个文件（工具栏入口）同样适用
@@ -193,7 +257,11 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
           type="button"
           className="lumora-button lumora-button--add"
           data-testid="add-object"
-          onClick={() => setAddMenuOpen((open) => !open)}
+          onClick={(e) => {
+            // 双击隔离：快速双击只开一次菜单，不因第二次点击立即关闭
+            if (e.detail > 1) return;
+            setAddMenuOpen((open) => !open);
+          }}
         >
           ＋ 添加
         </button>
@@ -261,10 +329,17 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
             dropTargetId={dropTargetId}
             setDropTargetId={setDropTargetId}
             handleDrop={handleDrop}
+            childrenOf={order.childrenOf}
+            moveMenuId={moveMenuId}
+            setMoveMenuId={setMoveMenuId}
+            moveCandidates={moveCandidates}
+            commitMove={commitMove}
+            moveMenuRef={moveMenuRef}
             rowRefs={rowRefs}
             getRowTabIndex={rowTabIndex}
             onRowKeyDown={handleRowKeyDown}
             setFocusedId={setFocusedId}
+            focusRow={focusRow}
           />
         ))}
       </div>
@@ -288,10 +363,17 @@ function TreeNode({
   dropTargetId,
   setDropTargetId,
   handleDrop,
+  childrenOf,
+  moveMenuId,
+  setMoveMenuId,
+  moveCandidates,
+  commitMove,
+  moveMenuRef,
   rowRefs,
   getRowTabIndex,
   onRowKeyDown,
   setFocusedId,
+  focusRow,
 }: {
   editor: SceneEditor;
   project: Project;
@@ -308,12 +390,21 @@ function TreeNode({
   dropTargetId: string | null;
   setDropTargetId: (id: string | null) => void;
   handleDrop: (targetId: string) => void;
+  childrenOf: Map<string, SceneObjectData[]>;
+  moveMenuId: string | null;
+  setMoveMenuId: (id: string | null) => void;
+  moveCandidates: SceneObjectData[];
+  commitMove: (targetId: string | null) => void;
+  moveMenuRef: React.RefObject<HTMLDivElement | null>;
   rowRefs: React.RefObject<Record<string, HTMLElement | null>>;
   getRowTabIndex: (id: string) => number;
   onRowKeyDown: (object: SceneObjectData, event: React.KeyboardEvent) => void;
   setFocusedId: (id: string | null) => void;
+  focusRow: (id: string) => void;
 }) {
-  const children = project.objects.filter((o) => o.parentId === object.id);
+  // R10-M3 #6：useId 实例命名空间——同一文档多个树实例时 aria 关联 id 全局唯一
+  const instanceNs = useId().replace(/[^a-zA-Z0-9_-]/g, '');
+  const children = childrenOf.get(object.id) ?? [];
   const isExpanded = expanded[object.id] ?? true;
   const isSelected = selection.includes(object.id);
   const isRenaming = renamingId === object.id;
@@ -351,7 +442,10 @@ function TreeNode({
       aria-expanded={children.length > 0 ? isExpanded : undefined}
       data-testid={`tree-row-${object.id}`}
       className={`lumora-tree__node${isDragOver ? ' lumora-tree-row--drop-target' : ''}`}
-      tabIndex={getRowTabIndex(object.id)}
+      draggable
+      // 行内重命名期间 treeitem 移出 Tab 顺序（APG treeview）：Tab 离开树，
+      // 而非跳到下一个 treeitem；提交/取消后恢复停靠点
+      tabIndex={isRenaming ? -1 : getRowTabIndex(object.id)}
       ref={(el) => {
         rowRefs.current[object.id] = el;
       }}
@@ -399,8 +493,11 @@ function TreeNode({
           data-testid={`tree-toggle-${object.id}`}
           onClick={(e) => {
             e.stopPropagation();
+            if (e.detail > 1) return; // 双击隔离：一次双击只折叠/展开一次
             toggleExpanded(object.id);
           }}
+          onDoubleClick={(e) => e.stopPropagation()}
+          tabIndex={-1} // 单一 tab 停靠点：行内按钮不进 Tab 顺序（APG treeview）
           aria-label={isExpanded ? '折叠' : '展开'}
         >
           {children.length > 0 && (isExpanded ? '▾' : '▸')}
@@ -435,9 +532,12 @@ function TreeNode({
             title={object.visible ? '隐藏' : '显示'}
             onClick={(e) => {
               e.stopPropagation();
+              if (e.detail > 1) return; // 双击隔离：一次双击只切换一次，不产生两步历史
               const result = editor.setVisible([object.id], !object.visible);
               if (!result.ok) showToast(result.error.message, 'error');
             }}
+            onDoubleClick={(e) => e.stopPropagation()}
+            tabIndex={-1}
           >
             {object.visible ? '显' : '隐'}
           </button>
@@ -448,11 +548,32 @@ function TreeNode({
             title={object.locked ? '解锁' : '锁定'}
             onClick={(e) => {
               e.stopPropagation();
+              if (e.detail > 1) return; // 双击隔离：一次双击只切换一次
               const result = editor.setLocked([object.id], !object.locked);
               if (!result.ok) showToast(result.error.message, 'error');
             }}
+            onDoubleClick={(e) => e.stopPropagation()}
+            tabIndex={-1}
           >
             {object.locked ? '锁' : '开'}
+          </button>
+          <button
+            type="button"
+            className="lumora-icon-button"
+            id={`tree-move-trigger-${instanceNs}-${enc(object.id)}`}
+            data-testid={`tree-move-${object.id}`}
+            title="移动到"
+            aria-haspopup="menu"
+            aria-expanded={moveMenuId === object.id}
+            aria-controls={`tree-move-menu-${instanceNs}-${enc(object.id)}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              setMoveMenuId(object.id);
+            }}
+            onDoubleClick={(e) => e.stopPropagation()}
+            tabIndex={-1}
+          >
+            移
           </button>
           <button
             type="button"
@@ -461,6 +582,7 @@ function TreeNode({
             title="删除"
             onClick={(e) => {
               e.stopPropagation();
+              if (e.detail > 1) return; // 双击隔离：双击的第二次点击不绕过确认直接删除
               if (!isDeleteConfirming) {
                 setDeleteConfirmId(object.id);
                 return;
@@ -470,11 +592,90 @@ function TreeNode({
               const result = editor.deleteSelection();
               if (!result.ok) showToast(result.error.message, 'error');
             }}
+            onDoubleClick={(e) => e.stopPropagation()}
+            tabIndex={-1}
             onBlur={() => setDeleteConfirmId(null)}
           >
             {isDeleteConfirming ? '确认?' : '删'}
           </button>
         </span>
+        {moveMenuId === object.id && (
+          <div
+            className="lumora-menu lumora-menu--tree"
+            role="menu"
+            id={`tree-move-menu-${instanceNs}-${enc(object.id)}`}
+            aria-labelledby={`tree-move-trigger-${instanceNs}-${enc(object.id)}`}
+            data-testid="tree-move-menu"
+            ref={moveMenuRef}
+            onClick={(e) => e.stopPropagation()}
+            onBlur={(e) => {
+              // 焦点离开菜单（点击他处/失焦）即关闭
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) setMoveMenuId(null);
+            }}
+            onKeyDown={(e) => {
+              // 菜单打开期间吞噬全部按键：Delete/Backspace 等 Studio 全局
+              // 快捷键不落到底层（R8-9）
+              e.stopPropagation();
+              const items = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+              const focusedIndex = items.indexOf(document.activeElement as HTMLElement);
+              switch (e.key) {
+                case 'ArrowDown':
+                  e.preventDefault();
+                  items[Math.min(focusedIndex + 1, items.length - 1)]?.focus();
+                  break;
+                case 'ArrowUp':
+                  e.preventDefault();
+                  items[Math.max(focusedIndex - 1, 0)]?.focus();
+                  break;
+                case 'Home':
+                  e.preventDefault();
+                  items[0]?.focus();
+                  break;
+                case 'End':
+                  e.preventDefault();
+                  items[items.length - 1]?.focus();
+                  break;
+                case 'Escape':
+                  e.preventDefault();
+                  setMoveMenuId(null);
+                  if (moveMenuId !== null) focusRow(moveMenuId);
+                  break;
+                case 'Enter':
+                case ' ':
+                  // 激活 roving focus 当前项（焦点在菜单外时落在首项）
+                  e.preventDefault();
+                  (document.activeElement as HTMLElement | null)?.click();
+                  break;
+                default:
+                  break;
+              }
+            }}
+          >
+            <button
+              type="button"
+              className="lumora-menu__item"
+              role="menuitem"
+              tabIndex={-1} // 单一 tab 停靠点：菜单项不进 Tab 顺序（APG roving focus，R8-9）
+              data-testid="tree-move-to-root"
+              onClick={() => commitMove(null)}
+            >
+              根节点（场景）
+            </button>
+            {moveCandidates.map((candidate) => (
+              <button
+                key={candidate.id}
+                type="button"
+                className="lumora-menu__item"
+                role="menuitem"
+                tabIndex={-1}
+                data-testid={`tree-move-to-${candidate.id}`}
+                onClick={() => commitMove(candidate.id)}
+              >
+                {candidate.name}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
       {isExpanded && children.length > 0 && (
         <ul role="group" className="lumora-tree__group">
@@ -496,10 +697,17 @@ function TreeNode({
               dropTargetId={dropTargetId}
               setDropTargetId={setDropTargetId}
               handleDrop={handleDrop}
+              childrenOf={childrenOf}
+              moveMenuId={moveMenuId}
+              setMoveMenuId={setMoveMenuId}
+              moveCandidates={moveCandidates}
+              commitMove={commitMove}
+              moveMenuRef={moveMenuRef}
               rowRefs={rowRefs}
               getRowTabIndex={getRowTabIndex}
               onRowKeyDown={onRowKeyDown}
               setFocusedId={setFocusedId}
+              focusRow={focusRow}
             />
           ))}
         </ul>

@@ -12,8 +12,16 @@ import { EditorViewport } from './editor/EditorViewport';
 import { ObjectTree } from './editor/ObjectTree';
 import { PropertiesPanel } from './editor/PropertiesPanel';
 import { ToastHost, showToast } from './editor/toasts';
-import { AssetCache } from './editor/asset-cache';
+import { ContentCache } from './editor/content-cache';
 import '../lumora.css';
+
+/**
+ * 已挂载实例根节点注册表（R8-9 修正）：快捷键隔离需要区分「多实例共存」与
+ * 「单实例嵌入」。浏览器里点击画布后焦点会回到页面 body——单实例页面中按键
+ * 目标在实例外是正常用户操作（Ctrl+K/Delete 等仍应生效）；多实例共存时才
+ * 只响应本实例子树内的按键，杜绝跨实例误触。
+ */
+const mountedRoots = new Set<HTMLElement>();
 
 export interface LumoraStudioProps {
   /** 挂载时注册的插件描述符；注册按声明顺序串行执行 */
@@ -48,12 +56,13 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   const editorState = useSceneEditor(runtime.editor);
   const { project } = editorState;
 
-  const cacheRef = useRef<AssetCache | null>(null);
-  if (!cacheRef.current) cacheRef.current = new AssetCache();
+  const cacheRef = useRef<ContentCache | null>(null);
+  if (!cacheRef.current) cacheRef.current = new ContentCache();
   const cache = cacheRef.current;
 
   const [pluginManagerOpen, setPluginManagerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
 
   useImperativeHandle(ref, () => ({ runtime }), [runtime]);
 
@@ -107,11 +116,21 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     };
   }, [runtime, cache]);
 
-  // 编辑器快捷键：撤销/重做/复制/删除/取消选择/Gizmo 模式
+  // 编辑器快捷键：撤销/重做/复制/删除/取消选择/Gizmo 模式。
+  // 按实例作用域（R8-9）：多个 Studio 实例共存时共享 window 监听，
+  // 无焦点包含校验则每个实例都执行全部快捷键（一个实例内按 Delete
+  // 会删掉其他实例的选择）——按键须落在本实例子树内；页面只挂载一个
+  // Studio 时（常见嵌入形态）放行实例外按键，点击画布后焦点在 body 的
+  // 正常操作（Ctrl+K/Delete）仍生效
   useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    mountedRoots.add(root);
     const onKey = (event: KeyboardEvent) => {
+      const onlyInstance = mountedRoots.size === 1 && mountedRoots.has(root);
+      if (!root.contains(event.target as Node) && !onlyInstance) return;
       const key = event.key.toLowerCase();
-      // 命令面板开关是全局快捷键：面板打开时焦点在其搜索输入框内，需先于输入守卫处理
+      // 命令面板开关先于输入守卫处理：面板打开时焦点在其搜索输入框内，Ctrl+K 仍需能关闭
       if ((event.ctrlKey || event.metaKey) && key === 'k') {
         event.preventDefault();
         setPaletteOpen((open) => !open);
@@ -161,11 +180,14 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       else if (event.key === '3') editor.setTransformMode('scale');
     };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      mountedRoots.delete(root);
+    };
   }, [runtime]);
 
   return (
-    <div className={`lumora-studio${className ? ` ${className}` : ''}`} data-testid="lumora-studio">
+    <div ref={rootRef} className={`lumora-studio${className ? ` ${className}` : ''}`} data-testid="lumora-studio">
       <Toolbar
         runtime={runtime}
         project={project}

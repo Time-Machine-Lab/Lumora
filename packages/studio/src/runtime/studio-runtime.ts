@@ -43,9 +43,12 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
       return host.events;
     },
     openProject(project) {
-      host.setProject(project);
-      host.events.emit('project:opened', { uri: project.uri, name: project.name, project });
+      // 编辑器先校验并取得 owned immutable 快照（深克隆 + 冻结），宿主/插件只能拿到
+      // 编辑器持有的快照，调用方传入的项目此后与编辑器完全解耦
       editor.openProject(project);
+      const owned = editor.getProject()!;
+      host.setProject(owned);
+      host.events.emit('project:opened', { uri: owned.uri, name: owned.name, project: owned });
     },
     closeProject() {
       const current = host.getProject();

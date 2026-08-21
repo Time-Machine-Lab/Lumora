@@ -27,6 +27,7 @@ export class TypedEventEmitter<E extends Record<string, unknown>> implements Dis
   }
 
   on<K extends keyof E & string>(event: K, handler: (payload: E[K]) => void): Disposable {
+    this.assertOpen();
     let set = this.handlers.get(event);
     if (!set) {
       set = new Set();
@@ -49,6 +50,7 @@ export class TypedEventEmitter<E extends Record<string, unknown>> implements Dis
   }
 
   onAny(handler: (event: string, payload: unknown) => void): Disposable {
+    this.assertOpen();
     this.anyHandlers.add(handler);
     return disposable(() => {
       this.anyHandlers.delete(handler);
@@ -60,6 +62,8 @@ export class TypedEventEmitter<E extends Record<string, unknown>> implements Dis
     const set = this.handlers.get(event);
     if (set) {
       for (const handler of [...set]) {
+        // 每个 handler 前检查终态：dispose 重入（监听器内释放）立即停止剩余监听器
+        if (this.disposedFlag) break;
         try {
           handler(payload);
         } catch (error) {
@@ -68,6 +72,7 @@ export class TypedEventEmitter<E extends Record<string, unknown>> implements Dis
       }
     }
     for (const handler of [...this.anyHandlers]) {
+      if (this.disposedFlag) break;
       try {
         handler(event, payload);
       } catch (error) {
@@ -92,5 +97,9 @@ export class TypedEventEmitter<E extends Record<string, unknown>> implements Dis
     this.disposedFlag = true;
     this.handlers.clear();
     this.anyHandlers.clear();
+  }
+
+  private assertOpen(): void {
+    if (this.disposedFlag) throw new Error('事件总线已关闭');
   }
 }

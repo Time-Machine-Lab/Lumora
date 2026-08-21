@@ -5,9 +5,18 @@ import { OrbitControls, TransformControls } from '@react-three/drei';
 import * as THREE from 'three';
 import { findObject, fitRect, getReachableIds } from '@lumora/core';
 import type { Project, SceneEditor, TransformData, ViewState } from '@lumora/core';
-import { ensureCacheSeeded } from './asset-cache';
-import type { AssetCache } from './asset-cache';
-import { applyTransform, attachModelContent, buildScene, disposeNode, findNode, syncScene } from './scene-builder';
+import { resolveFormat } from './content-cache';
+import type { CacheLease, ContentCache } from './content-cache';
+import { collectModelObjectIds } from './model-content';
+import {
+  applyTransform,
+  attachModelContent,
+  buildScene,
+  disposeNode,
+  findNode,
+  resolveOwnedIdAboveContent,
+  syncScene,
+} from './scene-builder';
 import { showToast } from './toasts';
 
 interface EditorViewportProps {
@@ -15,22 +24,19 @@ interface EditorViewportProps {
   project: Project | null;
   selection: string[];
   view: ViewState;
-  cache: AssetCache;
+  cache: ContentCache;
 }
 
-/** 沿父链找到最近的对象 id（GLB 内容网格挂在模型组下，需要向上追溯） */
-function findObjectId(object: THREE.Object3D): string | null {
-  let current: THREE.Object3D | null = object;
-  while (current) {
-    if (current.userData.objectId) return current.userData.objectId as string;
-    current = current.parent;
-  }
-  return null;
+/** 沿父链找到最近的对象 id（GLB 内容网格挂在模型组下，需要向上追溯）。
+ *  内容边界统一解析（R11-2）：完整走父链，遇 CONTENT_MARK 丢弃其下全部
+ *  候选（内容后代反射伪造品牌也不劫持拾取），只返回边界上方品牌节点 */
+export function findObjectId(object: THREE.Object3D): string | null {
+  return resolveOwnedIdAboveContent(object);
 }
 
 /**
  * 3D 视口：
- * - 场景树由项目数据增量同步（scene-builder），模型内容经 AssetCache 挂载
+ * - 场景树由项目数据增量同步（scene-builder），模型内容经 ContentCache lease 挂载
  * - Gizmo 拖动 = beginTransform/commitTransform 一步历史；局部/世界空间可切换
  * - 导演视图全容器拾取；相机视图 letterbox 到项目画幅（gl viewport/scissor
  *   传 CSS 像素，three 内部按 pixelRatio 换算），三分线/安全框以 DOM 覆盖层
@@ -138,7 +144,7 @@ export function EditorViewport({ editor, project, selection, view, cache }: Edit
         <color attach="background" args={['#14161f']} />
         <ambientLight intensity={0.35} />
         <gridHelper args={[20, 20, '#3a3f52', '#2a2e3d']} />
-        <SceneContent rootRef={rootRef} project={project} cache={cache} />
+        <SceneContent editor={editor} rootRef={rootRef} project={project} cache={cache} />
         {cameraView && project && (
           <CameraRig rootRef={rootRef} cameraObjectId={cameraView} aspect={aspect} project={project} />
         )}
@@ -173,16 +179,23 @@ function CameraProxy({ cameraRef }: { cameraRef: React.MutableRefObject<THREE.Ca
 }
 
 function SceneContent({
+  editor,
   rootRef,
   project,
   cache,
 }: {
+  editor: SceneEditor;
   rootRef: React.MutableRefObject<THREE.Group | null>;
   project: Project | null;
-  cache: AssetCache;
+  cache: ContentCache;
 }) {
   const scene = useThree((s) => s.scene);
   const prevProjectRef = useRef<Project | null>(null);
+  // 会话代：openProject/reset 自增会话令牌；令牌变化 = 新项目会话，强制全量重建，
+  // 否则复用 ID 的项目切换会把旧类型/旧资源节点保留下来（R8-4）
+  const sessionRef = useRef(editor.getSessionToken());
+  // 内容挂载代：身份分叉重建的模型（rebuiltModelIds）需要重新挂载内容（R9-M2）
+  const [contentVersion, setContentVersion] = useState(0);
 
   useEffect(() => {
     const current = rootRef.current;
@@ -193,14 +206,18 @@ function SceneContent({
         rootRef.current = null;
       }
       prevProjectRef.current = null;
+      sessionRef.current = editor.getSessionToken();
       return;
     }
     const aspect = project.settings.aspect[0] / project.settings.aspect[1];
+    const session = editor.getSessionToken();
     const sceneSwitched = prevProjectRef.current && prevProjectRef.current.activeSceneId !== project.activeSceneId;
-    if (current && prevProjectRef.current && !sceneSwitched) {
-      syncScene(current, prevProjectRef.current, project, aspect);
+    const newSession = session !== sessionRef.current;
+    if (current && prevProjectRef.current && !sceneSwitched && !newSession) {
+      const { rebuiltModelIds } = syncScene(current, prevProjectRef.current, project, aspect);
+      if (rebuiltModelIds.length > 0) setContentVersion((v) => v + 1);
     } else {
-      // 切场景（或重建）：旧树节点整体释放，避免跨场景残留 GPU 资源
+      // 切场景/新会话（或重建）：旧树节点整体释放，避免跨场景残留 GPU 资源
       if (current) {
         scene.remove(current);
         disposeNode(current);
@@ -208,38 +225,60 @@ function SceneContent({
       const root = buildScene(project, aspect);
       rootRef.current = root;
       scene.add(root);
+      sessionRef.current = session;
     }
     prevProjectRef.current = project;
-  }, [project, scene, rootRef]);
+  }, [project, scene, rootRef, editor]);
 
-  // 模型内容挂载（已解析立即挂；解析中的内容就绪后回调挂载）。
-  // 缓存缺失且资源带持久化载荷时同步启动重建（项目重开/撤销后重做恢复内容）
+  // 模型内容挂载：渲染消费者在使用期持有 lease（禁止裸资源旁路）——
+  // 按「活动场景内 hash → 全部模型对象 id」映射，统一「先 retain，失败再 seed」：
+  // 条目存活（含 loading）一律复用；仅缺失/判死刑时才从持久化载荷重建（seed）。
+  // 内容就绪后把克隆挂到引用该 hash 的每个节点（Ctrl+D 复制/多对象共享同一资源）。
+  // 异步回调在触碰资源前校验 lease 未释放且效应未重建（卸载/项目切换/缓存释放后
+  // 一律不得再挂载）。项目变更/卸载时释放全部 lease，由缓存按引用关系 + lease
+  // 计数决定清理。
   useEffect(() => {
     const root = rootRef.current;
     if (!root || !project) return;
-    ensureCacheSeeded(cache, project);
-    const cancels: (() => void)[] = [];
-    for (const object of project.objects) {
-      if (object.type !== 'model' || !object.assetId) continue;
-      const asset = project.assets.find((a) => a.id === object.assetId);
+    const leases: CacheLease[] = [];
+    let active = true;
+    for (const [hash, objectIds] of collectModelObjectIds(project)) {
+      const object = project.objects.find((o) => o.id === objectIds[0]!);
+      const asset = object ? project.assets.find((a) => a.id === object.assetId) : undefined;
       if (!asset) continue;
-      const cached = cache.get(asset.hash);
-      if (cached?.gltf) {
-        const node = findNode(root, object.id);
-        if (node) attachModelContent(node, cached.gltf);
-      } else if (cache.has(asset.hash)) {
-        cancels.push(
-          cache.onContentReady(asset.hash, (gltf) => {
-            const node = findNode(root, object.id);
-            if (node) attachModelContent(node, gltf);
-          }),
-        );
+      let lease: CacheLease | null = cache.retain(hash);
+      if (!lease && asset.payload) {
+        try {
+          lease = cache.seed(hash, asset.payload, {
+            format: asset.format ?? resolveFormat(asset.name, asset.mime),
+            parts: asset.parts ?? [],
+          });
+        } catch {
+          // 缓存已释放（卸载竞态）：渲染消费者随之卸载，无需再挂内容
+          lease = null;
+        }
       }
+      if (!lease) continue;
+      leases.push(lease);
+      void lease.content.then(
+        (gltf) => {
+          // 失效守卫：lease 已释放（cleanup/缓存 dispose 撤销）或效应已重建后不再挂载
+          if (!active || lease.isReleased) return;
+          for (const objectId of objectIds) {
+            const node = findNode(root, objectId);
+            if (node) attachModelContent(node, gltf);
+          }
+        },
+        () => undefined,
+      );
     }
     return () => {
-      for (const cancel of cancels) cancel();
+      active = false;
+      for (const lease of leases) lease.release();
     };
-  }, [project, cache, rootRef]);
+    // contentVersion：身份分叉重建的模型（rebuiltModelIds）需要重新挂载内容；
+    // attachModelContent 幂等（已有内容子树直接返回），全量重跑安全
+  }, [project, cache, rootRef, contentVersion]);
 
   // 项目变更后按 Project 全量 model→asset 关系清扫缓存（null=关闭项目，全部释放）
   useEffect(() => {

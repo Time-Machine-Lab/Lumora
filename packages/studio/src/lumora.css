@@ -229,6 +229,14 @@
   background: var(--lumora-surface);
 }
 
+/* 树行内「移动到」菜单：锚定在行下方，候选多时自身滚动（R6-D） */
+.lumora-menu--tree {
+  top: 100%;
+  left: 12px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
 .lumora-tree__list {
   flex: 1;
   overflow: auto;
@@ -250,6 +258,7 @@
 }
 
 .lumora-tree-row {
+  position: relative; /* 行内「移动到」菜单的定位锚点 */
   display: flex;
   align-items: center;
   gap: 4px;

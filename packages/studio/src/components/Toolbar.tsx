@@ -4,7 +4,7 @@ import type { Project } from '@lumora/core';
 import type { StudioRuntime } from '../runtime/studio-runtime';
 import type { EditorState } from '../hooks/use-scene-editor';
 import { useEventRefresh } from '../hooks/use-event-refresh';
-import type { AssetCache } from './editor/asset-cache';
+import type { ContentCache } from './editor/content-cache';
 import { importModelFile } from './editor/model-import';
 import { showToast } from './editor/toasts';
 
@@ -12,7 +12,7 @@ interface ToolbarProps {
   runtime: StudioRuntime;
   project: Project | null;
   editorState: EditorState;
-  cache: AssetCache;
+  cache: ContentCache;
   onTogglePlugins: () => void;
   onTogglePalette: () => void;
 }
@@ -28,12 +28,14 @@ export function Toolbar({
   useEventRefresh(runtime.events, ['contribution:changed', 'command:changed']);
   const toolbars = runtime.host.contributions.getToolbars();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const dirInputRef = useRef<HTMLInputElement>(null);
   const editor = runtime.editor;
   const { canUndo, canRedo, undoLabel, redoLabel } = editorState;
 
-  const handleImportFile = async (file: File | undefined) => {
-    if (!file) return;
-    const result = await importModelFile(editor, cache, file);
+  // 全量文件列表交给导入流程：.gltf 与外部 .bin/纹理一起选中时组成多文件导入
+  const handleImportFile = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const result = await importModelFile(editor, cache, Array.from(files));
     if (result.ok) {
       showToast(`已导入模型「${result.asset.name}」${result.deduped ? '（内容相同，资源已复用）' : ''}`, 'success');
     } else {
@@ -99,13 +101,36 @@ export function Toolbar({
         >
           导入模型
         </button>
+        <button
+          type="button"
+          className="lumora-button lumora-button--import"
+          data-testid="import-model-dir"
+          disabled={!project}
+          title="整目录选择：.gltf 的外部依赖按目录相对路径导入（嵌套目录/重名文件不丢失路径信息）"
+          onClick={() => dirInputRef.current?.click()}
+        >
+          导入模型目录
+        </button>
         <input
           ref={fileInputRef}
           type="file"
-          accept=".glb,.gltf,model/gltf-binary,model/gltf+json"
+          multiple
+          accept=".glb,.gltf,.bin,model/gltf-binary,model/gltf+json,application/octet-stream,image/png,image/jpeg,image/webp,image/gif"
           style={{ display: 'none' }}
           data-testid="toolbar-model-file-input"
-          onChange={(e) => void handleImportFile(e.target.files?.[0])}
+          onChange={(e) => void handleImportFile(e.target.files)}
+        />
+        <input
+          ref={dirInputRef}
+          type="file"
+          multiple
+          // 目录选择：浏览器为每个文件填充 webkitRelativePath，
+          // importModelFile 据此保留嵌套目录相对路径（R6，TML-57 第六轮）
+          {...({ webkitdirectory: '' } as Record<string, string>)}
+          accept=".glb,.gltf,.bin,model/gltf-binary,model/gltf+json,application/octet-stream,image/png,image/jpeg,image/webp,image/gif"
+          style={{ display: 'none' }}
+          data-testid="toolbar-model-dir-input"
+          onChange={(e) => void handleImportFile(e.target.files)}
         />
         {toolbars.map((item) => {
           const command = runtime.host.commands.get(item.commandId);

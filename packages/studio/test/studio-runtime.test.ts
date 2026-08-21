@@ -7,7 +7,9 @@ describe('StudioRuntime：宿主快照与事件总线随编辑器同步（S-3）
     const runtime = createStudioRuntime();
     const project = createSampleProject();
     runtime.openProject(project);
-    expect(runtime.host.getProject()).toBe(project);
+    // owned immutable：宿主同步的是编辑器持有的深克隆快照，而非传入的输入引用
+    expect(runtime.host.getProject()).not.toBe(project);
+    expect(runtime.host.getProject()).toEqual(project);
 
     const changed = vi.fn();
     const unsubscribe = runtime.events.on('project:changed', changed);
@@ -39,7 +41,8 @@ describe('StudioRuntime：宿主快照与事件总线随编辑器同步（S-3）
     unsubscribe.dispose();
 
     await runtime.dispose();
-    runtime.editor.openProject(createSampleProject());
+    // dispose 为终态：openProject 同步抛错，宿主快照保持空
+    expect(() => runtime.editor.openProject(createSampleProject())).toThrow('编辑器已释放');
     expect(runtime.host.getProject()).toBeNull();
   });
 });

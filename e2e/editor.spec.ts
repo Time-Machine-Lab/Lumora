@@ -2,28 +2,7 @@ import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
 import type { Download, Page } from '@playwright/test';
 import { decodePng, pngPixel, scanFrameBounds } from './helpers/png';
-
-/** 生成最小合法 GLB（仅 JSON chunk，无缓冲）：{asset, scenes, nodes} */
-function buildGlb(json: Record<string, unknown>): Buffer {
-  const jsonText = JSON.stringify(json);
-  const pad = (4 - (jsonText.length % 4)) % 4;
-  const jsonBytes = Buffer.concat([Buffer.from(jsonText, 'utf8'), Buffer.alloc(pad, 0x20)]);
-  const total = 12 + 8 + jsonBytes.length;
-  const header = Buffer.alloc(12);
-  header.writeUInt32LE(0x46546c67, 0); // 'glTF'
-  header.writeUInt32LE(2, 4);
-  header.writeUInt32LE(total, 8);
-  const chunkHeader = Buffer.alloc(8);
-  chunkHeader.writeUInt32LE(jsonBytes.length, 0);
-  chunkHeader.writeUInt32LE(0x4e4f534a, 4); // 'JSON'
-  return Buffer.concat([header, chunkHeader, jsonBytes]);
-}
-
-const MINIMAL_GLB = buildGlb({
-  asset: { version: '2.0' },
-  scenes: [{ nodes: [0] }],
-  nodes: [{ name: 'EmptyRoot' }],
-});
+import { MINIMAL_GLB } from './helpers/glb';
 
 /** 真实 GLB 夹具：嵌套节点 + 共享材质（CarRoot → BodyMesh + 4×WheelMesh，BIN chunk） */
 const FIXTURE_GLB = fileURLToPath(new URL('../packages/studio/test/fixtures/nested-mesh.glb', import.meta.url));
@@ -170,6 +149,170 @@ test('GLB 导入解析失败：提示错误，不产生对象', async ({ page })
   });
   await expect(page.getByTestId('lumora-toasts')).toContainText('模型解析失败');
   await expect(page.locator('.lumora-tree-row', { hasText: 'broken' })).toHaveCount(0);
+});
+
+test('浏览器 MIME 误报：.gltf 以 application/json 上报仍按扩展名决议导入（格式决议，P4）', async ({ page }) => {
+  const gltfJson = JSON.stringify({
+    asset: { version: '2.0' },
+    scenes: [{ nodes: [0] }],
+    nodes: [{ name: 'JsonRoot' }],
+  });
+  await page.getByTestId('toolbar-model-file-input').setInputFiles({
+    name: 'misreported.gltf',
+    mimeType: 'application/json',
+    buffer: Buffer.from(gltfJson, 'utf8'),
+  });
+  await expect(page.getByTestId('lumora-toasts')).toContainText('已导入模型');
+  await expect(page.locator('.lumora-tree-row', { hasText: 'misreported' })).toBeVisible();
+  // 资源以 .gltf 格式持久化，模型对象可选中
+  await page.locator('.lumora-tree-row', { hasText: 'misreported' }).click();
+  await expect(page.getByTestId('inspector-model')).toContainText('misreported.gltf');
+});
+
+test('对象树键盘导航：Arrow/Home/End/Enter 沿可见行 roving focus，折叠后跳过子级（P4）', async ({ page }) => {
+  const row = (id: string) => page.getByTestId(`tree-row-${id}`);
+  // 点击只选择不移焦（鼠标路径）；键盘路径经 Tab 落入 roving tabindex 停靠点
+  await row('sample-group').click();
+  await row('sample-group').focus();
+  await expect(row('sample-group')).toBeFocused();
+
+  // 展开的 group → 首个可见子级；连续 ArrowDown 沿深度优先可见序
+  await page.keyboard.press('ArrowDown');
+  await expect(row('sample-cube')).toBeFocused();
+  await expect(page.getByTestId('inspector-name')).toHaveValue('立方体');
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('ArrowDown');
+  await expect(row('sample-cone')).toBeFocused();
+  await expect(page.getByTestId('inspector-name')).toHaveValue('圆锥');
+
+  await page.keyboard.press('End'); // 最后一个可见行
+  await expect(row('sample-camera')).toBeFocused();
+  await expect(page.getByTestId('inspector-name')).toHaveValue('主摄像机');
+  await page.keyboard.press('Home');
+  await expect(row('sample-group')).toBeFocused();
+
+  // ArrowLeft 折叠 group（有子级且展开）；再 ArrowDown 跳过子级直达下一个根
+  await page.keyboard.press('ArrowLeft');
+  await expect(row('sample-cube')).not.toBeVisible();
+  await page.keyboard.press('ArrowDown');
+  await expect(row('sample-ground')).toBeFocused();
+
+  // ArrowRight 展开；再 ArrowRight 移到首个可见子级
+  await page.keyboard.press('ArrowUp');
+  await expect(row('sample-group')).toBeFocused();
+  await page.keyboard.press('ArrowRight');
+  await expect(row('sample-cube')).toBeVisible();
+  await page.keyboard.press('ArrowRight');
+  await expect(row('sample-cube')).toBeFocused();
+
+  // Enter：显式选中当前行
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('inspector-name')).toHaveValue('立方体');
+});
+
+test('M3 树行原生拖拽：拖到目标行重设父级，树层级与导出数据一致', async ({ page }) => {
+  // 生产契约：行本身是原生 draggable；真实拖拽（HTML5 DnD）把 sample-cube 拖到 sample-ground
+  await page.getByTestId('tree-row-sample-cube').dragTo(page.getByTestId('tree-row-sample-ground'));
+  // 树层级更新：cube 嵌套进 ground 行下（默认展开可见）
+  await expect(
+    page.locator('[data-testid="tree-row-sample-ground"] [data-testid="tree-row-sample-cube"]'),
+  ).toBeVisible();
+
+  // 导出：parentId 变更持久化（parent 关联进入项目 JSON）
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByTestId('toolbar-com.lumora.mock.toolbar.export').click();
+  const exported = JSON.parse(await readDownload(await downloadPromise));
+  const cube = exported.objects.find((o: { id: string }) => o.id === 'sample-cube');
+  expect(cube.parentId).toBe('sample-ground');
+});
+
+test('M3 APG 单一 Tab 入口：行是唯一 tab 停靠点，Tab 进入/离开树各只一次', async ({ page }) => {
+  const row = (id: string) => page.getByTestId(`tree-row-${id}`);
+  await row('sample-cube').click();
+  await expect(row('sample-cube')).toHaveAttribute('tabindex', '0');
+
+  // 行级 tab 停靠点唯一：仅活动行 tabIndex=0；行内按钮均非 tab 停靠点（APG treeview）
+  const zeroCount = await page
+    .locator('[role="treeitem"]')
+    .evaluateAll((els) => els.filter((el) => (el as HTMLElement).tabIndex === 0).length);
+  expect(zeroCount).toBe(1);
+  for (const testId of ['tree-toggle-sample-cube', 'tree-visible-sample-cube', 'tree-lock-sample-cube', 'tree-delete-sample-cube']) {
+    await expect(page.getByTestId(testId)).toHaveAttribute('tabindex', '-1');
+  }
+
+  // 单一 Tab 入口：从树头部控件（＋添加）Tab 一次即落入活动行，不逐行遍历
+  await page.getByTestId('add-object').focus();
+  await page.keyboard.press('Tab');
+  await expect(row('sample-cube')).toBeFocused();
+
+  // 从活动行再 Tab：直接离开树（行内按钮不拦截）
+  await page.keyboard.press('Tab');
+  const inTree = await page.evaluate(() => {
+    const el = document.activeElement as HTMLElement | null;
+    return el?.closest('[role="treeitem"]') !== null;
+  });
+  expect(inTree).toBe(false);
+});
+
+test('M3 树行键盘动作：V/L 切换可见/锁定，Delete 全局快捷键直接删除（可撤销）', async ({ page }) => {
+  const row = (id: string) => page.getByTestId(`tree-row-${id}`);
+  await row('sample-cube').click();
+  await row('sample-cube').focus();
+
+  // L：锁定（按钮文本翻转为「锁」）；V：隐藏（「隐」）——行内按钮等效快捷键
+  await page.keyboard.press('l');
+  await expect(page.getByTestId('tree-lock-sample-cube')).toHaveText('锁');
+  await page.keyboard.press('v');
+  await expect(page.getByTestId('tree-visible-sample-cube')).toHaveText('隐');
+  await page.keyboard.press('l');
+  await expect(page.getByTestId('tree-lock-sample-cube')).toHaveText('开');
+  // Delete：宿主全局快捷键（选中行上直接删除，撤销可恢复）
+  await page.keyboard.press('Delete');
+  await expect(row('sample-cube')).not.toBeVisible();
+  await page.getByTestId('undo').click();
+  await expect(row('sample-cube')).toBeVisible();
+});
+
+test('M3 按钮双击隔离：双击不绕过删除确认、不触发行重命名、不重复切换', async ({ page }) => {
+  // 双击删除按钮：第一次点击只进入确认态，双击的第二次点击被隔离 → 对象仍在
+  await page.getByTestId('tree-delete-sample-light').dblclick();
+  await expect(page.getByTestId('tree-row-sample-light')).toBeVisible();
+  await expect(page.getByTestId('tree-delete-sample-light')).toHaveText('确认?');
+  // 双击按钮不触发行级 dblclick（不进入重命名）
+  await expect(page.getByTestId('tree-rename-sample-light')).toHaveCount(0);
+  // 单击确认 → 删除
+  await page.getByTestId('tree-delete-sample-light').click();
+  await expect(page.getByTestId('tree-row-sample-light')).not.toBeVisible();
+
+  // 双击可见性按钮：只切换一次（一次双击只产生一步「隐藏」，不因第二次点击回弹）
+  await page.getByTestId('tree-visible-sample-cube').dblclick();
+  await expect(page.getByTestId('tree-visible-sample-cube')).toHaveText('隐');
+  await expect(page.getByTestId('tree-rename-sample-cube')).toHaveCount(0);
+});
+
+test('M3 数值字段 blur-first：点击外部提交草稿、Escape 同帧取消、Enter 提交', async ({ page }) => {
+  await page.getByTestId('tree-row-sample-cube').click();
+  const field = page.getByTestId('inspector-axis-0');
+  await expect(field).toHaveValue('-2.5');
+
+  // 草稿 + 点击树行（blur）→ 提交生效（blur-first，不依赖 Enter）
+  await field.fill('7.5');
+  await page.getByTestId('tree-row-sample-ground').click();
+  await page.getByTestId('tree-row-sample-cube').click();
+  await expect(field).toHaveValue('7.5');
+  // 一步历史：撤销回到原值
+  await page.getByTestId('undo').click();
+  await expect(field).toHaveValue('-2.5');
+
+  // Escape：草稿同帧取消，不提交
+  await field.fill('99');
+  await field.press('Escape');
+  await expect(field).toHaveValue('-2.5');
+
+  // Enter：提交（blur-first 的键盘路径）
+  await field.fill('1.25');
+  await field.press('Enter');
+  await expect(field).toHaveValue('1.25');
 });
 
 test('场景切换器与视图工具条：Gizmo 模式/空间切换即时生效', async ({ page }) => {
@@ -747,6 +890,12 @@ test.describe('第三轮验收：生产路径（AC1/AC3/AC4）', () => {
     await page.reload();
     await page.getByTestId('reopen-last-export').click();
     await expect(page.getByTestId('tree-row-probe-box')).toBeVisible();
+
+    // 隐藏宿主调试日志面板（340px）：否则 Studio 被压到 940px，340px 宽的画布上
+    // ±1px 整数量化即可让 16:9 比值在 1.7801（340×191）/1.7708（340×192）间翻转，
+    // 恰好落在 toBeCloseTo(16/9, 2) 容差边界上（工具栏换行等任意布局变化都会触发）。
+    // 全宽布局下画幅 680×382，量化噪声 0.0026 远小于容差，比值断言恢复真实精度。
+    await page.addStyleTag({ content: '.host__log { display: none }' });
 
     // 进入相机视图：画幅矩形与辅助线由同一 fitRect 计算，应逐像素重合
     await page.getByTestId('view-mode-select').selectOption('probe-camera');
