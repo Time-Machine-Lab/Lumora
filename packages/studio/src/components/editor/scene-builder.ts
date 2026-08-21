@@ -103,6 +103,7 @@ export function buildObject(data: SceneObjectData, aspect: number): THREE.Object
   node.userData.intensity = data.light?.intensity;
   node.userData.distance = data.light?.distance;
   node.userData.angle = data.light?.angle;
+  node.userData.assetId = data.assetId;
   applyTransform(node, data.transform);
   node.visible = data.visible;
   return node;
@@ -218,8 +219,11 @@ function applyObjectData(node: THREE.Object3D, data: SceneObjectData, aspect: nu
 }
 
 /**
- * 增量同步：对比前后项目，把对象变更应用到已构建的场景树。
- * 新建节点按数组顺序创建（父先于子），重挂靠父对象一并处理。
+ * 增量同步：对比前后项目，把对象变更应用到已构建的场景树（R8-4）：
+ * - 先建全部缺失/身份分叉节点、再统一挂载：恢复数组为 child-first 时
+ *   子节点先建，父节点虽尚不存在也不再被永久跳过（旧实现 continue）；
+ * - type/assetId 变化视为身份分叉，整节点重建，不残留旧类型/旧资源内容；
+ * - 挂载时父节点必已在表中；数据异常（父节点彻底不存在）时挂到根自愈。
  */
 export function syncScene(root: THREE.Group, previous: Project, next: Project, aspect: number): void {
   const idToNode = new Map<string, THREE.Object3D>();
@@ -230,17 +234,38 @@ export function syncScene(root: THREE.Group, previous: Project, next: Project, a
   // 只同步活动场景可达对象：其他场景的编辑/新建/删除不进入当前视口（多场景隔离）
   const nextReachable = getReachableObjectIds(next);
 
+  // 第一遍：创建全部缺失节点；身份分叉（type/assetId 变化）的旧节点整节点释放重建
+  const created: { node: THREE.Object3D; parentId: string | null }[] = [];
   for (const object of next.objects) {
     if (!nextReachable.has(object.id)) continue;
     const node = idToNode.get(object.id);
-    if (!node) {
-      const parentNode = object.parentId ? idToNode.get(object.parentId) : null;
-      if (object.parentId && !parentNode) continue;
-      const created = buildObject(object, aspect);
-      idToNode.set(object.id, created);
-      (parentNode ?? root).add(created);
-      continue;
+    if (
+      node &&
+      (node.userData.type !== object.type ||
+        (object.type === 'model' && node.userData.assetId !== object.assetId))
+    ) {
+      node.parent?.remove(node);
+      disposeNode(node);
+      idToNode.delete(object.id);
     }
+    if (!idToNode.has(object.id)) {
+      const createdNode = buildObject(object, aspect);
+      idToNode.set(object.id, createdNode);
+      created.push({ node: createdNode, parentId: object.parentId ?? null });
+    }
+  }
+
+  // 第二遍：统一挂载 —— 父节点要么早已存在、要么本遍已创建，全部可解析
+  for (const { node, parentId } of created) {
+    const parentNode = parentId ? idToNode.get(parentId) : null;
+    (parentNode ?? root).add(node);
+  }
+
+  // 第三遍：既有节点的重挂靠与数据更新
+  for (const object of next.objects) {
+    if (!nextReachable.has(object.id)) continue;
+    const node = idToNode.get(object.id);
+    if (!node) continue;
     const prev = prevById.get(object.id);
     if (prev) {
       if (prev.parentId !== object.parentId) {

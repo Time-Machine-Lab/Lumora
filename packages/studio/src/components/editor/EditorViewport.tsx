@@ -139,7 +139,7 @@ export function EditorViewport({ editor, project, selection, view, cache }: Edit
         <color attach="background" args={['#14161f']} />
         <ambientLight intensity={0.35} />
         <gridHelper args={[20, 20, '#3a3f52', '#2a2e3d']} />
-        <SceneContent rootRef={rootRef} project={project} cache={cache} />
+        <SceneContent editor={editor} rootRef={rootRef} project={project} cache={cache} />
         {cameraView && project && (
           <CameraRig rootRef={rootRef} cameraObjectId={cameraView} aspect={aspect} project={project} />
         )}
@@ -174,16 +174,21 @@ function CameraProxy({ cameraRef }: { cameraRef: React.MutableRefObject<THREE.Ca
 }
 
 function SceneContent({
+  editor,
   rootRef,
   project,
   cache,
 }: {
+  editor: SceneEditor;
   rootRef: React.MutableRefObject<THREE.Group | null>;
   project: Project | null;
   cache: ContentCache;
 }) {
   const scene = useThree((s) => s.scene);
   const prevProjectRef = useRef<Project | null>(null);
+  // 会话代：openProject/reset 自增会话令牌；令牌变化 = 新项目会话，强制全量重建，
+  // 否则复用 ID 的项目切换会把旧类型/旧资源节点保留下来（R8-4）
+  const sessionRef = useRef(editor.getSessionToken());
 
   useEffect(() => {
     const current = rootRef.current;
@@ -194,14 +199,17 @@ function SceneContent({
         rootRef.current = null;
       }
       prevProjectRef.current = null;
+      sessionRef.current = editor.getSessionToken();
       return;
     }
     const aspect = project.settings.aspect[0] / project.settings.aspect[1];
+    const session = editor.getSessionToken();
     const sceneSwitched = prevProjectRef.current && prevProjectRef.current.activeSceneId !== project.activeSceneId;
-    if (current && prevProjectRef.current && !sceneSwitched) {
+    const newSession = session !== sessionRef.current;
+    if (current && prevProjectRef.current && !sceneSwitched && !newSession) {
       syncScene(current, prevProjectRef.current, project, aspect);
     } else {
-      // 切场景（或重建）：旧树节点整体释放，避免跨场景残留 GPU 资源
+      // 切场景/新会话（或重建）：旧树节点整体释放，避免跨场景残留 GPU 资源
       if (current) {
         scene.remove(current);
         disposeNode(current);
@@ -209,9 +217,10 @@ function SceneContent({
       const root = buildScene(project, aspect);
       rootRef.current = root;
       scene.add(root);
+      sessionRef.current = session;
     }
     prevProjectRef.current = project;
-  }, [project, scene, rootRef]);
+  }, [project, scene, rootRef, editor]);
 
   // 模型内容挂载：渲染消费者在使用期持有 lease（禁止裸资源旁路）——
   // 按「活动场景内 hash → 全部模型对象 id」映射，统一「先 retain，失败再 seed」：
