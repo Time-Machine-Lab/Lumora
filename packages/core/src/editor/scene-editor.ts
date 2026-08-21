@@ -876,7 +876,7 @@ export class SceneEditor {
 
   /** 外部回调/克隆后的基线复验（R8）：编辑器被 dispose、会话切换或任何状态换入
    *  都使本次操作失效——不得移动历史、不得覆盖内层结果、不得复活已释放编辑器。 */
-  private verifyBaseline(project: Project, epoch: number, session: number): Result | null {
+  private verifyBaseline(project: Project, epoch: number, session: number): Result<never> | null {
     if (this.disposed) return failure('编辑器已释放');
     if (this.sessionToken !== session || this.stateEpoch !== epoch || this.project !== project) {
       return failure('编辑器状态已变更，操作被取消');
