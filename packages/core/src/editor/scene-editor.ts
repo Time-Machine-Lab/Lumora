@@ -939,11 +939,16 @@ export class SceneEditor {
 
   /** 选择按项目活动场景可达集过滤：跨场景/已删除对象不可选中；去重后过滤（R8-8）。
    *  可达集一次构建共享给全部候选（替代逐 id isInActiveScene 重建索引，
-   *  n 选 k 从 O(n·k) 收敛到 O(n)，R11-1） */
+   *  n 选 k 从 O(n·k) 收敛到 O(n)，R11-1）；存在性判定预建集合 O(1)
+   *  （替代逐候选 findObject 的 O(N) 数组扫描，R12-1——提交路径调用两次
+   *  本函数，旧实现全选平级根 ≈ 4n² 次 find 谓词执行）。
+   *  存在性检查不可省：getReachableIds 会把 rootObjectIds 中的不存在 id
+   *  原样加入可达集（幽灵根），「reachable 成员 ⇒ 真实对象」不成立 */
   private filterSelection(project: Project, ids: string[]): string[] {
     const reachable = getReachableIds(project, project.activeSceneId);
+    const existingIds = new Set(project.objects.map((object) => object.id));
     return this.dedupeSelection(ids).filter(
-      (id) => findObject(project, id) && reachable.has(id),
+      (id) => existingIds.has(id) && reachable.has(id),
     );
   }
 
