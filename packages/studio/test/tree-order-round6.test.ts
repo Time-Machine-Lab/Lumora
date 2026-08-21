@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createGroupObject } from '@lumora/core';
 import type { Project, SceneObjectData } from '@lumora/core';
 import { buildTreeOrder } from '../src/components/editor/tree-order';
@@ -10,6 +10,11 @@ import { buildTreeOrder } from '../src/components/editor/tree-order';
  *   （旧 ObjectTree 每节点 filter → O(n²)）；
  * - 操作计数（scans）为主证据；多规模增长比为辅（16× 规模线性 ≈16×、
  *   平方级 ≈256×，对照复刻旧逻辑证明断言能区分）。
+ *
+ * R12-3（第十二轮，冻结文件第二次豁免）：T3 的 <80× 计时断言在并发负载下
+ * 曾一次实测 90.08×（R6-D-T3 残余风险），计时主证据不可靠；改用确定性
+ * 操作计数为线性侧主证据（buildTreeOrder 无 filter/find/some/every 谓词，
+ * 执行数恒 0，两规模同探），naive 对照保留为 5 样本中位数 >100× 的形态佐证。
  */
 
 function makeGroup(id: string, parentId: string | null): SceneObjectData {
@@ -80,7 +85,7 @@ describe('R6-D 树序索引（buildTreeOrder）', () => {
     expect(order.scans).toBe(1);
   });
 
-  it('R6-D-T3 多规模增长比：索引 16× 规模近似线性（<60× 耗时），旧逐节点 filter 复刻为平方级（>100×）', () => {
+  it('R6-D-T3 多规模增长比：索引零数组扫描谓词（filter/find/some/every 计数恒 0），旧逐节点 filter 复刻平方级（5 样本中位数 >100×）', () => {
     const build = (n: number) => {
       const objects: SceneObjectData[] = [makeGroup('root', null)];
       for (let i = 0; i < n; i += 1) objects.push(makeGroup(`s${i}`, 'root'));
@@ -102,20 +107,58 @@ describe('R6-D 树序索引（buildTreeOrder）', () => {
       return rows;
     };
 
-    // 每规模测量时长 ≥ ~10ms（重复次数随规模缩放），噪声占比可控
+    // 确定性操作计数（替代计时主证据，消除 JIT/GC 并发噪声 flake）：
+    // buildTreeOrder 是纯 push + Map#set/get 遍历，不含任何数组扫描谓词
+    // （filter/find/some/every）→ 谓词执行数恒 0，n=300 与 n=4800 两规模同探
+    const countPredicates = (fn: () => void): number => {
+      let predicates = 0;
+      const originalFilter = Array.prototype.filter;
+      const originalFind = Array.prototype.find;
+      const originalSome = Array.prototype.some;
+      const originalEvery = Array.prototype.every;
+      const wrap = (original: (...args: unknown[]) => unknown) =>
+        function (this: unknown, ...args: unknown[]) {
+          const predicate = args[0] as (value: unknown, index: number, array: unknown[]) => unknown;
+          const wrapped = (value: unknown, index: number, array: unknown[]) => {
+            predicates += 1;
+            return predicate(value, index, array);
+          };
+          const rest = args.slice();
+          rest[0] = wrapped;
+          return original.apply(this, rest);
+        };
+      const spies = [
+        vi.spyOn(Array.prototype, 'filter').mockImplementation(wrap(originalFilter) as never),
+        vi.spyOn(Array.prototype, 'find').mockImplementation(wrap(originalFind) as never),
+        vi.spyOn(Array.prototype, 'some').mockImplementation(wrap(originalSome) as never),
+        vi.spyOn(Array.prototype, 'every').mockImplementation(wrap(originalEvery) as never),
+      ];
+      try {
+        fn();
+      } finally {
+        for (const s of spies) s.mockRestore();
+      }
+      return predicates;
+    };
+    // 探针自检：naiveRows(n=300) ≈ 301² 谓词 ≫ 0——若 mock 失效计数为 0 → 假绿排除
+    expect(countPredicates(() => naiveRows(small.objects, rootsSmall))).toBeGreaterThan(50_000);
+    expect(countPredicates(() => buildTreeOrder(small, rootsSmall, {}))).toBe(0);
+    expect(countPredicates(() => buildTreeOrder(large, rootsLarge, {}))).toBe(0);
+
+    // 对照（计时仅作形态佐证）：断言必须能区分平方级实现——5 样本中位数
+    // 抗单次 JIT/GC 噪声；16× 规模的平方 = 256×，>100× 留 2.5× 分辨力
+    const median = (xs: number[]) => {
+      const sorted = [...xs].sort((a, b) => a - b);
+      return sorted[Math.floor(sorted.length / 2)]!;
+    };
     const timeMs = (fn: () => void, reps: number) => {
       fn(); // 预热（JIT）
       const t0 = performance.now();
       for (let i = 0; i < reps; i += 1) fn();
       return (performance.now() - t0) / reps;
     };
-    const indexSmall = timeMs(() => buildTreeOrder(small, rootsSmall, {}), 8_000);
-    const indexLarge = timeMs(() => buildTreeOrder(large, rootsLarge, {}), 1_000);
-    expect(indexLarge / indexSmall).toBeLessThan(80); // R11-5：线性 ≈16×，平方级 ≈256×；60 在并发负载下被 JIT/GC 噪声推过（实测 61-63 flake），80 让出观察区且对平方特征仍有 3.2× 分辨力
-
-    // 对照：断言必须能区分平方级实现（旧逻辑复刻 >100×，16× 规模的平方 = 256×）
-    const naiveSmall = timeMs(() => naiveRows(small.objects, rootsSmall), 200);
-    const naiveLarge = timeMs(() => naiveRows(large.objects, rootsLarge), 1);
-    expect(naiveLarge / naiveSmall).toBeGreaterThan(100);
-  });
+    const naiveSmallSamples = Array.from({ length: 5 }, () => timeMs(() => naiveRows(small.objects, rootsSmall), 200));
+    const naiveLargeSamples = Array.from({ length: 5 }, () => timeMs(() => naiveRows(large.objects, rootsLarge), 1));
+    expect(median(naiveLargeSamples) / median(naiveSmallSamples)).toBeGreaterThan(100);
+  }, 60000);
 });
