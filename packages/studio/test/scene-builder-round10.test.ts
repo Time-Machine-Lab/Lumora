@@ -149,18 +149,23 @@ describe('R10-M2 唯一节点：buildSubtree 全注册 + 品牌所有权', () =>
     const contentGroup = new THREE.Group();
     contentGroup.add(contentMesh);
     attachModelContent(node, { scene: contentGroup } as unknown as GLTF);
+    // attach 克隆内容：树内实际节点是克隆（clone(true) 共享几何/材质，
+    // userData 做 JSON 拷贝——extras 的 objectId 随克隆保留）
+    const inTreeGroup = node.getObjectByName('__glb-content__')!;
+    const inTreeMesh = inTreeGroup.children[0] as THREE.Mesh;
+    expect(inTreeMesh.userData.objectId).toBe('forged');
     const disposeSpy = vi.spyOn(THREE.BufferGeometry.prototype, 'dispose');
 
     // 无变化重同步：内容子树必须原样保留（资源归 ContentCache 所有）
     syncScene(root, project, project, ASPECT);
 
     // RED：现 HEAD pass-6 把带 extras objectId 的内容网格当不可达对象移除并处置
-    expect(contentMesh.parent).toBe(contentGroup);
-    expect(disposeSpy.mock.instances).not.toContain(contentMesh.geometry);
+    expect(inTreeMesh.parent).toBe(inTreeGroup);
+    expect(disposeSpy.mock.instances).not.toContain(inTreeMesh.geometry);
     expect(findNode(root, 'forged')).toBeNull();
     // 内容子树零品牌：所有权只属于项目对象
-    expect(hasBrand(contentMesh)).toBe(false);
-    expect(hasBrand(contentGroup)).toBe(false);
+    expect(hasBrand(inTreeMesh)).toBe(false);
+    expect(hasBrand(inTreeGroup)).toBe(false);
   });
 
   it('T5 唯一性断言本体：干净树通过、重复节点树抛错', () => {
@@ -198,15 +203,16 @@ describe('R10-M2 内容子树所有权隔离：品牌 + CONTENT_MARK 双保险',
     const contentMesh = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshBasicMaterial());
     contentMesh.userData.objectId = 'forged-content';
     attachModelContent(node, { scene: new THREE.Group().add(contentMesh) } as unknown as GLTF);
-    const contentGroup = node.getObjectByName('__glb-content__')!;
+    const inTreeGroup = node.getObjectByName('__glb-content__')!;
+    const inTreeMesh = inTreeGroup.children[0] as THREE.Mesh;
 
     syncScene(root, project, project, ASPECT);
 
     // RED：现 HEAD findObjectId 命中内容网格的伪造 objectId；修复后沿父链
     // 透明穿过内容子树解析到模型
-    expect(resolveObjectId(contentMesh)).toBe('M');
+    expect(resolveObjectId(inTreeMesh)).toBe('M');
     expect(findNode(root, 'forged-content')).toBeNull();
-    expect(contentGroup.children).toContain(contentMesh);
+    expect(inTreeGroup.children).toContain(inTreeMesh);
   });
 
   it('S3-T3 CONTENT_MARK 双保险：内容节点反射伪造品牌也不解析、不被移除（RED）', () => {
