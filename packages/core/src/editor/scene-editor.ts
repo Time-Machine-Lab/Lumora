@@ -69,21 +69,42 @@ interface EditorSnapshot {
 }
 
 /**
- * 事务基线（R9-M1）：入口最开始时捕获的项目引用 + 会话/纪元。
+ * 事务基线（R9-M1）：入口最开始时捕获的项目引用 + 会话/版本号。
  * 外部窗口（输入对象克隆、updater 回调、transform 数组元素读取）后必须
- * guardReentry 复验：dispose 或任何状态换入（嵌套提交/嵌套 openProject）都
- * 使本次操作失效——不得移动历史、不得覆盖内层结果、不得复活已释放编辑器。
- * project 可为 null：openProject 在首次打开（尚无项目）时同样需要基线复验。
+ * guardReentry 复验：dispose 或任何状态写（嵌套提交/嵌套 openProject/嵌套
+ * selection/视图写）都使本次操作失效——不得移动历史、不得覆盖内层结果、
+ * 不得复活已释放编辑器。project 可为 null：openProject 在首次打开（尚无
+ * 项目）时同样需要基线复验。
  */
 interface Baseline {
   project: Project | null;
   selection: string[];
-  epoch: number;
+  version: number;
   session: number;
+}
+
+/**
+ * 视图写事务基线（R10-M1）：view setter 的轻量基线——不含 project/session，
+ * 只捕获版本号与视图快照（视图写不触碰项目状态，读项目属于越界防御）。
+ */
+interface ViewBaseline {
+  version: number;
+  view: ViewState;
 }
 
 function failure(message: string): Result<never> {
   return { ok: false, error: new Error(message) };
+}
+
+/** 视图状态等价（getView 副本引用必然不同，基线复验必须按值比较） */
+function sameViewState(a: ViewState, b: ViewState): boolean {
+  if (a.transformMode !== b.transformMode) return false;
+  if (a.transformSpace !== b.transformSpace) return false;
+  if (a.guides.thirds !== b.guides.thirds) return false;
+  if (a.guides.safeFrame !== b.guides.safeFrame) return false;
+  if (a.viewMode === b.viewMode) return true;
+  if (a.viewMode === 'director' || b.viewMode === 'director') return false;
+  return a.viewMode.cameraObjectId === b.viewMode.cameraObjectId;
 }
 
 /** 变换值等价（克隆副本引用必然不同，锁定校验必须按值比较） */
@@ -123,8 +144,9 @@ export class SceneEditor {
   private disposed = false;
   /** 每次应用状态的单调序号（openProject/提交/撤销/重做各取新值） */
   private revisionCounter = 0;
-  /** 状态变迁纪元：任何状态换入（swapState/dispose）递增；外部回调/克隆后据此检测重入 */
-  private stateEpoch = 0;
+  /** 状态变迁版本（R10-M1）：project/selection/view 三类状态任何一次实际写入
+   *  （swapState/dispose/选择写/视图写）都递增；外部回调/克隆后据此检测重入 */
+  private mutationVersion = 0;
 
   /** 当前项目（owned immutable：只读冻结引用，不泄露可写引用） */
   getProject(): Project | null {
@@ -169,7 +191,7 @@ export class SceneEditor {
     const baseline: Baseline = {
       project: this.project,
       selection: [...this.selection],
-      epoch: this.stateEpoch,
+      version: this.mutationVersion,
       session: this.sessionToken,
     };
     const owned = this.own(project); // clone 先行：校验与冻结都在编辑器自有副本上进行
@@ -217,7 +239,7 @@ export class SceneEditor {
     if (this.disposed) return;
     this.disposed = true;
     this.sessionToken += 1;
-    this.stateEpoch += 1;
+    this.mutationVersion += 1;
     this.history.clear();
     this.dragSnapshot = null;
     this.project = null;
@@ -229,12 +251,15 @@ export class SceneEditor {
   // ---------- 选择 ----------
 
   setSelection(ids: string[]): void {
-    if (this.disposed) return;
+    const version = this.mutationVersion;
     const project = this.project;
-    // 选择严格限定在活动场景可达集内：跨场景对象不可选中；重复 ID 首次出现去重（R8-8）
+    // 选择严格限定在活动场景可达集内：跨场景对象不可选中；重复 ID 首次出现去重（R8-8）。
+    // 读取 ids 期间可能触发 getter 副作用（dispose/嵌套写），读取后必须复验版本（R10-M1）
     const next = project ? this.filterSelection(project, ids) : [];
+    if (this.disposed || this.mutationVersion !== version) return;
     if (next.length === this.selection.length && next.every((id, i) => id === this.selection[i])) return;
     this.selection = next;
+    this.mutationVersion += 1;
     this.events.emit('selection:changed', { ids: this.getSelection() });
   }
 
@@ -569,8 +594,11 @@ export class SceneEditor {
     const baseline = this.beginIngress();
     if (!baseline) return failure('未打开项目');
     const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
-    // 归属校验（防御）：只影响活动场景内的对象
+    // 归属校验（防御）：只影响活动场景内的对象。
+    // ids 读取（filter/Set 枚举）期间可能触发 getter 副作用：复验后再走快路（R10-M1）
     const idSet = new Set(ids.filter((id) => isInActiveScene(project, id)));
+    const reentered = this.guardReentry(baseline);
+    if (reentered) return reentered;
     if (idSet.size === 0) return { ok: true };
     const next = {
       ...project,
@@ -583,8 +611,11 @@ export class SceneEditor {
     const baseline = this.beginIngress();
     if (!baseline) return failure('未打开项目');
     const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
-    // 归属校验（防御）：只影响活动场景内的对象
+    // 归属校验（防御）：只影响活动场景内的对象。
+    // ids 读取（filter/Set 枚举）期间可能触发 getter 副作用：复验后再走快路（R10-M1）
     const idSet = new Set(ids.filter((id) => isInActiveScene(project, id)));
+    const reentered = this.guardReentry(baseline);
+    if (reentered) return reentered;
     if (idSet.size === 0) return { ok: true };
     const next = {
       ...project,
@@ -598,11 +629,13 @@ export class SceneEditor {
     const baseline = this.beginIngress();
     if (!baseline) return failure('未打开项目');
     const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
-    const existing = findAssetByHash(project, asset.hash);
-    if (existing) return { ok: true, value: { asset: existing, deduped: true } };
+    // own 先行：asset 字段（含 hash）的读取必须发生在复验之前——getter 副作用
+    // （dispose/嵌套写）后不得再走 dedupe 快路返回成功（R10-M1）
     const owned = this.own(asset); // 无条件克隆为编辑器自有数据（R6）
     const reentered = this.guardReentry(baseline); // 克隆 getter 副作用（R8）
     if (reentered) return reentered;
+    const existing = findAssetByHash(project, owned.hash);
+    if (existing) return { ok: true, value: { asset: existing, deduped: true } };
     const result = this.commit(baseline, addAsset(project, owned), `注册资源 ${owned.name}`);
     if (!result.ok) return result;
     return { ok: true, value: { asset: owned, deduped: false } };
@@ -642,24 +675,31 @@ export class SceneEditor {
   // ---------- 视口 UI 状态（不进历史） ----------
 
   setTransformMode(mode: TransformMode): void {
-    if (this.disposed) return;
+    const baseline = this.captureViewBaseline();
+    // 视图写不读取任何外部输入（mode 为字符串字面量），基线捕获与复验之间无外部窗口
+    if (this.guardViewReentry(baseline)) return;
     if (this.view.transformMode === mode) return;
     this.view = { ...this.view, transformMode: mode };
+    this.mutationVersion += 1;
     this.events.emit('view:changed', { view: this.getView() });
   }
 
   setTransformSpace(space: TransformSpace): void {
-    if (this.disposed) return;
+    const baseline = this.captureViewBaseline();
+    if (this.guardViewReentry(baseline)) return;
     if (this.view.transformSpace === space) return;
     this.view = { ...this.view, transformSpace: space };
+    this.mutationVersion += 1;
     this.events.emit('view:changed', { view: this.getView() });
   }
 
   setViewMode(mode: ViewMode): void {
-    if (this.disposed) return;
-    // 参数复制为自有数据：调用方事后改 mode 对象不影响编辑器（R6）
+    const baseline = this.captureViewBaseline();
+    // 参数复制为自有数据：调用方事后改 mode 对象不影响编辑器（R6）。
+    // mode 读取（cameraObjectId getter）是外部窗口：复验后再做校验与写入（R10-M1）
     let owned: ViewMode =
       mode === 'director' ? 'director' : { cameraObjectId: mode.cameraObjectId };
+    if (this.guardViewReentry(baseline)) return;
     // 机位视图按活动场景隔离：机位不存在/不是相机/不属于活动场景 → 一律回退导演视图
     if (owned !== 'director') {
       const project = this.project;
@@ -676,12 +716,15 @@ export class SceneEditor {
         this.view.viewMode.cameraObjectId === owned.cameraObjectId);
     if (same) return;
     this.view = { ...this.view, viewMode: owned };
+    this.mutationVersion += 1;
     this.events.emit('view:changed', { view: this.getView() });
   }
 
   setGuide(kind: 'thirds' | 'safeFrame', enabled: boolean): void {
-    if (this.disposed) return;
+    const baseline = this.captureViewBaseline();
+    if (this.guardViewReentry(baseline)) return;
     this.view = { ...this.view, guides: { ...this.view.guides, [kind]: enabled } };
+    this.mutationVersion += 1;
     this.events.emit('view:changed', { view: this.getView() });
   }
 
@@ -711,26 +754,43 @@ export class SceneEditor {
     return {
       project: this.project,
       selection: [...this.selection],
-      epoch: this.stateEpoch,
+      version: this.mutationVersion,
       session: this.sessionToken,
     };
   }
 
   /**
-   * 基线复验（R9-M1，幂等）：编辑器被 dispose、会话切换或任何状态换入
-   * （嵌套提交/嵌套 openProject/undo/redo 的 swapState）都使本次操作失效——
+   * 基线复验（R9-M1，幂等）：编辑器被 dispose、会话切换或任何状态写
+   * （嵌套提交/嵌套 openProject/undo/redo 的 swapState，以及嵌套 selection/
+   * 视图写——R10-M1 起全部写都递增 mutationVersion）都使本次操作失效——
    * 不得移动历史、不得覆盖内层结果、不得复活已释放编辑器。
    */
   private guardReentry(baseline: Baseline): { ok: false; error: Error } | null {
     if (this.disposed) return { ok: false, error: new Error('编辑器已释放') };
     if (
       this.sessionToken !== baseline.session ||
-      this.stateEpoch !== baseline.epoch ||
+      this.mutationVersion !== baseline.version ||
       this.project !== baseline.project
     ) {
       return { ok: false, error: new Error('编辑器状态已变更，操作被取消') };
     }
     return null;
+  }
+
+  /** 视图写入口的轻量基线捕获（R10-M1）：版本号 + 视图快照（不含 project/session） */
+  private captureViewBaseline(): ViewBaseline {
+    return { version: this.mutationVersion, view: this.getView() };
+  }
+
+  /**
+   * 视图基线复验（R10-M1，幂等）：dispose 或任何状态写（嵌套视图写/嵌套提交/
+   * openProject/undo/redo）都使本次视图写失效——不得覆盖内层写入结果。
+   * 视图快照按值比较兜底：即使某处视图写漏递增版本，也能被捕获。
+   */
+  private guardViewReentry(baseline: ViewBaseline): boolean {
+    if (this.disposed) return true;
+    if (this.mutationVersion !== baseline.version) return true;
+    return !sameViewState(this.view, baseline.view);
   }
 
   /** 公开 ingress 的统一收口：克隆为编辑器自有数据再递归冻结（R6）。
@@ -864,7 +924,7 @@ export class SceneEditor {
     selection: string[],
     opts: { resetView?: boolean } = {},
   ): void {
-    this.stateEpoch += 1;
+    this.mutationVersion += 1;
     this.project = project;
     this.selection = project ? this.filterSelection(project, selection) : [];
     this.view = opts.resetView || !project ? freshDefaultView() : this.deriveView(project);
