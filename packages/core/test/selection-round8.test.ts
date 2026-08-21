@@ -47,7 +47,7 @@ describe('R8-8 选择去重与可达性不变量', () => {
     // 或返回指向不存在对象的副本 ID
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    const ids = result.value.ids;
+    const ids = result.value!.ids;
     expect(ids).toHaveLength(1);
     const project = editor.getProject()!;
     expect(project.objects.some((o) => o.id === ids[0])).toBe(true);
