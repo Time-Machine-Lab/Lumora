@@ -116,7 +116,7 @@ describe('R6-D 树序索引（buildTreeOrder）', () => {
       const originalFind = Array.prototype.find;
       const originalSome = Array.prototype.some;
       const originalEvery = Array.prototype.every;
-      const wrap = (original: (...args: unknown[]) => unknown) =>
+      const wrap = (original: unknown) =>
         function (this: unknown, ...args: unknown[]) {
           const predicate = args[0] as (value: unknown, index: number, array: unknown[]) => unknown;
           const wrapped = (value: unknown, index: number, array: unknown[]) => {
@@ -125,7 +125,7 @@ describe('R6-D 树序索引（buildTreeOrder）', () => {
           };
           const rest = args.slice();
           rest[0] = wrapped;
-          return original.apply(this, rest);
+          return (original as (...args: unknown[]) => unknown).apply(this, rest);
         };
       const spies = [
         vi.spyOn(Array.prototype, 'filter').mockImplementation(wrap(originalFilter) as never),
