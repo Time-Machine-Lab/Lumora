@@ -67,12 +67,14 @@ describe('R9-M2 深层链复制：迭代栈 + 共享 childrenOf 索引', () => {
     editor.setSelection(['chain-0']);
 
     // RED：现 HEAD 递归 duplicateSubtree 在 ~4k 层处抛 RangeError
-    let result: ReturnType<SceneEditor['duplicateSelection']>;
+    let captured: ReturnType<SceneEditor['duplicateSelection']> | undefined;
     expect(() => {
-      result = editor.duplicateSelection();
+      captured = editor.duplicateSelection();
     }).not.toThrow();
-    expect(result!.ok).toBe(true);
-    const newRootId = result!.value!.ids[0]!;
+    const result = captured!;
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('unreachable');
+    const newRootId = result.value!.ids[0]!;
     expect(chainLength(editor.getProject()!, newRootId)).toBe(6000);
   });
 
@@ -83,6 +85,7 @@ describe('R9-M2 深层链复制：迭代栈 + 共享 childrenOf 索引', () => {
       editor.setSelection(['chain-0']);
       const result = editor.duplicateSelection();
       expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error('unreachable');
       const newRootId = result.value!.ids[0]!;
       expect(chainLength(editor.getProject()!, newRootId)).toBe(depth);
     }

@@ -217,7 +217,7 @@ describe('R9-M1 事务边界：外部 getter 副作用入口探针', () => {
     const expected = [...PUBLIC_API_LIST, ...PRIVATE_API_LIST].sort();
     const methods = new Set(
       Object.getOwnPropertyNames(SceneEditor.prototype)
-        .filter((k) => k !== 'constructor' && typeof (SceneEditor.prototype as Record<string, unknown>)[k] === 'function')
+        .filter((k) => k !== 'constructor' && typeof (SceneEditor.prototype as unknown as Record<string, unknown>)[k] === 'function')
         .sort(),
     );
     expect([...methods]).toEqual(expected);

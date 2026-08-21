@@ -101,7 +101,7 @@ describe('R9-M2 节点身份与所有权：identityKey fork、coordination、单
     const prev = makeProject([p, c]);
     const next = makeProject([]);
     const root = buildScene(prev, ASPECT);
-    const cGeometry = findNode(root, 'C')!.geometry;
+    const cGeometry = (findNode(root, 'C') as THREE.Mesh).geometry;
     const spy = vi.spyOn(cGeometry, 'dispose');
 
     syncScene(root, prev, next, ASPECT);
@@ -125,13 +125,15 @@ describe('R9-M2 节点身份与所有权：identityKey fork、coordination、单
       if (child instanceof THREE.Mesh) contentGeoms.add(child.geometry);
     });
     expect(contentGeoms.size).toBeGreaterThan(0);
-    const disposeSpy = vi.spyOn(THREE.BufferGeometry.prototype, 'dispose');
+    const disposeSpy = vi.spyOn(THREE.BufferGeometry.prototype, 'dispose') as unknown as {
+      mock: { instances: THREE.BufferGeometry[] };
+    };
 
     syncScene(root, prev, next, ASPECT);
 
     // syncScene 处置期间零次释放：占位框在 attach 时已释放，内容子树一个几何
     // 都不处置（共享资源不可被实例误杀）；任何内容几何被处置都会使计数 > 0
-    const disposed = new Set(disposeSpy.mock.instances as THREE.BufferGeometry[]);
+    const disposed = new Set(disposeSpy.mock.instances);
     expect(disposed.size).toBe(0);
     for (const geometry of contentGeoms) {
       expect(disposed.has(geometry)).toBe(false);
