@@ -261,8 +261,9 @@ describe('R10-M1 统一事务版本：逐入口 × 快路行为矩阵', () => {
       const editor = makeEditor();
       const listener = vi.fn();
       editor.events.on('view:changed', listener);
-      editor.setGuide('thirds', true);
-      expect(editor.getView().guides.thirds).toBe(true);
+      // R11-3 起同值（默认 thirds 即 true）为 no-op，正常写用例改用真实变化
+      editor.setGuide('thirds', false);
+      expect(editor.getView().guides.thirds).toBe(false);
       expect(listener).toHaveBeenCalledTimes(1);
     });
 
