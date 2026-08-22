@@ -222,11 +222,15 @@ export class ProjectPersistence {
     return this.store.rename(uri, trimmed);
   }
 
-  /** 导出当前项目为 `.lumora` 工程包（同步纯构建；私有数据恒排除，NFR-008）。 */
-  exportCurrent(): ExportResult {
+  /**
+   * 导出当前项目为 `.lumora` 工程包（同步纯构建）。
+   * includePrivate 显式开启时允许包含插件私有设置（pluginData）；
+   * 凭据族字段（apiKey/token/secret/…）任何情况下都不进入包（NFR-008）。
+   */
+  exportCurrent(options: { includePrivate?: boolean } = {}): ExportResult {
     const project = this.editor.getProject();
     if (!project) return { ok: false, message: '当前没有打开的项目' };
-    const pkg = buildProjectPackage(project);
+    const pkg = buildProjectPackage(project, { includePrivate: options.includePrivate ?? false });
     const text = serializeProjectPackage(pkg);
     return { ok: true, text, filename: `${safeFilename(project.name)}.lumora`, bytes: estimatePackageBytes(text) };
   }

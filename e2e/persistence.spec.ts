@@ -21,6 +21,9 @@ const HERE = fileURLToPath(new URL('.', import.meta.url));
  * 会一直 pending 并阻塞后续 open），再删除数据库，等价于「清空浏览器本地数据」；
  * 重新挂载后从空存储导入工程包，校验 3 台摄像机、模型与层级引用全部恢复，
  * 且项目已持久化（刷新后仍可从最近项目重新打开）。
+ *
+ * AC4 隐私剥离（NFR-008）：向 e2e 源项目注入插件私有设置（pluginData，含嵌套
+ * 凭据），在真实浏览器链路验证默认导出与 includePrivate 导出均不携带任何凭据。
  */
 
 interface LumoraPackage {
@@ -102,6 +105,124 @@ test('AC1 导出→清空→导入：模型、三镜头完整恢复且已持久�
   await page.locator('[data-testid="recent-project"] .lumora-project-menu__recent-open').click();
   await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
   await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
+});
+
+test('AC4 源项目含 pluginData 与凭据：默认导出全剥离，includePrivate 仅放行插件设置', async ({ page }) => {
+  // 1. Node 端构造「含 AI 凭据与插件私有设置」的源工程包。buildProjectPackage 会剥离
+  //    凭据族字段，故先以 includePrivate 构建出正确的包结构，再把嵌套凭据写回包内
+  //    project.pluginData —— 模拟插件把私有设置（含凭据）存入项目本地状态的真实形态
+  const pluginId = 'com.example.ai-assistant';
+  const secrets = {
+    apiKey: 'sk-lumora-ac4-1f7a9c3d',
+    accessToken: 'tok-lumora-ac4-9c2b4d6e',
+    authorization: 'Bearer lumora-ac4-3d8e5f7a',
+    password: 'pwd-lumora-ac4-5a1b6c8d',
+    providerKey: 'key-lumora-ac4-7f4d8e2b',
+  };
+  const sourcePluginData: Record<string, unknown> = {
+    [pluginId]: {
+      theme: 'dark',
+      model: 'claude-sonnet-5',
+      auth: { apiKey: secrets.apiKey, accessToken: secrets.accessToken },
+      api: { authorization: secrets.authorization },
+      users: [{ name: 'u1' }, { name: 'u2', password: secrets.password }],
+      credentials: { provider: secrets.providerKey },
+    },
+  };
+  const sourceEditor = new SceneEditor();
+  sourceEditor.openProject(createSampleProject());
+  const pkg = buildProjectPackage(
+    {
+      ...sourceEditor.getProject()!,
+      uri: 'lumora://project/ac4-source',
+      name: 'AC4 源项目',
+      pluginData: sourcePluginData,
+    },
+    { includePrivate: true },
+  );
+  const raw = JSON.parse(serializeProjectPackage(pkg)) as { project: { pluginData?: Record<string, unknown> } };
+  raw.project.pluginData = sourcePluginData;
+  const tmpDir = join(HERE, '.tmp');
+  mkdirSync(tmpDir, { recursive: true });
+  const sourcePath = join(tmpDir, 'tml53-ac4-source.lumora');
+  writeFileSync(sourcePath, JSON.stringify(raw), 'utf8');
+
+  // 2. 浏览器导入源项目：插件私有设置（含嵌套凭据）成为编辑器与本地持久化状态
+  await page.goto('/');
+  await expect(page.getByTestId('studio-empty-hint')).toBeVisible();
+  await page.getByTestId('project-menu').click();
+  await page.setInputFiles('[data-testid="project-import-input"]', sourcePath);
+  await expect(page.getByTestId('studio-empty-hint')).not.toBeVisible();
+  await expect(page.getByTestId('event-log')).toContainText('项目已打开: AC4 源项目');
+  await expect(page.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 10_000 });
+
+  // 3. 源项目在浏览器本地存储中真实携带凭据（默认导出断言的前提，避免空转）
+  const storedPlugin = await page.evaluate(
+    ({ uri, id }: { uri: string; id: string }) =>
+      new Promise<{ theme?: string; auth?: Record<string, string> } | undefined>((resolve) => {
+        const openReq = indexedDB.open('lumora-studio');
+        openReq.onerror = () => resolve(undefined);
+        openReq.onsuccess = () => {
+          const db = openReq.result;
+          const tx = db.transaction('projects', 'readonly');
+          const getReq = tx.objectStore('projects').get(uri);
+          getReq.onerror = () => {
+            db.close();
+            resolve(undefined);
+          };
+          getReq.onsuccess = () => {
+            const record = getReq.result as
+              | {
+                  project?: { pluginData?: Record<string, { theme?: string; auth?: Record<string, string> }> };
+                }
+              | undefined;
+            db.close();
+            resolve(record?.project?.pluginData?.[id]);
+          };
+        };
+      }),
+    { uri: 'lumora://project/ac4-source', id: pluginId },
+  );
+  expect(storedPlugin?.theme).toBe('dark');
+  expect(storedPlugin?.auth).toEqual({ apiKey: secrets.apiKey, accessToken: secrets.accessToken });
+
+  // 4. 默认导出：工程包内无插件私有设置、无任何凭据（凭据与敏感键名都不出现）
+  await page.getByTestId('project-menu').click();
+  const downloadDefault = page.waitForEvent('download');
+  await page.getByTestId('project-export').click();
+  const defaultDownload = await downloadDefault;
+  const defaultPath = join(tmpDir, 'tml53-ac4-export.lumora');
+  await defaultDownload.saveAs(defaultPath);
+  const defaultText = readFileSync(defaultPath, 'utf8');
+  const defaultPkg = JSON.parse(defaultText) as LumoraPackage;
+  expect(defaultPkg.manifest.includePrivate).toBe(false);
+  expect(defaultPkg.project.pluginData).toBeUndefined();
+  for (const secret of Object.values(secrets)) expect(defaultText).not.toContain(secret);
+  expect(defaultText).not.toContain('pluginData');
+  for (const key of ['apiKey', 'accessToken', 'authorization', 'password', 'credentials']) {
+    expect(defaultText).not.toContain(key);
+  }
+
+  // 5. includePrivate 显式开启：插件私有设置可包含，凭据仍被剥离
+  await page.getByTestId('project-export-include-private').check();
+  await expect(page.getByTestId('project-export-include-private')).toBeChecked();
+  const downloadPrivate = page.waitForEvent('download');
+  await page.getByTestId('project-export').click();
+  const privateDownload = await downloadPrivate;
+  const privatePath = join(tmpDir, 'tml53-ac4-export-private.lumora');
+  await privateDownload.saveAs(privatePath);
+  const privateText = readFileSync(privatePath, 'utf8');
+  const privatePkg = JSON.parse(privateText) as LumoraPackage;
+  expect(privatePkg.manifest.includePrivate).toBe(true);
+  const plugin = (privatePkg.project.pluginData as
+    | Record<string, Record<string, unknown>>
+    | undefined)?.[pluginId];
+  expect(plugin?.theme).toBe('dark');
+  expect(plugin?.model).toBe('claude-sonnet-5');
+  for (const secret of Object.values(secrets)) expect(privateText).not.toContain(secret);
+  for (const key of ['apiKey', 'accessToken', 'authorization', 'password', 'credentials']) {
+    expect(privateText).not.toContain(key);
+  }
 });
 
 test('AC2 跨标签页冲突：本地计数追平不覆盖较新保存，须显式「加载较新版本」解决', async ({ context }) => {

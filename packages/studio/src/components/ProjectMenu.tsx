@@ -82,6 +82,8 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
   const [modal, setModal] = useState<ModalState | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ProjectSummary | null>(null);
   const [busy, setBusy] = useState(false);
+  // 导出是否显式包含插件私有设置（pluginData）；凭据族字段任何情况下都不导出（NFR-008）
+  const [includePrivate, setIncludePrivate] = useState(false);
   const importInputRef = useRef<HTMLInputElement>(null);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   // 窄屏下面板为 fixed 定位，垂直位置按按钮实测（视口坐标系）设置
@@ -213,7 +215,7 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
   };
 
   const exportCurrent = async () => {
-    const exported = persistence.exportCurrent();
+    const exported = persistence.exportCurrent({ includePrivate });
     if (!exported.ok) {
       showToast(exported.message, 'error');
       return;
@@ -442,6 +444,16 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
               }}
             />
           </div>
+          <label className="lumora-project-menu__export-private">
+            <input
+              type="checkbox"
+              data-testid="project-export-include-private"
+              checked={includePrivate}
+              disabled={!project}
+              onChange={(e) => setIncludePrivate(e.target.checked)}
+            />
+            <span>导出包含插件私有设置（凭据永不导出）</span>
+          </label>
           <div className="lumora-project-menu__recent">
             <div className="lumora-project-menu__recent-title">最近项目</div>
             {recent.length === 0 && <div className="lumora-project-menu__recent-empty">暂无本地项目</div>}

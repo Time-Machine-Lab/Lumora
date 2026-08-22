@@ -1051,6 +1051,20 @@
   flex-wrap: wrap;
 }
 
+.lumora-project-menu__export-private {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--lumora-text-dim);
+  cursor: pointer;
+}
+
+.lumora-project-menu__export-private:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
 .lumora-project-menu__recent {
   display: flex;
   flex-direction: column;

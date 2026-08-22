@@ -9,6 +9,7 @@ import {
   createSampleProject,
   serializeProjectPackage,
 } from '@lumora/core';
+import type { Project } from '@lumora/core';
 import { LumoraStudio } from '../src/components/LumoraStudio';
 import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
 import type { StudioRuntime } from '../src/runtime/studio-runtime';
@@ -207,6 +208,86 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
       clickSpy.mockRestore();
       vi.unstubAllGlobals();
     }
+  });
+
+  it('导出菜单勾选「包含插件私有设置」后 exportCurrent 显式收到 includePrivate', async () => {
+    const handle = renderStudio();
+    const runtime = await waitPersistence(handle);
+    runtime.openProject(createSampleProject('lumora://project/export', '导出样例'));
+    const spy = vi.spyOn(runtime.persistence, 'exportCurrent').mockReturnValue({
+      ok: true,
+      text: '{}',
+      filename: '导出样例.lumora',
+      bytes: 2,
+    });
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    const createObjectURL = vi.fn(() => 'blob:mock-download');
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal(
+      'URL',
+      class {
+        static createObjectURL = createObjectURL;
+        static revokeObjectURL = revokeObjectURL;
+      },
+    );
+    try {
+      await openMenu();
+      // 隐私默认：不勾选 → 默认导出
+      expect(screen.getByTestId('project-export-include-private')).not.toBeChecked();
+      screen.getByTestId('project-export').click();
+      await waitFor(() => expect(spy).toHaveBeenCalledWith({ includePrivate: false }));
+      // 显式开启：仅放行插件私有设置
+      fireEvent.click(screen.getByTestId('project-export-include-private'));
+      expect(screen.getByTestId('project-export-include-private')).toBeChecked();
+      screen.getByTestId('project-export').click();
+      await waitFor(() => expect(spy).toHaveBeenCalledWith({ includePrivate: true }));
+      await new Promise((r) => setTimeout(r, 1100));
+    } finally {
+      spy.mockRestore();
+      clickSpy.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('includePrivate 导出：插件私有设置可包含，凭据族字段仍剥离（NFR-008）', async () => {
+    const handle = renderStudio();
+    const runtime = await waitPersistence(handle);
+    const withPrivate: Project = {
+      ...createSampleProject('lumora://project/private', '私有设置项目'),
+      pluginData: {
+        'com.example.ai-assistant': {
+          theme: 'dark',
+          model: 'claude-sonnet-5',
+          auth: { apiKey: 'sk-lumora-secret-1234' },
+        },
+      },
+    };
+    await runtime.openProject(withPrivate);
+
+    // 默认导出：pluginData 与凭据都不进包
+    const defaultExport = runtime.persistence.exportCurrent();
+    expect(defaultExport.ok).toBe(true);
+    const defaultJson = JSON.stringify(JSON.parse(defaultExport.ok ? defaultExport.text : ''));
+    expect(defaultJson).not.toContain('pluginData');
+    expect(defaultJson).not.toContain('sk-lumora-secret-1234');
+    expect(defaultJson).not.toContain('apiKey');
+
+    // includePrivate 显式开启：插件设置可包含，凭据仍剥离
+    const privateExport = runtime.persistence.exportCurrent({ includePrivate: true });
+    expect(privateExport.ok).toBe(true);
+    const privatePkg = JSON.parse(privateExport.ok ? privateExport.text : '') as {
+      manifest: { includePrivate: boolean };
+      project: { pluginData?: Record<string, unknown> };
+    };
+    expect(privatePkg.manifest.includePrivate).toBe(true);
+    const plugin = privatePkg.project.pluginData?.['com.example.ai-assistant'] as
+      | Record<string, unknown>
+      | undefined;
+    expect(plugin?.theme).toBe('dark');
+    expect(plugin?.model).toBe('claude-sonnet-5');
+    const privateJson = JSON.stringify(privatePkg);
+    expect(privateJson).not.toContain('sk-lumora-secret-1234');
+    expect(privateJson).not.toContain('apiKey');
   });
 
   it('导入工程包：完整恢复并打开；同 uri 已存在时作为副本导入', async () => {
