@@ -4,5 +4,6 @@ dist/
 .vite/
 test-results/
 playwright-report/
+e2e/.tmp/
 .DS_Store
 *.log
