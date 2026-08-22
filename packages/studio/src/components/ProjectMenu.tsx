@@ -4,7 +4,7 @@ import { MAX_PACKAGE_TEXT_BYTES, genId } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import type { StudioRuntime } from '../runtime/studio-runtime';
 import type { AutosaveState } from '../persistence/autosave';
-import type { ProjectSummary } from '../persistence/project-store';
+import type { ProjectSummary } from '../persistence/project-storage';
 import { showToast } from './editor/toasts';
 
 interface ProjectMenuProps {

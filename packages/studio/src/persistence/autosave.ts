@@ -22,7 +22,7 @@
  */
 
 import type { Project, SceneEditor } from '@lumora/core';
-import type { ProjectStore, SaveFailureCode, SaveOutcome } from './project-store';
+import type { ProjectStorage, SaveFailureCode, SaveOutcome } from './project-storage';
 
 export const AUTOSAVE_DEBOUNCE_MS = 2000;
 
@@ -49,7 +49,7 @@ interface LatchedError {
 }
 
 export class ProjectAutosaver {
-  private store: ProjectStore | null;
+  private store: ProjectStorage | null;
   private currentUri: string | null = null;
   private lastSavedRevision = 0;
   /** 各 uri 已确认落盘的 revision（含已切换走的项目：旧项目保存成功也推进基线）。
@@ -74,7 +74,7 @@ export class ProjectAutosaver {
 
   constructor(
     private readonly editor: SceneEditor,
-    store: ProjectStore | null,
+    store: ProjectStorage | null,
     options: AutosaverOptions = {},
   ) {
     this.store = store;
@@ -96,7 +96,7 @@ export class ProjectAutosaver {
   }
 
   /** 持久化就绪后接入（init 完成）：对当前打开的项目重新对账（冷启动不丢事件）。 */
-  setStore(store: ProjectStore | null): void {
+  setStore(store: ProjectStorage | null): void {
     this.store = store;
     const project = this.editor.getProject();
     if (this.disposed) return;

@@ -1,6 +1,7 @@
 import { PluginHost, SceneEditor } from '@lumora/core';
 import type { EventMap, Project } from '@lumora/core';
 import { ProjectPersistence } from '../persistence/project-persistence';
+import type { StorageBackend } from '../persistence/project-storage';
 
 export interface StudioRuntimeOptions {
   hostVersion?: string;
@@ -19,13 +20,16 @@ export interface StudioRuntime {
   /** 核心场景编辑器：项目数据、选择、视口状态与历史栈（撤销/重做）的唯一持有者 */
   editor: SceneEditor;
   /**
-   * 项目持久化门面：IndexedDB 本地存储（最近项目/重命名/复制/删除）、
+   * 项目持久化门面：IndexedDB 或 OPFS 本地存储（最近项目/重命名/复制/删除）、
    * 2 秒防抖自动保存与 `.lumora` 工程包导入导出。init() 后生效；
-   * IndexedDB 不可用时静默降级（available = false，仅内存编辑）。
+   * 存储不可用时静默降级（available = false，仅内存编辑）。
    */
   persistence: ProjectPersistence;
-  /** 初始化本地存储并接入自动保存（幂等）。 */
-  init(options?: { debounceMs?: number; dbName?: string }): Promise<void>;
+  /**
+   * 初始化本地存储并接入自动保存（幂等）。
+   * options.storage 选择存储后端（缺省 indexeddb；opfs = Origin Private File System）。
+   */
+  init(options?: { debounceMs?: number; dbName?: string; storage?: StorageBackend }): Promise<void>;
   /**
    * 打开/切换项目（可等待的类型化切换屏障）：替换编辑器前先稳定排空当前项目的
    * 未保存变更（flushPending 稳定排空）。落盘失败时返回 { ok: false } 且不触碰

@@ -9,47 +9,21 @@
  * 并发安全（NFR-003 / AC2）：save(project, expectedStoredRevision) 在同一
  * readwrite 事务内完成「读已存 → 比对期望基线 → 写入」，提交前等待事务
  * complete（而非仅请求成功），杜绝「声称已保存但事务未提交」的假成功。
- * - expectedStoredRevision 为 number 时是 CAS：已存 revision 必须与期望基线
- *   一致才写入。调用方以「上次确认已存的 revision」为期望，任何不一致（更新
- *   或缺失）都判定冲突，绝不静默覆盖 —— 多标签页下的较新保存不得被旧数据覆盖；
- * - null 为创建语义：同 uri 已有记录即冲突（新建/复制项目的首存防碰撞）；
- * - undefined 为无条件写入（显式迁移/测试等不受 CAS 约束的场景）。
- * 冲突不提供自动恢复路径：必须由用户显式解决（加载较新版本 / 另存副本），
- * 防止「本地计数追平后覆盖较新内容」的数据丢失。
+ * 语义（CAS 基线 / 创建语义 / 无条件写入 / 防倒退 / 防分叉）见 project-storage.ts 文件头。
  * 配额不足（QuotaExceededError）同样以可操作错误返回，调用方（自动保存）保持脏状态。
  */
 
 import type { Project } from '@lumora/core';
 import { genId } from '@lumora/core';
-
-export interface ProjectSummary {
-  uri: string;
-  name: string;
-  savedAt: string;
-  revision: number;
-  schemaVersion: number;
-}
-
-export interface StoredProject {
-  uri: string;
-  savedAt: string;
-  project: Project;
-}
-
-export type SaveFailureCode =
-  | 'revision-conflict'
-  | 'quota-exceeded'
-  | 'storage-error'
-  // autosaver 锁存态：恢复快照待处理（flush/排空与打开屏障同样阻断，见 autosave.flush）
-  | 'recovery-available';
-
-export type SaveOutcome =
-  | { ok: true }
-  | { ok: false; code: SaveFailureCode; message: string; storedRevision?: number };
-
-export type DuplicateOutcome =
-  | { ok: true; summary: ProjectSummary }
-  | { ok: false; code: 'not-found' | 'storage-error'; message: string };
+import type {
+  DuplicateOutcome,
+  ProjectStorage,
+  ProjectSummary,
+  RenameOutcome,
+  SaveOutcome,
+  StoredProject,
+} from './project-storage';
+import { failureMessage, isQuotaError, sameProjectContent } from './project-storage';
 
 export const PROJECT_STORE_DB = 'lumora-studio';
 export const PROJECTS_STORE = 'projects';
@@ -73,50 +47,9 @@ function transactionDone(transaction: IDBTransaction): Promise<void> {
   });
 }
 
-/** 浏览器存储配额估算（不可用时返回 null，调用方跳过配额预检） */
-export async function estimateStorage(): Promise<{ usage: number; quota: number } | null> {
-  const storage = (globalThis as { navigator?: { storage?: { estimate?: () => Promise<{ usage?: number; quota?: number }> } } })
-    .navigator?.storage;
-  if (!storage?.estimate) return null;
-  try {
-    const estimate = await storage.estimate();
-    if (typeof estimate.quota !== 'number') return null;
-    return { usage: estimate.usage ?? 0, quota: estimate.quota };
-  } catch {
-    return null;
-  }
-}
+export class ProjectStore implements ProjectStorage {
+  readonly kind = 'indexeddb' as const;
 
-/** 键排序稳定序列化：同 revision 分叉判定需要与键序无关的内容比较 */
-function stableStringify(value: unknown): string {
-  return JSON.stringify(value, (_key, item) => {
-    if (item && typeof item === 'object' && !Array.isArray(item)) {
-      return Object.keys(item as Record<string, unknown>)
-        .sort()
-        .reduce<Record<string, unknown>>((acc, key) => {
-          acc[key] = (item as Record<string, unknown>)[key];
-          return acc;
-        }, {});
-    }
-    return item;
-  });
-}
-
-/** 同 revision 幂等重存判定：内容逐字段一致（仅 savedAt 等记录字段可漂移） */
-function sameProjectContent(a: Project, b: Project): boolean {
-  return stableStringify(a) === stableStringify(b);
-}
-
-function isQuotaError(error: unknown): boolean {
-  const name = error instanceof DOMException ? error.name : (error as { name?: string })?.name;
-  return name === 'QuotaExceededError' || name === 'NS_ERROR_DOM_QUOTA_REACHED';
-}
-
-function failureMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-export class ProjectStore {
   private constructor(
     private readonly db: IDBDatabase,
     readonly dbName: string,
@@ -257,7 +190,7 @@ export class ProjectStore {
 
   /** 直接重命名已存储项目（仅适用于未打开的项目；打开中的重命名走编辑器提交）。
    *  以加载到的 revision 为 CAS 期望：读-改-写间被其他写入推进时拒绝，防倒退。 */
-  async rename(uri: string, name: string): Promise<{ ok: true } | { ok: false; code: 'not-found' | 'storage-error'; message: string }> {
+  async rename(uri: string, name: string): Promise<RenameOutcome> {
     const project = await this.load(uri);
     if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
     const result = await this.save({ ...project, name, revision: project.revision + 1 }, project.revision);
