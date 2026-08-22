@@ -10,13 +10,18 @@ export { buildScene, syncScene } from './components/editor/scene-builder';
 export { PanelErrorBoundary } from './components/panels/PanelErrorBoundary';
 export { createStudioRuntime } from './runtime/studio-runtime';
 export type { StudioRuntime, StudioRuntimeOptions } from './runtime/studio-runtime';
-export { ProjectStore, estimateStorage } from './persistence/project-store';
+export { ProjectStore } from './persistence/project-store';
+export { OpfsProjectStore } from './persistence/project-store-opfs';
+export { estimateStorage } from './persistence/project-storage';
 export type {
   DuplicateOutcome,
+  ProjectStorage,
   ProjectSummary,
+  RenameOutcome,
   SaveOutcome,
+  StorageBackend,
   StoredProject,
-} from './persistence/project-store';
+} from './persistence/project-storage';
 export { ProjectAutosaver, AUTOSAVE_DEBOUNCE_MS } from './persistence/autosave';
 export type { AutosaverOptions, AutosaveState } from './persistence/autosave';
 export { ProjectPersistence } from './persistence/project-persistence';

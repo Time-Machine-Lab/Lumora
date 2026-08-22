@@ -4,6 +4,7 @@ import type { PluginDescriptor, Project } from '@lumora/core';
 import { createStudioRuntime } from '../runtime/studio-runtime';
 import type { StudioRuntime } from '../runtime/studio-runtime';
 import { useSceneEditor } from '../hooks/use-scene-editor';
+import type { StorageBackend } from '../persistence/project-storage';
 import { PanelHost } from './panels/PanelHost';
 import { Toolbar } from './Toolbar';
 import { CommandPalette } from './CommandPalette';
@@ -32,6 +33,8 @@ export interface LumoraStudioProps {
   onError?: (error: unknown) => void;
   /** 场景槽位，缺省为内置 3D 场景编辑器视口 */
   scene?: (project: Project | null) => ReactNode;
+  /** 本地存储后端（缺省 indexeddb；opfs = Origin Private File System） */
+  storage?: StorageBackend;
   className?: string;
 }
 
@@ -45,7 +48,7 @@ export interface LumoraStudioHandle {
  * - 卸载时释放全部资源：停用插件、移除订阅、销毁事件总线、资源缓存与 WebGL 场景
  */
 export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(function LumoraStudio(
-  { plugins = [], hostVersion, initialProject, onError, scene, className },
+  { plugins = [], hostVersion, initialProject, onError, scene, storage, className },
   ref,
 ) {
   const runtimeRef = useRef<StudioRuntime | null>(null);
@@ -81,7 +84,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       const onErrorRef = onError;
       const boot = async () => {
         // 先接入本地持久化与自动保存，再打开初始项目（自动保存脏基线以打开为准）
-        await runtime.init();
+        await runtime.init({ storage });
         for (const descriptor of pluginsRef) {
           if (cancelBootRef.current) return;
           try {

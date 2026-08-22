@@ -66,6 +66,9 @@ const PLUGINS: PluginDescriptor[] = [mockPlugin, brokenManifestPlugin, brokenEng
 /** 默认只记录事件摘要；?debug=full 时输出完整 payload（大数据量下会产生 GB 级字符串，仅限调试） */
 const DEBUG_FULL = new URLSearchParams(window.location.search).get('debug') === 'full';
 
+/** 本地存储后端选择：?storage=opfs 使用 OPFS，缺省 IndexedDB（持久化门面可切换，TML-53 范围项） */
+const STORAGE = new URLSearchParams(window.location.search).get('storage') === 'opfs' ? 'opfs' : 'indexeddb';
+
 export default function App() {
   const [mounted, setMounted] = useState(true);
   const [log, setLog] = useState<string[]>([]);
@@ -133,7 +136,7 @@ export default function App() {
       </header>
       <div className="host__layout">
         {mounted ? (
-          <LumoraStudio ref={handleRef} plugins={PLUGINS} hostVersion="0.1.0" className="host__studio" />
+          <LumoraStudio ref={handleRef} plugins={PLUGINS} hostVersion="0.1.0" storage={STORAGE} className="host__studio" />
         ) : (
           <div className="host__placeholder" data-testid="studio-placeholder">
             Studio 已卸载 —— WebGL 场景、插件贡献项与事件订阅均已释放
