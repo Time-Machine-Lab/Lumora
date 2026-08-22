@@ -1,0 +1,253 @@
+/**
+ * 项目本地存储（FR-011）：IndexedDB 适配器。
+ *
+ * 存储结构：
+ * - `projects` 对象仓库：keyPath uri，记录 { uri, savedAt, project }（项目名以
+ *   project.name 为唯一来源，不单独冗余，避免重命名/撤销后的摘要漂移）；
+ * - `meta` 对象仓库：预留键值位（keyPath key）。
+ *
+ * 并发安全（NFR-003 / AC2）：save(project, expectedStoredRevision) 在同一
+ * readwrite 事务内完成「读已存 → 比对期望基线 → 写入」，提交前等待事务
+ * complete（而非仅请求成功），杜绝「声称已保存但事务未提交」的假成功。
+ * - expectedStoredRevision 为 number 时是 CAS：已存 revision 必须与期望基线
+ *   一致才写入。调用方以「上次确认已存的 revision」为期望，任何不一致（更新
+ *   或缺失）都判定冲突，绝不静默覆盖 —— 多标签页下的较新保存不得被旧数据覆盖；
+ * - null 为创建语义：同 uri 已有记录即冲突（新建/复制项目的首存防碰撞）；
+ * - undefined 为无条件写入（显式迁移/测试等不受 CAS 约束的场景）。
+ * 冲突不提供自动恢复路径：必须由用户显式解决（加载较新版本 / 另存副本），
+ * 防止「本地计数追平后覆盖较新内容」的数据丢失。
+ * 配额不足（QuotaExceededError）同样以可操作错误返回，调用方（自动保存）保持脏状态。
+ */
+
+import type { Project } from '@lumora/core';
+import { genId } from '@lumora/core';
+
+export interface ProjectSummary {
+  uri: string;
+  name: string;
+  savedAt: string;
+  revision: number;
+  schemaVersion: number;
+}
+
+export interface StoredProject {
+  uri: string;
+  savedAt: string;
+  project: Project;
+}
+
+export type SaveFailureCode = 'revision-conflict' | 'quota-exceeded' | 'storage-error';
+
+export type SaveOutcome =
+  | { ok: true }
+  | { ok: false; code: SaveFailureCode; message: string; storedRevision?: number };
+
+export type DuplicateOutcome =
+  | { ok: true; summary: ProjectSummary }
+  | { ok: false; code: 'not-found' | 'storage-error'; message: string };
+
+export const PROJECT_STORE_DB = 'lumora-studio';
+export const PROJECTS_STORE = 'projects';
+export const META_STORE = 'meta';
+
+const STORE_VERSION = 1;
+
+function request<T>(req: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error ?? new Error('IndexedDB 请求失败'));
+  });
+}
+
+/** 等待事务提交完成：请求成功 ≠ 事务已提交，save 必须以此为完成边界 */
+function transactionDone(transaction: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error('IndexedDB 事务失败'));
+    transaction.onabort = () => reject(transaction.error ?? new Error('IndexedDB 事务中止'));
+  });
+}
+
+/** 浏览器存储配额估算（不可用时返回 null，调用方跳过配额预检） */
+export async function estimateStorage(): Promise<{ usage: number; quota: number } | null> {
+  const storage = (globalThis as { navigator?: { storage?: { estimate?: () => Promise<{ usage?: number; quota?: number }> } } })
+    .navigator?.storage;
+  if (!storage?.estimate) return null;
+  try {
+    const estimate = await storage.estimate();
+    if (typeof estimate.quota !== 'number') return null;
+    return { usage: estimate.usage ?? 0, quota: estimate.quota };
+  } catch {
+    return null;
+  }
+}
+
+function isQuotaError(error: unknown): boolean {
+  const name = error instanceof DOMException ? error.name : (error as { name?: string })?.name;
+  return name === 'QuotaExceededError' || name === 'NS_ERROR_DOM_QUOTA_REACHED';
+}
+
+function failureMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export class ProjectStore {
+  private constructor(
+    private readonly db: IDBDatabase,
+    readonly dbName: string,
+  ) {}
+
+  /** 创建存储；IndexedDB 不可用或打开失败时返回 null（持久化静默降级） */
+  static async create(dbName = PROJECT_STORE_DB): Promise<ProjectStore | null> {
+    if (typeof indexedDB === 'undefined') return null;
+    try {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const open = indexedDB.open(dbName, STORE_VERSION);
+        open.onupgradeneeded = () => {
+          const database = open.result;
+          if (!database.objectStoreNames.contains(PROJECTS_STORE)) {
+            database.createObjectStore(PROJECTS_STORE, { keyPath: 'uri' });
+          }
+          if (!database.objectStoreNames.contains(META_STORE)) {
+            database.createObjectStore(META_STORE, { keyPath: 'key' });
+          }
+        };
+        open.onsuccess = () => resolve(open.result);
+        open.onerror = () => reject(open.error ?? new Error(`无法打开本地数据库 ${dbName}`));
+        open.onblocked = () => reject(new Error(`本地数据库 ${dbName} 被其他标签页占用`));
+      });
+      return new ProjectStore(db, dbName);
+    } catch {
+      return null;
+    }
+  }
+
+  /** 删除数据库（测试隔离 / 清空本地数据）。 */
+  static async drop(dbName = PROJECT_STORE_DB): Promise<void> {
+    if (typeof indexedDB === 'undefined') return;
+    await new Promise<void>((resolve) => {
+      const del = indexedDB.deleteDatabase(dbName);
+      del.onsuccess = () => resolve();
+      del.onerror = () => resolve();
+      del.onblocked = () => resolve();
+    });
+  }
+
+  /** 最近项目列表（按保存时间倒序）。 */
+  async list(): Promise<ProjectSummary[]> {
+    const records = await request(this.db.transaction(PROJECTS_STORE).objectStore(PROJECTS_STORE).getAll() as IDBRequest<StoredProject[]>);
+    return records
+      .map((record) => ({
+        uri: record.uri,
+        name: record.project.name,
+        savedAt: record.savedAt,
+        revision: record.project.revision,
+        schemaVersion: record.project.schemaVersion,
+      }))
+      .sort((a, b) => (a.savedAt < b.savedAt ? 1 : a.savedAt > b.savedAt ? -1 : 0));
+  }
+
+  /** 加载项目（返回调用方可自由修改的副本）。 */
+  async load(uri: string): Promise<Project | null> {
+    const record = await request(
+      this.db.transaction(PROJECTS_STORE).objectStore(PROJECTS_STORE).get(uri) as IDBRequest<StoredProject | undefined>,
+    );
+    return record?.project ? structuredClone(record.project) : null;
+  }
+
+  /**
+   * 保存项目（CAS，NFR-003 / AC2）：
+   * - expectedStoredRevision 为 number：已存 revision 必须与期望基线一致才写入；
+   * - null：创建语义（同 uri 已有记录即冲突）；
+   * - undefined：无条件写入。
+   * 读-比-写与提交在同一 readwrite 事务内，且以事务 complete 为完成边界。
+   */
+  async save(project: Project, expectedStoredRevision?: number | null): Promise<SaveOutcome> {
+    const transaction = this.db.transaction(PROJECTS_STORE, 'readwrite');
+    const store = transaction.objectStore(PROJECTS_STORE);
+    try {
+      const existing = await request(store.get(project.uri) as IDBRequest<StoredProject | undefined>);
+      const storedRevision = existing?.project.revision;
+      const mismatch =
+        expectedStoredRevision === null
+          ? existing !== undefined
+          : typeof expectedStoredRevision === 'number' && storedRevision !== expectedStoredRevision;
+      if (mismatch) {
+        // 事务未做任何写入，自动提交；不提供自动恢复路径（冲突须显式解决）
+        return {
+          ok: false,
+          code: 'revision-conflict',
+          message:
+            expectedStoredRevision === null
+              ? '本地已存在同 uri 的项目记录，未覆盖'
+              : `本地保存内容与期望基线不一致（revision ${storedRevision ?? '无记录'} ≠ ${expectedStoredRevision}），未覆盖`,
+          ...(storedRevision !== undefined ? { storedRevision } : {}),
+        };
+      }
+      const record: StoredProject = {
+        uri: project.uri,
+        savedAt: new Date().toISOString(),
+        project: structuredClone(project),
+      };
+      await request(store.put(record) as IDBRequest<IDBValidKey>);
+      await transactionDone(transaction);
+      return { ok: true };
+    } catch (error) {
+      if (isQuotaError(error)) {
+        return { ok: false, code: 'quota-exceeded', message: '本地存储空间不足，保存失败' };
+      }
+      return { ok: false, code: 'storage-error', message: `保存失败：${failureMessage(error)}` };
+    }
+  }
+
+  /** 删除项目；返回是否真的存在并删除。 */
+  async remove(uri: string): Promise<boolean> {
+    const transaction = this.db.transaction(PROJECTS_STORE, 'readwrite');
+    const store = transaction.objectStore(PROJECTS_STORE);
+    const existing = await request(store.get(uri) as IDBRequest<StoredProject | undefined>);
+    if (!existing) return false;
+    await request(store.delete(uri) as IDBRequest<undefined>);
+    return true;
+  }
+
+  /** 直接重命名已存储项目（仅适用于未打开的项目；打开中的重命名走编辑器提交）。
+   *  以加载到的 revision 为 CAS 期望：读-改-写间被其他写入推进时拒绝，防倒退。 */
+  async rename(uri: string, name: string): Promise<{ ok: true } | { ok: false; code: 'not-found' | 'storage-error'; message: string }> {
+    const project = await this.load(uri);
+    if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
+    const result = await this.save({ ...project, name, revision: project.revision + 1 }, project.revision);
+    if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
+    return { ok: true };
+  }
+
+  /** 复制项目：新 uri + 名称（缺省「原名 副本」）+ 重置 revision/createdAt。
+   *  新 uri 首存走创建语义（null），防与并发创建的碰撞。 */
+  async duplicate(uri: string, name?: string): Promise<DuplicateOutcome> {
+    const project = await this.load(uri);
+    if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
+    const copy: Project = {
+      ...structuredClone(project),
+      uri: `lumora://project/${genId('p')}`,
+      name: name ?? `${project.name} 副本`,
+      createdAt: new Date().toISOString(),
+      revision: 0,
+    };
+    const result = await this.save(copy, null);
+    if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
+    return {
+      ok: true,
+      summary: {
+        uri: copy.uri,
+        name: copy.name,
+        savedAt: new Date().toISOString(),
+        revision: 0,
+        schemaVersion: copy.schemaVersion,
+      },
+    };
+  }
+
+  /** 关闭连接（幂等；应用卸载前调用）。 */
+  close(): void {
+    this.db.close();
+  }
+}

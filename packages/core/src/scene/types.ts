@@ -126,6 +126,12 @@ export interface Project {
   /** 扁平对象列表；层级经 parentId 表达，场景经 rootObjectIds 归属 */
   objects: SceneObjectData[];
   assets: AssetData[];
+  /**
+   * 插件私有设置（按插件 instanceId 键控）：随项目本地持久化，
+   * 但导出 `.lumora` 工程包时默认排除（见 project/package.ts）。
+   * 值必须是 JSON 纯结构（整树会被 deepFreeze）。
+   */
+  pluginData?: Record<string, unknown>;
 }
 
 export function isSceneObject(obj: unknown): obj is SceneObjectData {

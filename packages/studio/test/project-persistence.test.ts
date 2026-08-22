@@ -1,0 +1,305 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { createGroupObject } from '@lumora/core';
+import { createStudioRuntime } from '../src/runtime/studio-runtime';
+import type { StudioRuntime } from '../src/runtime/studio-runtime';
+import { ProjectStore } from '../src/persistence/project-store';
+import { buildProjectPackage, serializeProjectPackage } from '@lumora/core';
+
+const DB = 'lumora-test-persist';
+
+async function settle(ms = 40): Promise<void> {
+  await new Promise((r) => setTimeout(r, ms));
+}
+
+const openStores: ProjectStore[] = [];
+const openRuntimes: StudioRuntime[] = [];
+
+async function makeRuntime() {
+  const runtime = createStudioRuntime();
+  openRuntimes.push(runtime);
+  await runtime.init({ debounceMs: 10, dbName: DB });
+  return runtime;
+}
+
+async function openStandaloneStore(): Promise<ProjectStore> {
+  const store = await ProjectStore.create(DB);
+  expect(store).not.toBeNull();
+  openStores.push(store!);
+  return store!;
+}
+
+beforeEach(async () => {
+  await ProjectStore.drop(DB);
+});
+
+afterEach(async () => {
+  // 先释放运行时与全部连接再删库：deleteDatabase 会排在未关闭连接之后，
+  // 挂起的删除会无限阻塞后续 open（fake-indexeddb 与真实浏览器行为一致）
+  for (const runtime of openRuntimes) await runtime.dispose();
+  openRuntimes.length = 0;
+  for (const store of openStores) store.close();
+  openStores.length = 0;
+  await ProjectStore.drop(DB);
+});
+
+describe('ProjectPersistence：新建 / 最近项目 / 重命名 / 复制 / 删除（FR-001）', () => {
+  it('init 后可用；新建项目 → 打开 → 自动保存 → 出现在最近项目列表', async () => {
+    const runtime = await makeRuntime();
+    expect(runtime.persistence.available).toBe(true);
+    expect(await runtime.persistence.listRecent()).toEqual([]);
+
+    const project = runtime.persistence.createProject('我的新项目');
+    expect(project.name).toBe('我的新项目');
+    expect(project.uri).toMatch(/^lumora:\/\/project\//);
+    expect(project.scenes).toHaveLength(1);
+
+    runtime.openProject(project);
+    runtime.editor.addObject(createGroupObject());
+    await settle(60);
+
+    const recent = await runtime.persistence.listRecent();
+    expect(recent).toHaveLength(1);
+    expect(recent[0]!.uri).toBe(project.uri);
+    expect(recent[0]!.name).toBe('我的新项目');
+    expect(recent[0]!.revision).toBe(runtime.editor.getProject()!.revision);
+    await runtime.dispose();
+  });
+
+  it('打开中的项目重命名走编辑器提交（revision 递增并自动落盘）', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('旧名字');
+    runtime.openProject(project);
+    const result = await runtime.persistence.renameProject(project.uri, '新名字');
+    expect(result.ok).toBe(true);
+    expect(runtime.editor.getProject()!.name).toBe('新名字');
+    await settle(60);
+    const stored = await openStandaloneStore();
+    expect((await stored!.load(project.uri))!.name).toBe('新名字');
+    await runtime.dispose();
+  });
+
+  it('未打开项目的重命名直接改存储记录；空名拒绝', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('不打开的项目');
+    // 需要先落盘：模拟曾经打开并保存过的项目
+    const store = await openStandaloneStore();
+    await store!.save(project);
+
+    const ok = await runtime.persistence.renameProject(project.uri, '改名不打开');
+    expect(ok.ok).toBe(true);
+    const reopened = await openStandaloneStore();
+    expect((await reopened!.load(project.uri))!.name).toBe('改名不打开');
+
+    const empty = await runtime.persistence.renameProject(project.uri, '   ');
+    expect(empty.ok).toBe(false);
+    if (!empty.ok) expect(empty.code).toBe('empty-name');
+    await runtime.dispose();
+  });
+
+  it('复制项目生成新 uri 与副本名；删除后从列表移除', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('源项目');
+    runtime.openProject(project);
+    runtime.editor.addObject(createGroupObject());
+    await settle(60);
+
+    const dup = await runtime.persistence.duplicateProject(project.uri);
+    expect(dup.ok).toBe(true);
+    if (!dup.ok) return;
+    expect(dup.summary.uri).not.toBe(project.uri);
+    expect(dup.summary.name).toBe('源项目 副本');
+
+    // 复制出的项目同样可被打开编辑
+    const copy = await openStandaloneStore();
+    const copyProject = await copy!.load(dup.summary.uri);
+    expect(copyProject!.revision).toBe(0);
+
+    expect(await runtime.persistence.deleteProject(dup.summary.uri)).toBe(true);
+    const recent = await runtime.persistence.listRecent();
+    expect(recent.map((s) => s.uri)).not.toContain(dup.summary.uri);
+    await runtime.dispose();
+  });
+});
+
+describe('ProjectPersistence：工程包导出 / 导入（FR-011 / AC1 / AC3）', () => {
+  it('导出当前项目为 .lumora 文本：不含私有字段，可再次导入完整恢复', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('导出项目');
+    runtime.openProject(project);
+    runtime.editor.addObject(createGroupObject());
+
+    const exported = runtime.persistence.exportCurrent();
+    expect(exported.ok).toBe(true);
+    if (!exported.ok) return;
+    expect(exported.filename).toBe('导出项目.lumora');
+    expect(exported.bytes).toBeGreaterThan(0);
+
+    // 未打开项目时导出失败
+    await runtime.closeProject();
+    expect(runtime.persistence.exportCurrent().ok).toBe(false);
+
+    // 导入恢复（同 revision 体系与内容）
+    const imported = await runtime.persistence.importPackage(exported.text);
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    expect(imported.project.name).toBe('导出项目');
+    expect(imported.project.uri).toBe(project.uri);
+    expect(imported.project.objects.length).toBe(project.objects.length + 1);
+    await runtime.dispose();
+  });
+
+  it('导入失败（损坏包）不改变当前项目（AC3 失败回滚）', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('当前项目');
+    runtime.openProject(project);
+    const before = runtime.editor.getProject()!;
+
+    const broken = await runtime.persistence.importPackage('这不是 JSON {{{');
+    expect(broken.ok).toBe(false);
+    if (broken.ok) return;
+    expect(broken.error.code).toBe('not-json');
+
+    // 当前项目原样保留，未被打断
+    expect(runtime.editor.getProject()).toEqual(before);
+
+    // 未知未来 schema 的包同样拒绝且不产生副作用
+    const pkg = buildProjectPackage(before);
+    const raw = JSON.parse(serializeProjectPackage(pkg)) as { project: Record<string, unknown> };
+    raw.project.schemaVersion = 99;
+    const future = await runtime.persistence.importPackage(JSON.stringify(raw));
+    expect(future.ok).toBe(false);
+    if (!future.ok) expect(future.error.code).toBe('migration-failed');
+    expect(runtime.editor.getProject()).toEqual(before);
+    await runtime.dispose();
+  });
+
+  it('缺失资产载荷的包：导入成功并给出缺失明细（缺失资产报告）', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('缺资产项目');
+    runtime.openProject(project);
+    const pkg = buildProjectPackage(runtime.editor.getProject()!);
+    pkg.assets = {};
+    const imported = await runtime.persistence.importPackage(serializeProjectPackage(pkg));
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    expect(Array.isArray(imported.warnings)).toBe(true);
+    await runtime.dispose();
+  });
+});
+
+describe('ProjectPersistence：运行时集成（自动保存链路）', () => {
+  it('dispose 冲刷未保存变更（不等防抖）', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('卸载前项目');
+    runtime.openProject(project);
+    runtime.editor.addObject(createGroupObject());
+    // 不等待防抖，直接卸载
+    await runtime.dispose();
+    const store = await openStandaloneStore();
+    const stored = await store!.load(project.uri);
+    expect(stored!.revision).toBeGreaterThan(0);
+  });
+
+  it('closeProject 前冲刷未保存变更（排空屏障：在途保存也等待完成）', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('关闭前项目');
+    runtime.openProject(project);
+    runtime.editor.addObject(createGroupObject());
+    await runtime.closeProject();
+    const store = await openStandaloneStore();
+    const stored = await store!.load(project.uri);
+    expect(stored).not.toBeNull();
+    expect(stored!.objects.length).toBeGreaterThan(project.objects.length);
+    await runtime.dispose();
+  });
+
+  it('重新打开已保存项目：从磁盘加载重开（内存旧对象会触发冲突，必须走存储）', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('再打开项目');
+    runtime.openProject(project);
+    runtime.editor.addObject(createGroupObject());
+    await settle(60);
+    const savedRevision = (await runtime.persistence.listRecent())[0]!.revision;
+
+    await runtime.closeProject();
+    const loaded = await runtime.persistence.loadProject(project.uri);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    runtime.openProject(loaded.project);
+    // 打开后不做任何编辑：不触发保存（savedAt 不刷新、不产生脏状态）
+    await settle(60);
+    const recent = await runtime.persistence.listRecent();
+    expect(recent[0]!.revision).toBe(savedRevision);
+    await runtime.dispose();
+  });
+
+  it('冷启动：init 前打开并编辑的项目在持久化就绪后对账落盘（不丢事件）', async () => {
+    const runtime = createStudioRuntime();
+    openRuntimes.push(runtime);
+    const project = runtime.persistence.createProject('冷启动项目');
+    runtime.openProject(project);
+    runtime.editor.addObject(createGroupObject()); // init 之前的变更（仅内存受理）
+    await runtime.init({ debounceMs: 10, dbName: DB });
+    await settle(80);
+    const store = await openStandaloneStore();
+    const stored = await store!.load(project.uri);
+    expect(stored).not.toBeNull();
+    expect(stored!.revision).toBe(runtime.editor.getProject()!.revision);
+    expect(stored!.objects.length).toBe(project.objects.length + 1);
+    await runtime.dispose();
+  });
+
+  it('复制打开中的项目以编辑器快照为准（磁盘记录可能落后于未保存变更，不丢内容）', async () => {
+    const runtime = createStudioRuntime();
+    openRuntimes.push(runtime);
+    await runtime.init({ debounceMs: 1000, dbName: DB });
+    const project = runtime.persistence.createProject('快照源');
+    runtime.openProject(project);
+    runtime.editor.addObject(createGroupObject()); // 未保存（防抖 1s 内操作）
+    const dup = await runtime.persistence.duplicateProject(project.uri);
+    expect(dup.ok).toBe(true);
+    if (!dup.ok) return;
+    const copy = await openStandaloneStore();
+    const copyProject = await copy!.load(dup.summary.uri);
+    // 副本来自编辑器快照：含未保存的新增对象
+    expect(copyProject).not.toBeNull();
+    expect(copyProject!.objects.length).toBe(project.objects.length + 1);
+    expect(copyProject!.revision).toBe(0);
+    await runtime.dispose();
+  });
+
+  it('reloadOpenProject（加载较新版本）：以本地较新保存内容为基线重开，冲突解除后正常保存', async () => {
+    const runtime = await makeRuntime();
+    const states: string[] = [];
+    runtime.persistence.events.on('save-state', ({ state }) => states.push(state.status));
+    const project = runtime.persistence.createProject('冲突项目');
+    runtime.openProject(project);
+    runtime.editor.addObject(createGroupObject());
+    await settle(60); // rev1 已存
+
+    // 模拟另一标签页写入了较新内容（rev5）
+    const store = await openStandaloneStore();
+    await store!.save({ ...project, name: '较新内容', revision: 5 });
+
+    // 本地再编辑 → 保存失败（期望基线 1 ≠ 已存 5）
+    runtime.editor.addObject(createGroupObject());
+    await settle(60);
+    expect(states).toContain('error');
+
+    // 显式解决「加载较新版本」
+    const reloaded = await runtime.persistence.reloadOpenProject();
+    expect(reloaded.ok).toBe(true);
+    if (!reloaded.ok) return;
+    expect(runtime.editor.getProject()!.name).toBe('较新内容');
+    expect(runtime.editor.getProject()!.revision).toBe(5);
+
+    // 冲突解除：后续编辑可正常保存为 rev6（不覆盖较新内容）
+    runtime.editor.addObject(createGroupObject());
+    await settle(60);
+    const final = await openStandaloneStore();
+    const stored = await final!.load(project.uri);
+    expect(stored!.revision).toBe(6);
+    expect(stored!.name).toBe('较新内容');
+    await runtime.dispose();
+  });
+});

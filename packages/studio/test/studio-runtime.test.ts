@@ -34,7 +34,7 @@ describe('StudioRuntime：宿主快照与事件总线随编辑器同步（S-3）
     const closed = vi.fn();
     const unsubscribe = runtime.events.on('project:closed', closed);
 
-    runtime.closeProject();
+    await runtime.closeProject();
     expect(runtime.host.getProject()).toBeNull();
     expect(runtime.editor.getProject()).toBeNull();
     expect(closed).toHaveBeenCalledTimes(1);

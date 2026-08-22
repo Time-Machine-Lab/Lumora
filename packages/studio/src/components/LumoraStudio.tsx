@@ -80,6 +80,8 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       const initialRef = initialProject;
       const onErrorRef = onError;
       const boot = async () => {
+        // 先接入本地持久化与自动保存，再打开初始项目（自动保存脏基线以打开为准）
+        await runtime.init();
         for (const descriptor of pluginsRef) {
           if (cancelBootRef.current) return;
           try {

@@ -71,6 +71,7 @@ const PUBLIC_API_LIST = [
   'setGuide',
   'setLocked',
   'setParent',
+  'setProjectName',
   'setSelection',
   'setTransform',
   'setTransformMode',

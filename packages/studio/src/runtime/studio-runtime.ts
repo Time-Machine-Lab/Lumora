@@ -1,5 +1,6 @@
 import { PluginHost, SceneEditor } from '@lumora/core';
 import type { EventMap, Project } from '@lumora/core';
+import { ProjectPersistence } from '../persistence/project-persistence';
 
 export interface StudioRuntimeOptions {
   hostVersion?: string;
@@ -17,8 +18,17 @@ export interface StudioRuntime {
   events: import('@lumora/core').TypedEventEmitter<EventMap>;
   /** 核心场景编辑器：项目数据、选择、视口状态与历史栈（撤销/重做）的唯一持有者 */
   editor: SceneEditor;
+  /**
+   * 项目持久化门面：IndexedDB 本地存储（最近项目/重命名/复制/删除）、
+   * 2 秒防抖自动保存与 `.lumora` 工程包导入导出。init() 后生效；
+   * IndexedDB 不可用时静默降级（available = false，仅内存编辑）。
+   */
+  persistence: ProjectPersistence;
+  /** 初始化本地存储并接入自动保存（幂等）。 */
+  init(options?: { debounceMs?: number; dbName?: string }): Promise<void>;
   openProject(project: Project): void;
-  closeProject(): void;
+  /** 关闭项目：等待未保存变更全量落盘（排空屏障）后重置编辑器。 */
+  closeProject(): Promise<void>;
   getProject(): Project | null;
   dispose(): Promise<void>;
 }
@@ -29,7 +39,9 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
     onError: options.onError,
   });
   const editor = new SceneEditor();
+  const persistence = new ProjectPersistence(editor);
   let disposed = false;
+  let initialized = false;
   // 编辑器每次变更（提交/撤销/重做/打开/关闭）都同步宿主快照并广播给插件
   const unsubscribe = editor.events.on('project:changed', ({ project }) => {
     if (disposed) return;
@@ -39,8 +51,14 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
   return {
     host,
     editor,
+    persistence,
     get events() {
       return host.events;
+    },
+    async init(options) {
+      if (initialized || disposed) return;
+      initialized = true;
+      await persistence.init(options);
     },
     openProject(project) {
       // 编辑器先校验并取得 owned immutable 快照（深克隆 + 冻结），宿主/插件只能拿到
@@ -50,9 +68,12 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
       host.setProject(owned);
       host.events.emit('project:opened', { uri: owned.uri, name: owned.name, project: owned });
     },
-    closeProject() {
+    async closeProject() {
       const current = host.getProject();
       if (current) {
+        // 先等待未保存变更全量落盘（排空屏障，含在途保存），再清空编辑器，
+        // 避免关闭项目时丢失未保存变更
+        await persistence.flushPending();
         host.setProject(null);
         host.events.emit('project:closed', { uri: current.uri });
       }
@@ -63,6 +84,8 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
       if (disposed) return;
       disposed = true;
       unsubscribe.dispose();
+      // 先冲刷自动保存（flush 需读取未销毁的编辑器），再依次释放
+      await persistence.dispose();
       editor.dispose();
       await host.dispose();
     },

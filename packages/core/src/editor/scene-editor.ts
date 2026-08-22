@@ -325,6 +325,17 @@ export class SceneEditor {
     return result;
   }
 
+  /** 重命名项目（FR-001）：作为一步历史，名称变化同样递增 revision 触发自动保存 */
+  setProjectName(name: string): Result {
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
+    const trimmed = name.trim();
+    if (!trimmed) return failure('项目名称不能为空');
+    if (project.name === trimmed) return { ok: true };
+    return this.commit(baseline, { ...project, name: trimmed }, `重命名项目为「${trimmed}」`);
+  }
+
   setActiveCamera(objectId: string | null): Result {
     const baseline = this.beginIngress();
     if (!baseline) return failure('未打开项目');

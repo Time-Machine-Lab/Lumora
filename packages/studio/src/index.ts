@@ -10,6 +10,17 @@ export { buildScene, syncScene } from './components/editor/scene-builder';
 export { PanelErrorBoundary } from './components/panels/PanelErrorBoundary';
 export { createStudioRuntime } from './runtime/studio-runtime';
 export type { StudioRuntime, StudioRuntimeOptions } from './runtime/studio-runtime';
+export { ProjectStore, estimateStorage } from './persistence/project-store';
+export type {
+  DuplicateOutcome,
+  ProjectSummary,
+  SaveOutcome,
+  StoredProject,
+} from './persistence/project-store';
+export { ProjectAutosaver, AUTOSAVE_DEBOUNCE_MS } from './persistence/autosave';
+export type { AutosaverOptions, AutosaveState } from './persistence/autosave';
+export { ProjectPersistence } from './persistence/project-persistence';
+export type { ExportResult, ImportResult, PersistenceEventMap, RenameResult } from './persistence/project-persistence';
 
 // 便捷再导出：宿主与插件常见类型
 export { createSampleProject, PluginHost, TypedEventEmitter } from '@lumora/core';

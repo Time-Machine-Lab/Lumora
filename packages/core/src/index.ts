@@ -79,6 +79,44 @@ export type {
   ViewState,
 } from './editor/scene-editor';
 
+// 项目持久化与工程包（MVP-3）
+export {
+  CURRENT_PROJECT_SCHEMA_VERSION,
+  LUMORA_PACKAGE_EXTENSION,
+  PACKAGE_FORMAT_VERSION,
+  PRIVATE_PROJECT_FIELDS,
+  PROJECT_PACKAGE_FORMAT,
+} from './project/schema';
+export type {
+  PackageAppInfo,
+  PrivateProjectField,
+  ProjectAssetPayload,
+  ProjectPackage,
+  ProjectPackageManifest,
+} from './project/schema';
+export { createBlankProject } from './project/create-project';
+export type { BlankProjectOptions } from './project/create-project';
+export { migrateProjectSchema, readSchemaVersion } from './project/migrate';
+export type {
+  MigrateResult,
+  ProjectMigration,
+  ProjectMigrationError,
+  ProjectMigrationErrorKind,
+} from './project/migrate';
+export {
+  buildProjectPackage,
+  estimatePackageBytes,
+  parseProjectPackage,
+  serializeProjectPackage,
+} from './project/package';
+export type {
+  MissingAssetWarning,
+  PackageBuildOptions,
+  PackageImportError,
+  PackageImportErrorCode,
+  PackageParseResult,
+} from './project/package';
+
 // Manifest v1
 export { manifestSchema, validateManifest } from './manifest/validate';
 export type { Manifest, ManifestValidationResult } from './manifest/validate';

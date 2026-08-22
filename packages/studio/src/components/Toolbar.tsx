@@ -7,6 +7,7 @@ import { useEventRefresh } from '../hooks/use-event-refresh';
 import type { ContentCache } from './editor/content-cache';
 import { importModelFile } from './editor/model-import';
 import { showToast } from './editor/toasts';
+import { ProjectMenu } from './ProjectMenu';
 
 interface ToolbarProps {
   runtime: StudioRuntime;
@@ -48,6 +49,7 @@ export function Toolbar({
     <header className="lumora-toolbar" data-testid="lumora-toolbar">
       <span className="lumora-toolbar__brand">Lumora Studio</span>
       <div className="lumora-toolbar__actions">
+        <ProjectMenu runtime={runtime} project={project} />
         <button
           type="button"
           className="lumora-button"
