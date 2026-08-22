@@ -117,7 +117,12 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
         void refreshRecent();
         return;
       }
-      runtime.openProject(loaded.project);
+      // 切换屏障：旧项目未保存变更排空失败时保持旧项目打开，切换被阻止
+      const opened = await runtime.openProject(loaded.project);
+      if (!opened.ok) {
+        showToast(`无法打开「${summary.name}」：${opened.message}`, 'error');
+        return;
+      }
       setOpen(false);
     } finally {
       setBusy(false);
@@ -125,11 +130,21 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
   };
 
   const createProject = async (name: string) => {
-    setModal(null);
-    setOpen(false);
-    runtime.openProject(persistence.createProject(name));
-    menuButtonRef.current?.focus();
-    showToast(`已新建项目「${name}」`, 'success');
+    setBusy(true);
+    try {
+      // 切换屏障：旧项目未保存变更排空失败时不新建（旧项目保持打开）
+      const opened = await runtime.openProject(persistence.createProject(name));
+      if (!opened.ok) {
+        showToast(`无法新建：${opened.message}`, 'error');
+        return;
+      }
+      setModal(null);
+      setOpen(false);
+      menuButtonRef.current?.focus();
+      showToast(`已新建项目「${name}」`, 'success');
+    } finally {
+      setBusy(false);
+    }
   };
 
   const renameProject = async (uri: string, name: string) => {
@@ -157,7 +172,17 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
         return;
       }
       const loaded = await persistence.loadProject(result.summary.uri);
-      if (loaded.ok) runtime.openProject(loaded.project);
+      if (loaded.ok) {
+        // 复制打开中的项目时内容已以副本落盘：跳过切换排空屏障（flush:false），
+        // 旧项目的未保存快照随后由排空任务尽力保存或转为恢复快照
+        const opened = await runtime.openProject(loaded.project, {
+          flush: uri === project?.uri ? false : undefined,
+        });
+        if (!opened.ok) {
+          showToast(`无法打开副本：${opened.message}`, 'error');
+          return;
+        }
+      }
       showToast(`已复制为「${result.summary.name}」`, 'success');
       void refreshRecent();
     } finally {
@@ -182,6 +207,8 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
       void refreshRecent();
     } finally {
       setBusy(false);
+      // 删除后焦点回到常驻「项目」按钮（被删行的删除按钮已随列表移除，不落 BODY）
+      menuButtonRef.current?.focus();
     }
   };
 
@@ -220,7 +247,12 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
       if (await persistence.hasLocal(restored.uri)) {
         restored = { ...restored, uri: `lumora://project/${genId('p')}`, name: `${restored.name}（导入）` };
       }
-      runtime.openProject(restored);
+      // 切换屏障：旧项目未保存变更排空失败时保持旧项目打开，导入被阻止
+      const opened = await runtime.openProject(restored);
+      if (!opened.ok) {
+        showToast(`导入失败：${opened.message}`, 'error');
+        return;
+      }
       setOpen(false);
       menuButtonRef.current?.focus();
       if (imported.warnings.length > 0) {
@@ -266,7 +298,12 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
           return;
         }
         persistence.clearRecovery(project.uri);
-        runtime.openProject(saved.project);
+        // 未保存内容已以副本保全：跳过切换排空屏障（flush:false）
+        const opened = await runtime.openProject(saved.project, { flush: false });
+        if (!opened.ok) {
+          showToast(`无法打开副本：${opened.message}`, 'error');
+          return;
+        }
         setOpen(false);
         showToast(`未保存更改已另存为「${saved.project.name}」`, 'success');
         void refreshRecent();
@@ -278,7 +315,13 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
         return;
       }
       const loaded = await persistence.loadProject(dup.summary.uri);
-      if (loaded.ok) runtime.openProject(loaded.project);
+      if (loaded.ok) {
+        const opened = await runtime.openProject(loaded.project, { flush: false });
+        if (!opened.ok) {
+          showToast(`无法打开副本：${opened.message}`, 'error');
+          return;
+        }
+      }
       setOpen(false);
       showToast(`未保存更改已另存为「${dup.summary.name}」`, 'success');
       void refreshRecent();
@@ -291,7 +334,19 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
   const currentUri = project?.uri ?? null;
 
   return (
-    <div className="lumora-project-menu">
+    // Escape 在包含 trigger + dropdown 的根容器上处理：刚点击「项目」后焦点仍在
+    // trigger 上，事件不经过 dropdown，只有根容器能覆盖两种焦点位置
+    <div
+      className="lumora-project-menu"
+      onKeyDown={(e) => {
+        if (e.key === 'Escape' && open && !modal && !pendingDelete) {
+          e.stopPropagation();
+          e.preventDefault();
+          setOpen(false);
+          menuButtonRef.current?.focus();
+        }
+      }}
+    >
       <button
         ref={menuButtonRef}
         type="button"
@@ -352,13 +407,6 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
           className="lumora-project-menu__dropdown"
           data-testid="project-menu-dropdown"
           style={dropdownTop !== null ? ({ '--lumora-menu-top': `${dropdownTop}px` } as CSSProperties) : undefined}
-          onKeyDown={(e) => {
-            if (e.key === 'Escape') {
-              e.stopPropagation();
-              setOpen(false);
-              menuButtonRef.current?.focus();
-            }
-          }}
         >
           <div className="lumora-project-menu__actions">
             <button type="button" className="lumora-button" data-testid="project-new" onClick={() => setModal({ kind: 'create' })}>

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SceneEditor } from '../src/editor/scene-editor';
 import type { Result } from '../src/editor/scene-editor';
+import { sha256Hex } from '../src/scene/assets';
 import { createCameraObject, createModelObject, createPrimitiveObject } from '../src/scene/create';
 import { createSampleProject } from '../src/scene/sample-project';
 import { findObject } from '../src/scene/scene-graph';
@@ -23,7 +24,8 @@ function makeAsset(name = 'character.glb') {
     kind: 'gltf',
     name,
     mime: 'model/gltf-binary',
-    hash: `hash-${name}`,
+    // 载荷存在时 hash 必须为 64 位十六进制（TML-53 第三轮 #5）；同名 → 同哈希
+    hash: sha256Hex(new TextEncoder().encode(name)),
     size: 42,
     source: 'file',
     storageRef: 'blob:test',

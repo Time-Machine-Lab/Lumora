@@ -36,7 +36,12 @@ export interface StoredProject {
   project: Project;
 }
 
-export type SaveFailureCode = 'revision-conflict' | 'quota-exceeded' | 'storage-error';
+export type SaveFailureCode =
+  | 'revision-conflict'
+  | 'quota-exceeded'
+  | 'storage-error'
+  // autosaver 锁存态：恢复快照待处理（flush/排空与打开屏障同样阻断，见 autosave.flush）
+  | 'recovery-available';
 
 export type SaveOutcome =
   | { ok: true }
@@ -80,6 +85,26 @@ export async function estimateStorage(): Promise<{ usage: number; quota: number 
   } catch {
     return null;
   }
+}
+
+/** 键排序稳定序列化：同 revision 分叉判定需要与键序无关的内容比较 */
+function stableStringify(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => {
+    if (item && typeof item === 'object' && !Array.isArray(item)) {
+      return Object.keys(item as Record<string, unknown>)
+        .sort()
+        .reduce<Record<string, unknown>>((acc, key) => {
+          acc[key] = (item as Record<string, unknown>)[key];
+          return acc;
+        }, {});
+    }
+    return item;
+  });
+}
+
+/** 同 revision 幂等重存判定：内容逐字段一致（仅 savedAt 等记录字段可漂移） */
+function sameProjectContent(a: Project, b: Project): boolean {
+  return stableStringify(a) === stableStringify(b);
 }
 
 function isQuotaError(error: unknown): boolean {
@@ -183,6 +208,26 @@ export class ProjectStore {
               : `本地保存内容与期望基线不一致（revision ${storedRevision ?? '无记录'} ≠ ${expectedStoredRevision}），未覆盖`,
           ...(storedRevision !== undefined ? { storedRevision } : {}),
         };
+      }
+      if (existing) {
+        // CAS 通过后仍拒绝倒退与分叉（NFR-003）：旧 revision 覆盖较新记录、
+        // 同 revision 写入不同内容都会让多标签页的计数收敛失效
+        if (project.revision < existing.project.revision) {
+          return {
+            ok: false,
+            code: 'revision-conflict',
+            message: `不能以旧 revision（${project.revision}）覆盖较新记录（${existing.project.revision}），未写入`,
+            storedRevision: existing.project.revision,
+          };
+        }
+        if (project.revision === existing.project.revision && !sameProjectContent(project, existing.project)) {
+          return {
+            ok: false,
+            code: 'revision-conflict',
+            message: `同 revision（${project.revision}）但内容不同的记录已存在（分叉），未覆盖`,
+            storedRevision: existing.project.revision,
+          };
+        }
       }
       const record: StoredProject = {
         uri: project.uri,

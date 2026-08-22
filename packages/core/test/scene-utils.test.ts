@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fnv1aHex, hashBytes } from '../src/scene/assets';
+import { hashBytes, sha256Hex } from '../src/scene/assets';
 import { focalLengthToFovDeg, fovDegToFocalLength, fitRect, FULL_FRAME_SENSOR } from '../src/scene/camera-math';
 import {
   collectUnreferencedAssets,
@@ -27,11 +27,27 @@ describe('资源哈希与去重', () => {
     expect(a).not.toBe(b);
   });
 
-  it('fnv1a 回退哈希确定性且区分内容', () => {
-    const a = fnv1aHex(new TextEncoder().encode('aaa'));
-    const b = fnv1aHex(new TextEncoder().encode('aab'));
-    expect(fnv1aHex(new TextEncoder().encode('aaa'))).toBe(a);
-    expect(b).not.toBe(a);
+  it('纯 JS SHA-256 与 WebCrypto 摘要一致（确定性算法，任何环境同结果）', async () => {
+    const data = new TextEncoder().encode('deterministic hash content');
+    const subtle = globalThis.crypto?.subtle;
+    const js = sha256Hex(data);
+    expect(js).toMatch(/^[0-9a-f]{64}$/);
+    if (subtle) {
+      const digest = await subtle.digest('SHA-256', data);
+      const hex = Array.from(new Uint8Array(digest))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+      expect(js).toBe(hex);
+    }
+  });
+
+  it('纯 JS SHA-256 已知向量：空串与 abc', () => {
+    expect(sha256Hex(new TextEncoder().encode(''))).toBe(
+      'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    );
+    expect(sha256Hex(new TextEncoder().encode('abc'))).toBe(
+      'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+    );
   });
 
   it('collectUnreferencedAssets：删除最后引用后资源无引用可释放', () => {

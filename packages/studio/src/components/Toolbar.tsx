@@ -54,7 +54,12 @@ export function Toolbar({
           type="button"
           className="lumora-button"
           data-testid="open-sample-project"
-          onClick={() => runtime.openProject(createSampleProject())}
+          onClick={() => {
+            // 切换屏障：旧项目未保存变更排空失败时保持旧项目打开
+            void runtime.openProject(createSampleProject()).then((result) => {
+              if (!result.ok) showToast(`无法打开示例项目：${result.message}`, 'error');
+            });
+          }}
         >
           打开示例项目
         </button>

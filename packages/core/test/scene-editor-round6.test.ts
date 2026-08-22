@@ -95,7 +95,8 @@ function baseAsset(id: string, name: string): AssetData {
     kind: 'gltf',
     name,
     mime: 'model/gltf-binary',
-    hash: 'h'.repeat(64),
+    // 载荷存在时 hash 必须为 64 位十六进制（TML-53 第三轮 #5）
+    hash: 'b'.repeat(64),
     size: 1,
     source: 'file',
     storageRef: '',

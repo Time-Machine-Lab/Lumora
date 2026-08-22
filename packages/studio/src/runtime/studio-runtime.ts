@@ -26,7 +26,14 @@ export interface StudioRuntime {
   persistence: ProjectPersistence;
   /** 初始化本地存储并接入自动保存（幂等）。 */
   init(options?: { debounceMs?: number; dbName?: string }): Promise<void>;
-  openProject(project: Project): void;
+  /**
+   * 打开/切换项目（可等待的类型化切换屏障）：替换编辑器前先稳定排空当前项目的
+   * 未保存变更（flushPending 稳定排空）。落盘失败时返回 { ok: false } 且不触碰
+   * 编辑器 —— 旧项目保持打开，调用方必须阻止切换（内容仍在编辑器/恢复快照中）。
+   * options.flush = false 跳过排空屏障：仅用于「内容已另行保全」的复制/另存流程
+   * （副本已落盘，旧项目的未保存快照随后由排空任务尽力保存或转为恢复快照）。
+   */
+  openProject(project: Project, options?: { flush?: boolean }): Promise<{ ok: true } | { ok: false; message: string }>;
   /**
    * 关闭项目：等待未保存变更全量落盘（排空屏障）后重置编辑器。
    * 落盘失败时返回 { ok: false } 且不重置编辑器（未保存内容仍在编辑器中），
@@ -64,13 +71,25 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
       initialized = true;
       await persistence.init(options);
     },
-    openProject(project) {
+    async openProject(project, options = {}) {
+      // 切换屏障：替换编辑器前稳定排空当前项目的未保存变更。失败时旧项目保持打开，
+      // 不触碰编辑器（未保存内容仍在编辑器与恢复快照中，调用方必须阻止切换）
+      if (options.flush !== false) {
+        const current = host.getProject();
+        if (current) {
+          const outcome = await persistence.flushPending();
+          if (!outcome.ok) {
+            return { ok: false, message: outcome.message ?? '未保存更改落盘失败' };
+          }
+        }
+      }
       // 编辑器先校验并取得 owned immutable 快照（深克隆 + 冻结），宿主/插件只能拿到
       // 编辑器持有的快照，调用方传入的项目此后与编辑器完全解耦
       editor.openProject(project);
       const owned = editor.getProject()!;
       host.setProject(owned);
       host.events.emit('project:opened', { uri: owned.uri, name: owned.name, project: owned });
+      return { ok: true };
     },
     async closeProject() {
       const current = host.getProject();

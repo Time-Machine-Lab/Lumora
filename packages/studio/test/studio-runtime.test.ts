@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createGroupObject, createSampleProject } from '@lumora/core';
 import { createStudioRuntime } from '../src/runtime/studio-runtime';
+import { ProjectStore } from '../src/persistence/project-store';
 
 describe('StudioRuntime：宿主快照与事件总线随编辑器同步（S-3）', () => {
   it('编辑器每次变更后 host 快照与 project:changed 广播保持当前', () => {
@@ -44,5 +45,57 @@ describe('StudioRuntime：宿主快照与事件总线随编辑器同步（S-3）
     // dispose 为终态：openProject 同步抛错，宿主快照保持空
     expect(() => runtime.editor.openProject(createSampleProject())).toThrow('编辑器已释放');
     expect(runtime.host.getProject()).toBeNull();
+  });
+});
+
+describe('StudioRuntime：openProject 可等待的类型化切换屏障（TML-53 第三轮 #1）', () => {
+  it('切换前先稳定排空当前项目未保存变更，再打开新项目', async () => {
+    const runtime = createStudioRuntime();
+    const db = 'lumora-test-runtime-switch';
+    await ProjectStore.drop(db);
+    await runtime.init({ dbName: db, debounceMs: 20 });
+    const opened = await runtime.openProject(createSampleProject('lumora://project/a', '项目A'));
+    expect(opened).toEqual({ ok: true });
+    await new Promise((r) => setTimeout(r, 10)); // 首存完成
+    runtime.editor.addObject(createGroupObject()); // rev1 未保存
+    const switched = await runtime.openProject(createSampleProject('lumora://project/b', '项目B'));
+    expect(switched).toEqual({ ok: true });
+    // A 的未保存编辑已在替换编辑器前排空落盘
+    const loaded = await runtime.persistence.loadProject('lumora://project/a');
+    expect(loaded.ok).toBe(true);
+    if (loaded.ok) {
+      expect(loaded.project.revision).toBe(1);
+      expect(loaded.project.objects.length).toBe(createSampleProject().objects.length + 1);
+    }
+    // 新项目已打开（宿主与编辑器同步）
+    expect(runtime.editor.getProject()!.uri).toBe('lumora://project/b');
+    expect(runtime.host.getProject()!.uri).toBe('lumora://project/b');
+    await runtime.dispose();
+    await ProjectStore.drop(db);
+  });
+
+  it('排空失败（锁存冲突）时 openProject 返回 {ok:false} 且不触碰编辑器：旧项目保持打开', async () => {
+    const runtime = createStudioRuntime();
+    const db = 'lumora-test-runtime-conflict';
+    await ProjectStore.drop(db);
+    const store = await ProjectStore.create(db);
+    if (!store) throw new Error('store 创建失败');
+    // 预置较新的已存内容（revision 5，模拟另一标签页已保存）
+    await store.save({ ...createSampleProject('lumora://project/a', '较新内容'), revision: 5 });
+    store.close();
+
+    await runtime.init({ dbName: db, debounceMs: 20 });
+    await runtime.openProject({ ...createSampleProject('lumora://project/a', '较旧内容'), revision: 3 });
+    await new Promise((r) => setTimeout(r, 60)); // 对账 → revision 冲突锁存
+
+    const switched = await runtime.openProject(createSampleProject('lumora://project/b'));
+    expect(switched.ok).toBe(false);
+    if (switched.ok) return;
+    expect(switched.message).toContain('不一致');
+    // 旧项目保持打开：编辑器与宿主都未被替换
+    expect(runtime.editor.getProject()!.uri).toBe('lumora://project/a');
+    expect(runtime.host.getProject()!.uri).toBe('lumora://project/a');
+    await runtime.dispose();
+    await ProjectStore.drop(db);
   });
 });

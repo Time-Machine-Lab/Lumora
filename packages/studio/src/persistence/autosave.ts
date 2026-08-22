@@ -26,12 +26,15 @@ import type { ProjectStore, SaveFailureCode, SaveOutcome } from './project-store
 
 export const AUTOSAVE_DEBOUNCE_MS = 2000;
 
+/** flush 稳定排空的轮次上限：连续排空仍不一致视为无法稳定（防御编辑风暴） */
+export const MAX_FLUSH_DRAIN_ROUNDS = 32;
+
 export type AutosaveState =
   | { status: 'idle' } // 无打开项目
   | { status: 'clean' } // 已同步保存
   | { status: 'dirty' } // 有未保存变更（防抖等待中）
   | { status: 'saving' } // 保存进行中
-  | { status: 'error'; code: SaveFailureCode | 'recovery-available'; message: string } // 保存失败（仍为脏）/ 恢复快照待处理
+  | { status: 'error'; code: SaveFailureCode; message: string } // 保存失败（仍为脏）/ 恢复快照待处理
   | { status: 'memory' }; // 持久化不可用：仅内存编辑，不假报已保存
 
 export interface AutosaverOptions {
@@ -49,8 +52,10 @@ export class ProjectAutosaver {
   private store: ProjectStore | null;
   private currentUri: string | null = null;
   private lastSavedRevision = 0;
-  /** 各 uri 已确认落盘的 revision（含已切换走的项目：旧项目保存成功也推进基线） */
-  private readonly committedByUri = new Map<string, number>();
+  /** 各 uri 已确认落盘的 revision（含已切换走的项目：旧项目保存成功也推进基线）。
+   *  null = 尚无任何已确认记录（首存基线）：仅 load/对账成功后才建立数字基线，
+   *  首存与重试按创建语义（create-only）执行，绝不把「未确认存在」当作数字基线。 */
+  private readonly committedByUri = new Map<string, number | null>();
   /** 最新未保存快照（编辑器的只读冻结快照）：编辑后立即捕获，reset/close 后仍可冲刷 */
   private pending: Project | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -156,7 +161,9 @@ export class ProjectAutosaver {
     this.pending = null;
     this.saveQueued = false;
     this.latched = null;
-    this.committedByUri.set(project.uri, project.revision);
+    // 新项目尚无「已确认落盘」记录：基线置 null（create-only 语义），数字基线
+    // 仅由对账的 load/保存成功建立 —— 首存失败不被吞，后续保存仍按创建语义重试
+    this.committedByUri.set(project.uri, null);
     if (prevUri !== null && previous !== null) {
       this.enqueueDrain(prevUri, previous);
     }
@@ -199,19 +206,40 @@ export class ProjectAutosaver {
   }
 
   /**
-   * 立即冲刷未保存变更（关闭项目 / 卸载 / 页面隐藏 / 重试）：排空屏障，等待在途保存。
-   * 返回类型化结果：失败时调用方不得放行关闭/切换（内容仍在编辑器与恢复快照中）。
+   * 立即冲刷未保存变更（关闭项目 / 卸载 / 页面隐藏 / 重试）：稳定排空屏障 ——
+   * 循环保存直到编辑器与已提交基线一致（排空期间的新编辑也会被追平），等待在途保存。
+   * 返回类型化结果：保存失败或锁存错误（冲突/恢复待处理）都如实返回，
+   * 调用方不得放行关闭/切换（内容仍在编辑器与恢复快照中）。
    */
   async flush(): Promise<SaveOutcome> {
     if (this.disposed) return { ok: true };
+    // 仅内存模式：无可持久化内容，排空无意义也不阻塞关闭
+    if (!this.store) return { ok: true };
     this.cancelTimer();
-    const project = this.pending ?? this.editor.getProject();
-    if (project && project.uri === this.currentUri && project.revision !== this.lastSavedRevision) {
-      return this.enqueue(() => this.saveSnapshot(project));
+    for (let i = 0; i < MAX_FLUSH_DRAIN_ROUNDS; i += 1) {
+      const project = this.pending ?? this.editor.getProject();
+      if (project && project.uri === this.currentUri && project.revision !== this.lastSavedRevision) {
+        const outcome = await this.enqueue(() => this.saveSnapshot(project));
+        if (!outcome.ok) return outcome;
+        continue;
+      }
+      if (this.latched && this.latched.uri === this.currentUri) {
+        // 锁存错误下排空无法稳定：返回锁存错误，由调用方阻断关闭/切换并引导显式解决
+        return { ok: false, code: this.latched.code, message: this.latched.message };
+      }
+      // 无脏快照时仍等待在途保存（含首存）完成，复查后再放行：
+      // 等待期间可能落败（下轮重试）或产生新编辑（下轮追平）
+      await this.chainTail;
+      const latest = this.pending ?? this.editor.getProject();
+      if (!latest || latest.uri !== this.currentUri || latest.revision === this.lastSavedRevision) {
+        return { ok: true };
+      }
     }
-    // 无脏快照时仍等待在途保存（含首存）完成：避免「已保存」早于落盘
-    await this.chainTail;
-    return { ok: true };
+    return {
+      ok: false,
+      code: 'storage-error',
+      message: `自动保存未能稳定（连续 ${MAX_FLUSH_DRAIN_ROUNDS} 次排空后仍有未保存变更），请稍后重试`,
+    };
   }
 
   /** 恢复快照（切换/关闭时保存失败的旧项目内容；null = 无）。 */
@@ -220,8 +248,11 @@ export class ProjectAutosaver {
   }
 
   /**
-   * 显式重试保存恢复快照（另存副本之外的第二条出路）：以该 uri 当前已提交基线做 CAS。
-   * 成功清除恢复快照与锁存；失败返回错误（冲突/配额/存储），由调用方明示。
+   * 显式重试保存恢复快照（另存副本之外的第二条出路）：以该 uri 当前已提交基线做 CAS
+   * （尚无记录时按创建语义，首存失败同样可重试）。
+   * 成功清除恢复快照与锁存，并把编辑器对齐到已落盘内容：恢复快照不新于编辑器时
+   * 重开恢复快照（防止后续对账把「编辑器落后」误判为冲突再次锁存），更新时把
+   * 编辑器内容向前保存（重试期间的编辑不丢失）。失败返回错误，由调用方明示。
    */
   retryRecovery(uri: string): Promise<SaveOutcome> {
     const snapshot = this.recovery.get(uri);
@@ -230,19 +261,30 @@ export class ProjectAutosaver {
     }
     return this.enqueue(async () => {
       if (this.disposed) return { ok: false, code: 'storage-error', message: '自动保存已停用' };
-      const expected = this.committedByUri.get(uri) ?? 0;
+      const expected = this.committedByUri.get(uri) ?? null;
       const result = await this.storeSave(snapshot, expected);
-      if (result.ok) {
-        const prev = this.committedByUri.get(uri) ?? 0;
-        this.committedByUri.set(uri, Math.max(prev, snapshot.revision));
-        this.recovery.delete(uri);
-        if (this.latched?.uri === uri) this.latched = null;
-        if (uri === this.currentUri) {
-          const current = this.editor.getProject();
-          void this.enqueue(() => this.reconcile(current ?? snapshot));
+      if (!result.ok) {
+        if (result.code === 'revision-conflict') {
+          this.latch({ uri, code: 'revision-conflict', message: result.message });
         }
-      } else if (result.code === 'revision-conflict') {
-        this.latch({ uri, code: 'revision-conflict', message: result.message });
+        return result;
+      }
+      const prev = this.committedByUri.get(uri);
+      this.committedByUri.set(uri, Math.max(prev ?? -1, snapshot.revision));
+      this.recovery.delete(uri);
+      if (this.latched?.uri === uri) this.latched = null;
+      if (uri === this.currentUri) {
+        const current = this.editor.getProject();
+        if (current && current.revision > snapshot.revision) {
+          // 恢复快照落盘后编辑器内容更新（重试期间的编辑）：向前保存编辑器内容，
+          // expected = 刚落盘 revision，绝不反向覆盖
+          void this.enqueue(() => this.saveSnapshot(current));
+        } else if (current) {
+          // 编辑器不新于恢复快照：以恢复快照为准重开编辑器（重开 recovery 快照，
+          // 编辑器与存储对齐，同 revision 分叉由 store 层拒绝并锁存冲突供显式解决）
+          this.resetTo(snapshot);
+          this.editor.openProject(snapshot);
+        }
       }
       return result;
     });
@@ -321,7 +363,7 @@ export class ProjectAutosaver {
       return { ok: true };
     }
     const session = this.session;
-    const expected = this.committedByUri.get(project.uri) ?? 0;
+    const expected = this.committedByUri.get(project.uri) ?? null;
     if (this.isFresh(project.uri, session)) this.emit({ status: 'saving' });
     const result = await this.storeSave(project, expected);
     this.applySaveResult(project, session, result);
@@ -337,11 +379,11 @@ export class ProjectAutosaver {
     if (!this.store) return;
     void this.enqueue(async () => {
       if (this.disposed) return;
-      const expected = this.committedByUri.get(uri) ?? 0;
+      const expected = this.committedByUri.get(uri) ?? null;
       const result = await this.storeSave(snapshot, expected);
       if (result.ok) {
-        const prev = this.committedByUri.get(uri) ?? 0;
-        this.committedByUri.set(uri, Math.max(prev, snapshot.revision));
+        const prev = this.committedByUri.get(uri);
+        this.committedByUri.set(uri, Math.max(prev ?? -1, snapshot.revision));
         this.recovery.delete(uri);
       } else {
         this.recovery.set(uri, snapshot);
@@ -426,8 +468,8 @@ export class ProjectAutosaver {
    */
   private applySaveResult(project: Project, session: number, result: SaveOutcome): void {
     if (result.ok) {
-      const prev = this.committedByUri.get(project.uri) ?? 0;
-      this.committedByUri.set(project.uri, Math.max(prev, project.revision));
+      const prev = this.committedByUri.get(project.uri);
+      this.committedByUri.set(project.uri, Math.max(prev ?? -1, project.revision));
       this.recovery.delete(project.uri);
       if (this.latched?.uri === project.uri) this.latched = null;
       if (!this.isFresh(project.uri, session)) return;

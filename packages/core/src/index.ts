@@ -63,7 +63,7 @@ export {
   defaultTransform,
   genId,
 } from './scene/create';
-export { fnv1aHex, hashBytes, compositeContentHash } from './scene/assets';
+export { hashBytes, sha256Hex, compositeContentHash } from './scene/assets';
 export { fovDegToFocalLength, focalLengthToFovDeg, fitRect, FULL_FRAME_SENSOR } from './scene/camera-math';
 
 // 历史与场景编辑器
@@ -115,6 +115,7 @@ export type {
   PackageBuildOptions,
   PackageImportError,
   PackageImportErrorCode,
+  PackageParseLimits,
   PackageParseResult,
 } from './project/package';
 

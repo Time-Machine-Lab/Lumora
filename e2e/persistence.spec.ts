@@ -1,7 +1,16 @@
-import { mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
+import {
+  SceneEditor,
+  buildProjectPackage,
+  compositeContentHash,
+  createSampleProject,
+  genId,
+  hashBytes,
+  serializeProjectPackage,
+} from '@lumora/core';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 
@@ -177,4 +186,102 @@ test('窄屏（375px）：菜单与对话框不超出视口，Escape 关闭且�
     () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
   );
   expect(noHorizontalOverflow).toBe(true);
+});
+
+test('Escape 关闭菜单：焦点在 trigger（点击后未移入面板）时同样生效（TML-53 第三轮 #11）', async ({ page }) => {
+  await page.goto('/');
+  await page.getByTestId('project-menu').click();
+  await expect(page.getByTestId('project-menu-dropdown')).toBeVisible();
+  // 刚点击「项目」：焦点仍在 trigger 上，keydown 事件不经过 dropdown，由菜单根容器接住
+  await expect(page.getByTestId('project-menu')).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('project-menu-dropdown')).not.toBeVisible();
+  await expect(page.getByTestId('project-menu')).toBeFocused();
+});
+
+test('删除项目后焦点回到常驻「项目」按钮，不落 BODY（TML-53 第三轮 #12）', async ({ page }) => {
+  await page.goto('/');
+  await page.getByTestId('project-menu').click();
+  await page.getByTestId('project-new').click();
+  await page.getByTestId('project-name-input').fill('待删除项目');
+  await page.getByTestId('project-name-confirm').click();
+  // 新建后面板已收起：重新展开菜单，等首次落盘（autosaver 防抖 2 秒）后最近行出现
+  await page.getByTestId('project-menu').click();
+  await expect(page.getByTestId('recent-project').first()).toContainText('待删除项目', {
+    timeout: 10_000,
+  });
+  await page.getByTestId('recent-delete').click();
+  await page.getByTestId('confirm-delete').click();
+  await expect(page.getByTestId('recent-project')).toHaveCount(0);
+  // 被删行的删除按钮已随列表移除：焦点必须回到常驻「项目」按钮，不得落 BODY
+  await expect(page.getByTestId('project-menu')).toBeFocused();
+});
+
+test('parts-only 被引用模型：导入拒绝（缺主载荷），parse→cache→viewport 链路未进入（TML-53 第三轮 #6）', async ({
+  page,
+}) => {
+  // Node 端构建含 glTF 主载荷 + 外部分件的真实工程包，再剥离主载荷 → parts-only 载荷
+  const editor = new SceneEditor();
+  editor.openProject(createSampleProject());
+  const mainBytes = new TextEncoder().encode('glb-main-content-bytes');
+  const partBytes = new TextEncoder().encode('external-part-content-bytes');
+  const assetId = genId('asset');
+  const partPath = 'ext/part.bin';
+  const part: { path: string; mime: string; payload: string; partHash: string } = {
+    path: partPath,
+    mime: 'application/octet-stream',
+    payload: btoa(String.fromCharCode(...partBytes)),
+    partHash: await hashBytes(partBytes),
+  };
+  const hash = await compositeContentHash(await hashBytes(mainBytes), [
+    { path: partPath, partHash: part.partHash },
+  ]);
+  editor.registerAsset({
+    id: assetId,
+    kind: 'gltf',
+    name: '分包模型.glb',
+    format: 'glb',
+    mime: 'model/gltf-binary',
+    hash,
+    size: mainBytes.length + partBytes.length,
+    source: 'file',
+    storageRef: 'blob:runtime-only',
+    payload: btoa(String.fromCharCode(...mainBytes)),
+    parts: [part],
+    createdAt: new Date().toISOString(),
+  });
+  editor.addObject({
+    id: genId('obj'),
+    type: 'model',
+    name: '分包模型',
+    parentId: null,
+    transform: { position: [0, 1, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+    visible: true,
+    locked: false,
+    assetId,
+  });
+  const raw = JSON.parse(serializeProjectPackage(buildProjectPackage(editor.getProject()!))) as {
+    assets: Record<string, { payload?: string }>;
+  };
+  delete raw.assets[assetId]!.payload; // 主载荷缺失，仅剩外部分件
+  const tmpDir = join(HERE, '.tmp');
+  mkdirSync(tmpDir, { recursive: true });
+  const partsOnlyPath = join(tmpDir, 'tml53-parts-only.lumora');
+  writeFileSync(partsOnlyPath, JSON.stringify(raw), 'utf8');
+
+  await page.goto('/');
+  await page.getByTestId('open-sample-project').click();
+  await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
+  await expect(page.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
+  const logBefore = await page.getByTestId('event-log').innerText();
+
+  await page.getByTestId('project-menu').click();
+  await page.setInputFiles('[data-testid="project-import-input"]', partsOnlyPath);
+  // 解析端拒绝：明确提示缺主载荷（被引用模型不得判为导入成功）
+  await expect(page.getByTestId('lumora-toasts')).toContainText(/导入失败.*主载荷/);
+  // 失败回滚（AC3）：当前项目原样打开，缓存/视口链路未被触碰（无新的项目打开事件）
+  await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
+  await expect(page.getByTestId('studio-empty-hint')).not.toBeVisible();
+  await expect(page.getByTestId('save-state-badge')).toHaveText('已保存');
+  expect(await page.getByTestId('event-log').innerText()).toBe(logBefore);
 });

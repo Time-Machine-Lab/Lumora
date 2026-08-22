@@ -333,13 +333,16 @@ describe('parseProjectPackage：损坏资产载荷一律拒绝导入（严重项
 
   it('外部分件载荷非法 → invalid-project', async () => {
     const project = await buildFixtureProject();
-    const parts: AssetPartData[] = [
+    const pkg = buildProjectPackage(project);
+    // 手工构造 parts-only bundle（构建端已不产出；此处直接篡改包文本验证解析端）
+    const raw = JSON.parse(serializeProjectPackage(pkg)) as { assets: Record<string, { parts?: AssetPartData[] }> };
+    const bundle = Object.values(raw.assets)[0]!;
+    delete (bundle as Record<string, unknown>).payload;
+    bundle.parts = [
       { path: 'bin/scene.bin', mime: 'application/octet-stream', payload: btoa('valid part bytes') },
       { path: 'textures/tex.png', mime: 'image/png', payload: 'not base64!!!' },
     ];
-    const rich = { ...project, assets: [{ ...project.assets[0]!, payload: undefined, parts }] } as Project;
-    const pkg = buildProjectPackage(rich);
-    const result = await parseProjectPackage(serializeProjectPackage(pkg));
+    const result = await parseProjectPackage(JSON.stringify(raw));
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error.code).toBe('invalid-project');
@@ -349,14 +352,17 @@ describe('parseProjectPackage：损坏资产载荷一律拒绝导入（严重项
 
   it('外部分件数超过上限 → invalid-project（拒绝解码攻击）', async () => {
     const project = await buildFixtureProject();
-    const parts: AssetPartData[] = Array.from({ length: MAX_ASSET_PARTS + 1 }, (_, i) => ({
+    const pkg = buildProjectPackage(project);
+    // 手工构造 parts-only bundle（构建端已不产出；此处直接篡改包文本验证解析端）
+    const raw = JSON.parse(serializeProjectPackage(pkg)) as { assets: Record<string, { parts?: AssetPartData[] }> };
+    const bundle = Object.values(raw.assets)[0]!;
+    delete (bundle as Record<string, unknown>).payload;
+    bundle.parts = Array.from({ length: MAX_ASSET_PARTS + 1 }, (_, i) => ({
       path: `ext/${i}.bin`,
       mime: 'application/octet-stream',
       payload: btoa(`part-${i}-bytes`),
     }));
-    const rich = { ...project, assets: [{ ...project.assets[0]!, payload: undefined, parts }] } as Project;
-    const pkg = buildProjectPackage(rich);
-    const result = await parseProjectPackage(serializeProjectPackage(pkg));
+    const result = await parseProjectPackage(JSON.stringify(raw));
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error.code).toBe('invalid-project');
@@ -471,7 +477,7 @@ describe('parseProjectPackage：多文件模型（.gltf + 外部分件）组合�
     }
   });
 
-  it('未引用孤儿包（包内载荷无对应资产条目）→ 同样全量校验，损坏即拒绝（无法绕过校验）', async () => {
+  it('未引用孤儿包（包内载荷无对应资产条目）→ 拒绝导入（损坏即拒绝）', async () => {
     const project = await buildFixtureProject();
     const pkg = buildProjectPackage(project);
     const raw = JSON.parse(serializeProjectPackage(pkg)) as { assets: Record<string, unknown> };
@@ -480,17 +486,21 @@ describe('parseProjectPackage：多文件模型（.gltf + 外部分件）组合�
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error.code).toBe('invalid-project');
-      expect(result.error.message).toContain('未引用资产');
+      expect(result.error.message).toContain('孤儿');
     }
   });
 
-  it('未引用孤儿包合法载荷可通过（校验不误杀，仅要求完整性与计入累计）', async () => {
+  it('未引用孤儿包即使载荷合法也拒绝（无项目资产条目可挂载的 bundle 一律视为损坏）', async () => {
     const project = await buildFixtureProject();
     const pkg = buildProjectPackage(project);
     const raw = JSON.parse(serializeProjectPackage(pkg)) as { assets: Record<string, unknown> };
     raw.assets['orphan-bundle-1'] = { payload: btoa('orphan payload bytes') };
     const result = await parseProjectPackage(JSON.stringify(raw));
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('invalid-project');
+      expect(result.error.message).toContain('孤儿');
+    }
   });
 });
 

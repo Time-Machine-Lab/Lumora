@@ -205,7 +205,18 @@ export function validateProjectSchema(project: unknown): string | null {
     if (!isString(a.id) || assetIds.has(a.id)) return '资源 id 非法或重复';
     assetIds.add(a.id);
     if (a.kind !== 'gltf') return '资源 kind 非法';
-    if (!isString(a.name) || !isString(a.mime) || !isString(a.hash)) return '资源名称/MIME/hash 非法';
+    if (!isString(a.name) || !isString(a.mime)) return '资源名称/MIME 非法';
+    // 有载荷（主载荷或分件）的资产必须携带格式明确的哈希（SHA-256 64 位十六进制），
+    // 内容完整性依赖它做无条件校验；无载荷（URL 来源）资产允许空哈希（去重键缺省）
+    const hasPayload =
+      a.payload !== undefined || (Array.isArray(a.parts) && a.parts.length > 0);
+    if (hasPayload) {
+      if (typeof a.hash !== 'string' || !/^[0-9a-fA-F]{64}$/.test(a.hash)) {
+        return '资源 hash 非法（载荷存在时必须为 64 位十六进制 SHA-256）';
+      }
+    } else if (!isString(a.hash)) {
+      return '资源 hash 非法';
+    }
     if (typeof a.size !== 'number' || !Number.isFinite(a.size) || a.size < 0) return '资源 size 非法';
     if (a.source !== 'file' && a.source !== 'url') return '资源 source 非法';
     if (!isString(a.storageRef) || !isString(a.createdAt)) return '资源 storageRef/createdAt 非法';

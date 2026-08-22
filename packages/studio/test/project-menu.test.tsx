@@ -139,6 +139,43 @@ describe('ProjectMenu：新建 / 最近项目 / 重命名 / 删除（FR-001）',
     await waitFor(() => expect(runtime.getProject()).toBeNull());
     expect((await runtime.persistence.listRecent()).map((s) => s.uri)).not.toContain(uri);
   });
+
+  it('Escape 关闭菜单：焦点在 trigger（点击后未移入面板）时同样生效（TML-53 第三轮 #11）', async () => {
+    const handle = renderStudio();
+    await waitPersistence(handle);
+    await openMenu();
+    const trigger = screen.getByTestId('project-menu');
+    // 刚点击「项目」后焦点在 trigger 上：keydown 事件不经过 dropdown，只由根容器接住
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByTestId('project-menu-dropdown')).not.toBeInTheDocument());
+    // 关闭后面板焦点回到常驻「项目」按钮
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('Escape 在面板内焦点时同样关闭菜单，且关闭后面板焦点回到 trigger', async () => {
+    const handle = renderStudio();
+    await waitPersistence(handle);
+    await openMenu();
+    const dropdown = screen.getByTestId('project-menu-dropdown');
+    fireEvent.keyDown(dropdown, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByTestId('project-menu-dropdown')).not.toBeInTheDocument());
+    expect(document.activeElement).toBe(screen.getByTestId('project-menu'));
+  });
+
+  it('删除项目后焦点回到常驻「项目」按钮，不落 BODY（TML-53 第三轮 #12）', async () => {
+    const handle = renderStudio();
+    const runtime = await waitPersistence(handle);
+    await openMenu();
+    await createProjectViaMenu('焦点回退项目');
+    await waitRecent(runtime, '焦点回退项目');
+
+    await openMenu();
+    fireEvent.click(await screen.findByTestId('recent-delete'));
+    fireEvent.click(await screen.findByTestId('confirm-delete'));
+    await waitFor(() => expect(runtime.getProject()).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByTestId('project-menu')));
+  });
 });
 
 describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () => {

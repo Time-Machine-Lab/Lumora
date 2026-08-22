@@ -90,7 +90,8 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
             onErrorRef?.(error);
           }
         }
-        if (!cancelBootRef.current && initialRef) runtime.openProject(initialRef);
+        // 启动时无已打开项目：切换屏障为空操作，失败只会是初始项目非法（抛错）
+        if (!cancelBootRef.current && initialRef) await runtime.openProject(initialRef);
       };
       void boot();
     }

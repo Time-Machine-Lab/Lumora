@@ -110,9 +110,25 @@ describe('ProjectStore：IndexedDB 持久化（FR-011）', () => {
     const same = project('lumora://project/a', '同名', 7);
     expect((await store.save(same, null)).ok).toBe(true);
     await new Promise((r) => setTimeout(r, 5));
-    // 期望基线 = 已存 7 → 匹配，允许重存
-    expect((await store.save(project('lumora://project/a', '同名', 7), 7)).ok).toBe(true);
+    // 期望基线 = 已存 7 → 匹配；内容逐字节一致（自动保存抖动重发同一内容）→ 允许重存
+    const jitter = { ...same };
+    expect((await store.save(jitter, 7)).ok).toBe(true);
     expect((await store.load('lumora://project/a'))!.name).toBe('同名');
+    store.close();
+  });
+
+  it('同 revision 内容分叉拒绝（评审阻断项回归：禁止同 revision 分叉覆盖）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const first = project('lumora://project/a', '分叉前', 7);
+    expect((await store.save(first, null)).ok).toBe(true);
+    // 同 revision 7 但内容不同（改场景名）→ 视为分叉，拒绝且不覆盖
+    const fork = { ...first, scenes: [{ ...first.scenes[0]!, name: '被改名的场景' }] };
+    const result = await store.save(fork, 7);
+    expect(result.ok).toBe(false);
+    if (result.ok || result.code !== 'revision-conflict') return;
+    expect(result.storedRevision).toBe(7);
+    expect((await store.load('lumora://project/a'))!.name).toBe('分叉前');
     store.close();
   });
 

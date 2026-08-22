@@ -435,6 +435,135 @@ describe('ProjectAutosaver：恢复快照（切换/关闭时保存失败的旧�
   });
 });
 
+describe('ProjectAutosaver：首存失败 / flush 稳定排空 / retryRecovery 对齐（TML-53 第三轮回归）', () => {
+  it('首存失败不被吞：如实报错且存储无假记录；重试仍按创建语义（null 基线）成功', async () => {
+    const { editor, store, autosaver } = await wired();
+    const realSave = store.save.bind(store);
+    let bSaveFailed = false;
+    const saveSpy = vi.spyOn(store, 'save').mockImplementation(async (project, expected) => {
+      if (project.uri === 'lumora://project/b' && !bSaveFailed) {
+        bSaveFailed = true;
+        return { ok: false, code: 'quota-exceeded' as const, message: '本地存储空间不足，保存失败' };
+      }
+      return realSave(project, expected);
+    });
+    editor.openProject(createSampleProject('lumora://project/a'));
+    await settle(10);
+    saveSpy.mockClear();
+
+    const states: AutosaveState[] = [];
+    autosaver.onState((s) => states.push(s));
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60);
+    // 首存失败如实呈现，且未产生任何「假已保存」记录
+    expect(states.at(-1)).toMatchObject({ status: 'error', code: 'quota-exceeded' });
+    expect(await store.load('lumora://project/b')).toBeNull();
+
+    // 重试：仍以 null 基线（create-only）发起，不以失败后的数字基线 CAS 误拒
+    editor.addObject(createGroupObject()); // rev1
+    await settle(60);
+    const bCalls = saveSpy.mock.calls.filter((call) => (call[0] as { uri: string }).uri === 'lumora://project/b');
+    expect(bCalls).toHaveLength(2); // 首存失败 + 重试
+    expect(bCalls.every((call) => call[1] === null)).toBe(true);
+    const stored = await store.load('lumora://project/b');
+    expect(stored).not.toBeNull();
+    expect(stored!.revision).toBe(1);
+    autosaver.dispose();
+  });
+
+  it('flush 稳定排空：排空期间产生的新编辑被循环追平，直到与已提交基线一致', async () => {
+    const { editor, store, autosaver } = await wired();
+    editor.openProject(createSampleProject('lumora://project/a'));
+    await settle(10);
+    editor.addObject(createGroupObject()); // rev1
+    const flushing = autosaver.flush(); // 排空开始（rev1 落盘中）
+    editor.addObject(createGroupObject()); // rev2：排空期间的新编辑
+    const outcome = await flushing;
+    expect(outcome.ok).toBe(true);
+    const stored = await store.load('lumora://project/a');
+    expect(stored!.revision).toBe(2);
+    expect(stored!.objects.length).toBe(createSampleProject().objects.length + 2);
+    autosaver.dispose();
+  });
+
+  it('flush 在锁存错误（revision 冲突）下返回锁存错误：排空无法稳定，调用方不放行切换/关闭', async () => {
+    const { editor, store, autosaver } = await wired();
+    const newer = { ...createSampleProject('lumora://project/a', '较新内容'), revision: 5 };
+    expect((await store.save(newer)).ok).toBe(true);
+    editor.openProject({ ...createSampleProject('lumora://project/a', '较旧内容'), revision: 3 });
+    await settle(60); // 对账 → 冲突锁存
+    const outcome = await autosaver.flush();
+    expect(outcome).toMatchObject({ ok: false, code: 'revision-conflict' });
+    autosaver.dispose();
+  });
+
+  it('retryRecovery 成功且编辑器更新于恢复快照：向前保存编辑器内容，绝不反向覆盖', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(10);
+    // 保存全面失败 → 切换产生恢复快照（rev1）
+    vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    editor.addObject(createGroupObject()); // rev1
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60);
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+    vi.mocked(store.save).mockRestore();
+
+    // 重开 A：恢复快照明示可用（锁存期间编辑不触发自动保存）
+    editor.openProject({ ...base, name: '项目A' });
+    await settle(60);
+    editor.addObject(createGroupObject()); // rev1
+    editor.addObject(createGroupObject()); // rev2（编辑器已更新于恢复快照 rev1）
+    const outcome = await autosaver.retryRecovery(A);
+    expect(outcome.ok).toBe(true);
+    // 向前保存（retryRecovery 内部追加排空）：flush 屏障等待编辑器 rev2 内容落盘
+    await autosaver.flush();
+    const stored = await store.load(A);
+    expect(stored!.revision).toBe(2);
+    expect(stored!.objects.length).toBe(base.objects.length + 2);
+    expect(editor.getProject()!.revision).toBe(2);
+    autosaver.dispose();
+  });
+
+  it('retryRecovery 成功且编辑器不新于恢复快照：以恢复快照重开编辑器（对齐已落盘内容）', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(10);
+    vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    editor.addObject(createGroupObject()); // rev1（恢复快照内容）
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60);
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+    vi.mocked(store.save).mockRestore();
+
+    editor.openProject({ ...base, name: '项目A' });
+    await settle(60);
+    const outcome = await autosaver.retryRecovery(A);
+    expect(outcome.ok).toBe(true);
+    // 编辑器不新于恢复快照 → 重开恢复快照：编辑器内容 = 已落盘的恢复快照（rev1）
+    const stored = await store.load(A);
+    expect(stored!.revision).toBe(1);
+    expect(stored!.objects.length).toBe(base.objects.length + 1);
+    expect(editor.getProject()!.revision).toBe(1);
+    expect(editor.getProject()!.objects.length).toBe(base.objects.length + 1);
+    autosaver.dispose();
+  });
+});
+
 describe('ProjectAutosaver：撤销回到已保存状态即转净', () => {
   it('保存后撤销 → dirty → 再保存 → clean', async () => {
     const { editor, store, autosaver } = await wired();
