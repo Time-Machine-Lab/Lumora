@@ -135,18 +135,39 @@ const SENSITIVE_ANY_WORD = new Set([
 ]);
 const SENSITIVE_SUFFIX_WORD = new Set(['key', 'keys', 'token', 'cookie']);
 
-/** 键名 → 小写分词列表（'access_key'、'privateKey'、'MAXTokens' 均正确拆分） */
+/** 紧凑别名：无分隔符拼接的凭据词（API_KEY→apikey、ACCESS_TOKEN→accesstoken）。
+ *  全小写/全大写形态拆不出单词边界（APIKEY、accesstoken 是单一连续段），须显式枚举 */
+const COMPACT_SENSITIVE = new Set([
+  'apikey',
+  'apikeys',
+  'accesstoken',
+  'accesstokens',
+  'secretkey',
+  'secretkeys',
+  'clientsecret',
+  'clientsecrets',
+  'privatekey',
+  'privatekeys',
+  'providerkey',
+  'providerkeys',
+]);
+
+/**
+ * 键名 → 小写分词列表。边界规则：分隔符（_/-/./空格）+ 驼峰边界，且连续大写段
+ * 保持整体（缩写）：APIKey → api|key（而非 a|p|i|key）、MAXTokens → max|tokens；
+ * 全大写/全小写拼接形态（APIKEY）保持为单个词，由 COMPACT_SENSITIVE 兜底。
+ */
 function splitKeyWords(key: string): string[] {
   return key
     .split(/[^A-Za-z0-9]+/)
-    .flatMap((part) => part.split(/(?=[A-Z])/))
+    .flatMap((part) => part.split(/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/))
     .map((word) => word.toLowerCase())
     .filter((word) => word.length > 0);
 }
 
 function isSensitiveKey(key: string): boolean {
   const words = splitKeyWords(key);
-  if (words.some((word) => SENSITIVE_ANY_WORD.has(word))) return true;
+  if (words.some((word) => SENSITIVE_ANY_WORD.has(word) || COMPACT_SENSITIVE.has(word))) return true;
   const last = words[words.length - 1];
   return last !== undefined && SENSITIVE_SUFFIX_WORD.has(last);
 }

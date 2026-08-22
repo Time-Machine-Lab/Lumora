@@ -394,13 +394,16 @@ describe('ProjectAutosaver：恢复快照（切换/关闭时保存失败的旧�
     await settle(20);
     expect(states.at(-1)).toMatchObject({ status: 'error', code: 'recovery-available' });
 
-    // 显式重试：以已提交基线 CAS 落盘恢复快照，成功清除快照与锁存
+    // 显式重试：快照以已提交基线 CAS 落盘（内容不丢），但锁存期间的编辑（G3）
+    // 与快照内容（G1+G2）三方分叉 → 锁存冲突供显式解决，当前编辑不被静默覆盖
     const outcome = await autosaver.retryRecovery(A);
-    expect(outcome.ok).toBe(true);
-    expect(autosaver.getRecovery(A)).toBeNull();
+    expect(outcome).toMatchObject({ ok: false, code: 'revision-conflict' });
+    expect(autosaver.getRecovery(A)).toBeNull(); // 快照已落盘
     const stored = await store.load(A);
     expect(stored!.revision).toBe(2);
     expect(stored!.objects.length).toBe(base.objects.length + 2);
+    expect(editor.getProject()!.revision).toBe(1); // 锁存期间编辑保持（未覆盖）
+    expect(states.at(-1)).toMatchObject({ status: 'error', code: 'revision-conflict' });
     autosaver.dispose();
   });
 
@@ -499,13 +502,13 @@ describe('ProjectAutosaver：首存失败 / flush 稳定排空 / retryRecovery �
     autosaver.dispose();
   });
 
-  it('retryRecovery 成功且编辑器更新于恢复快照：向前保存编辑器内容，绝不反向覆盖', async () => {
+  it('retryRecovery 三方分叉（编辑器 ≠ 快照 ≠ 已提交基线）：快照落盘但不覆盖当前编辑，锁存冲突（第五轮 #4）', async () => {
     const { editor, store, autosaver } = await wired();
     const A = 'lumora://project/a';
     const base = createSampleProject(A, '项目A');
     editor.openProject(base);
-    await settle(10);
-    // 保存全面失败 → 切换产生恢复快照（rev1）
+    await settle(10); // 基线 rev0
+    // 保存全面失败 → 切换产生恢复快照（rev1，内容 = base + 1 新对象）
     vi.spyOn(store, 'save').mockImplementation(async () => ({
       ok: false,
       code: 'storage-error' as const,
@@ -518,19 +521,60 @@ describe('ProjectAutosaver：首存失败 / flush 稳定排空 / retryRecovery �
     expect(autosaver.getRecovery(A)).not.toBeNull();
     vi.mocked(store.save).mockRestore();
 
-    // 重开 A：恢复快照明示可用（锁存期间编辑不触发自动保存）
+    // 重开 A（对账基线 rev0），重试前编辑出另一分支内容（base + 2 个新对象）：
+    // 三方内容各不相同 —— 旧逻辑按 revision 大小（2 > 1）误判为「编辑器更新」向前
+    // 保存、静默丢弃快照内容；新逻辑按内容指纹判为真分叉，须显式解决
     editor.openProject({ ...base, name: '项目A' });
     await settle(60);
     editor.addObject(createGroupObject()); // rev1
-    editor.addObject(createGroupObject()); // rev2（编辑器已更新于恢复快照 rev1）
+    editor.addObject(createGroupObject()); // rev2
+    const outcome = await autosaver.retryRecovery(A);
+    expect(outcome).toMatchObject({ ok: false, code: 'revision-conflict' });
+    // 恢复快照已落盘（内容不丢），当前编辑不被静默覆盖
+    const stored = await store.load(A);
+    expect(stored!.revision).toBe(1);
+    expect(stored!.objects.length).toBe(base.objects.length + 1);
+    expect(editor.getProject()!.revision).toBe(2);
+    expect(editor.getProject()!.objects.length).toBe(base.objects.length + 2);
+    // 锁存冲突下 flush 同样阻断（调用方不放行关闭/切换）
+    expect(await autosaver.flush()).toMatchObject({ ok: false, code: 'revision-conflict' });
+    autosaver.dispose();
+  });
+
+  it('retryRecovery 快照与已提交基线一致（未带来新内容）：编辑器内容向前保存（第五轮 #4）', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(10); // 基线 rev0
+    // 保存失败 → 编辑后撤销回已保存内容（revision 递增、内容 == 基线）→ 切换产生恢复快照
+    vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    editor.addObject(createGroupObject()); // rev1
+    editor.undo(); // rev2，内容与基线一致
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60);
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+    vi.mocked(store.save).mockRestore();
+
+    // 重开 A（基线 rev0），重试前编辑出新内容（rev3 > 快照 rev2）
+    editor.openProject({ ...base, name: '项目A' });
+    await settle(60);
+    editor.addObject(createGroupObject()); // rev1
+    editor.addObject(createGroupObject()); // rev2
+    editor.addObject(createGroupObject()); // rev3
     const outcome = await autosaver.retryRecovery(A);
     expect(outcome.ok).toBe(true);
-    // 向前保存（retryRecovery 内部追加排空）：flush 屏障等待编辑器 rev2 内容落盘
+    // 快照 == 旧基线内容（未带来新内容）→ 编辑器内容向前保存
     await autosaver.flush();
     const stored = await store.load(A);
-    expect(stored!.revision).toBe(2);
-    expect(stored!.objects.length).toBe(base.objects.length + 2);
-    expect(editor.getProject()!.revision).toBe(2);
+    expect(stored!.revision).toBe(3);
+    expect(stored!.objects.length).toBe(base.objects.length + 3);
+    expect(editor.getProject()!.revision).toBe(3);
     autosaver.dispose();
   });
 
@@ -631,6 +675,26 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     const after = await store.load(A);
     expect(after!.revision).toBe(5);
     expect(after!.name).toBe('内容甲');
+    autosaver.dispose();
+  });
+
+  it('同 uri 同 revision 运行期替换不判净：保存被分叉保护拒绝并锁存冲突，磁盘与编辑器各自保留（第五轮 #3）', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    editor.openProject(createSampleProject(A, '原项目'));
+    await settle(10); // rev0 已落盘（基线 {0, 原内容指纹}）
+
+    // 运行期以同 uri 同 revision 的另一内容替换编辑器（导入/替换打开路径）：
+    // 旧逻辑按 revision 一致判净，替换内容会被后续保存/切换静默吞掉
+    editor.openProject({ ...createSampleProject(A, '替换项目'), revision: 0 });
+    const states: AutosaveState[] = [];
+    autosaver.onState((s) => states.push(s));
+    await settle(60);
+    // 内容指纹不同 → 判为未保存 → 保存被存储层同 revision 分叉保护拒绝 → 锁存冲突
+    expect(states.at(-1)).toMatchObject({ status: 'error', code: 'revision-conflict' });
+    const after = await store.load(A);
+    expect(after!.name).toBe('原项目'); // 磁盘未被替换内容覆盖
+    expect(editor.getProject()!.name).toBe('替换项目'); // 编辑器保留替换内容供显式解决
     autosaver.dispose();
   });
 

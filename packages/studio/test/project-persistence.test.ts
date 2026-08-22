@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createGroupObject } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import { createStudioRuntime } from '../src/runtime/studio-runtime';
@@ -343,6 +343,68 @@ describe('ProjectPersistence：本地加载边界 schema 迁移（TML-53 第四�
     expect(loaded.ok).toBe(false);
     if (loaded.ok) return;
     expect(loaded.message).toContain('tracks');
+    await runtime.dispose();
+  });
+});
+
+describe('ProjectPersistence：本地加载边界统一「迁移 → 校验」（第五轮 #7）', () => {
+  it('当前版本（v3）损坏记录：结构校验拒绝，绝不原样交给编辑器，也不产生写回', async () => {
+    const runtime = await makeRuntime();
+    const store = await openStandaloneStore();
+    const v3 = runtime.persistence.createProject('损坏的当前版本');
+    const bad = { ...v3, tracks: 'not-an-array' } as unknown as Project;
+    expect((await store!.save(bad)).ok).toBe(true);
+
+    const loaded = await runtime.persistence.loadProject(v3.uri);
+    expect(loaded.ok).toBe(false);
+    if (loaded.ok) return;
+    expect(loaded.message).toContain('tracks');
+
+    // 磁盘记录保持原样（无写回尝试），下次加载仍被拒绝
+    const after = await store!.load(v3.uri);
+    expect(after!.tracks).toBe('not-an-array');
+    await runtime.dispose();
+  });
+
+  it('当前版本（v3）合法记录：校验通过原样返回，不做无意义写回（save 不被调用）', async () => {
+    const runtime = createStudioRuntime();
+    openRuntimes.push(runtime);
+    const injected = await ProjectStore.create(DB);
+    if (!injected) return;
+    const saveSpy = vi.spyOn(injected, 'save');
+    openStores.push(injected);
+    await runtime.init({ debounceMs: 10, dbName: DB, store: injected });
+    const project = runtime.persistence.createProject('合法记录');
+    runtime.openProject(project);
+    await settle(60); // 打开时自动保存已建立记录
+    saveSpy.mockClear();
+
+    const loaded = await runtime.persistence.loadProject(project.uri);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(saveSpy).not.toHaveBeenCalled();
+    expect(loaded.project.schemaVersion).toBe(3);
+    await runtime.dispose();
+  });
+
+  it('reloadOpenProject 复用统一边界：损坏记录 → 失败且编辑器状态不变（第五轮 #5）', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('冲突项目');
+    runtime.openProject(project);
+    runtime.editor.addObject(createGroupObject());
+    await settle(60); // rev1 已存
+    // 磁盘记录被破坏（同 uri，tracks 损坏，revision 更新）
+    const store = await openStandaloneStore();
+    const bad = { ...project, revision: 2, tracks: 'corrupted' } as unknown as Project;
+    expect((await store!.save(bad)).ok).toBe(true);
+
+    const reloaded = await runtime.persistence.reloadOpenProject();
+    expect(reloaded.ok).toBe(false);
+    if (reloaded.ok) return;
+    expect(reloaded.message).toContain('tracks');
+    // 失败不改变编辑器状态（内容与 revision 原样）
+    expect(runtime.editor.getProject()!.name).toBe('冲突项目');
+    expect(runtime.editor.getProject()!.revision).toBe(1);
     await runtime.dispose();
   });
 });

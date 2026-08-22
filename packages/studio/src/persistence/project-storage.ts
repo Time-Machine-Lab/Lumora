@@ -88,7 +88,9 @@ export async function estimateStorage(): Promise<{ usage: number; quota: number 
   }
 }
 
-/** 键排序稳定序列化：同 revision 分叉判定需要与键序无关的内容比较 */
+/** 键排序稳定序列化：同 revision 分叉判定需要与键序无关的内容比较。
+ *  累加器用 null 原型对象：普通对象字面量的 __proto__ 是原型 setter，
+ *  以它为累加器会把名为 __proto__ 的字段静默丢弃（fork 检测绕过，第五轮 #6）。 */
 export function stableStringify(value: unknown): string {
   return JSON.stringify(value, (_key, item) => {
     if (item && typeof item === 'object' && !Array.isArray(item)) {
@@ -97,10 +99,51 @@ export function stableStringify(value: unknown): string {
         .reduce<Record<string, unknown>>((acc, key) => {
           acc[key] = (item as Record<string, unknown>)[key];
           return acc;
-        }, {});
+        }, Object.create(null));
     }
     return item;
   });
+}
+
+/** 数据图中不可 JSON 编码的值的类型（写入前预检，与具体后端无关） */
+export type JsonEncodingProblem =
+  | 'circular-reference'
+  | 'undefined-value'
+  | 'function-value'
+  | 'symbol-value'
+  | 'bigint-value'
+  | 'non-finite-number';
+
+/**
+ * 递归检查数据图是否可无损 JSON 编码：循环引用（JSON.stringify 直接抛错）、
+ * undefined/函数/符号（键被静默丢弃）、非有限数值（静默变 null）、BigInt（抛错）。
+ * 返回首个问题；无可序列化问题返回 null。seen 按路径维护（退出即删除）：
+ * 同一对象出现在两处（DAG）可正常序列化，不应误判为循环。
+ */
+export function findJsonEncodingProblem(value: unknown, seen = new Set<object>()): JsonEncodingProblem | null {
+  if (value === null || typeof value !== 'object') {
+    if (typeof value === 'number' && !Number.isFinite(value)) return 'non-finite-number';
+    if (value === undefined) return 'undefined-value';
+    if (typeof value === 'function') return 'function-value';
+    if (typeof value === 'symbol') return 'symbol-value';
+    if (typeof value === 'bigint') return 'bigint-value';
+    return null;
+  }
+  if (seen.has(value)) return 'circular-reference';
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const problem = findJsonEncodingProblem(item, seen);
+      if (problem) return problem;
+    }
+  } else {
+    for (const key of Object.keys(value)) {
+      const problem = findJsonEncodingProblem((value as Record<string, unknown>)[key], seen);
+      if (problem) return problem;
+    }
+  }
+  seen.delete(value);
+  return null;
 }
 
 /** 同 revision 幂等重存判定：内容逐字段一致（仅 savedAt 等记录字段可漂移） */

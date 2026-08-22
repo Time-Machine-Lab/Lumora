@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createBlankProject } from '@lumora/core';
+import type { Project } from '@lumora/core';
 import { ProjectStore } from '../src/persistence/project-store';
+import { findJsonEncodingProblem, sameProjectContent, stableStringify } from '../src/persistence/project-storage';
 
 const DB = 'lumora-test-store';
 
@@ -196,5 +198,78 @@ describe('ProjectStore：IndexedDB 持久化（FR-011）', () => {
     } finally {
       Object.defineProperty(globalThis, 'indexedDB', { value: idb, configurable: true });
     }
+  });
+});
+
+describe('ProjectStore：JSON 可编码性契约（第五轮 #8，与 OPFS 后端一致）', () => {
+  it('含 undefined 字段的项目：事务前拒绝，不产生记录', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const bad = project('lumora://project/a', '含 undefined', 1) as Project & Record<string, unknown>;
+    bad.extra = undefined;
+    const result = await store.save(bad as Project, null);
+    expect(result).toMatchObject({ ok: false, code: 'storage-error' });
+    if (result.ok || result.code !== 'storage-error') return;
+    expect(result.message).toContain('undefined');
+    expect(await store.load('lumora://project/a')).toBeNull();
+    store.close();
+  });
+
+  it('含非有限数值的项目：拒绝（JSON 会静默失真为 null）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const bad = project('lumora://project/a', '非有限数值', 1);
+    bad.settings = { ...bad.settings, fps: Infinity };
+    const result = await store.save(bad, null);
+    expect(result).toMatchObject({ ok: false, code: 'storage-error' });
+    if (result.ok || result.code !== 'storage-error') return;
+    expect(result.message).toContain('non-finite');
+    store.close();
+  });
+
+  it('含循环引用的项目：拒绝（structuredClone 能存但 JSON 契约不能编码）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const bad = project('lumora://project/a', '循环引用', 1) as Project & Record<string, unknown>;
+    bad.loop = bad;
+    const result = await store.save(bad as Project, null);
+    expect(result).toMatchObject({ ok: false, code: 'storage-error' });
+    if (result.ok || result.code !== 'storage-error') return;
+    expect(result.message).toContain('circular');
+    store.close();
+  });
+});
+
+describe('project-storage 共享工具（第五轮 #6 / #8）', () => {
+  it('stableStringify 保留名为 __proto__ 的自有字段（null 原型累加器，防 fork 检测绕过）', () => {
+    const plain = JSON.parse('{"a":1}');
+    const withProto = JSON.parse('{"a":1,"__proto__":{"x":1}}');
+    expect(stableStringify(withProto)).toContain('__proto__');
+    expect(stableStringify(plain)).not.toBe(stableStringify(withProto));
+    // 仅 __proto__ 字段差异的两个项目：内容指纹必须不同（分叉检测不可绕过）
+    const base = JSON.parse(
+      '{"uri":"lumora://project/a","name":"n","schemaVersion":3,"createdAt":"t","revision":0,"settings":{"fps":30,"aspect":[16,9]},"activeSceneId":"s1","scenes":[],"objects":[],"tracks":[],"assets":[],"pluginData":{}}',
+    ) as Project;
+    const forked = JSON.parse(
+      '{"uri":"lumora://project/a","name":"n","schemaVersion":3,"createdAt":"t","revision":0,"settings":{"fps":30,"aspect":[16,9]},"activeSceneId":"s1","scenes":[],"objects":[],"tracks":[],"assets":[],"pluginData":{"__proto__":{"x":1}}}',
+    ) as Project;
+    expect(sameProjectContent(base, forked)).toBe(false);
+  });
+
+  it('findJsonEncodingProblem：循环/DAG 判定正确，各类不可编码值识别', () => {
+    const dag: Record<string, unknown> = { a: { n: 1 } };
+    dag.b = dag.a; // 同一对象两处引用（DAG）：JSON.stringify 可正常处理，不误判循环
+    expect(findJsonEncodingProblem(dag)).toBeNull();
+
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    expect(findJsonEncodingProblem(circular)).toBe('circular-reference');
+    expect(findJsonEncodingProblem({ u: undefined })).toBe('undefined-value');
+    expect(findJsonEncodingProblem({ n: NaN })).toBe('non-finite-number');
+    expect(findJsonEncodingProblem({ n: Infinity })).toBe('non-finite-number');
+    expect(findJsonEncodingProblem({ b: 1n })).toBe('bigint-value');
+    expect(findJsonEncodingProblem({ f: () => undefined })).toBe('function-value');
+    expect(findJsonEncodingProblem({ s: Symbol('x') })).toBe('symbol-value');
+    expect(findJsonEncodingProblem({ ok: [1, 'a', null, { deep: true }] })).toBeNull();
   });
 });

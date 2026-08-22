@@ -9,7 +9,7 @@
 import type { OpfsDirectoryHandle, OpfsFileHandle } from '../src/persistence/project-store-opfs';
 
 class NotFoundError extends Error {
-  readonly name = 'NotFoundError';
+  override readonly name = 'NotFoundError';
 }
 
 export class MemWritable {

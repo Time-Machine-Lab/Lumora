@@ -1,7 +1,8 @@
 /**
  * 项目自动保存（FR-011 / NFR-003 / AC2）：
  * - 编辑器每次变更（project:changed）后防抖 AUTOSAVE_DEBOUNCE_MS 触发保存；
- * - 脏状态 = 编辑器 revision 与上次成功保存 revision 不一致（撤销回到已保存状态即转净）；
+ * - 脏状态 = 编辑器 revision 与上次成功保存 revision 不一致，或 revision 一致但
+ *   内容指纹不同（同 uri 同 revision 的运行期替换/分叉，见 isUnsaved）；
  * - 保存失败（配额不足 / 存储错误 / revision 冲突）保持脏状态与快照并广播可操作错误，
  *   绝不覆盖较新的已存内容（CAS 防倒退）；冲突不提供自动恢复 —— 必须显式解决
  *   （加载较新版本 / 另存副本），防止「本地计数追平后覆盖」的数据丢失；
@@ -23,7 +24,7 @@
 
 import type { Project, SceneEditor } from '@lumora/core';
 import type { ProjectStorage, SaveFailureCode, SaveOutcome } from './project-storage';
-import { sameProjectContent } from './project-storage';
+import { sameProjectContent, stableStringify } from './project-storage';
 
 export const AUTOSAVE_DEBOUNCE_MS = 2000;
 
@@ -49,23 +50,40 @@ interface LatchedError {
   message: string;
 }
 
+/** 已提交基线：revision + 已提交内容的稳定序列化指纹（同 revision 内容分叉判定）。 */
+interface CommittedBaseline {
+  revision: number;
+  fingerprint: string;
+}
+
+/** 内容指纹（不含 revision 计数器）：分叉判定关注内容本身；revision 由数字比较
+ *  单独负责（撤销回已保存内容时 revision 递增但内容一致，不构成内容分叉） */
+function contentFingerprint(project: Project): string {
+  const { revision: _revision, ...content } = project;
+  return stableStringify(content);
+}
+
 export class ProjectAutosaver {
   private store: ProjectStorage | null;
   private currentUri: string | null = null;
-  /** 各 uri 已确认落盘的 revision（含已切换走的项目：旧项目保存成功也推进基线）。
+  /** 各 uri 已确认落盘的基线（含已切换走的项目：旧项目保存成功也推进基线）。
    *  null = 尚无任何已确认记录（首存基线）：仅 load/对账成功后才建立数字基线，
    *  首存与重试按创建语义（create-only）执行，绝不把「未确认存在」当作数字基线。
    *  净/脏判定统一以此为准（isUnsaved）：首存失败后不得以「revision 未变」判净。 */
-  private readonly committedByUri = new Map<string, number | null>();
+  private readonly committedByUri = new Map<string, CommittedBaseline | null>();
 
   /**
    * 项目是否有未保存变更（以已确认落盘的 committed baseline 判净，而非打开时
    *  revision 快照）：baseline 为 null（首存从未成功）恒为未保存 —— 首存失败后
    *  flush/排空必须重试或阻断，绝不假报已保存放行切换。
+   *  revision 一致时进一步比较内容指纹：同 uri 同 revision 的运行期替换
+   *  （导入/替换打开）不得被误判为净（第五轮 #3）。
    */
   private isUnsaved(project: Project): boolean {
     const baseline = this.committedByUri.get(project.uri);
-    return baseline === undefined || baseline === null || baseline !== project.revision;
+    if (baseline === undefined || baseline === null) return true;
+    if (baseline.revision !== project.revision) return true;
+    return contentFingerprint(project) !== baseline.fingerprint;
   }
   /** 最新未保存快照（编辑器的只读冻结快照）：编辑后立即捕获，reset/close 后仍可冲刷 */
   private pending: Project | null = null;
@@ -208,7 +226,7 @@ export class ProjectAutosaver {
     this.pending = null;
     this.saveQueued = false;
     this.latched = null;
-    this.committedByUri.set(project.uri, project.revision);
+    this.committedByUri.set(project.uri, { revision: project.revision, fingerprint: contentFingerprint(project) });
     this.recovery.delete(project.uri);
     this.emit(this.store ? { status: 'clean' } : { status: 'memory' });
   }
@@ -260,9 +278,15 @@ export class ProjectAutosaver {
   /**
    * 显式重试保存恢复快照（另存副本之外的第二条出路）：以该 uri 当前已提交基线做 CAS
    * （尚无记录时按创建语义，首存失败同样可重试）。
-   * 成功清除恢复快照与锁存，并把编辑器对齐到已落盘内容：恢复快照不新于编辑器时
-   * 重开恢复快照（防止后续对账把「编辑器落后」误判为冲突再次锁存），更新时把
-   * 编辑器内容向前保存（重试期间的编辑不丢失）。失败返回错误，由调用方明示。
+   * 成功清除恢复快照与锁存，并按「当前编辑器 ↔ 恢复快照 ↔ 已提交基线」三方内容
+   * 指纹对齐（第五轮 #4：不做 revision 大小推断 —— revision 顺序不等于内容祖先，
+   * 同 uri 替换等场景会把分叉误判为可自动恢复）：
+   * - 编辑器 == 恢复快照：对齐已落盘内容（重置基线并重开快照，幂等）；
+   * - 编辑器 == 已提交基线：编辑器未动，恢复快照是唯一新内容 → 采用快照；
+   * - 恢复快照 == 已提交基线：快照未带来新内容 → 把编辑器内容向前保存；
+   * - 三方各不相同：真分叉 —— 快照已落盘但不覆盖当前编辑，锁存冲突供显式解决
+   *   （加载较新版本 = 已保存快照 / 另存副本 = 当前编辑）。
+   * 失败返回错误，由调用方明示。
    */
   retryRecovery(uri: string): Promise<SaveOutcome> {
     const snapshot = this.recovery.get(uri);
@@ -271,7 +295,8 @@ export class ProjectAutosaver {
     }
     return this.enqueue(async () => {
       if (this.disposed) return { ok: false, code: 'storage-error', message: '自动保存已停用' };
-      const expected = this.committedByUri.get(uri) ?? null;
+      const baseline = this.committedByUri.get(uri);
+      const expected = baseline?.revision ?? null;
       const result = await this.storeSave(snapshot, expected);
       if (!result.ok) {
         if (result.code === 'revision-conflict') {
@@ -279,40 +304,40 @@ export class ProjectAutosaver {
         }
         return result;
       }
-      const prev = this.committedByUri.get(uri);
-      this.committedByUri.set(uri, Math.max(prev ?? -1, snapshot.revision));
+      const baseFp = baseline ? baseline.fingerprint : undefined;
+      const snapFp = contentFingerprint(snapshot);
+      this.committedByUri.set(uri, { revision: snapshot.revision, fingerprint: snapFp });
       this.recovery.delete(uri);
       if (this.latched?.uri === uri) this.latched = null;
       if (uri === this.currentUri) {
         const current = this.editor.getProject();
-        if (current && current.revision > snapshot.revision) {
-          // 恢复快照落盘后编辑器内容更新（重试期间的编辑）：向前保存编辑器内容，
-          // expected = 刚落盘 revision，绝不反向覆盖
-          void this.enqueue(() => this.saveSnapshot(current));
-        } else if (
-          current &&
-          current.revision === snapshot.revision &&
-          !sameProjectContent(current, snapshot)
-        ) {
-          // 同 revision 但内容分叉：恢复快照已落盘，当前内容与快照不一致 ——
-          // 不得用恢复快照静默覆盖当前编辑（resetTo 会替换编辑器内容），
-          // 锁存冲突供显式解决（加载较新版本 = 已保存快照 / 另存副本 = 当前编辑）
-          this.latch({
-            uri,
-            code: 'revision-conflict',
-            message:
-              '恢复快照已保存，但当前内容与快照分叉（同 revision 不同内容）。请「另存副本」保留当前编辑，或「加载较新版本」采用已保存内容',
-          });
-          return {
-            ok: false,
-            code: 'revision-conflict',
-            message: '当前内容与恢复快照分叉（同 revision 不同内容），未覆盖当前编辑。请先「另存副本」保留当前内容',
-          };
-        } else if (current) {
-          // 编辑器不新于恢复快照（落后或同 revision 同内容）：以恢复快照为准重开
-          // 编辑器（重开 recovery 快照，编辑器与存储对齐）
-          this.resetTo(snapshot);
-          this.editor.openProject(snapshot);
+        if (current) {
+          const curFp = contentFingerprint(current);
+          if (curFp === snapFp || curFp === baseFp) {
+            // 编辑器 == 已落盘内容，或编辑器停留在旧基线（快照是唯一新内容）：
+            // 以恢复快照为准重开编辑器，与存储对齐（重试期间未编辑或编辑与快照一致）
+            this.resetTo(snapshot);
+            this.editor.openProject(snapshot);
+          } else if (snapFp === baseFp) {
+            // 快照与旧基线一致（未带来新内容）：编辑器内容向前保存，
+            // expected = 刚落盘 revision，绝不反向覆盖
+            void this.enqueue(() => this.saveSnapshot(current));
+          } else {
+            // 三方各不相同 = 真分叉：恢复快照已落盘（内容不丢），但不以快照
+            // 静默覆盖当前编辑（resetTo 会替换编辑器内容），也不以编辑器静默
+            // 覆盖快照 —— 锁存冲突供显式解决（另存副本 / 加载较新版本）
+            this.latch({
+              uri,
+              code: 'revision-conflict',
+              message:
+                '恢复快照已保存，但当前编辑与快照、已保存基线三方内容不一致（分叉）。请「另存副本」保留当前编辑，或「加载较新版本」采用已保存内容',
+            });
+            return {
+              ok: false,
+              code: 'revision-conflict',
+              message: '当前内容与恢复快照三方分叉，未覆盖当前编辑。请先「另存副本」保留当前内容',
+            };
+          }
         }
       }
       return result;
@@ -392,7 +417,7 @@ export class ProjectAutosaver {
       return { ok: true };
     }
     const session = this.session;
-    const expected = this.committedByUri.get(project.uri) ?? null;
+    const expected = this.committedByUri.get(project.uri)?.revision ?? null;
     if (this.isFresh(project.uri, session)) this.emit({ status: 'saving' });
     const result = await this.storeSave(project, expected);
     this.applySaveResult(project, session, result);
@@ -408,11 +433,14 @@ export class ProjectAutosaver {
     if (!this.store) return;
     void this.enqueue(async () => {
       if (this.disposed) return;
-      const expected = this.committedByUri.get(uri) ?? null;
+      const expected = this.committedByUri.get(uri)?.revision ?? null;
       const result = await this.storeSave(snapshot, expected);
       if (result.ok) {
         const prev = this.committedByUri.get(uri);
-        this.committedByUri.set(uri, Math.max(prev ?? -1, snapshot.revision));
+        this.committedByUri.set(uri, {
+          revision: Math.max(prev?.revision ?? -1, snapshot.revision),
+          fingerprint: contentFingerprint(snapshot),
+        });
         this.recovery.delete(uri);
       } else {
         this.recovery.set(uri, snapshot);
@@ -472,7 +500,7 @@ export class ProjectAutosaver {
       this.applySaveResult(latest, session, result);
       return;
     }
-    this.committedByUri.set(project.uri, stored.revision);
+    this.committedByUri.set(project.uri, { revision: stored.revision, fingerprint: contentFingerprint(stored) });
     if (this.recovery.has(project.uri)) {
       this.latch({
         uri: project.uri,
@@ -508,7 +536,10 @@ export class ProjectAutosaver {
   private applySaveResult(project: Project, session: number, result: SaveOutcome): void {
     if (result.ok) {
       const prev = this.committedByUri.get(project.uri);
-      this.committedByUri.set(project.uri, Math.max(prev ?? -1, project.revision));
+      this.committedByUri.set(project.uri, {
+        revision: Math.max(prev?.revision ?? -1, project.revision),
+        fingerprint: contentFingerprint(project),
+      });
       this.recovery.delete(project.uri);
       if (this.latched?.uri === project.uri) this.latched = null;
       if (!this.isFresh(project.uri, session)) return;

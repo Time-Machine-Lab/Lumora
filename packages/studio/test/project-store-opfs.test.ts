@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createBlankProject } from '@lumora/core';
-import { OpfsProjectStore } from '../src/persistence/project-store-opfs';
-import { MemDirectoryHandle } from './opfs-fs-shim';
+import type { Project } from '@lumora/core';
+import { OpfsProjectStore, projectFileName } from '../src/persistence/project-store-opfs';
+import { MemDirectoryHandle, MemFileHandle } from './opfs-fs-shim';
 
 const DB = 'lumora-test-opfs';
 
@@ -232,10 +233,10 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     const store = await OpfsProjectStore.create(DB);
     if (!store) return;
     // 直接向存储目录写入非法 JSON（模拟外部改动/半写）
-    const root = (await navigator.storage.getDirectory()) as MemDirectoryHandle;
+    const root = (await navigator.storage.getDirectory()) as unknown as MemDirectoryHandle;
     const rootDir = await root.getDirectoryHandle(DB);
     const projectsDir = await rootDir.getDirectoryHandle('projects');
-    await projectsDir.getFileHandle('lumora%3A%2F%2Fproject%2Fbroken', { create: true });
+    await projectsDir.getFileHandle(projectFileName('lumora://project/broken'), { create: true });
 
     expect(await store.load('lumora://project/broken')).toBeNull();
     // 创建语义与 CAS 都拒绝覆盖损坏记录
@@ -249,6 +250,141 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     store.close();
   });
 
+  it('结构损坏记录（合法 JSON 但形状错误）：load 视为缺失、list 跳过、save 拒绝、remove 可删除（第五轮 #9）', async () => {
+    const store = await OpfsProjectStore.create(DB);
+    if (!store) return;
+    const root = (await navigator.storage.getDirectory()) as unknown as MemDirectoryHandle;
+    const rootDir = await root.getDirectoryHandle(DB);
+    const projectsDir = await rootDir.getDirectoryHandle('projects');
+    // 缺 project 对象的半写记录
+    const incomplete = await projectsDir.getFileHandle(projectFileName('lumora://project/incomplete'), { create: true });
+    const writable = await incomplete.createWritable();
+    await writable.write(JSON.stringify({ uri: 'lumora://project/incomplete', savedAt: 'x' }));
+    await writable.close();
+    // 记录外壳与 project.uri 不一致（外部改动）
+    const mismatched = await projectsDir.getFileHandle(projectFileName('lumora://project/mismatch'), { create: true });
+    const writable2 = await mismatched.createWritable();
+    await writable2.write(
+      JSON.stringify({
+        uri: 'lumora://project/mismatch',
+        savedAt: 'x',
+        project: { uri: 'lumora://project/other', name: 'n', schemaVersion: 3, revision: 0 },
+      }),
+    );
+    await writable2.close();
+
+    expect(await store.load('lumora://project/incomplete')).toBeNull();
+    expect(await store.load('lumora://project/mismatch')).toBeNull();
+    // list 跳过结构损坏记录，不把半写数据当项目
+    expect((await store.list()).map((s) => s.uri)).toEqual([]);
+    const result = await store.save(project('lumora://project/incomplete', '试图覆盖', 1), null);
+    expect(result.ok).toBe(false);
+    if (result.ok || result.code !== 'storage-error') return;
+    expect(result.message).toContain('损坏');
+    expect(await store.remove('lumora://project/incomplete')).toBe(true);
+    store.close();
+  });
+
+  it('JSON 不可编码数据：与 IndexedDB 一致事务前拒绝（undefined / 非有限数值 / 循环引用）（第五轮 #8）', async () => {
+    const store = await OpfsProjectStore.create(DB);
+    if (!store) return;
+    const badUndefined = project('lumora://project/a', '含 undefined', 1) as Project & Record<string, unknown>;
+    badUndefined.extra = undefined;
+    const resultUndefined = await store.save(badUndefined as Project, null);
+    expect(resultUndefined).toMatchObject({ ok: false, code: 'storage-error' });
+    if (resultUndefined.ok || resultUndefined.code !== 'storage-error') return;
+    expect(resultUndefined.message).toContain('undefined');
+    expect(await store.load('lumora://project/a')).toBeNull();
+
+    const badNaN = project('lumora://project/b', '非有限数值', 1);
+    badNaN.settings = { ...badNaN.settings, fps: NaN };
+    const resultNaN = await store.save(badNaN, null);
+    expect(resultNaN).toMatchObject({ ok: false, code: 'storage-error' });
+    if (resultNaN.ok || resultNaN.code !== 'storage-error') return;
+    expect(resultNaN.message).toContain('non-finite');
+
+    const badCircular = project('lumora://project/c', '循环引用', 1) as Project & Record<string, unknown>;
+    badCircular.loop = badCircular;
+    const resultCircular = await store.save(badCircular as Project, null);
+    expect(resultCircular).toMatchObject({ ok: false, code: 'storage-error' });
+    if (resultCircular.ok || resultCircular.code !== 'storage-error') return;
+    expect(resultCircular.message).toContain('circular');
+    store.close();
+  });
+
+  it('move 能力缺失（受限环境）：非原子降级直接写目标，保存/读取语义不变', async () => {
+    // 构造 move 缺失的文件系统：root/DB/projects 链上，projects 目录的
+    // getFileHandle 返回去掉 move 能力的包装句柄（能力探测 → 降级路径）
+    const root = new MemDirectoryHandle('root');
+    const noMoveFile = (handle: MemFileHandle) =>
+      new Proxy(handle, {
+        get(h, hp, hr) {
+          if (hp === 'move') return undefined;
+          return Reflect.get(h, hp, hr);
+        },
+      });
+    const noMoveDir = (dir: MemDirectoryHandle) =>
+      new Proxy(dir, {
+        get(t, p, r) {
+          if (p === 'getFileHandle') {
+            return async (name: string, options?: { create?: boolean }) => {
+              const handle = await (t as MemDirectoryHandle).getFileHandle(name, options);
+              return noMoveFile(handle as MemFileHandle);
+            };
+          }
+          const value = Reflect.get(t, p, r);
+          return typeof value === 'function' ? value.bind(t) : value;
+        },
+      });
+    const rootProxy = new Proxy(root, {
+      get(t, p, r) {
+        if (p === 'getDirectoryHandle') {
+          return async (name: string, options?: { create?: boolean }) => {
+            if (name === DB) {
+              const dir = await (t as MemDirectoryHandle).getDirectoryHandle(name, options);
+              // 再包一层：使其 getDirectoryHandle('projects') 返回去 move 的目录
+              return new Proxy(dir as MemDirectoryHandle, {
+                get(d, dp, dr) {
+                  if (dp === 'getDirectoryHandle') {
+                    return async (subName: string, subOpts?: { create?: boolean }) => {
+                      const sub = await (d as MemDirectoryHandle).getDirectoryHandle(subName, subOpts);
+                      return subName === 'projects' ? noMoveDir(sub as MemDirectoryHandle) : sub;
+                    };
+                  }
+                  const value = Reflect.get(d, dp, dr);
+                  return typeof value === 'function' ? value.bind(d) : value;
+                },
+              });
+            }
+            return (t as MemDirectoryHandle).getDirectoryHandle(name, options);
+          };
+        }
+        const value = Reflect.get(t, p, r);
+        return typeof value === 'function' ? value.bind(t) : value;
+      },
+    });
+    const store = await OpfsProjectStore.create(DB, rootProxy);
+    if (!store) return;
+
+    const saved = project('lumora://project/a', '降级保存', 3);
+    expect((await store.save(saved)).ok).toBe(true);
+    expect((await store.load('lumora://project/a'))).toEqual(saved);
+    // 覆盖写入（CAS 通过）也走降级路径
+    expect((await store.save(project('lumora://project/a', '降级更新', 4), 3)).ok).toBe(true);
+    expect((await store.load('lumora://project/a'))!.name).toBe('降级更新');
+    store.close();
+  });
+
+  it('文件名固定前缀 + uri 哈希：任意 uri（含文件系统敏感字符）都映射为安全文件名', () => {
+    const a = projectFileName('lumora://project/安全中文名');
+    const b = projectFileName('lumora://project/../%2e%2e/x');
+    expect(a).toMatch(/^p_[0-9a-f]{16}\.json$/);
+    expect(b).toMatch(/^p_[0-9a-f]{16}\.json$/);
+    expect(a).not.toBe(b);
+    // 同 uri 稳定映射
+    expect(projectFileName('lumora://project/安全中文名')).toBe(a);
+  });
+
   it('配额不足：写入失败返回 quota-exceeded，旧记录保持原样且无临时文件残留', async () => {
     const store = await OpfsProjectStore.create(DB);
     if (!store) return;
@@ -256,7 +392,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     expect((await store.save(saved)).ok).toBe(true);
 
     // 注入写入失败（QuotaExceededError）后重存同 uri 内容
-    const root = (await navigator.storage.getDirectory()) as MemDirectoryHandle;
+    const root = (await navigator.storage.getDirectory()) as unknown as MemDirectoryHandle;
     const rootDir = await root.getDirectoryHandle(DB);
     const projectsDir = await rootDir.getDirectoryHandle('projects');
     projectsDir.failNextWrite(new DOMException('磁盘配额不足', 'QuotaExceededError'));

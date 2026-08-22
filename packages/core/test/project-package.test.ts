@@ -241,6 +241,51 @@ describe('工程包凭据清除（NFR-008：嵌套扩展数据递归清除）', 
     expect(json).toContain('2048');
     expect(json).toContain('cl100k');
   });
+
+  it('凭据键名大小写/命名风格矩阵：分隔符/驼峰/首字母大写/全大写/紧凑别名全部清除（第五轮 #2）', async () => {
+    const project = await buildFixtureProject();
+    const stripped: Record<string, string> = {};
+    const preserved: Record<string, string> = {};
+    // 凭据族各命名风格：snake/kebab/小驼峰/大驼峰/全大写/全小写紧凑/全大写紧凑
+    for (const key of [
+      'api_key', 'api-key', 'apiKey', 'ApiKey', 'APIKey', 'API_KEY', 'apikey', 'APIKEY',
+      'access_token', 'access-token', 'accessToken', 'AccessToken', 'ACCESS_TOKEN',
+      'accesstoken', 'ACCESSTOKEN', 'access_keys', 'accessKeys', 'ACCESS_KEYS',
+      'secret_key', 'secretKey', 'SecretKey', 'SECRET_KEY', 'secretkey', 'SECRETKEY',
+      'client_secret', 'clientSecret', 'ClientSecret', 'CLIENT_SECRET',
+      'clientsecret', 'CLIENTSECRET',
+      'private_key', 'privateKey', 'PrivateKey', 'PRIVATE_KEY', 'PRIVATEKEY',
+      'provider_key', 'providerKey', 'PROVIDER_KEY',
+      'auth_cookie', 'authCookie', 'AUTH_COOKIE', 'session_cookie',
+      'session_token', 'sessionToken', 'SESSION_TOKEN', 'token', 'TOKEN',
+      'password', 'PASSWORD', 'Password',
+      'credential', 'CREDENTIAL', 'Credentials', 'credentials',
+      'authorization', 'AUTHORIZATION', 'Authorization',
+      'secret', 'SECRET', 'Secret', 'secrets', 'SECRETS',
+      'api_keys', 'API_KEYS', 'apikeys', 'APIKEYS',
+    ]) {
+      stripped[key] = `sensitive-${key}`;
+    }
+    // 非凭据配置：token 族计数/分词、key 前缀的词、普通配置（含全大写形态）
+    for (const key of [
+      'maxTokens', 'MAXTOKENS', 'max_tokens', 'max-tokens', 'MaxTokens',
+      'tokenizer', 'TOKENIZER', 'tokenBudget', 'token_budget', 'tokenCount',
+      'tokensPerSec', 'token_limit',
+      'keyframes', 'KEYFRAMES', 'keyframeRate',
+      '2048', 'cl100k', 'sampleRate', 'SAMPLE_RATE', 'apiUrl', 'API_URL', 'APIURL',
+      'endpoint', 'url', 'URL',
+    ]) {
+      preserved[key] = `safe-${key}`;
+    }
+    const rich = { ...project, pluginData: { 'com.example': { ...stripped, ...preserved } } } as Project;
+    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
+    for (const key of Object.keys(stripped)) {
+      expect(json, `凭据键 ${key} 必须被清除`).not.toContain(`sensitive-${key}`);
+    }
+    for (const key of Object.keys(preserved)) {
+      expect(json, `非凭据键 ${key} 必须保留`).toContain(`safe-${key}`);
+    }
+  });
 });
 
 describe('parseProjectPackage：导出 → 导入 完整恢复（AC1）', () => {

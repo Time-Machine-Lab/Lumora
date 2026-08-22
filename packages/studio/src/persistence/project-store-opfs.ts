@@ -34,7 +34,7 @@ import type {
   SaveOutcome,
   StoredProject,
 } from './project-storage';
-import { failureMessage, isQuotaError, sameProjectContent } from './project-storage';
+import { failureMessage, findJsonEncodingProblem, isQuotaError, sameProjectContent } from './project-storage';
 
 /** OPFS 根目录名（与 IndexedDB 的 PROJECT_STORE_DB 同名，切换后端不混淆命名空间） */
 export const OPFS_STORE_DIR = 'lumora-studio';
@@ -94,8 +94,40 @@ function withFallbackLock<T>(name: string, task: () => Promise<T>): Promise<T> {
   });
 }
 
-function projectFileName(uri: string): string {
-  return encodeURIComponent(uri);
+/** FNV-1a 64 位哈希（BigInt）：文件名安全（固定前缀 + 十六进制，与 uri 内容一一对应）。
+ *  对任意 uri 输入（含 '..'、'/' 等文件系统敏感字符）都产出安全文件名（第五轮一般项）。 */
+export function fnv1a64Hex(input: string): string {
+  let hash = 0xcbf29ce484222325n;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= BigInt(input.charCodeAt(i));
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return hash.toString(16).padStart(16, '0');
+}
+
+/** 项目记录文件名：固定安全前缀 + uri 哈希（encodeURIComponent 曾允许 '..'/'/' 等
+ *  保留字符进入文件名，收紧为纯哈希命名；uri 语义由记录内容校验承担） */
+export function projectFileName(uri: string): string {
+  return `p_${fnv1a64Hex(uri)}.json`;
+}
+
+/** 记录结构校验（第五轮 #9）：JSON 能解析 ≠ 是合法记录 —— 外部改动/半写可能留下
+ *  形状错误的文件；校验失败视为损坏（load 视为缺失 / list 跳过 / save 拒绝覆盖）。 */
+export function isStoredProjectRecord(value: unknown): value is StoredProject {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const project = record.project as Record<string, unknown> | null | undefined;
+  return (
+    typeof record.uri === 'string' &&
+    typeof record.savedAt === 'string' &&
+    project !== null &&
+    typeof project === 'object' &&
+    !Array.isArray(project) &&
+    project.uri === record.uri &&
+    typeof project.name === 'string' &&
+    typeof project.schemaVersion === 'number' &&
+    typeof project.revision === 'number'
+  );
 }
 
 function isNotFoundError(error: unknown): boolean {
@@ -177,6 +209,17 @@ export class OpfsProjectStore implements ProjectStorage {
    * 提交边界 = writable.close()（落盘）。
    */
   async save(project: Project, expectedStoredRevision?: number | null): Promise<SaveOutcome> {
+    // 写入前 JSON 可编码性预检：与 IndexedDB 后端契约一致（第五轮 #8）——
+    // OPFS 以 JSON 文本落盘，循环引用/BigInt 会抛错、undefined/非有限数值会静默
+    // 失真；两后端对同一数据必须有一致的接受/拒绝语义
+    const encodingProblem = findJsonEncodingProblem(project);
+    if (encodingProblem) {
+      return {
+        ok: false,
+        code: 'storage-error',
+        message: `项目包含无法本地保存的数据（${encodingProblem}），保存被拒绝`,
+      };
+    }
     return this.withLock(async () => {
       const name = projectFileName(project.uri);
       try {
@@ -305,8 +348,9 @@ export class OpfsProjectStore implements ProjectStorage {
   }
 
   /**
-   * 读取记录：文件缺失返回 undefined；损坏（无法解析）返回 null；
-   * 合法记录返回 StoredProject。
+   * 读取记录：文件缺失返回 undefined；损坏（无法解析或结构校验失败）返回 null；
+   * 合法记录返回 StoredProject。个体损坏可隔离：load 视为缺失、list 跳过、
+   * save 拒绝覆盖、remove 可删除（用户的修复路径）。
    */
   private async readRecord(name: string): Promise<StoredProject | undefined | null> {
     let handle: OpfsFileHandle;
@@ -319,17 +363,45 @@ export class OpfsProjectStore implements ProjectStorage {
     const file = await handle.getFile();
     const text = await file.text();
     try {
-      return JSON.parse(text) as StoredProject;
+      const parsed: unknown = JSON.parse(text);
+      return isStoredProjectRecord(parsed) ? parsed : null;
     } catch {
       return null;
     }
   }
 
-  /** 原子写入：临时文件落盘后 move 覆盖目标名；任一步失败旧记录保持原样。 */
+  /**
+   * 原子写入：临时文件落盘后 move 覆盖目标名；任一步失败旧记录保持原样。
+   * move 能力缺失（受限环境，能力探测）时退化为直接写目标文件 —— 非原子降级，
+   * 中断可能留下半写记录，readRecord 的结构校验会将其视为损坏（list 跳过、
+   * load 视为缺失、可删除重试），绝不把半写数据当合法记录用。
+   */
   private async writeRecord(name: string, record: StoredProject): Promise<void> {
-    const tmpName = `.${name}.tmp`;
     const text = JSON.stringify(record);
+    const tmpName = `.${name}.tmp`;
     const tmp = await this.projectsDir.getFileHandle(tmpName, { create: true });
+    if (typeof tmp.move !== 'function') {
+      // 非原子降级路径：不创建临时文件（上一行已创建，先清理），直接写目标
+      try {
+        await this.projectsDir.removeEntry(tmpName);
+      } catch {
+        // 清理失败不掩盖写入
+      }
+      const direct = await this.projectsDir.getFileHandle(name, { create: true });
+      const directWritable = await direct.createWritable();
+      try {
+        await directWritable.write(text);
+        await directWritable.close();
+      } catch (error) {
+        try {
+          await directWritable.close();
+        } catch {
+          // 写入本身已失败，close 可能再次拒绝；忽略
+        }
+        throw error;
+      }
+      return;
+    }
     const writable = await tmp.createWritable();
     try {
       await writable.write(text);

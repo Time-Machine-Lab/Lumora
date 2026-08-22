@@ -113,30 +113,33 @@ export class ProjectPersistence {
   }
 
   /**
-   * 加载本地项目（打开最近项目）。本地加载边界执行 schema 迁移（TML-53 第四轮）：
-   * 旧版本（如 v2 无 tracks）记录先逐级迁移到当前版本，校验通过后以已存 revision
-   * 为期望基线 CAS 原子写回 —— 下次加载不再迁移；迁移/校验失败返回可操作错误，
-   * 绝不把旧版本数据原样交给编辑器。
+   * 加载本地项目（打开最近项目）的统一边界（第五轮 #7）：全部加载结果一律走
+   * 「迁移 → 结构校验」管道 —— 旧版本（如 v2 无 tracks）记录先逐级迁移到当前
+   * 版本；当前版本记录也做结构校验（损坏记录不得原样交给编辑器）。仅当迁移
+   * 实际发生（migratedFrom ≠ 当前版本）时以已存 revision 为期望基线 CAS 原子
+   * 写回 —— 下次加载不再迁移；迁移/校验失败返回可操作错误，绝不把未经验证
+   * 的数据交给编辑器。
    */
   async loadProject(uri: string): Promise<{ ok: true; project: Project; migratedFrom?: number } | { ok: false; message: string }> {
     if (!this.store) return { ok: false, message: '本地持久化不可用' };
     const stored = await this.store.load(uri);
     if (!stored) return { ok: false, message: '本地项目不存在或已损坏' };
-    if (stored.schemaVersion < CURRENT_PROJECT_SCHEMA_VERSION) {
-      const migrated = migrateProjectSchema(stored);
-      if (!migrated.ok) {
-        return { ok: false, message: `本地项目数据无法迁移到当前版本：${migrated.error.message}` };
-      }
-      const project = migrated.project as Project;
-      const problem = validateProjectSchema(project);
-      if (problem) {
-        return { ok: false, message: `本地项目数据校验失败：${problem}` };
-      }
+    const migrated = migrateProjectSchema(stored);
+    if (!migrated.ok) {
+      return { ok: false, message: `本地项目数据无法迁移到当前版本：${migrated.error.message}` };
+    }
+    const project = migrated.project as Project;
+    const problem = validateProjectSchema(project);
+    if (problem) {
+      return { ok: false, message: `本地项目数据校验失败：${problem}` };
+    }
+    if (migrated.migratedFrom !== CURRENT_PROJECT_SCHEMA_VERSION) {
+      // 仅迁移实际发生时写回（当前版本数据通过校验后原样返回，不做无意义写回）
       const result = await this.store.save(project, stored.revision);
       if (!result.ok) return { ok: false, message: `迁移结果写回失败：${result.message}` };
       return { ok: true, project, migratedFrom: stored.schemaVersion };
     }
-    return { ok: true, project: stored };
+    return { ok: true, project };
   }
 
   /** 本地是否已存在同 uri 记录（导入防碰撞：同 uri 视为副本导入）。 */
@@ -188,17 +191,18 @@ export class ProjectPersistence {
   }
 
   /**
-   * 冲突解决「加载较新版本」：以存储内容为基线重开当前项目。
-   * 显式丢弃未保存变更是用户确认的选择；失败返回可操作错误（不改变编辑器状态）。
+   * 冲突解决「加载较新版本」：复用统一边界 loadProject（load → 迁移 → 校验）
+   * 以存储内容为基线重开当前项目（第五轮 #5）。显式丢弃未保存变更是用户确认
+   * 的选择；失败返回可操作错误且不改变编辑器状态 —— 只有全部成功后才原子切换
+   * （重置自动保存基线 + 重开编辑器）。
    */
   async reloadOpenProject(): Promise<{ ok: true; project: Project } | { ok: false; message: string }> {
-    if (!this.store || !this.currentUri) return { ok: false, message: '本地持久化不可用' };
-    const stored = await this.store.load(this.currentUri);
-    if (!stored) return { ok: false, message: '本地项目不存在或已损坏' };
-    // 先重置自动保存基线（丢弃脏快照），再重开编辑器（触发 project:changed 净态路径）
-    this.autosaver.resetTo(stored);
-    this.editor.openProject(stored);
-    return { ok: true, project: stored };
+    if (!this.currentUri) return { ok: false, message: '本地持久化不可用' };
+    const loaded = await this.loadProject(this.currentUri);
+    if (!loaded.ok) return loaded;
+    this.autosaver.resetTo(loaded.project);
+    this.editor.openProject(loaded.project);
+    return { ok: true, project: loaded.project };
   }
 
   /** 新建项目（FR-001）：默认场景 + 摄像机 + 16:9；持久化不可用时仍可内存编辑。 */

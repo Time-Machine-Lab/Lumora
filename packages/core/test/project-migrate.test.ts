@@ -105,6 +105,21 @@ describe('migrateProjectSchema：版本化 schema 迁移管道（NFR-017）', ()
     expect(validateProjectSchema(migrated)).toContain('tracks');
   });
 
+  it('v2 数据携带 tracks: undefined 自有属性 → 迁移不视为缺失（Object.hasOwn 判定），v3 校验拒绝', () => {
+    const input = v2Fixture();
+    input.tracks = undefined;
+    const result = migrateProjectSchema(input);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const migrated = result.project as unknown as Record<string, unknown>;
+    expect(migrated.schemaVersion).toBe(CURRENT_PROJECT_SCHEMA_VERSION);
+    // 存在但为 undefined 也是现场数据（半写/手工构造），迁移不猜测解释补空数组
+    expect(Object.hasOwn(migrated, 'tracks')).toBe(true);
+    expect(migrated.tracks).toBeUndefined();
+    // 由 v3 校验明确拒绝（缺失/非法 tracks 一律不过）
+    expect(validateProjectSchema(migrated)).toContain('tracks');
+  });
+
   it('v2 数据携带自定义未知字段时透传保留（不静默丢字段）', () => {
     const input = v2Fixture();
     input.customTopLevel = { nested: [1, 2, 3] };

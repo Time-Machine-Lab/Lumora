@@ -23,7 +23,7 @@ import type {
   SaveOutcome,
   StoredProject,
 } from './project-storage';
-import { failureMessage, isQuotaError, sameProjectContent } from './project-storage';
+import { failureMessage, findJsonEncodingProblem, isQuotaError, sameProjectContent } from './project-storage';
 
 export const PROJECT_STORE_DB = 'lumora-studio';
 export const PROJECTS_STORE = 'projects';
@@ -121,6 +121,17 @@ export class ProjectStore implements ProjectStorage {
    * 读-比-写与提交在同一 readwrite 事务内，且以事务 complete 为完成边界。
    */
   async save(project: Project, expectedStoredRevision?: number | null): Promise<SaveOutcome> {
+    // 事务前 JSON 可编码性预检：与 OPFS 后端（JSON 文件）契约一致 —— 循环引用/
+    // BigInt 会让 JSON 序列化抛错、undefined/非有限数值会静默丢字段或失真，
+    // IndexedDB 的 structuredClone 却能原样保存 → 两后端落盘内容不一致（第五轮 #8）
+    const encodingProblem = findJsonEncodingProblem(project);
+    if (encodingProblem) {
+      return {
+        ok: false,
+        code: 'storage-error',
+        message: `项目包含无法本地保存的数据（${encodingProblem}），保存被拒绝`,
+      };
+    }
     const transaction = this.db.transaction(PROJECTS_STORE, 'readwrite');
     const store = transaction.objectStore(PROJECTS_STORE);
     try {

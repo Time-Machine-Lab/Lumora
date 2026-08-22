@@ -90,7 +90,10 @@ describe('ProjectPersistence：OPFS 后端（可配置切换，行为与 Indexed
     const renamed = await runtime.persistence.renameProject(project.uri, '新名');
     expect(renamed.ok).toBe(true);
     await settle(60);
-    expect((await runtime.persistence.loadProject(project.uri))!.project.name).toBe('新名');
+    const renamedLoaded = await runtime.persistence.loadProject(project.uri);
+    expect(renamedLoaded.ok).toBe(true);
+    if (!renamedLoaded.ok) return;
+    expect(renamedLoaded.project.name).toBe('新名');
 
     // 复制
     const duplicate = await runtime.persistence.duplicateProject(project.uri);
