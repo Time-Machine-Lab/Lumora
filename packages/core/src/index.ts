@@ -7,7 +7,7 @@ export { TypedEventEmitter } from './events/typed-event-emitter';
 export type { EventHandler, TypedEventEmitterOptions } from './events/typed-event-emitter';
 export type { EventMap } from './events/event-map';
 
-// 场景数据模型（Project v2）
+// 场景数据模型（Project v3）
 export { createSampleProject } from './scene/sample-project';
 export type {
   AssetData,
@@ -24,6 +24,9 @@ export type {
   SceneObjectData,
   SceneObjectKind,
   SceneObjectType,
+  TrackData,
+  TrackKeyframeData,
+  TrackTargetPath,
   TransformData,
   Vec3,
 } from './scene/types';

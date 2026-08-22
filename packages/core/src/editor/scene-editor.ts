@@ -400,6 +400,9 @@ export class SceneEditor {
     }
     const removed = ids.size;
     let next = removeObjects(project, ids);
+    // 轨道归属其驱动对象（TML-88）：对象被删除后，绑定该对象的轨道一并移除，
+    // 保证轨道引用不悬空（undo 时随历史快照整体恢复）
+    next = { ...next, tracks: next.tracks.filter((track) => !ids.has(track.objectId)) };
     const unreferenced = new Set(collectUnreferencedAssets(next).map((a) => a.id));
     next = removeAssets(next, unreferenced);
     const parentId = baseline.selection

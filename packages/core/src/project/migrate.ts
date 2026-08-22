@@ -38,6 +38,10 @@ export type ProjectMigration = (data: unknown) => unknown;
  * v1（历史草案格式，仅用于迁移管道测试与文档）：对象条目缺少 visible/locked
  * 字段（草案期的默认可见、未锁定），场景/资源结构与 v2 一致。迁移补默认值，
  * 不丢弃任何字段。生产数据从首个提交起即为 v2，v1 迁移不会被真实数据触发。
+ *
+ * v2 → v3：Project 新增 tracks（轨道）字段（v2 无轨道概念，此前以场景/层级
+ * 引用替代）。迁移补默认空数组（TML-88）；v2 数据若已携带 tracks（手工构造），
+ * 原样透传不丢弃，内容合法性由迁移后的统一校验裁决。
  */
 const MIGRATIONS: Record<number, ProjectMigration> = {
   1: (data) => {
@@ -54,6 +58,14 @@ const MIGRATIONS: Record<number, ProjectMigration> = {
         })
       : raw.objects;
     return { ...(raw as Record<string, unknown>), schemaVersion: 2, objects };
+  },
+  2: (data) => {
+    const raw = data as Record<string, unknown>;
+    return {
+      ...raw,
+      schemaVersion: 3,
+      tracks: Array.isArray(raw.tracks) ? raw.tracks : [],
+    };
   },
 };
 

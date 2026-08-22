@@ -50,6 +50,7 @@ function multiRootProject(rootCount: number): Project {
     ...sample,
     objects,
     scenes: [{ id: 'scene-1', name: '主场景', rootObjectIds, activeCameraId: null }],
+    tracks: [],
   };
 }
 
@@ -131,6 +132,7 @@ describe('R11-1 #7 复制根筛选收敛：多根全选 O(n³)→O(n)', () => {
         { id: 'scene-2', name: '次场景', rootObjectIds: ['other-x'], activeCameraId: null },
       ],
       activeSceneId: 'scene-1',
+      tracks: [],
     };
     editor.openProject(project);
     editor.setSelection(['root-a', 'other-x', 'ghost']);
@@ -222,6 +224,7 @@ describe('R11-1 #7 复制根筛选收敛：多根全选 O(n³)→O(n)', () => {
         { id: 'scene-1', name: '主场景', rootObjectIds: ['root-a', 'ghost-root'], activeCameraId: null },
       ],
       activeSceneId: 'scene-1',
+      tracks: [],
     };
     const reachable = sceneGraph.getReachableIds(project, 'scene-1');
     expect(reachable.has('root-a')).toBe(true);
@@ -231,6 +234,7 @@ describe('R11-1 #7 复制根筛选收敛：多根全选 O(n³)→O(n)', () => {
     editor.openProject({
       ...project,
       scenes: [{ id: 'scene-1', name: '主场景', rootObjectIds: ['root-a'], activeCameraId: null }],
+      tracks: [],
     });
     editor.setSelection(['root-a', 'ghost']);
     const result = editor.duplicateSelection();

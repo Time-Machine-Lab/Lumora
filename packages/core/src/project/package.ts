@@ -128,6 +128,7 @@ const PUBLIC_PROJECT_FIELDS = [
   'activeSceneId',
   'scenes',
   'objects',
+  'tracks',
   'assets',
 ] as const;
 

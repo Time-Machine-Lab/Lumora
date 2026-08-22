@@ -67,13 +67,14 @@ function deepProject(): Project {
   return {
     uri: 'lumora://deep',
     name: '深树',
-    schemaVersion: 2,
+    schemaVersion: 3,
     createdAt: '2026-08-20T00:00:00.000Z',
     revision: 0,
     settings: { fps: 24, aspect: [16, 9] },
     activeSceneId: 's1',
     scenes: [{ id: 's1', name: '主场景', rootObjectIds: ['d0'], activeCameraId: null }],
     objects,
+    tracks: [],
     assets: [],
   };
 }

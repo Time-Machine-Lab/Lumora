@@ -23,13 +23,14 @@ export function createBlankProject(
   return {
     uri,
     name,
-    schemaVersion: 2,
+    schemaVersion: 3,
     createdAt: now,
     revision: 0,
     settings: { fps: options.fps ?? 24, aspect: options.aspect ?? [16, 9] },
     activeSceneId: scene.id,
     scenes: [{ ...scene, rootObjectIds: [camera.id], activeCameraId: camera.id }],
     objects: [camera],
+    tracks: [],
     assets: [],
   };
 }

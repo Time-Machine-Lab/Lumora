@@ -13,11 +13,11 @@ import {
   serializeProjectPackage,
   stripSensitiveFields,
 } from '../src/project/package';
-import { PACKAGE_FORMAT_VERSION, PROJECT_PACKAGE_FORMAT } from '../src/project/schema';
+import { CURRENT_PROJECT_SCHEMA_VERSION, PACKAGE_FORMAT_VERSION, PROJECT_PACKAGE_FORMAT } from '../src/project/schema';
 import type { AssetData, AssetPartData, Project, SceneObjectData } from '../src/scene/types';
 
-/** 生成含模型（含载荷）与三镜头（三场景各一台活动机位）的项目。
- *  经 SceneEditor 打开与提交构造，保证满足全部结构不变量。
+/** 生成含模型（含载荷）、三镜头（三场景各一台活动机位）与轨道的项目。
+ *  经 SceneEditor 打开与提交构造，保证满足全部结构不变量；轨道引用模型对象。
  *  hash/size 为真实 SHA-256 与解码字节数（导入校验按内容验证哈希）。 */
 async function buildFixtureProject(): Promise<Project> {
   const editor = new SceneEditor();
@@ -58,7 +58,19 @@ async function buildFixtureProject(): Promise<Project> {
     assetId: asset.id,
   };
   editor.addObject(object);
-  return editor.getProject()!;
+  // 轨道引用模型对象（TML-88）：模型、三镜头与轨道三者同时随项目往返
+  const project = editor.getProject()!;
+  const track = {
+    id: genId('track'),
+    name: '模型位移动画',
+    objectId: object.id,
+    targetPath: 'position' as const,
+    keyframes: [
+      { time: 0, value: [0, 1, 0] as [number, number, number] },
+      { time: 2, value: [0, 2, 0] as [number, number, number] },
+    ],
+  };
+  return { ...project, tracks: [...project.tracks, track] };
 }
 
 /** 不含可保存载荷的资产（URL 来源，可重建缓存场景） */
@@ -177,12 +189,13 @@ describe('工程包凭据清除（NFR-008：嵌套扩展数据递归清除）', 
     expect(json).not.toContain('apiKey');
   });
 
-  it('未知顶层字段不进入工程包（公开字段白名单）', async () => {
+  it('未知顶层字段不进入工程包（公开字段白名单）；tracks 属公开数据随包携带', async () => {
     const project = await buildFixtureProject();
     const rich = { ...project, runtimeCache: { x: 1 }, internalNote: 'zzz' } as Project & Record<string, unknown>;
     const json = JSON.stringify(buildProjectPackage(rich));
     expect(json).not.toContain('runtimeCache');
     expect(json).not.toContain('internalNote');
+    expect(JSON.parse(json)).toMatchObject({ project: { tracks: project.tracks } });
   });
 
   it('stripSensitiveFields 对循环引用安全：不崩溃且敏感键清除', () => {
@@ -203,7 +216,7 @@ describe('parseProjectPackage：导出 → 导入 完整恢复（AC1）', () => 
     const result = await parseProjectPackage(serializeProjectPackage(pkg));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.migratedFrom).toBe(2);
+    expect(result.migratedFrom).toBe(CURRENT_PROJECT_SCHEMA_VERSION);
     expect(result.warnings).toEqual([]);
     expect(result.project).toEqual(normalized(project));
     // 引用完整：模型对象 → 资源 → 载荷链路在恢复后依然成立
@@ -211,6 +224,11 @@ describe('parseProjectPackage：导出 → 导入 完整恢复（AC1）', () => 
     const asset = result.project.assets.find((a) => a.id === model.assetId)!;
     expect(asset.payload).toBeDefined();
     expect(result.project.scenes.filter((s) => s.activeCameraId !== null)).toHaveLength(3);
+    // 轨道完整恢复（TML-88）：轨道数据与引用逐项一致
+    expect(result.project.tracks).toEqual(project.tracks);
+    for (const track of result.project.tracks) {
+      expect(result.project.objects.some((o) => o.id === track.objectId)).toBe(true);
+    }
   });
 
   it('缺失资产载荷 → 打开成功但给出缺失明细（缺失资产报告）', async () => {
@@ -553,7 +571,7 @@ describe('parseProjectPackage：损坏包与未知 schema 拒绝（AC3）', () =
     const project = await buildFixtureProject();
     const pkg = buildProjectPackage(project);
     const raw = JSON.parse(serializeProjectPackage(pkg)) as { project: Record<string, unknown> };
-    raw.project.schemaVersion = 3;
+    raw.project.schemaVersion = 99;
     const result = await parseProjectPackage(JSON.stringify(raw));
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -591,7 +609,7 @@ describe('createBlankProject（FR-001：默认场景与摄像机）', () => {
   it('新项目含默认场景、活动机位与 16:9 画幅设置', () => {
     const project = createBlankProject('lumora://project/test', '新片场');
     expect(project.name).toBe('新片场');
-    expect(project.schemaVersion).toBe(2);
+    expect(project.schemaVersion).toBe(3);
     expect(project.revision).toBe(0);
     expect(project.settings).toEqual({ fps: 24, aspect: [16, 9] });
     expect(project.scenes).toHaveLength(1);

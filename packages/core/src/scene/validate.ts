@@ -1,11 +1,13 @@
 import { SCENE_OBJECT_TYPES } from './types';
-import type { AssetData, Project, SceneObjectData, TransformData, Vec3 } from './types';
+import type { AssetData, Project, SceneObjectData, TrackData, TransformData, Vec3 } from './types';
 
 /** 完整 schema + 有限数值校验：候选状态在提交/打开前必须通过（M1，TML-57 第五轮）。 */
 
 export const PRIMITIVE_KINDS = ['box', 'sphere', 'cone', 'torus', 'plane'] as const;
 export const LIGHT_KINDS = ['directional', 'point', 'spot'] as const;
 export const CAMERA_PROJECTIONS = ['perspective'] as const;
+export const TRACK_TARGET_PATHS = ['position', 'rotation', 'scale'] as const;
+export const TRACK_INTERPOLATIONS = ['linear', 'step'] as const;
 
 // ---------- 非 JSON 结构拒绝（R8-6）：Map/Set/Date 冻结壳封堵 ----------
 // deepFreeze 只遍历自有属性：Map/Set 内部槽位（[[MapData]]）与 Date 时间槽位
@@ -161,7 +163,7 @@ export function validateProjectSchema(project: unknown): string | null {
   if (jsonProblem) return jsonProblem;
   const p = project as Partial<Project>;
   if (!isString(p.uri) || !isString(p.name)) return 'uri/name 非法';
-  if (p.schemaVersion !== 2) return 'schemaVersion 非法';
+  if (p.schemaVersion !== 3) return 'schemaVersion 非法';
   if (!isString(p.createdAt)) return 'createdAt 非法';
   if (typeof p.revision !== 'number' || !Number.isFinite(p.revision) || p.revision < 0) {
     return 'revision 非法';
@@ -196,6 +198,39 @@ export function validateProjectSchema(project: unknown): string | null {
   for (const object of p.objects) {
     const problem = validateSceneObjectData(object);
     if (problem) return `对象数据不合法（${problem}）`;
+  }
+  if (!Array.isArray(p.tracks)) return 'tracks 缺失';
+  const trackIds = new Set<string>();
+  for (const track of p.tracks) {
+    if (!track || typeof track !== 'object') return '轨道条目非法';
+    const t = track as Partial<TrackData>;
+    if (!isString(t.id) || t.id.length === 0 || trackIds.has(t.id)) return '轨道 id 非法或重复';
+    trackIds.add(t.id);
+    if (!isString(t.name)) return '轨道 name 非法';
+    if (!isString(t.objectId) || t.objectId.length === 0) return '轨道 objectId 非法';
+    if (!isString(t.targetPath) || !(TRACK_TARGET_PATHS as readonly string[]).includes(t.targetPath)) {
+      return '轨道 targetPath 非法';
+    }
+    if (!Array.isArray(t.keyframes)) return '轨道 keyframes 非法';
+    let lastTime = -Infinity;
+    for (const keyframe of t.keyframes) {
+      if (!keyframe || typeof keyframe !== 'object') return '轨道关键帧条目非法';
+      const k = keyframe as { time?: unknown; value?: unknown; interpolation?: unknown };
+      if (typeof k.time !== 'number' || !Number.isFinite(k.time) || k.time < 0) {
+        return '轨道关键帧 time 非法（需为非负有限数）';
+      }
+      // 关键帧按 time 严格升序（重复时刻的插值语义未定义，拒绝猜测）
+      if (k.time <= lastTime) return '轨道关键帧 time 未按升序排列';
+      lastTime = k.time;
+      if (!isFiniteVec3(k.value)) return '轨道关键帧 value 非法（不允许 NaN/Infinity）';
+      if (
+        k.interpolation !== undefined &&
+        (typeof k.interpolation !== 'string' ||
+          !(TRACK_INTERPOLATIONS as readonly string[]).includes(k.interpolation))
+      ) {
+        return '轨道关键帧 interpolation 非法';
+      }
+    }
   }
   if (!Array.isArray(p.assets)) return 'assets 缺失';
   const assetIds = new Set<string>();
@@ -237,6 +272,13 @@ export function validateProjectSchema(project: unknown): string | null {
   for (const object of p.objects) {
     if (object.type === 'model' && !assetIds.has(object.assetId as string)) {
       return `模型对象引用不存在的资源（${(object.assetId as string | undefined) ?? '缺失'}）`;
+    }
+  }
+  // 交叉引用（TML-88）：轨道 objectId 必须指向项目内已注册对象
+  const objectIds = new Set<string>(p.objects.map((object) => object.id));
+  for (const track of p.tracks) {
+    if (!objectIds.has(track.objectId)) {
+      return `轨道引用不存在的对象（${track.objectId}）`;
     }
   }
   return null;

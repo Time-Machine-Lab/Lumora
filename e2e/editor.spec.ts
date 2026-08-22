@@ -826,7 +826,7 @@ test.describe('第三轮验收：生产路径（AC1/AC3/AC4）', () => {
         const project = {
           uri: 'lumora://probe-project',
           name: '投影探针',
-          schemaVersion: 2,
+          schemaVersion: 3,
           createdAt: new Date().toISOString(),
           revision: 0,
           settings: { fps: 24, aspect: [16, 9] },
@@ -881,6 +881,7 @@ test.describe('第三轮验收：生产路径（AC1/AC3/AC4）', () => {
               light: { kind: 'directional', color: '#ffffff', intensity: 1.4 },
             },
           ],
+          tracks: [],
           assets: [],
         };
         localStorage.setItem('lumora.demo.last-export', JSON.stringify(project));

@@ -2,7 +2,7 @@
  * 版本化 Project schema 与 `.lumora` 工程包格式（MVP-3，TML-53）。
  *
  * 分层版本：
- * - project schemaVersion：项目数据本身的版本（当前 2），未知/未来版本一律拒绝并给出
+ * - project schemaVersion：项目数据本身的版本（当前 3），未知/未来版本一律拒绝并给出
  *   可操作错误（升级提示），旧版本经 migrate.ts 的迁移管道逐级升级；
  * - 包 formatVersion：`.lumora` 包容器版本（当前 1），与 schemaVersion 解耦——
  *   容器演进（目录结构、压缩、资产引用方式）不要求项目数据版本联动。
@@ -23,7 +23,7 @@
 import type { AssetPartData, Project } from '../scene/types';
 
 /** 当前项目数据版本（types.ts 的 Project.schemaVersion 字面量与此保持一致） */
-export const CURRENT_PROJECT_SCHEMA_VERSION = 2;
+export const CURRENT_PROJECT_SCHEMA_VERSION = 3;
 
 /** 包容器格式标识：manifest.format 必须精确匹配 */
 export const PROJECT_PACKAGE_FORMAT = 'lumora.project';

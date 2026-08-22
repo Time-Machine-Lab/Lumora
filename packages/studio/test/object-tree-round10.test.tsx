@@ -53,6 +53,8 @@ function makeEditorWithCubeId(id: string) {
   editor.openProject({
     ...sample,
     objects: sample.objects.map((o) => (o.id === 'sample-cube' ? { ...o, id } : o)),
+    // 轨道引用随对象 id 重命名同步（sample-track-cube-spin 绑定 sample-cube）
+    tracks: sample.tracks.map((t) => (t.objectId === 'sample-cube' ? { ...t, objectId: id } : t)),
   });
   return editor;
 }

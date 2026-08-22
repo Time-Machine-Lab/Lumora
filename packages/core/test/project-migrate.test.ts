@@ -19,6 +19,13 @@ function v1Fixture(): Record<string, unknown> {
   };
 }
 
+/** v2 夹具（TML-88 迁移测试）：无 tracks 字段（v2 schema 无轨道概念）。 */
+function v2Fixture(): Record<string, unknown> {
+  const v3 = createSampleProject('lumora://sample-project', '迁移样本');
+  const { tracks: _tracks, ...v2 } = v3;
+  return { ...v2, schemaVersion: 2 };
+}
+
 describe('migrateProjectSchema：版本化 schema 迁移管道（NFR-017）', () => {
   it('v1 → 当前版本：补默认字段、schemaVersion 升级、其余字段完整保留（不静默丢字段）', () => {
     const input = v1Fixture();
@@ -32,7 +39,7 @@ describe('migrateProjectSchema：版本化 schema 迁移管道（NFR-017）', ()
       expect(object.visible).toBe(true);
       expect(object.locked).toBe(false);
     }
-    // 字段级透传：除迁移点外不丢任何数据
+    // 字段级透传：除迁移点外不丢任何数据（含 v1 携带的 tracks 原样到达 v3）
     const original = input as unknown as Project;
     expect(migrated.uri).toBe(original.uri);
     expect(migrated.name).toBe(original.name);
@@ -41,7 +48,57 @@ describe('migrateProjectSchema：版本化 schema 迁移管道（NFR-017）', ()
     expect(migrated.objects.map(({ visible: _v, locked: _l, ...rest }) => rest)).toEqual(
       original.objects.map(({ visible: _v, locked: _l, ...rest }) => rest),
     );
+    expect(migrated.tracks).toEqual(original.tracks);
     expect(migrated.assets).toEqual(original.assets);
+  });
+
+  it('v2 → 当前版本：无 tracks 的 v2 数据补默认空数组，其余字段完整保留', () => {
+    const input = v2Fixture();
+    const result = migrateProjectSchema(input);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.migratedFrom).toBe(2);
+    const migrated = result.project as Project;
+    expect(migrated.schemaVersion).toBe(CURRENT_PROJECT_SCHEMA_VERSION);
+    expect(migrated.tracks).toEqual([]);
+    // 字段级透传：迁移点之外不丢任何数据
+    const original = input as unknown as Project;
+    expect(migrated.uri).toBe(original.uri);
+    expect(migrated.name).toBe(original.name);
+    expect(migrated.settings).toEqual(original.settings);
+    expect(migrated.scenes).toEqual(original.scenes);
+    expect(migrated.objects).toEqual(original.objects);
+    expect(migrated.assets).toEqual(original.assets);
+  });
+
+  it('v2 数据携带 tracks（手工构造）时原样透传，不覆盖不丢弃', () => {
+    const input = v2Fixture();
+    const tracks = [
+      {
+        id: 't1',
+        name: '推镜',
+        objectId: 'sample-camera',
+        targetPath: 'position' as const,
+        keyframes: [{ time: 0, value: [0, 0, 0] as [number, number, number] }],
+      },
+    ];
+    input.tracks = tracks;
+    const result = migrateProjectSchema(input);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const migrated = result.project as Project;
+    expect(migrated.schemaVersion).toBe(CURRENT_PROJECT_SCHEMA_VERSION);
+    expect(migrated.tracks).toEqual(tracks);
+  });
+
+  it('v2 数据携带自定义未知字段时透传保留（不静默丢字段）', () => {
+    const input = v2Fixture();
+    input.customTopLevel = { nested: [1, 2, 3] };
+    const result = migrateProjectSchema(input);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const migrated = result.project as unknown as Record<string, unknown>;
+    expect(migrated.customTopLevel).toEqual({ nested: [1, 2, 3] });
   });
 
   it('v1 对象携带自定义未知字段时透传保留', () => {
@@ -110,6 +167,22 @@ describe('迁移与包解析集成（AC3：未知 schema 的包导入失败）',
     expect(result.project.schemaVersion).toBe(CURRENT_PROJECT_SCHEMA_VERSION);
     expect(result.project.objects.every((o) => o.visible === true && o.locked === false)).toBe(true);
     expect(result.project.scenes).toEqual(v1.scenes);
+    expect(result.project.tracks).toEqual(v1.tracks);
+  });
+
+  it('v2 工程包经解析迁移：tracks 补空数组，数据与引用完整恢复', async () => {
+    const v2 = v2Fixture() as unknown as Project;
+    const pkg = buildProjectPackage(v2, { exportedAt: '2026-08-21T00:00:00.000Z' });
+    const parsed = JSON.parse(serializeProjectPackage(pkg)) as { project: Project };
+    expect(parsed.project.schemaVersion).toBe(2);
+    const result = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.migratedFrom).toBe(2);
+    expect(result.project.schemaVersion).toBe(CURRENT_PROJECT_SCHEMA_VERSION);
+    expect(result.project.tracks).toEqual([]);
+    expect(result.project.scenes).toEqual(v2.scenes);
+    expect(result.project.objects).toEqual(v2.objects);
   });
 
   it('未来 schemaVersion 的包导入失败，返回可操作错误', async () => {

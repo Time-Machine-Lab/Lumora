@@ -33,7 +33,11 @@ interface LumoraPackage {
     project: { uri: string; name: string; revision: number };
     includePrivate: boolean;
   };
-  project: { objects: Array<{ type: string }>; pluginData?: unknown };
+  project: {
+    objects: Array<{ type: string; id: string }>;
+    pluginData?: unknown;
+    tracks?: Array<{ id: string; name: string; objectId: string; targetPath: string; keyframes: unknown[] }>;
+  };
 }
 
 test('AC1 导出→清空→导入：模型、三镜头完整恢复且已持久化', async ({ page }) => {
@@ -66,6 +70,11 @@ test('AC1 导出→清空→导入：模型、三镜头完整恢复且已持久�
   expect(pkg.manifest.includePrivate).toBe(false);
   expect(pkg.project.objects.filter((o) => o.type === 'camera')).toHaveLength(3);
   expect(pkg.project.pluginData).toBeUndefined();
+  // 轨道（TML-88）：示例项目轨道随包导出，objectId 引用指向包内对象
+  expect(pkg.project.tracks!.length).toBeGreaterThan(0);
+  for (const track of pkg.project.tracks!) {
+    expect(pkg.project.objects.some((o) => o.id === track.objectId)).toBe(true);
+  }
 
   // 3. 清空本地数据：卸载 Studio（释放连接）→ 删除 IndexedDB → 重新挂载
   await page.getByTestId('project-menu').click(); // 收起菜单
@@ -97,6 +106,20 @@ test('AC1 导出→清空→导入：模型、三镜头完整恢复且已持久�
   await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
   await expect(page.getByTestId('event-log')).toContainText('项目已打开: 示例项目');
   await expect(page.getByTestId('save-state-badge')).toHaveText('已保存');
+
+  // 4b. 轨道与引用完整恢复（TML-88）：清空数据导入后再导出，轨道数据逐项一致，
+  // 且每条轨道的 objectId 仍指向包内对象（引用未断裂）
+  const reexportPromise = page.waitForEvent('download');
+  await page.getByTestId('project-menu').click();
+  await page.getByTestId('project-export').click();
+  const reexport = await reexportPromise;
+  const reexportPath = join(tmpDir, 'tml53-import-reexport.lumora');
+  await reexport.saveAs(reexportPath);
+  const reexported = JSON.parse(readFileSync(reexportPath, 'utf8')) as LumoraPackage;
+  expect(reexported.project.tracks).toEqual(pkg.project.tracks);
+  for (const track of reexported.project.tracks!) {
+    expect(reexported.project.objects.some((o) => o.id === track.objectId)).toBe(true);
+  }
 
   // 5. 已持久化：刷新后可从最近项目重新打开
   await page.reload();

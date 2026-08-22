@@ -1,4 +1,4 @@
-/** 场景数据模型（Project v2）：对象为扁平列表 + 场景根引用，构成可序列化层级。 */
+/** 场景数据模型（Project v3）：对象为扁平列表 + 场景根引用，构成可序列化层级；轨道绑定对象属性通道。 */
 
 export type Vec3 = [number, number, number];
 
@@ -80,6 +80,31 @@ export interface SceneData {
   activeCameraId: string | null;
 }
 
+/** 轨道可驱动的对象属性通道（与 TransformData 同型的 Vec3 通道） */
+export type TrackTargetPath = 'position' | 'rotation' | 'scale';
+
+export interface TrackKeyframeData {
+  /** 帧时刻（秒，相对轨道起点，非负） */
+  time: number;
+  /** 该时刻的目标属性值（与目标通道同型的三元向量） */
+  value: Vec3;
+  /** 插值方式：linear（默认，线性插值）/ step（阶跃，保持到下一帧） */
+  interpolation?: 'linear' | 'step';
+}
+
+/** 动画轨道：绑定一个场景对象的属性通道，携带按时间升序的关键帧序列 */
+export interface TrackData {
+  /** 稳定 ID，不随重命名变化 */
+  id: string;
+  name: string;
+  /** 被驱动对象 ID（场景对象引用；对象随项目恢复后引用保持有效） */
+  objectId: string;
+  /** 驱动通道 */
+  targetPath: TrackTargetPath;
+  /** 关键帧（按 time 严格升序，同一轨道的帧时刻不可重复） */
+  keyframes: TrackKeyframeData[];
+}
+
 export interface ProjectSettings {
   fps: number;
   /** 画幅宽高比，如 [16, 9] */
@@ -116,7 +141,7 @@ export interface AssetData {
 export interface Project {
   uri: string;
   name: string;
-  schemaVersion: 2;
+  schemaVersion: 3;
   createdAt: string;
   /** 每次提交可撤销变更 +1，用于自动保存判断 */
   revision: number;
@@ -125,6 +150,8 @@ export interface Project {
   scenes: SceneData[];
   /** 扁平对象列表；层级经 parentId 表达，场景经 rootObjectIds 归属 */
   objects: SceneObjectData[];
+  /** 动画轨道：绑定对象的属性通道 + 关键帧序列（objectId 引用 objects） */
+  tracks: TrackData[];
   assets: AssetData[];
   /**
    * 插件私有设置（按插件 instanceId 键控）：随项目本地持久化，
