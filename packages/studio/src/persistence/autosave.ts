@@ -23,6 +23,7 @@
  */
 
 import type { Project, SceneEditor } from '@lumora/core';
+import { findJsonEncodingProblem } from '@lumora/core';
 import type { ProjectStorage, SaveFailureCode, SaveOutcome } from './project-storage';
 import { sameProjectContent, stableStringify } from './project-storage';
 
@@ -50,15 +51,23 @@ interface LatchedError {
   message: string;
 }
 
-/** 已提交基线：revision + 已提交内容的稳定序列化指纹（同 revision 内容分叉判定）。 */
+/** 已提交基线：revision + 已提交内容的稳定序列化指纹（同 revision 内容分叉判定）。
+ *  fingerprint 为 null = 内容不可 JSON 编码（无法可靠序列化比较）。 */
 interface CommittedBaseline {
   revision: number;
-  fingerprint: string;
+  fingerprint: string | null;
 }
 
-/** 内容指纹（不含 revision 计数器）：分叉判定关注内容本身；revision 由数字比较
- *  单独负责（撤销回已保存内容时 revision 递增但内容一致，不构成内容分叉） */
-function contentFingerprint(project: Project): string {
+/**
+ * 内容指纹（不含 revision 计数器）：分叉判定关注内容本身；revision 由数字比较
+ * 单独负责（撤销回已保存内容时 revision 递增但内容一致，不构成内容分叉）。
+ * 无异常、无信息丢失（第六轮 #1）：先以 core 的 JSON 编码边界识别不可编码数据
+ * （undefined/NaN/BigInt/循环引用/数组非索引键 —— JSON.stringify 会丢字段或抛错），
+ * 返回 null 表示不可比较 —— 调用方一律视为未保存（不可编码内容不得因序列化
+ * 丢字段而误判为「与已保存内容相同」）。
+ */
+function contentFingerprint(project: Project): string | null {
+  if (findJsonEncodingProblem(project)) return null;
   const { revision: _revision, ...content } = project;
   return stableStringify(content);
 }
@@ -83,7 +92,11 @@ export class ProjectAutosaver {
     const baseline = this.committedByUri.get(project.uri);
     if (baseline === undefined || baseline === null) return true;
     if (baseline.revision !== project.revision) return true;
-    return contentFingerprint(project) !== baseline.fingerprint;
+    const fingerprint = contentFingerprint(project);
+    // 当前内容不可编码（undefined/NaN/BigInt/循环引用/数组非索引键）→ 恒判未保存，
+    // 绝不因 JSON.stringify 丢字段而误判净（第六轮 #1）；保存路径将返回类型化错误
+    if (fingerprint === null) return true;
+    return fingerprint !== baseline.fingerprint;
   }
   /** 最新未保存快照（编辑器的只读冻结快照）：编辑后立即捕获，reset/close 后仍可冲刷 */
   private pending: Project | null = null;
@@ -278,15 +291,17 @@ export class ProjectAutosaver {
   /**
    * 显式重试保存恢复快照（另存副本之外的第二条出路）：以该 uri 当前已提交基线做 CAS
    * （尚无记录时按创建语义，首存失败同样可重试）。
-   * 成功清除恢复快照与锁存，并按「当前编辑器 ↔ 恢复快照 ↔ 已提交基线」三方内容
-   * 指纹对齐（第五轮 #4：不做 revision 大小推断 —— revision 顺序不等于内容祖先，
-   * 同 uri 替换等场景会把分叉误判为可自动恢复）：
-   * - 编辑器 == 恢复快照：对齐已落盘内容（重置基线并重开快照，幂等）；
-   * - 编辑器 == 已提交基线：编辑器未动，恢复快照是唯一新内容 → 采用快照；
-   * - 恢复快照 == 已提交基线：快照未带来新内容 → 把编辑器内容向前保存；
-   * - 三方各不相同：真分叉 —— 快照已落盘但不覆盖当前编辑，锁存冲突供显式解决
-   *   （加载较新版本 = 已保存快照 / 另存副本 = 当前编辑）。
-   * 失败返回错误，由调用方明示。
+   * 写入前完成「当前编辑器 ↔ 恢复快照 ↔ 已提交基线」三方内容指纹决策（第六轮 #4：
+   * 不做 revision 大小推断 —— revision 顺序不等于内容祖先，同 uri 替换等场景会把
+   * 分叉误判为可自动恢复；也不先写快照再决策 —— 决策失败时磁盘不得被提前推进）：
+   * - 编辑器 == 恢复快照，或编辑器 == 已提交基线：恢复快照是唯一新内容 → 按原基线
+   *   保存快照并重开编辑器对齐（幂等）；
+   * - 恢复快照 == 已提交基线：快照未带来新内容 → 按原基线把编辑器内容向前保存，
+   *   await 并传播最终结果（绝不 fire-and-forget 假成功；revision 反转时保存如实
+   *   失败、恢复快照保留）；
+   * - 三方各不相同（或当前内容不可编码无法比较）：真分叉 —— 不写入磁盘，快照保留
+   *   在恢复区可重试，锁存冲突供显式解决（另存副本 / 加载较新版本）。
+   * 任一保存失败（含 revision 反转）都如实返回，快照与锁存按结果维护。
    */
   retryRecovery(uri: string): Promise<SaveOutcome> {
     const snapshot = this.recovery.get(uri);
@@ -297,50 +312,62 @@ export class ProjectAutosaver {
       if (this.disposed) return { ok: false, code: 'storage-error', message: '自动保存已停用' };
       const baseline = this.committedByUri.get(uri);
       const expected = baseline?.revision ?? null;
-      const result = await this.storeSave(snapshot, expected);
-      if (!result.ok) {
-        if (result.code === 'revision-conflict') {
+      const baseFp = baseline?.fingerprint ?? undefined;
+      const snapFp = contentFingerprint(snapshot);
+      const current = uri === this.currentUri ? this.editor.getProject() : null;
+      const curFp = current ? contentFingerprint(current) : undefined;
+      const fpEqual = (a: string | null | undefined, b: string | null | undefined): boolean =>
+        a !== null && a !== undefined && b !== null && b !== undefined && a === b;
+
+      const commit = (saved: Project, fp: string | null): void => {
+        this.committedByUri.set(uri, { revision: saved.revision, fingerprint: fp });
+        this.recovery.delete(uri);
+        if (this.latched?.uri === uri) this.latched = null;
+      };
+
+      if (!current || fpEqual(curFp, snapFp) || fpEqual(curFp, baseFp)) {
+        // 编辑器 == 快照、编辑器停留在旧基线（快照是唯一新内容）、或非当前项目：
+        // 按原基线保存快照
+        const result = await this.storeSave(snapshot, expected);
+        if (result.ok) {
+          commit(snapshot, snapFp);
+          if (current) {
+            // 以恢复快照为准重开编辑器，与已落盘内容对齐（重试期间未编辑或编辑与快照一致）
+            this.resetTo(snapshot);
+            this.editor.openProject(snapshot);
+          }
+        } else if (result.code === 'revision-conflict') {
           this.latch({ uri, code: 'revision-conflict', message: result.message });
         }
         return result;
       }
-      const baseFp = baseline ? baseline.fingerprint : undefined;
-      const snapFp = contentFingerprint(snapshot);
-      this.committedByUri.set(uri, { revision: snapshot.revision, fingerprint: snapFp });
-      this.recovery.delete(uri);
-      if (this.latched?.uri === uri) this.latched = null;
-      if (uri === this.currentUri) {
-        const current = this.editor.getProject();
-        if (current) {
-          const curFp = contentFingerprint(current);
-          if (curFp === snapFp || curFp === baseFp) {
-            // 编辑器 == 已落盘内容，或编辑器停留在旧基线（快照是唯一新内容）：
-            // 以恢复快照为准重开编辑器，与存储对齐（重试期间未编辑或编辑与快照一致）
-            this.resetTo(snapshot);
-            this.editor.openProject(snapshot);
-          } else if (snapFp === baseFp) {
-            // 快照与旧基线一致（未带来新内容）：编辑器内容向前保存，
-            // expected = 刚落盘 revision，绝不反向覆盖
-            void this.enqueue(() => this.saveSnapshot(current));
-          } else {
-            // 三方各不相同 = 真分叉：恢复快照已落盘（内容不丢），但不以快照
-            // 静默覆盖当前编辑（resetTo 会替换编辑器内容），也不以编辑器静默
-            // 覆盖快照 —— 锁存冲突供显式解决（另存副本 / 加载较新版本）
-            this.latch({
-              uri,
-              code: 'revision-conflict',
-              message:
-                '恢复快照已保存，但当前编辑与快照、已保存基线三方内容不一致（分叉）。请「另存副本」保留当前编辑，或「加载较新版本」采用已保存内容',
-            });
-            return {
-              ok: false,
-              code: 'revision-conflict',
-              message: '当前内容与恢复快照三方分叉，未覆盖当前编辑。请先「另存副本」保留当前内容',
-            };
+      if (fpEqual(snapFp, baseFp)) {
+        // 快照未带来新内容：按原基线把编辑器内容向前保存（await 并传播最终结果；
+        // revision 反转时保存失败如实返回，快照保留不删除 —— 不假成功）
+        const result = await this.storeSave(current!, expected);
+        if (result.ok) {
+          commit(current!, contentFingerprint(current!));
+          if (uri === this.currentUri) {
+            this.emit(this.store ? { status: 'clean' } : { status: 'memory' });
           }
+        } else if (result.code === 'revision-conflict') {
+          this.latch({ uri, code: 'revision-conflict', message: result.message });
         }
+        return result;
       }
-      return result;
+      // 三方各不相同（或当前内容不可编码）：真分叉 —— 不写入磁盘，恢复快照保留
+      // 在恢复区（可重试 / 另存副本），绝不静默覆盖当前编辑
+      this.latch({
+        uri,
+        code: 'revision-conflict',
+        message:
+          '当前编辑与恢复快照、已保存基线三方内容不一致（分叉）。请「另存副本」保留当前编辑，或「加载较新版本」采用已保存内容',
+      });
+      return {
+        ok: false,
+        code: 'revision-conflict',
+        message: '当前内容与恢复快照三方分叉，未覆盖当前编辑。请先「另存副本」保留当前内容',
+      };
     });
   }
 

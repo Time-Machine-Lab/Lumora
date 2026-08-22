@@ -67,7 +67,9 @@ export {
   genId,
 } from './scene/create';
 export { hashBytes, sha256Hex, compositeContentHash } from './scene/assets';
-export { validateProjectSchema, validateSceneObjectData } from './scene/validate';
+export { validateProjectSchema, validateProjectStructure, validateSceneObjectData } from './scene/validate';
+export { findJsonEncodingProblem } from './scene/json-encoding';
+export type { JsonEncodingProblem } from './scene/json-encoding';
 export { fovDegToFocalLength, focalLengthToFovDeg, fitRect, FULL_FRAME_SENSOR } from './scene/camera-math';
 
 // 历史与场景编辑器

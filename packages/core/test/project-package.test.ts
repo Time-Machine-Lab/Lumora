@@ -286,6 +286,32 @@ describe('工程包凭据清除（NFR-008：嵌套扩展数据递归清除）', 
       expect(json, `非凭据键 ${key} 必须保留`).toContain(`safe-${key}`);
     }
   });
+
+  it('组合式规则（第六轮 #3）：provider 前缀 + value/pem 后缀的凭据键清除；普通 key/token 词保留', async () => {
+    const project = await buildFixtureProject();
+    const stripped: Record<string, string> = {};
+    // 前缀限定词（api/access/ssh/private/provider）+ 后缀（Value/Pem）组合的凭据键：
+    // 任意位置的 key/token 核心词在前词为敏感限定词时同样清除
+    for (const key of [
+      'OPENAIAPIKEY', 'openaiApiKey', 'apiKeyValue', 'apiKeyPem',
+      'accessTokenValue', 'accessKeyId', 'sshPrivateKeyPem', 'providerKeyValue',
+    ]) {
+      stripped[key] = `secret-${key}`;
+    }
+    // 普通设置：非限定词的 key/token 末词（快捷键/主键/缓存键/计数）必须保留
+    const preserved: Record<string, string> = {};
+    for (const key of ['shortcutKey', 'keyboardKey', 'primaryKey', 'cacheKey', 'maxToken', 'tokenBudget', 'tokenizer']) {
+      preserved[key] = `safe-${key}`;
+    }
+    const rich = { ...project, pluginData: { 'com.example': { ...stripped, ...preserved } } } as Project;
+    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
+    for (const key of Object.keys(stripped)) {
+      expect(json, `凭据键 ${key} 必须被清除`).not.toContain(`secret-${key}`);
+    }
+    for (const key of Object.keys(preserved)) {
+      expect(json, `普通键 ${key} 必须保留`).toContain(`safe-${key}`);
+    }
+  });
 });
 
 describe('parseProjectPackage：导出 → 导入 完整恢复（AC1）', () => {
@@ -713,6 +739,19 @@ describe('parseProjectPackage：损坏包与未知 schema 拒绝（AC3）', () =
     if (result.ok) return;
     expect(result.error.code).toBe('invalid-project');
     expect(result.error.message).toContain('校验失败');
+  });
+
+  it('图关系损坏（对象挂到不存在的父级）→ invalid-project，与本地项目加载同源校验（第六轮 #2）', async () => {
+    const project = await buildFixtureProject();
+    const pkg = buildProjectPackage(project);
+    const raw = JSON.parse(serializeProjectPackage(pkg)) as { project: Record<string, unknown> };
+    const objects = raw.project.objects as Array<Record<string, unknown>>;
+    objects[0]!.parentId = 'nonexistent-parent';
+    const result = await parseProjectPackage(JSON.stringify(raw));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.code).toBe('invalid-project');
+    expect(result.error.message).toContain('对象缺少父级');
   });
 });
 

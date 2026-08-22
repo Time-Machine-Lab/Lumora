@@ -13,7 +13,7 @@
 
 import type { Project } from '../scene/types';
 import { compositeContentHash, hashBytes } from '../scene/assets';
-import { validateProjectSchema } from '../scene/validate';
+import { validateProjectSchema, validateProjectStructure } from '../scene/validate';
 import { migrateProjectSchema } from './migrate';
 import { PACKAGE_FORMAT_VERSION, PROJECT_PACKAGE_FORMAT, CURRENT_PROJECT_SCHEMA_VERSION } from './schema';
 import type { ProjectAssetPayload, ProjectPackage } from './schema';
@@ -120,10 +120,18 @@ export function preDecodePayloadFailure(
  * 结构性排除（见 PRIVATE_PROJECT_FIELDS），此处仅兜底嵌套任意键名。
  * 匹配规则为显式分词后精确匹配（camelCase/连字符/下划线/点分拆分）：
  * - 任意位置命中：secret/secrets/password/credential/credentials/authorization；
- * - 键名末词命中：key/keys/token/cookie（XxxKey / XxxToken / XxxCookie 模式）。
+ * - 末词核心词（key/keys/token/tokens/cookie）按组合规则（第六轮 #3）：
+ *   cookie 末词即敏感；key/token 仅当它是唯一词、或前一词是敏感限定词
+ *   （api/access/auth/oauth/private/client/provider/session）时敏感 ——
+ *   普通设置 shortcutKey/keyboardKey/primaryKey/cacheKey/maxToken 因此保留，
+ *   而 apiKey/accessToken/sessionToken/apiKeyValue/sshPrivateKeyPem 清除；
+ * - 紧凑别名：无分隔符拼接的凭据词（API_KEY→apikey、ACCESS_TOKEN→accesstoken），
+ *   全小写/全大写形态拆不出单词边界（APIKEY、accesstoken 是单一连续段），
+ *   显式枚举；另有 provider 前缀 + 紧凑核心后缀形态（OPENAIAPIKEY→openaiapikey，
+ *   provider 名不可枚举，按核心后缀匹配）。
  * 不含 token 的非末词形态（tokenizer/tokenBudget/maxTokens 等 token* 配置是
  * 常见插件设置，不是凭据；末词 token 才是访问令牌模式），也不含 keyframes
- * 这类以 key 开头但语义非凭据的词（末词匹配天然排除）。
+ * 这类以 key 开头但语义非凭据的词（组合规则天然排除）。
  */
 const SENSITIVE_ANY_WORD = new Set([
   'secret',
@@ -133,7 +141,10 @@ const SENSITIVE_ANY_WORD = new Set([
   'credentials',
   'authorization',
 ]);
-const SENSITIVE_SUFFIX_WORD = new Set(['key', 'keys', 'token', 'cookie']);
+/** 末词核心词：需限定词组合（cookie 除外，cookie 末词本身就是凭据语义） */
+const SENSITIVE_CORE_LAST = new Set(['key', 'keys', 'token', 'tokens', 'cookie']);
+/** 敏感限定词：与末词核心词相邻（前一词）时构成凭据模式 */
+const SENSITIVE_QUALIFIER = new Set(['api', 'access', 'auth', 'oauth', 'private', 'client', 'provider', 'session']);
 
 /** 紧凑别名：无分隔符拼接的凭据词（API_KEY→apikey、ACCESS_TOKEN→accesstoken）。
  *  全小写/全大写形态拆不出单词边界（APIKEY、accesstoken 是单一连续段），须显式枚举 */
@@ -151,6 +162,21 @@ const COMPACT_SENSITIVE = new Set([
   'providerkey',
   'providerkeys',
 ]);
+/** 紧凑核心后缀（provider 前缀 + 凭据核心的连续拼接，如 OPENAIAPIKEY）：按后缀匹配 */
+const COMPACT_SENSITIVE_SUFFIXES = [
+  'apikey',
+  'apikeys',
+  'accesstoken',
+  'accesstokens',
+  'secretkey',
+  'secretkeys',
+  'clientsecret',
+  'clientsecrets',
+  'privatekey',
+  'privatekeys',
+  'providerkey',
+  'providerkeys',
+];
 
 /**
  * 键名 → 小写分词列表。边界规则：分隔符（_/-/./空格）+ 驼峰边界，且连续大写段
@@ -167,9 +193,24 @@ function splitKeyWords(key: string): string[] {
 
 function isSensitiveKey(key: string): boolean {
   const words = splitKeyWords(key);
-  if (words.some((word) => SENSITIVE_ANY_WORD.has(word) || COMPACT_SENSITIVE.has(word))) return true;
-  const last = words[words.length - 1];
-  return last !== undefined && SENSITIVE_SUFFIX_WORD.has(last);
+  if (words.some((word) => SENSITIVE_ANY_WORD.has(word))) return true;
+  // 紧凑别名完整命中，或 provider 前缀 + 紧凑核心后缀（OPENAIAPIKEY → openaiapikey）
+  if (words.some((word) => COMPACT_SENSITIVE.has(word) || COMPACT_SENSITIVE_SUFFIXES.some((core) => word.endsWith(core)))) {
+    return true;
+  }
+  // 核心词任意位置组合规则：cookie 末词即敏感（凭据语义强）；key/token 唯一词、
+  // 或前一词为敏感限定词时敏感 —— 普通设置（shortcutKey/maxToken/…）保留
+  for (let i = 0; i < words.length; i += 1) {
+    const word = words[i]!;
+    if (!SENSITIVE_CORE_LAST.has(word)) continue;
+    if (word === 'cookie') {
+      if (i === words.length - 1) return true;
+      continue;
+    }
+    if (i === 0 && words.length === 1) return true;
+    if (i > 0 && SENSITIVE_QUALIFIER.has(words[i - 1]!)) return true;
+  }
+  return false;
 }
 
 /** 工程包仅携带的公开项目字段（白名单：未知顶层字段一律不进包） */
@@ -617,6 +658,12 @@ export async function parseProjectPackage(
   const problem = validateProjectSchema(restored);
   if (problem) {
     return failure('invalid-project', `工程包数据校验失败：${problem}`, problem);
+  }
+  // 完整图结构校验（第六轮 #2）：父引用/根挂载/活动场景/机位归属与加载边界同一套
+  // 纯校验 —— 图关系损坏的包不得判为导入成功
+  const structureProblem = validateProjectStructure(restored as Project);
+  if (structureProblem) {
+    return failure('invalid-project', `工程包数据校验失败：${structureProblem}`, structureProblem);
   }
   return { ok: true, project: restored as Project, warnings, migratedFrom: migrated.migratedFrom };
 }

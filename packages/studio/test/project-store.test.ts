@@ -238,6 +238,65 @@ describe('ProjectStore：JSON 可编码性契约（第五轮 #8，与 OPFS 后�
     expect(result.message).toContain('circular');
     store.close();
   });
+
+  it('含 BigInt 字段的项目：拒绝（JSON.stringify 会抛错，两端一致，第六轮 #5）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const bad = project('lumora://project/a', 'BigInt', 1) as Project & Record<string, unknown>;
+    bad.extra = { value: 1n };
+    const result = await store.save(bad as Project, null);
+    expect(result).toMatchObject({ ok: false, code: 'storage-error' });
+    if (result.ok || result.code !== 'storage-error') return;
+    expect(result.message).toContain('bigint');
+    expect(await store.load('lumora://project/a')).toBeNull();
+    store.close();
+  });
+
+  it('含数组非索引键（pluginData.arr.extra）的项目：拒绝（JSON.stringify 静默丢键，两端一致，第六轮 #5）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const bad = project('lumora://project/a', '数组扩展键', 1);
+    const arr = [1, 2] as unknown as Record<string, unknown>;
+    arr.extra = 3;
+    (bad as { pluginData?: Record<string, unknown> }).pluginData = { arr: arr as unknown as unknown[] };
+    const result = await store.save(bad, null);
+    expect(result).toMatchObject({ ok: false, code: 'storage-error' });
+    if (result.ok || result.code !== 'storage-error') return;
+    expect(result.message).toContain('array-extra-keys');
+    expect(await store.load('lumora://project/a')).toBeNull();
+    store.close();
+  });
+});
+
+describe('ProjectStore：拒绝 schema 降级（第六轮 #6）', () => {
+  it('以旧 schema 版本覆盖较新记录：返回 schema-downgrade 类型化错误，不写入', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const current = project('lumora://project/a', 'v3', 0);
+    expect((await store.save(current)).ok).toBe(true);
+    const old = { ...current, schemaVersion: 2 } as unknown as Project;
+    const result = await store.save(old, 0);
+    expect(result).toMatchObject({ ok: false, code: 'schema-downgrade' });
+    if (result.ok || result.code !== 'schema-downgrade') return;
+    expect(result.message).toContain('schema');
+    const stored = await store.load('lumora://project/a');
+    expect(stored!.schemaVersion).toBe(3);
+    expect(stored!.revision).toBe(0);
+    store.close();
+  });
+
+  it('无条件写入（expected undefined）同样拒绝 schema 降级', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const current = project('lumora://project/a', 'v3', 0);
+    expect((await store.save(current)).ok).toBe(true);
+    const old = { ...current, schemaVersion: 2, revision: 1 } as unknown as Project;
+    const result = await store.save(old);
+    expect(result).toMatchObject({ ok: false, code: 'schema-downgrade' });
+    const stored = await store.load('lumora://project/a');
+    expect(stored!.schemaVersion).toBe(3);
+    store.close();
+  });
 });
 
 describe('project-storage 共享工具（第五轮 #6 / #8）', () => {

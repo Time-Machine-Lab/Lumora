@@ -156,6 +156,16 @@ export class ProjectStore implements ProjectStorage {
       if (existing) {
         // CAS 通过后仍拒绝倒退与分叉（NFR-003）：旧 revision 覆盖较新记录、
         // 同 revision 写入不同内容都会让多标签页的计数收敛失效
+        // 拒绝 schema 降级（第六轮 #6）：迁移只向前推进；旧 schema 内容不得
+        // 覆盖较新记录（迁移豁免仅限显式的旧版→当前版操作，见 loadProject）
+        if (project.schemaVersion < existing.project.schemaVersion) {
+          return {
+            ok: false,
+            code: 'schema-downgrade',
+            message: `不能以旧 schema 版本（${project.schemaVersion}）覆盖较新记录（${existing.project.schemaVersion}），未写入`,
+            storedRevision: existing.project.revision,
+          };
+        }
         if (project.revision < existing.project.revision) {
           return {
             ok: false,

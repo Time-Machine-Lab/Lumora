@@ -394,14 +394,15 @@ describe('ProjectAutosaver：恢复快照（切换/关闭时保存失败的旧�
     await settle(20);
     expect(states.at(-1)).toMatchObject({ status: 'error', code: 'recovery-available' });
 
-    // 显式重试：快照以已提交基线 CAS 落盘（内容不丢），但锁存期间的编辑（G3）
-    // 与快照内容（G1+G2）三方分叉 → 锁存冲突供显式解决，当前编辑不被静默覆盖
+    // 显式重试（第六轮 #4 写入前决策）：锁存期间的编辑（G3）与快照内容（G1+G2）、
+    // 已提交基线三方内容各不相同 → 真分叉 —— 不写入磁盘，快照保留在恢复区可重试，
+    // 锁存冲突供显式解决，当前编辑不被静默覆盖
     const outcome = await autosaver.retryRecovery(A);
     expect(outcome).toMatchObject({ ok: false, code: 'revision-conflict' });
-    expect(autosaver.getRecovery(A)).toBeNull(); // 快照已落盘
+    expect(autosaver.getRecovery(A)).not.toBeNull(); // 快照保留（未预持久化）
     const stored = await store.load(A);
-    expect(stored!.revision).toBe(2);
-    expect(stored!.objects.length).toBe(base.objects.length + 2);
+    expect(stored!.revision).toBe(0); // 磁盘未被推进，保持已提交基线
+    expect(stored!.objects.length).toBe(base.objects.length);
     expect(editor.getProject()!.revision).toBe(1); // 锁存期间编辑保持（未覆盖）
     expect(states.at(-1)).toMatchObject({ status: 'error', code: 'revision-conflict' });
     autosaver.dispose();
@@ -502,7 +503,7 @@ describe('ProjectAutosaver：首存失败 / flush 稳定排空 / retryRecovery �
     autosaver.dispose();
   });
 
-  it('retryRecovery 三方分叉（编辑器 ≠ 快照 ≠ 已提交基线）：快照落盘但不覆盖当前编辑，锁存冲突（第五轮 #4）', async () => {
+  it('retryRecovery 三方分叉（编辑器 ≠ 快照 ≠ 已提交基线）：写入前决策不落盘、快照保留，锁存冲突（第六轮 #4）', async () => {
     const { editor, store, autosaver } = await wired();
     const A = 'lumora://project/a';
     const base = createSampleProject(A, '项目A');
@@ -530,10 +531,12 @@ describe('ProjectAutosaver：首存失败 / flush 稳定排空 / retryRecovery �
     editor.addObject(createGroupObject()); // rev2
     const outcome = await autosaver.retryRecovery(A);
     expect(outcome).toMatchObject({ ok: false, code: 'revision-conflict' });
-    // 恢复快照已落盘（内容不丢），当前编辑不被静默覆盖
+    // 写入前决策（第六轮 #4）：三方分叉不落盘 —— 磁盘保持基线，快照保留在
+    // 恢复区（可重试/另存副本），当前编辑不被静默覆盖
+    expect(autosaver.getRecovery(A)).not.toBeNull();
     const stored = await store.load(A);
-    expect(stored!.revision).toBe(1);
-    expect(stored!.objects.length).toBe(base.objects.length + 1);
+    expect(stored!.revision).toBe(0);
+    expect(stored!.objects.length).toBe(base.objects.length);
     expect(editor.getProject()!.revision).toBe(2);
     expect(editor.getProject()!.objects.length).toBe(base.objects.length + 2);
     // 锁存冲突下 flush 同样阻断（调用方不放行关闭/切换）
@@ -698,7 +701,7 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     autosaver.dispose();
   });
 
-  it('retryRecovery 同 revision 分叉：快照落盘但不静默覆盖当前编辑，锁存冲突引导显式解决', async () => {
+  it('retryRecovery 同 revision 分叉：写入前决策不落盘、快照保留，锁存冲突引导显式解决', async () => {
     const { editor, store, autosaver } = await wired();
     const A = 'lumora://project/a';
     const base = createSampleProject(A, '项目A');
@@ -726,15 +729,95 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     editor.addObject(createGroupObject()); // rev2（内容 ≠ 恢复快照）
     const outcome = await autosaver.retryRecovery(A);
     expect(outcome).toMatchObject({ ok: false, code: 'revision-conflict' });
-    // 当前编辑未被恢复快照静默覆盖（同 revision 不得以快照替换编辑器）
+    // 写入前决策（第六轮 #4）：同 revision 分叉不落盘 —— 磁盘保持基线 rev0，
+    // 快照保留在恢复区，当前编辑未被恢复快照静默覆盖
+    expect(autosaver.getRecovery(A)).not.toBeNull();
     const current = editor.getProject()!;
     expect(current.revision).toBe(2);
     expect(current.objects.length).toBe(base.objects.length + 2);
-    const stored = await store.load(A);
-    expect(stored!.revision).toBe(2);
     expect(current.objects.filter((o) => o.type === 'light').length).toBe(
-      stored!.objects.filter((o) => o.type === 'light').length + 1,
+      base.objects.filter((o) => o.type === 'light').length + 1,
     );
+    const stored = await store.load(A);
+    expect(stored!.revision).toBe(0);
+    expect(stored!.objects.length).toBe(base.objects.length);
     autosaver.dispose();
+  });
+
+  it('retryRecovery 快照 revision 高于当前编辑器（第六轮 #4）：按内容决策向前保存当前编辑，不按 revision 大小推断', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(10); // 基线 rev0
+
+    // 保存全面失败 → 编辑 4 次后撤销回基线内容：恢复快照 revision 高（8）
+    // 但内容 == 已提交基线（未带来新内容）
+    vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    for (let i = 0; i < 4; i += 1) editor.addObject(createGroupObject());
+    for (let i = 0; i < 4; i += 1) editor.undo();
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60);
+    const snapshot = autosaver.getRecovery(A);
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.revision).toBeGreaterThan(2); // 快照 revision 高于后续当前编辑
+    vi.mocked(store.save).mockRestore();
+
+    // 重开 A 后编辑出当前内容（rev2）。旧逻辑先落盘快照（rev8）再以刚落盘
+    // revision 为期望保存当前编辑 → rev2 < rev8 被存储层拒绝、fire-and-forget
+    // 静默丢当前编辑；新逻辑写入前决策：快照 == 基线 → 按原基线保存当前内容
+    editor.openProject({ ...base, name: '项目A' });
+    await settle(60);
+    editor.addObject(createGroupObject()); // rev1
+    editor.addObject(createGroupObject()); // rev2
+    const outcome = await autosaver.retryRecovery(A);
+    expect(outcome.ok).toBe(true);
+    const stored = await store.load(A);
+    expect(stored!.revision).toBe(2); // 当前编辑内容落盘，而非快照的 rev8
+    expect(stored!.objects.length).toBe(base.objects.length + 2);
+    expect(editor.getProject()!.revision).toBe(2); // 编辑器不被重开覆盖
+    expect(autosaver.getRecovery(A)).toBeNull(); // 成功清除恢复快照
+    autosaver.dispose();
+  });
+
+  it('阻断1：不可编码内容（undefined/NaN/BigInt/循环引用/数组非索引键）恒判未保存，保存返回类型化错误且不崩溃', async () => {
+    const cases: Array<[string, () => object]> = [
+      ['undefined 字段', () => ({ extra: undefined })],
+      ['NaN', () => ({ extra: { value: NaN } })],
+      ['BigInt', () => ({ extra: { value: 1n } })],
+      ['循环引用', () => {
+        const loop: Record<string, unknown> = {};
+        loop.self = loop;
+        return { extra: loop };
+      }],
+      ['数组非索引键', () => {
+        const arr = [1, 2] as unknown as Record<string, unknown>;
+        arr.extra = 3;
+        return { extra: arr };
+      }],
+    ];
+    for (const [label, corrupt] of cases) {
+      const { editor, store, autosaver } = await wired();
+      const states: AutosaveState[] = [];
+      autosaver.onState((s) => states.push(s));
+      const A = `lumora://project/${label}`;
+      editor.openProject({ ...createSampleProject(A, '项目A'), ...corrupt() });
+      await settle(80);
+      // 指纹不可比较 → 恒判未保存 → 保存路径返回类型化错误（storage-error +
+      // 具体编码问题），绝不假报 clean、不崩溃、不产生假记录
+      const last = states.at(-1)!;
+      expect(last).toMatchObject({ status: 'error', code: 'storage-error' });
+      if (last.status === 'error') expect(last.message).toContain('无法本地保存');
+      expect(states.some((s) => s.status === 'clean')).toBe(false);
+      expect(await store.load(A)).toBeNull();
+      const outcome = await autosaver.flush();
+      expect(outcome).toMatchObject({ ok: false, code: 'storage-error' });
+      autosaver.dispose();
+    }
   });
 });

@@ -20,10 +20,12 @@ import {
   CURRENT_PROJECT_SCHEMA_VERSION,
   buildProjectPackage,
   estimatePackageBytes,
+  findJsonEncodingProblem,
   migrateProjectSchema,
   parseProjectPackage,
   serializeProjectPackage,
   validateProjectSchema,
+  validateProjectStructure,
 } from '@lumora/core';
 import type { MissingAssetWarning, PackageImportError } from '@lumora/core';
 import { ProjectAutosaver } from './autosave';
@@ -132,6 +134,10 @@ export class ProjectPersistence {
     const problem = validateProjectSchema(project);
     if (problem) {
       return { ok: false, message: `本地项目数据校验失败：${problem}` };
+    }
+    const structureProblem = validateProjectStructure(project);
+    if (structureProblem) {
+      return { ok: false, message: `本地项目数据校验失败：${structureProblem}` };
     }
     if (migrated.migratedFrom !== CURRENT_PROJECT_SCHEMA_VERSION) {
       // 仅迁移实际发生时写回（当前版本数据通过校验后原样返回，不做无意义写回）
@@ -270,6 +276,13 @@ export class ProjectPersistence {
     const project = this.editor.getProject();
     if (!project) return { ok: false, message: '当前没有打开的项目' };
     const pkg = buildProjectPackage(project, { includePrivate: options.includePrivate ?? false });
+    // 导出前置编码预检（第六轮 #5）：不可 JSON 编码的数据（undefined/NaN/BigInt/
+    // 循环引用/数组非索引键）在序列化中会抛错或静默失真 —— 在包构建前拒绝并
+    // 返回类型化失败，绝不产出丢字段的包
+    const problem = findJsonEncodingProblem(pkg);
+    if (problem) {
+      return { ok: false, message: `项目包含无法导出的数据（${problem}），导出被拒绝` };
+    }
     const text = serializeProjectPackage(pkg);
     return { ok: true, text, filename: `${safeFilename(project.name)}.lumora`, bytes: estimatePackageBytes(text) };
   }

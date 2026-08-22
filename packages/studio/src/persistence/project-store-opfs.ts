@@ -25,7 +25,7 @@
  */
 
 import type { Project } from '@lumora/core';
-import { genId } from '@lumora/core';
+import { genId, migrateProjectSchema, validateProjectSchema, validateProjectStructure } from '@lumora/core';
 import type {
   DuplicateOutcome,
   ProjectStorage,
@@ -133,6 +133,12 @@ export function isStoredProjectRecord(value: unknown): value is StoredProject {
 function isNotFoundError(error: unknown): boolean {
   const name = error instanceof DOMException ? error.name : (error as { name?: string })?.name;
   return name === 'NotFoundError';
+}
+
+/** 明确的能力缺失错误：move 方法存在但后端不支持时按此判定降级（第六轮一般项） */
+function isNotSupportedError(error: unknown): boolean {
+  const name = error instanceof DOMException ? error.name : (error as { name?: string })?.name;
+  return name === 'NotSupportedError';
 }
 
 export class OpfsProjectStore implements ProjectStorage {
@@ -251,6 +257,16 @@ export class OpfsProjectStore implements ProjectStorage {
         if (existing) {
           // CAS 通过后仍拒绝倒退与分叉（NFR-003）：旧 revision 覆盖较新记录、
           // 同 revision 写入不同内容都会让多标签页的计数收敛失效
+          // 拒绝 schema 降级（第六轮 #6）：迁移只向前推进；旧 schema 内容不得
+          // 覆盖较新记录（迁移豁免仅限显式的旧版→当前版操作，见 loadProject）
+          if (project.schemaVersion < existing.project.schemaVersion) {
+            return {
+              ok: false,
+              code: 'schema-downgrade',
+              message: `不能以旧 schema 版本（${project.schemaVersion}）覆盖较新记录（${existing.project.schemaVersion}），未写入`,
+              storedRevision: existing.project.revision,
+            };
+          }
           if (project.revision < existing.project.revision) {
             return {
               ok: false,
@@ -348,9 +364,11 @@ export class OpfsProjectStore implements ProjectStorage {
   }
 
   /**
-   * 读取记录：文件缺失返回 undefined；损坏（无法解析或结构校验失败）返回 null；
-   * 合法记录返回 StoredProject。个体损坏可隔离：load 视为缺失、list 跳过、
-   * save 拒绝覆盖、remove 可删除（用户的修复路径）。
+   * 读取记录：文件缺失返回 undefined；损坏返回 null；合法记录返回 StoredProject。
+   * 损坏判定为深度校验（第六轮一般项）：记录形状通过后，版本感知迁移到当前
+   * schema（未来版本/缺版本/迁移链缺失 → 损坏），再做完整 schema + 图结构校验
+   * —— 缺 settings/scenes/objects/tracks/assets 或图关系损坏的记录不得被
+   * list/load/rename/duplicate 使用（各自经 null 路径隔离，remove 可删除作为修复路径）。
    */
   private async readRecord(name: string): Promise<StoredProject | undefined | null> {
     let handle: OpfsFileHandle;
@@ -364,7 +382,13 @@ export class OpfsProjectStore implements ProjectStorage {
     const text = await file.text();
     try {
       const parsed: unknown = JSON.parse(text);
-      return isStoredProjectRecord(parsed) ? parsed : null;
+      if (!isStoredProjectRecord(parsed)) return null;
+      const migrated = migrateProjectSchema(parsed.project);
+      if (!migrated.ok) return null;
+      const project = migrated.project as Project;
+      if (validateProjectSchema(project)) return null;
+      if (validateProjectStructure(project)) return null;
+      return { ...parsed, project };
     } catch {
       return null;
     }
@@ -372,9 +396,10 @@ export class OpfsProjectStore implements ProjectStorage {
 
   /**
    * 原子写入：临时文件落盘后 move 覆盖目标名；任一步失败旧记录保持原样。
-   * move 能力缺失（受限环境，能力探测）时退化为直接写目标文件 —— 非原子降级，
-   * 中断可能留下半写记录，readRecord 的结构校验会将其视为损坏（list 跳过、
-   * load 视为缺失、可删除重试），绝不把半写数据当合法记录用。
+   * move 能力缺失或方法存在但抛 NotSupportedError（受限环境，能力探测，
+   * 第六轮一般项）时退化为直接写目标文件 —— 非原子降级，中断可能留下半写
+   * 记录，readRecord 的深度校验会将其视为损坏（list 跳过、load 视为缺失、
+   * 可删除重试），绝不把半写数据当合法记录用。
    */
   private async writeRecord(name: string, record: StoredProject): Promise<void> {
     const text = JSON.stringify(record);
@@ -387,19 +412,7 @@ export class OpfsProjectStore implements ProjectStorage {
       } catch {
         // 清理失败不掩盖写入
       }
-      const direct = await this.projectsDir.getFileHandle(name, { create: true });
-      const directWritable = await direct.createWritable();
-      try {
-        await directWritable.write(text);
-        await directWritable.close();
-      } catch (error) {
-        try {
-          await directWritable.close();
-        } catch {
-          // 写入本身已失败，close 可能再次拒绝；忽略
-        }
-        throw error;
-      }
+      await this.directWrite(name, text);
       return;
     }
     const writable = await tmp.createWritable();
@@ -420,6 +433,35 @@ export class OpfsProjectStore implements ProjectStorage {
       }
       throw error;
     }
-    await tmp.move(this.projectsDir, name);
+    try {
+      await tmp.move(this.projectsDir, name);
+    } catch (error) {
+      // 方法存在但后端不支持：清理 .tmp 后降级直接写（仅明确能力错误降级，
+      // 其余错误如实上抛，不留半写临时文件）
+      if (!isNotSupportedError(error)) throw error;
+      try {
+        await this.projectsDir.removeEntry(tmpName);
+      } catch {
+        // 清理失败不掩盖降级
+      }
+      await this.directWrite(name, text);
+    }
+  }
+
+  /** 直接写目标文件（move 缺失/不支持时的非原子降级路径，见 writeRecord） */
+  private async directWrite(name: string, text: string): Promise<void> {
+    const direct = await this.projectsDir.getFileHandle(name, { create: true });
+    const directWritable = await direct.createWritable();
+    try {
+      await directWritable.write(text);
+      await directWritable.close();
+    } catch (error) {
+      try {
+        await directWritable.close();
+      } catch {
+        // 写入本身已失败，close 可能再次拒绝；忽略
+      }
+      throw error;
+    }
   }
 }

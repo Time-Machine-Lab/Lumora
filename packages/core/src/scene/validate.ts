@@ -283,3 +283,103 @@ export function validateProjectSchema(project: unknown): string | null {
   }
   return null;
 }
+
+/**
+ * 完整图结构校验（第六轮 #2：从 SceneEditor 私有校验抽取为共享纯函数，
+ * 加载边界与工程包导入在状态变更前复用）：父引用存在 → 父子循环 →
+ * 根列表一致性（parentId === null ⇔ 恰好出现在一个场景根列表）→
+ * 活动场景存在 → 机位归属（activeCameraId 指向本场景可达的相机）。
+ * 调用方必须先通过 validateProjectSchema（本函数信任其基本类型保证）。
+ * 返回首个问题描述；null 表示结构合法。
+ */
+export function validateProjectStructure(project: Project): string | null {
+  if (!project || typeof project !== 'object') return '项目不是对象';
+  if (!Array.isArray(project.objects)) return 'objects 缺失';
+  if (!Array.isArray(project.scenes)) return 'scenes 缺失';
+  const byId = new Map<string, SceneObjectData>();
+  for (const object of project.objects) {
+    if (byId.has(object.id)) return `对象数据不合法：${object.id}`;
+    byId.set(object.id, object);
+  }
+  for (const object of project.objects) {
+    if (object.parentId !== null && !byId.has(object.parentId)) {
+      return `对象缺少父级：${object.id}`;
+    }
+  }
+  // 三色循环检测（O(n) 摊还）：顺序遍历 parent 链，路径内重复即循环；
+  // 已确认无环（'ok'）的链直接复用，不重复走
+  const status = new Map<string, 'in-progress' | 'ok'>();
+  for (const object of project.objects) {
+    const path: string[] = [];
+    let cursor: SceneObjectData | undefined = object;
+    while (cursor && cursor.parentId !== null) {
+      const s = status.get(cursor.id);
+      if (s === 'ok') break;
+      if (s === 'in-progress') return `父子关系存在循环：${cursor.id}`;
+      status.set(cursor.id, 'in-progress');
+      path.push(cursor.id);
+      cursor = byId.get(cursor.parentId);
+    }
+    for (const id of path) status.set(id, 'ok');
+  }
+  // 根列表一致性：rootObjectIds 引用合法根对象；每个根对象恰好出现一次
+  const rootCount = new Map<string, number>();
+  for (const scene of project.scenes) {
+    for (const rootId of scene.rootObjectIds) {
+      const root = byId.get(rootId);
+      if (!root || root.parentId !== null) return `场景根列表引用非法：${rootId}`;
+      rootCount.set(rootId, (rootCount.get(rootId) ?? 0) + 1);
+    }
+  }
+  for (const object of project.objects) {
+    if (object.parentId === null && !rootCount.has(object.id)) {
+      return `孤立根对象：${object.id}`;
+    }
+  }
+  for (const [rootId, count] of rootCount) {
+    if (count > 1) return `根对象重复挂载：${rootId}`;
+  }
+  const scene = project.scenes.find((s) => s.id === project.activeSceneId);
+  if (!scene) return '活动场景不存在';
+  // 所有场景的 activeCameraId 都必须指向本场景可达的相机（非活动场景同样校验）。
+  // 根一致性 ⇒ 无环单父森林中每对象沿父链上溯唯一根、场景子树不相交 → 单次
+  // 构建归属根索引（O(N) 摊还路径压缩）+ 场景根集合，机位校验收敛 O(1)。
+  if (project.scenes.some((s) => s.activeCameraId !== null)) {
+    const rootOf = new Map<string, string>();
+    const resolvedRoot = new Map<string, string>();
+    for (const object of project.objects) {
+      if (object.parentId === null) {
+        rootOf.set(object.id, object.id);
+        continue;
+      }
+      const path: string[] = [];
+      let cursor: SceneObjectData | undefined = object;
+      let rootId: string | null = null;
+      while (cursor && cursor.parentId !== null) {
+        const cached = resolvedRoot.get(cursor.id);
+        if (cached !== undefined) {
+          rootId = cached;
+          break;
+        }
+        path.push(cursor.id);
+        cursor = byId.get(cursor.parentId);
+      }
+      if (rootId === null && cursor) rootId = cursor.id;
+      for (const id of path) resolvedRoot.set(id, rootId!);
+      rootOf.set(object.id, rootId!);
+    }
+    const sceneRoots = new Map<string, Set<string>>();
+    for (const s of project.scenes) sceneRoots.set(s.id, new Set(s.rootObjectIds));
+    for (const s of project.scenes) {
+      if (s.activeCameraId === null) continue;
+      const camera = byId.get(s.activeCameraId);
+      if (!camera || camera.type !== 'camera') {
+        return `场景「${s.name}」的机位不存在或不是相机`;
+      }
+      if (!sceneRoots.get(s.id)!.has(rootOf.get(s.activeCameraId)!)) {
+        return `场景「${s.name}」的机位不属于该场景`;
+      }
+    }
+  }
+  return null;
+}

@@ -408,3 +408,73 @@ describe('ProjectPersistence：本地加载边界统一「迁移 → 校验」�
     await runtime.dispose();
   });
 });
+
+describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 #2 / #5）', () => {
+  it('图结构损坏记录（activeSceneId 指向不存在的场景）：loadProject 拒绝，恢复快照不受影响', async () => {
+    // 注入 store 以便 spy 运行时实际使用的保存路径（makeRuntime 内部自建 store）
+    const runtime = createStudioRuntime();
+    openRuntimes.push(runtime);
+    const store = await openStandaloneStore();
+    await runtime.init({ debounceMs: 10, dbName: DB, store });
+    // 打开正常项目并制造恢复快照（保存失败 → 切换 → 快照保留）
+    const A = runtime.persistence.createProject('正常项目');
+    runtime.openProject(A);
+    await settle(40);
+    vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    runtime.editor.addObject(createGroupObject());
+    await settle(40);
+    // 切换屏障（flush 失败则拒绝切换）下无法制造恢复快照：显式跳过排空走切换路径
+    runtime.openProject(runtime.persistence.createProject('另一项目'), { flush: false });
+    await settle(40);
+    vi.mocked(store.save).mockRestore();
+    expect(runtime.persistence.getRecoverySnapshot(A.uri)).not.toBeNull();
+
+    // 磁盘记录被破坏为图结构非法（schema 通过、结构校验拒绝）
+    const bad = { ...A, revision: 1, activeSceneId: '不存在的场景' } as unknown as Project;
+    expect((await store.save(bad)).ok).toBe(true);
+
+    const loaded = await runtime.persistence.loadProject(A.uri);
+    expect(loaded.ok).toBe(false);
+    if (loaded.ok) return;
+    expect(loaded.message).toContain('活动场景不存在');
+    // 失败路径不触碰恢复区：快照仍可重试/另存副本
+    expect(runtime.persistence.getRecoverySnapshot(A.uri)).not.toBeNull();
+    await runtime.dispose();
+  });
+
+  it('exportCurrent 编码预检：数组非索引键（pluginData.arr.extra）与循环引用 → 类型化失败，不产出丢字段的包', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('不可导出');
+    // pluginData.arr 数组带非索引自有键（JSON.stringify 会静默丢键）
+    const arr = [1, 2] as unknown as Record<string, unknown>;
+    arr.extra = 3;
+    runtime.openProject({ ...project, pluginData: { arr: arr as unknown as unknown[] } } as Project);
+    await settle(40);
+    const result = await runtime.persistence.exportCurrent({ includePrivate: true });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.message).toContain('无法导出');
+    expect(result.message).toContain('array-extra-keys');
+    // 不含私有设置时 pluginData 不进包：导出成功（插件私有数据不污染公开包）
+    expect(runtime.persistence.exportCurrent().ok).toBe(true);
+    await runtime.dispose();
+  });
+
+  it('exportCurrent 编码预检：循环引用扩展字段 → 类型化失败', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('循环项目');
+    const loop: Record<string, unknown> = {};
+    loop.self = loop;
+    runtime.openProject({ ...project, pluginData: { loop } } as Project);
+    await settle(40);
+    const result = await runtime.persistence.exportCurrent({ includePrivate: true });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.message).toContain('circular-reference');
+    await runtime.dispose();
+  });
+});

@@ -18,6 +18,13 @@
  */
 
 import type { Project } from '@lumora/core';
+import { findJsonEncodingProblem } from '@lumora/core';
+import type { JsonEncodingProblem } from '@lumora/core';
+
+// JSON 可编码性判定由 core 唯一负责（第六轮 #5：严格 JSON-value 校验/规范化边界，
+// 存储两后端与工程包共用同一函数）；此处 re-export 保持既有导入面不变。
+export { findJsonEncodingProblem };
+export type { JsonEncodingProblem };
 
 /** 本地存储后端：IndexedDB（默认）或 OPFS（Origin Private File System） */
 export type StorageBackend = 'indexeddb' | 'opfs';
@@ -40,6 +47,8 @@ export type SaveFailureCode =
   | 'revision-conflict'
   | 'quota-exceeded'
   | 'storage-error'
+  // 以旧 schema 版本覆盖较新记录（第六轮 #6：拒绝 schema 降级）
+  | 'schema-downgrade'
   // autosaver 锁存态：恢复快照待处理（flush/排空与打开屏障同样阻断，见 autosave.flush）
   | 'recovery-available';
 
@@ -105,49 +114,14 @@ export function stableStringify(value: unknown): string {
   });
 }
 
-/** 数据图中不可 JSON 编码的值的类型（写入前预检，与具体后端无关） */
-export type JsonEncodingProblem =
-  | 'circular-reference'
-  | 'undefined-value'
-  | 'function-value'
-  | 'symbol-value'
-  | 'bigint-value'
-  | 'non-finite-number';
-
 /**
- * 递归检查数据图是否可无损 JSON 编码：循环引用（JSON.stringify 直接抛错）、
- * undefined/函数/符号（键被静默丢弃）、非有限数值（静默变 null）、BigInt（抛错）。
- * 返回首个问题；无可序列化问题返回 null。seen 按路径维护（退出即删除）：
- * 同一对象出现在两处（DAG）可正常序列化，不应误判为循环。
+ * 同 revision 幂等重存判定：内容逐字段一致（仅 savedAt 等记录字段可漂移）。
+ * 任一方向不可 JSON 编码（undefined/NaN/BigInt/循环引用/数组非索引键）时
+ * 无法可靠序列化比较，保守判为内容不同（分叉）—— 不可编码内容绝不因
+ * JSON.stringify 丢字段/归一化而误判为与其它内容相同。
  */
-export function findJsonEncodingProblem(value: unknown, seen = new Set<object>()): JsonEncodingProblem | null {
-  if (value === null || typeof value !== 'object') {
-    if (typeof value === 'number' && !Number.isFinite(value)) return 'non-finite-number';
-    if (value === undefined) return 'undefined-value';
-    if (typeof value === 'function') return 'function-value';
-    if (typeof value === 'symbol') return 'symbol-value';
-    if (typeof value === 'bigint') return 'bigint-value';
-    return null;
-  }
-  if (seen.has(value)) return 'circular-reference';
-  seen.add(value);
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const problem = findJsonEncodingProblem(item, seen);
-      if (problem) return problem;
-    }
-  } else {
-    for (const key of Object.keys(value)) {
-      const problem = findJsonEncodingProblem((value as Record<string, unknown>)[key], seen);
-      if (problem) return problem;
-    }
-  }
-  seen.delete(value);
-  return null;
-}
-
-/** 同 revision 幂等重存判定：内容逐字段一致（仅 savedAt 等记录字段可漂移） */
 export function sameProjectContent(a: Project, b: Project): boolean {
+  if (findJsonEncodingProblem(a) || findJsonEncodingProblem(b)) return false;
   return stableStringify(a) === stableStringify(b);
 }
 
