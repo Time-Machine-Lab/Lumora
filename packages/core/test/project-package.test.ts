@@ -3,7 +3,7 @@ import { SceneEditor } from '../src/editor/scene-editor';
 import { createCameraObject, genId } from '../src/scene/create';
 import { createSampleProject } from '../src/scene/sample-project';
 import { createBlankProject } from '../src/project/create-project';
-import { hashBytes } from '../src/scene/assets';
+import { compositeContentHash, hashBytes } from '../src/scene/assets';
 import {
   MAX_ASSET_PARTS,
   MAX_ASSETS_PER_PROJECT,
@@ -283,7 +283,7 @@ describe('parseProjectPackage：损坏资产载荷一律拒绝导入（严重项
     }
   });
 
-  it('解码字节数超过声明 size → invalid-project', async () => {
+  it('解码字节数与声明 size 不一致（双向精确核对，偏大方向）→ invalid-project', async () => {
     const project = await buildFixtureProject();
     const pkg = buildProjectPackage(project);
     const raw = JSON.parse(serializeProjectPackage(pkg)) as { assets: Record<string, { payload: string }> };
@@ -293,7 +293,26 @@ describe('parseProjectPackage：损坏资产载荷一律拒绝导入（严重项
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error.code).toBe('invalid-project');
-      expect(result.error.message).toContain('超过声明 size');
+      expect(result.error.message).toContain('声明 size');
+    }
+  });
+
+  it('解码字节数与声明 size 不一致（偏小方向：3 字节 vs size 999）→ invalid-project', async () => {
+    const project = await buildFixtureProject();
+    const pkg = buildProjectPackage(project);
+    const raw = JSON.parse(serializeProjectPackage(pkg)) as {
+      assets: Record<string, { payload: string }>;
+      project: { assets: Array<Record<string, unknown>> };
+    };
+    const key = Object.keys(raw.assets)[0]!;
+    raw.assets[key]!.payload = btoa('xyz');
+    const entry = raw.project.assets.find((a) => a.id === key)!;
+    entry.size = 999;
+    const result = await parseProjectPackage(JSON.stringify(raw));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('invalid-project');
+      expect(result.error.message).toContain('声明 size');
     }
   });
 
@@ -302,7 +321,8 @@ describe('parseProjectPackage：损坏资产载荷一律拒绝导入（严重项
     const pkg = buildProjectPackage(project);
     const raw = JSON.parse(serializeProjectPackage(pkg)) as { assets: Record<string, { payload: string }> };
     const key = Object.keys(raw.assets)[0]!;
-    raw.assets[key]!.payload = btoa('mock glb payload byter');
+    // 与原载荷同长（22 字节）：先通过 size 精确核对，再由哈希校验拦截
+    raw.assets[key]!.payload = btoa('mock glb payload bytez');
     const result = await parseProjectPackage(JSON.stringify(raw));
     expect(result.ok).toBe(false);
     if (!result.ok) {
@@ -376,6 +396,101 @@ describe('parseProjectPackage：损坏资产载荷一律拒绝导入（严重项
       expect(result.error.code).toBe('too-large');
       expect(result.error.message).toContain('资产数超过上限');
     }
+  });
+});
+
+describe('parseProjectPackage：多文件模型（.gltf + 外部分件）组合哈希（阻断项回归）', () => {
+  /** 构建含真实主载荷 + 2 个外部分件（真实组合哈希）的项目 */
+  async function buildMultipartProject(): Promise<Project> {
+    const project = await buildFixtureProject();
+    const mainBytes = new TextEncoder().encode('gltf-json-main-content-0123456789');
+    const partA = new TextEncoder().encode('bin-scene-bytes-AAAA');
+    const partB = new TextEncoder().encode('tex-png-bytes-BBBB');
+    const parts: AssetPartData[] = [
+      { path: 'bin/scene.bin', mime: 'application/octet-stream', payload: btoa(String.fromCharCode(...partA)) },
+      { path: 'textures/tex.png', mime: 'image/png', payload: btoa(String.fromCharCode(...partB)) },
+    ];
+    const partHashes = await Promise.all(
+      parts.map(async (p) => ({ path: p.path, partHash: await hashBytes(new TextEncoder().encode(atob(p.payload))) })),
+    );
+    const composite = await compositeContentHash(await hashBytes(mainBytes), partHashes);
+    return {
+      ...project,
+      assets: [
+        {
+          ...project.assets[0]!,
+          payload: btoa(String.fromCharCode(...mainBytes)),
+          parts,
+          hash: composite,
+          size: mainBytes.length + partA.length + partB.length,
+        },
+      ],
+    };
+  }
+
+  it('真实多文件往返：组合哈希校验通过，主载荷与分件完整恢复（与模型导入同一算法）', async () => {
+    const project = await buildMultipartProject();
+    const pkg = buildProjectPackage(project);
+    const result = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const asset = result.project.assets.find((a) => a.id === project.assets[0]!.id)!;
+    expect(asset.payload).toBe(pkg.assets[project.assets[0]!.id]!.payload);
+    expect(asset.parts).toEqual(project.assets[0]!.parts);
+    expect(result.warnings).toEqual([]);
+  });
+
+  it('篡改任意外部分件 → 组合哈希不一致 → 拒绝导入', async () => {
+    const project = await buildMultipartProject();
+    const pkg = buildProjectPackage(project);
+    const raw = JSON.parse(serializeProjectPackage(pkg)) as {
+      assets: Record<string, { parts?: AssetPartData[] }>;
+    };
+    const bundle = Object.values(raw.assets)[0]!;
+    // 同长篡改（18 字节）：先通过 size 精确核对，再由组合哈希校验拦截
+    bundle.parts![1]!.payload = btoa('tampered-part-XYZQ');
+    const result = await parseProjectPackage(JSON.stringify(raw));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('invalid-project');
+      expect(result.error.message).toContain('哈希不一致');
+    }
+  });
+
+  it('声明了 parts 却为空数组 → 视为损坏 → 拒绝导入', async () => {
+    const project = await buildFixtureProject();
+    const pkg = buildProjectPackage(project);
+    const raw = JSON.parse(serializeProjectPackage(pkg)) as { assets: Record<string, { parts?: unknown }> };
+    const bundle = Object.values(raw.assets)[0]!;
+    bundle.parts = [];
+    const result = await parseProjectPackage(JSON.stringify(raw));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('invalid-project');
+      expect(result.error.message).toContain('外部分件为空');
+    }
+  });
+
+  it('未引用孤儿包（包内载荷无对应资产条目）→ 同样全量校验，损坏即拒绝（无法绕过校验）', async () => {
+    const project = await buildFixtureProject();
+    const pkg = buildProjectPackage(project);
+    const raw = JSON.parse(serializeProjectPackage(pkg)) as { assets: Record<string, unknown> };
+    raw.assets['orphan-bundle-1'] = { payload: 'not base64!!!' };
+    const result = await parseProjectPackage(JSON.stringify(raw));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('invalid-project');
+      expect(result.error.message).toContain('未引用资产');
+    }
+  });
+
+  it('未引用孤儿包合法载荷可通过（校验不误杀，仅要求完整性与计入累计）', async () => {
+    const project = await buildFixtureProject();
+    const pkg = buildProjectPackage(project);
+    const raw = JSON.parse(serializeProjectPackage(pkg)) as { assets: Record<string, unknown> };
+    raw.assets['orphan-bundle-1'] = { payload: btoa('orphan payload bytes') };
+    const result = await parseProjectPackage(JSON.stringify(raw));
+    expect(result.ok).toBe(true);
   });
 });
 

@@ -1,4 +1,4 @@
-import { createModelObject, findAssetByHash, genId, hashBytes } from '@lumora/core';
+import { compositeContentHash, createModelObject, findAssetByHash, genId, hashBytes } from '@lumora/core';
 import type { AssetData, AssetPartData, Project, SceneEditor } from '@lumora/core';
 import { collectGltfUris, relativePosixPath, resolveFormat, resolvePartPath } from './content-cache';
 import type { CacheLease, CachePartFile, ContentCache } from './content-cache';
@@ -91,7 +91,7 @@ export async function importModelFile(
   const mainHash = await hashBytes(new Uint8Array(mainBytes));
 
   let parts: CachePartFile[] = [];
-  let partsText = '';
+  const partHashes: { path: string; partHash: string }[] = [];
   if (partPaths.length > 0) {
     if (!/\.gltf$/i.test(main.name)) return fail('仅 .gltf 支持外部依赖文件');
     let required: string[];
@@ -122,7 +122,6 @@ export async function importModelFile(
         .filter((part): part is (typeof partPaths)[number] => part !== null),
     );
     const loaded: CachePartFile[] = [];
-    const hashes: { path: string; partHash: string }[] = [];
     for (const { file: partFile, path } of used) {
       let bytes: ArrayBuffer;
       try {
@@ -131,20 +130,14 @@ export async function importModelFile(
         return fail(`无法读取依赖文件：${path}`);
       }
       loaded.push({ path, mime: partFile.type || 'application/octet-stream', bytes });
-      hashes.push({ path, partHash: await hashBytes(new Uint8Array(bytes)) });
+      partHashes.push({ path, partHash: await hashBytes(new Uint8Array(bytes)) });
     }
     parts = loaded;
-    partsText = hashes
-      .slice()
-      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
-      .map((p) => `${p.path}:${p.partHash}`)
-      .join('|');
   }
 
-  // 组合内容哈希：主文件 + 全部依赖（按路径排序，确定性），缺任一字节即换哈希
-  const hash = partsText
-    ? await hashBytes(new TextEncoder().encode(`${mainHash}|${partsText}`))
-    : mainHash;
+  // 组合内容哈希（主文件 + 全部依赖，按路径排序确定性）：
+  // 与工程包校验共用 core 的同一算法，保证多文件模型可从自身导出的包恢复
+  const hash = await compositeContentHash(mainHash, partHashes);
 
   const format = formatFor(main.name, main.type);
   let lease: CacheLease;

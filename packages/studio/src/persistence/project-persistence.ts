@@ -25,7 +25,7 @@ import type { MissingAssetWarning, PackageImportError } from '@lumora/core';
 import { ProjectAutosaver } from './autosave';
 import type { AutosaveState } from './autosave';
 import { ProjectStore, estimateStorage } from './project-store';
-import type { DuplicateOutcome, ProjectSummary } from './project-store';
+import type { DuplicateOutcome, ProjectSummary, SaveOutcome } from './project-store';
 
 export interface PersistenceEventMap extends Record<string, unknown> {
   'save-state': { state: AutosaveState };
@@ -110,9 +110,46 @@ export class ProjectPersistence {
     return (await this.store.load(uri)) !== null;
   }
 
-  /** 立即冲刷未保存变更（关闭项目 / 卸载前调用；不改变打开状态）。 */
-  flushPending(): Promise<void> {
+  /**
+   * 立即冲刷未保存变更（关闭项目 / 卸载前调用；不改变打开状态）。
+   * 返回类型化结果：失败（冲突/配额/存储）时调用方必须阻止关闭/切换 ——
+   * 内容仍在编辑器与恢复快照中，放行即丢失。
+   */
+  flushPending(): Promise<SaveOutcome> {
     return this.autosaver.flush();
+  }
+
+  /** 恢复快照（切换/关闭时保存失败的旧项目内容；null = 无）。 */
+  getRecoverySnapshot(uri: string): Project | null {
+    return this.autosaver.getRecovery(uri);
+  }
+
+  /** 显式重试保存恢复快照（成功清除恢复快照与锁存；失败返回错误）。 */
+  retryRecovery(uri: string): Promise<SaveOutcome> {
+    return this.autosaver.retryRecovery(uri);
+  }
+
+  /** 清除恢复快照（用户已另存副本等显式决定后调用）。 */
+  clearRecovery(uri: string): void {
+    this.autosaver.clearRecovery(uri);
+  }
+
+  /** 把恢复快照（或当前编辑器内容）另存为全新项目：以副本保留未保存内容（新 uri，revision 0）。 */
+  async saveSnapshotAsNew(
+    project: Project,
+    name?: string,
+  ): Promise<{ ok: true; project: Project } | { ok: false; message: string }> {
+    if (!this.store) return { ok: false, message: '本地持久化不可用' };
+    const copy: Project = {
+      ...structuredClone(project),
+      uri: `lumora://project/${genId('p')}`,
+      name: name ?? `${project.name} 副本`,
+      createdAt: new Date().toISOString(),
+      revision: 0,
+    };
+    const result = await this.store.save(copy, null);
+    if (!result.ok) return { ok: false, message: result.message };
+    return { ok: true, project: copy };
   }
 
   /**

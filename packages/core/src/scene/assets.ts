@@ -26,3 +26,21 @@ export async function hashBytes(data: ArrayBuffer | Uint8Array): Promise<string>
   }
   return fnv1aHex(new Uint8Array(arrayBuffer));
 }
+
+/**
+ * 组合内容哈希（多文件资产唯一标识）：主文件哈希 + 全部依赖分件（按路径排序的
+ * `path:hash` 列表），缺任一字节即换哈希。模型导入（model-import）与工程包校验
+ * （project/package）必须使用同一算法，否则多文件模型无法从自身导出的包恢复。
+ */
+export async function compositeContentHash(
+  mainHash: string,
+  parts: ReadonlyArray<{ path: string; partHash: string }>,
+): Promise<string> {
+  if (parts.length === 0) return mainHash;
+  const partsText = parts
+    .slice()
+    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+    .map((p) => `${p.path}:${p.partHash}`)
+    .join('|');
+  return hashBytes(new TextEncoder().encode(`${mainHash}|${partsText}`));
+}

@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
-import { genId } from '@lumora/core';
+import { MAX_PACKAGE_TEXT_BYTES, genId } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import type { StudioRuntime } from '../runtime/studio-runtime';
 import type { AutosaveState } from '../persistence/autosave';
@@ -128,6 +128,7 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
     setModal(null);
     setOpen(false);
     runtime.openProject(persistence.createProject(name));
+    menuButtonRef.current?.focus();
     showToast(`已新建项目「${name}」`, 'success');
   };
 
@@ -168,7 +169,14 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
     setPendingDelete(null);
     setBusy(true);
     try {
-      if (project?.uri === summary.uri) await runtime.closeProject();
+      if (project?.uri === summary.uri) {
+        // 关闭即丢弃未保存内容：落盘失败时必须中止删除（内容仍在编辑器/恢复快照中）
+        const closed = await runtime.closeProject();
+        if (!closed.ok) {
+          showToast(`无法删除：${closed.message ?? '未保存更改落盘失败'}`, 'error');
+          return;
+        }
+      }
       await persistence.deleteProject(summary.uri);
       showToast(`已删除「${summary.name}」`, 'success');
       void refreshRecent();
@@ -193,6 +201,11 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
 
   const importPackage = async (file: File) => {
     if (importInputRef.current) importInputRef.current.value = '';
+    // 先于读取的字节量预检（与解析端的文本长度上限一致，拒绝超长文件解码攻击）
+    if (file.size > MAX_PACKAGE_TEXT_BYTES) {
+      showToast(`文件过大（${Math.ceil(file.size / 1024 / 1024)} MB），无法导入`, 'error');
+      return;
+    }
     setBusy(true);
     try {
       const text = await readFileText(file);
@@ -209,6 +222,7 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
       }
       runtime.openProject(restored);
       setOpen(false);
+      menuButtonRef.current?.focus();
       if (imported.warnings.length > 0) {
         const names = imported.warnings.map((w) => w.name).join('、');
         showToast(`已导入；${imported.warnings.length} 个资产内容缺失（${names}）`, 'error');
@@ -237,11 +251,27 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
     }
   };
 
-  /** 冲突解决「另存副本」：当前未保存内容另存为新项目并打开 */
+  /** 冲突/恢复解决「另存副本」：未保存内容另存为新项目并打开 */
   const saveAsCopy = async () => {
     if (!project) return;
     setBusy(true);
     try {
+      // 恢复快照可用时以恢复快照为准（切换/关闭时保存失败被保留的内容）；
+      // 否则以当前编辑器内容为准（冲突/配额失败时的现场）
+      const recovery = persistence.getRecoverySnapshot(project.uri);
+      if (recovery) {
+        const saved = await persistence.saveSnapshotAsNew(recovery);
+        if (!saved.ok) {
+          showToast(saved.message, 'error');
+          return;
+        }
+        persistence.clearRecovery(project.uri);
+        runtime.openProject(saved.project);
+        setOpen(false);
+        showToast(`未保存更改已另存为「${saved.project.name}」`, 'success');
+        void refreshRecent();
+        return;
+      }
       const dup = await persistence.duplicateProject(project.uri);
       if (!dup.ok) {
         showToast(dup.message, 'error');
@@ -300,8 +330,15 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
                 className="lumora-project-menu__retry"
                 data-testid="save-retry"
                 onClick={() => {
-                  void persistence.flushPending();
-                  showToast('正在重试保存…', 'info');
+                  if (saveState.status === 'error' && saveState.code === 'recovery-available' && project) {
+                    void persistence.retryRecovery(project.uri).then((result) => {
+                      showToast(result.ok ? '恢复快照已重新保存' : `重试失败：${result.message}`, result.ok ? 'success' : 'error');
+                    });
+                  } else {
+                    void persistence.flushPending().then((result) => {
+                      if (!result.ok) showToast(`保存失败：${result.message}`, 'error');
+                    });
+                  }
                 }}
               >
                 重试
@@ -315,6 +352,13 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
           className="lumora-project-menu__dropdown"
           data-testid="project-menu-dropdown"
           style={dropdownTop !== null ? ({ '--lumora-menu-top': `${dropdownTop}px` } as CSSProperties) : undefined}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              e.stopPropagation();
+              setOpen(false);
+              menuButtonRef.current?.focus();
+            }
+          }}
         >
           <div className="lumora-project-menu__actions">
             <button type="button" className="lumora-button" data-testid="project-new" onClick={() => setModal({ kind: 'create' })}>
@@ -452,6 +496,8 @@ function ProjectNameModal({ title, initial, confirmLabel, busy, onCancel, onConf
     <div className="lumora-project-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} data-testid="project-dialog">
       <div className="lumora-project-dialog__box" ref={boxRef} onKeyDown={(e) => {
         if (e.key === 'Escape') {
+          // 对话框内 Escape 自行消化：不得冒泡到全局键处理（会误清编辑器选择）
+          e.stopPropagation();
           e.preventDefault();
           onCancel();
           return;
@@ -513,6 +559,8 @@ function ConfirmDeleteDialog({ name, busy, onCancel, onConfirm }: ConfirmDeleteD
     <div className="lumora-project-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} data-testid="delete-dialog">
       <div className="lumora-project-dialog__box" ref={boxRef} onKeyDown={(e) => {
         if (e.key === 'Escape') {
+          // 对话框内 Escape 自行消化：不得冒泡到全局键处理（会误清编辑器选择）
+          e.stopPropagation();
           e.preventDefault();
           onCancel();
           return;

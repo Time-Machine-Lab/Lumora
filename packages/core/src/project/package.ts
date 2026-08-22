@@ -3,15 +3,16 @@
  *
  * 导出 = 打包：project.json 按公开字段白名单构建（私有字段与运行时缓存引用剥离，
  *         扩展数据递归清除凭据族键）+ manifest + assets 载荷段。
- * 导入 = 解析：JSON → manifest 校验 → schema 迁移 → 载荷完整性校验（规范 base64 /
- *         声明 size / SHA-256 hash / 资源上限）→ 载荷回挂 → 完整校验 →
- *         缺失资产报告（warning 明细，不阻断项目打开）。
+ * 导入 = 解析：文本长度上限 → JSON → manifest 校验 → schema 迁移 → 载荷完整性校验
+ *         （先于解码的长度上限 / 规范 base64 / size 精确核对 / 组合内容哈希 /
+ *         资源上限）→ 载荷回挂 → 完整校验 → 缺失资产报告（warning 明细，不阻断）。
  * 任何校验失败都返回可操作错误明细，由调用方保证当前项目不被覆盖（失败回滚）。
- * 损坏载荷（非法 base64 / size 不符 / hash 不符 / 超限）一律拒绝导入，
- * 绝不把损坏资产判为导入成功。
+ * 损坏载荷（非法 base64 / size 不符 / hash 不符 / 超限 / 空分件 / 未引用孤儿包）
+ * 一律拒绝导入，绝不把损坏资产判为导入成功。
  */
 
 import type { Project } from '../scene/types';
+import { compositeContentHash, hashBytes } from '../scene/assets';
 import { validateProjectSchema } from '../scene/validate';
 import { migrateProjectSchema } from './migrate';
 import { PACKAGE_FORMAT_VERSION, PROJECT_PACKAGE_FORMAT, CURRENT_PROJECT_SCHEMA_VERSION } from './schema';
@@ -61,6 +62,29 @@ export const MAX_ASSET_PARTS = 512;
 export const MAX_ASSETS_PER_PROJECT = 1000;
 export const MAX_OBJECTS_PER_PROJECT = 50000;
 export const MAX_SCENE_DEPTH = 256;
+
+/** 包文本长度上限（字符数）：总载荷 base64 上限 + JSON 结构/字段开销余量。
+ *  先于 JSON.parse 检查，防止超长文本解码攻击。 */
+export const MAX_PACKAGE_TEXT_BYTES = Math.ceil((MAX_TOTAL_PAYLOAD_BYTES * 4) / 3) + 16 * 1024 * 1024;
+
+/**
+ * 先于解码的长度上限预检（base64 字符数 → 解码字节上界，base64 解码只减不增）。
+ * 单资产字符上限与累计剩余预算任一超限即拒绝，防止超长文本进入 atob 解码。
+ */
+export function preDecodePayloadFailure(
+  payloadLength: number,
+  maxAssetBytes: number,
+  maxTotalBytes: number,
+  cumulativeBytes: number,
+): string | null {
+  if (payloadLength > Math.ceil((maxAssetBytes * 4) / 3)) {
+    return `编码长度超过单资产上限（解码字节将超过 ${maxAssetBytes}）`;
+  }
+  if (Math.ceil((payloadLength * 3) / 4) > maxTotalBytes - cumulativeBytes) {
+    return `载荷累计字节数超过上限（${maxTotalBytes}）`;
+  }
+  return null;
+}
 
 /** 导出时递归清除的凭据族键名（插件扩展数据可携带任意嵌套键） */
 const SENSITIVE_KEY_PATTERN = /(api[_-]?key|secret|password|credential|authorization|token)/i;
@@ -199,16 +223,6 @@ function binaryStringToBytes(binary: string): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 
-function sha256Hex(bytes: Uint8Array<ArrayBuffer>): Promise<string> | null {
-  const subtle = globalThis.crypto?.subtle;
-  if (!subtle) return null;
-  return subtle.digest('SHA-256', bytes).then((digest) =>
-    Array.from(new Uint8Array(digest))
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join(''),
-  );
-}
-
 /** 对象层级深度与环校验（导入上限）：沿 parentId 回溯，超深或成环即超限 */
 function hasExcessiveHierarchy(objects: readonly unknown[]): boolean {
   const parents = new Map<string, string | null>();
@@ -233,9 +247,16 @@ function hasExcessiveHierarchy(objects: readonly unknown[]): boolean {
 /**
  * 解析并校验 `.lumora` 工程包文本（失败时返回可操作错误，不产生任何副作用）。
  * 成功时返回恢复的 Project（含回挂载荷）与缺失资产明细。
- * 载荷完整性：规范 base64、解码字节上限、声明 size 上限、SHA-256 hash 一致。
+ * 载荷完整性：先于解码的长度上限、规范 base64、size 精确核对（主载荷 + 分件）、
+ * 组合内容哈希（与模型导入同一算法，任何环境不跳过）。
  */
 export async function parseProjectPackage(text: string): Promise<PackageParseResult> {
+  if (text.length > MAX_PACKAGE_TEXT_BYTES) {
+    return failure(
+      'too-large',
+      `工程包文件过大（字符数 ${text.length} 超过上限 ${MAX_PACKAGE_TEXT_BYTES}），无法导入`,
+    );
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -321,26 +342,40 @@ export async function parseProjectPackage(text: string): Promise<PackageParseRes
   // 载荷完整性校验（失败即拒绝，绝不把损坏资产判为导入成功）
   let cumulativePayloadBytes = 0;
   let integrityFailure: string | null = null;
-  const hashChecks: Array<{ assetId: string; name: string; hash: string; decoded: string }> = [];
+  /** 哈希校验队列：解码完成后再统一验证（组合哈希 = 主载荷 + 分件） */
+  const hashChecks: Array<{
+    assetId: string;
+    name: string;
+    hash: string;
+    main: string | null;
+    parts: Array<{ path: string; decoded: string }>;
+  }> = [];
+  /** 已被项目资产条目认领的包内 bundle；认领集之外 = 未引用孤儿包，同样全量校验 */
+  const claimedBundleIds = new Set<string>();
 
-  const checkBundlePayload = (label: string, payload: unknown, entry: Record<string, unknown>): string | null => {
-    if (typeof payload !== 'string') return `${label} 非字符串`;
+  const checkBundlePayload = (
+    label: string,
+    payload: unknown,
+  ): { ok: true; decoded: string; bytes: number } | { ok: false; reason: string } => {
+    if (typeof payload !== 'string') return { ok: false, reason: `${label} 非字符串` };
+    // 先于解码的长度上限检查：base64 字符数换算的解码字节上界，超限直接拒绝（拒绝解码攻击）
+    const pre = preDecodePayloadFailure(
+      payload.length,
+      MAX_ASSET_PAYLOAD_BYTES,
+      MAX_TOTAL_PAYLOAD_BYTES,
+      cumulativePayloadBytes,
+    );
+    if (pre) return { ok: false, reason: pre };
     const checked = checkCanonicalBase64(payload);
-    if (!checked.ok) return `${label} ${checked.reason}`;
-    if (checked.bytes > MAX_ASSET_PAYLOAD_BYTES) return `${label} 解码字节数超过上限（${MAX_ASSET_PAYLOAD_BYTES}）`;
+    if (!checked.ok) return { ok: false, reason: `${label} ${checked.reason}` };
+    if (checked.bytes > MAX_ASSET_PAYLOAD_BYTES) {
+      return { ok: false, reason: `${label} 解码字节数超过上限（${MAX_ASSET_PAYLOAD_BYTES}）` };
+    }
     cumulativePayloadBytes += checked.bytes;
     if (cumulativePayloadBytes > MAX_TOTAL_PAYLOAD_BYTES) {
-      return `载荷累计字节数超过上限（${MAX_TOTAL_PAYLOAD_BYTES}）`;
+      return { ok: false, reason: `载荷累计字节数超过上限（${MAX_TOTAL_PAYLOAD_BYTES}）` };
     }
-    const declaredSize = entry.size;
-    if (typeof declaredSize === 'number' && declaredSize > 0 && checked.bytes > declaredSize) {
-      return `${label} 解码字节数（${checked.bytes}）超过声明 size（${declaredSize}）`;
-    }
-    const hash = entry.hash;
-    if (typeof hash === 'string' && hash.length > 0) {
-      hashChecks.push({ assetId: String(entry.id), name: String(entry.name ?? ''), hash, decoded: checked.decoded });
-    }
-    return null;
+    return { ok: true, decoded: checked.decoded, bytes: checked.bytes };
   };
 
   const assets = Array.isArray(project.assets)
@@ -348,67 +383,135 @@ export async function parseProjectPackage(text: string): Promise<PackageParseRes
         if (!isPlainRecord(entry)) return entry;
         const rawBundle = packageAssets[String(entry.id)];
         const bundle = isPlainRecord(rawBundle) ? rawBundle : null;
+        if (bundle) claimedBundleIds.add(String(entry.id));
         const payload = bundle?.payload;
         const parts = bundle?.parts;
 
-        let payloadFailure: string | null = null;
+        let mainDecoded: string | null = null;
+        let mainBytes = 0;
+        const partDecoded: Array<{ path: string; decoded: string; bytes: number }> = [];
         if (payload !== undefined) {
-          payloadFailure = checkBundlePayload('主载荷', payload, entry);
-          if (payloadFailure && !integrityFailure) integrityFailure = payloadFailure;
+          const checked = checkBundlePayload('主载荷', payload);
+          if (!checked.ok) {
+            if (!integrityFailure) integrityFailure = checked.reason;
+          } else {
+            mainDecoded = checked.decoded;
+            mainBytes = checked.bytes;
+          }
         }
-        let partsValid = false;
         if (parts !== undefined) {
           if (!Array.isArray(parts)) {
-            if (!integrityFailure) integrityFailure = 'parts 非数组';
+            if (!integrityFailure) integrityFailure = '外部分件为空或非数组';
+          } else if (parts.length === 0) {
+            // 声明了分件字段却为空：与「无分件」无法区分，按损坏处理
+            if (!integrityFailure) integrityFailure = '外部分件为空';
           } else if (parts.length > MAX_ASSET_PARTS) {
             if (!integrityFailure) integrityFailure = `外部分件数超过上限（${MAX_ASSET_PARTS}）`;
           } else {
-            partsValid = true;
             for (const [index, part] of parts.entries()) {
               if (!isPlainRecord(part) || typeof part.path !== 'string' || typeof part.payload !== 'string') {
-                partsValid = false;
                 if (!integrityFailure) integrityFailure = `外部分件 ${index} 结构非法`;
                 break;
               }
-              const partFailure = checkBundlePayload(`外部分件 ${part.path}`, part.payload, part);
-              if (partFailure) {
-                partsValid = false;
-                if (!integrityFailure) integrityFailure = partFailure;
+              const checked = checkBundlePayload(`外部分件 ${part.path}`, part.payload);
+              if (!checked.ok) {
+                if (!integrityFailure) integrityFailure = checked.reason;
                 break;
               }
+              partDecoded.push({ path: part.path, decoded: checked.decoded, bytes: checked.bytes });
             }
           }
         }
         if (integrityFailure) return entry;
-        if (payload === undefined && !partsValid) {
+        if (mainDecoded === null && partDecoded.length === 0) {
           warnMissing(String(entry.id), String(entry.name ?? ''));
           return entry;
         }
+        // size 精确核对：主载荷 + 全部外部分件解码字节之和必须与声明 size 完全一致（双向）
+        const total = mainBytes + partDecoded.reduce((sum, p) => sum + p.bytes, 0);
+        if (typeof entry.size !== 'number' || entry.size !== total) {
+          integrityFailure = `资产 ${String(entry.name ?? entry.id)} 解码字节数（${total}）与声明 size（${entry.size}）不一致`;
+          return entry;
+        }
+        if (typeof entry.hash === 'string' && entry.hash.length > 0) {
+          hashChecks.push({
+            assetId: String(entry.id),
+            name: String(entry.name ?? ''),
+            hash: entry.hash,
+            main: mainDecoded,
+            parts: partDecoded.map((p) => ({ path: p.path, decoded: p.decoded })),
+          });
+        }
         return {
           ...entry,
-          ...(payload !== undefined ? { payload } : {}),
-          ...(partsValid && Array.isArray(parts) && parts.length > 0 ? { parts } : {}),
+          ...(mainDecoded !== null ? { payload: payload as string } : {}),
+          ...(partDecoded.length > 0 ? { parts } : {}),
         };
       })
     : project.assets;
+
+  // 未引用孤儿包：包内 assets 段存在但项目资产条目未认领（迁移保持资产 id，合法包
+  // 不存在孤儿）——同样全量校验并计入累计字节，拒绝「绕过资产条目校验」的载荷
+  for (const [bundleId, rawBundle] of Object.entries(packageAssets)) {
+    if (claimedBundleIds.has(bundleId)) continue;
+    const bundle = isPlainRecord(rawBundle) ? rawBundle : null;
+    if (!bundle) {
+      integrityFailure = `包内资产 ${bundleId} 结构非法（非对象）`;
+      break;
+    }
+    if (bundle.payload !== undefined) {
+      const checked = checkBundlePayload('主载荷', bundle.payload);
+      if (!checked.ok) {
+        integrityFailure = `未引用资产 ${bundleId} ${checked.reason}`;
+        break;
+      }
+    }
+    if (bundle.parts !== undefined) {
+      if (!Array.isArray(bundle.parts) || bundle.parts.length === 0) {
+        integrityFailure = `未引用资产 ${bundleId} 外部分件为空或非数组`;
+        break;
+      }
+      if (bundle.parts.length > MAX_ASSET_PARTS) {
+        integrityFailure = `未引用资产 ${bundleId} 外部分件数超过上限（${MAX_ASSET_PARTS}）`;
+        break;
+      }
+      let partsOk = true;
+      for (const [index, part] of bundle.parts.entries()) {
+        if (!isPlainRecord(part) || typeof part.path !== 'string' || typeof part.payload !== 'string') {
+          integrityFailure = `未引用资产 ${bundleId} 外部分件 ${index} 结构非法`;
+          partsOk = false;
+          break;
+        }
+        const checked = checkBundlePayload(`未引用资产 ${bundleId} 外部分件 ${part.path}`, part.payload);
+        if (!checked.ok) {
+          integrityFailure = checked.reason;
+          partsOk = false;
+          break;
+        }
+      }
+      if (!partsOk) break;
+    }
+  }
 
   if (integrityFailure) {
     return failure('invalid-project', `工程包数据校验失败：资产载荷不合法（${integrityFailure}）`, integrityFailure);
   }
 
-  // 组合哈希：声明 hash 必须与解码内容 SHA-256 一致（crypto 不可用时跳过校验）
-  if (hashChecks.length > 0) {
-    for (const check of hashChecks) {
-      const digestPromise = sha256Hex(binaryStringToBytes(check.decoded));
-      if (!digestPromise) break;
-      const digest = await digestPromise;
-      if (digest !== check.hash.toLowerCase()) {
-        return failure(
-          'invalid-project',
-          `工程包数据校验失败：资产内容哈希不一致（${check.name}）`,
-          `asset ${check.assetId}: 声明 ${check.hash}，实际 ${digest}`,
-        );
-      }
+  // 组合内容哈希：声明 hash 必须与解码内容一致（主载荷 + 分件，与模型导入同一算法）。
+  // 用可移植 hashBytes（crypto.subtle 不可用时回退 FNV-1a）：任何环境都不跳过校验，
+  // 跨环境包（SHA-256 声明 vs FNV 环境）因摘要长度不一致自然拒绝。
+  for (const check of hashChecks) {
+    const mainHash = check.main !== null ? await hashBytes(binaryStringToBytes(check.main)) : '';
+    const partHashes = await Promise.all(
+      check.parts.map(async (p) => ({ path: p.path, partHash: await hashBytes(binaryStringToBytes(p.decoded)) })),
+    );
+    const composite = await compositeContentHash(mainHash, partHashes);
+    if (composite !== check.hash.toLowerCase()) {
+      return failure(
+        'invalid-project',
+        `工程包数据校验失败：资产内容哈希不一致（${check.name}）`,
+        `asset ${check.assetId}: 声明 ${check.hash}，实际 ${composite}`,
+      );
     }
   }
 

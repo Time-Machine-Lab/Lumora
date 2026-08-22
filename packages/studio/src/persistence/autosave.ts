@@ -5,12 +5,17 @@
  * - 保存失败（配额不足 / 存储错误 / revision 冲突）保持脏状态与快照并广播可操作错误，
  *   绝不覆盖较新的已存内容（CAS 防倒退）；冲突不提供自动恢复 —— 必须显式解决
  *   （加载较新版本 / 另存副本），防止「本地计数追平后覆盖」的数据丢失；
- * - 项目切换 / 关闭：旧项目的未保存快照排入串行任务链（绑定旧 uri 与期望基线），
- *   不被取消、不丢失；保存结果按 { uri } 绑定回写，绝不污染新打开项目的状态；
+ * - 项目切换 / 关闭：旧项目的未保存快照排入串行任务链（绑定旧 uri），不被取消、
+ *   不丢失；保存结果按 { uri } 绑定回写（旧 uri 成功也推进该 uri 的已提交基线），
+ *   绝不污染新打开项目的状态；切换/关闭时保存失败的快照按 uri 保留为恢复快照，
+ *   重新打开该 uri 时以「恢复快照可用」状态明示，可另存副本或重试；
+ * - 会话一致性：open/close/resetTo 递增会话代，异步续体在每次 await 后复验
+ *   （会话代 + uri 仍为当前），过期任务的结果一律丢弃，绝不覆盖新状态；
  * - 首次落盘诚实：新项目先进入 saving，存储提交成功后才转 clean（不假报已保存）；
- * - 持久化不可用（store 为 null）：明示「仅内存」状态，不报错、不假报已保存；
+ * - 持久化不可用（store 为 null）：明示「仅内存」状态，不报错、不假报已保存，
+ *   关闭时无排空语义（无可持久化内容）；
  * - 页面隐藏（visibilitychange/pagehide）与显式 flush（关闭项目 / 卸载运行时）
- *   时尽力冲刷未保存变更（flush 等待在途保存完成，构成排空屏障）。
+ *   时尽力冲刷未保存变更（flush 返回类型化结果，调用方据其决定是否放行关闭）。
  *
  * 状态完全由编辑器事件驱动：openProject 发出的 project:changed 自动重设脏基线，
  * reset/close 发出的 { project: null } 自动冲刷并归位。
@@ -26,17 +31,26 @@ export type AutosaveState =
   | { status: 'clean' } // 已同步保存
   | { status: 'dirty' } // 有未保存变更（防抖等待中）
   | { status: 'saving' } // 保存进行中
-  | { status: 'error'; code: SaveFailureCode; message: string } // 保存失败（仍为脏）
+  | { status: 'error'; code: SaveFailureCode | 'recovery-available'; message: string } // 保存失败（仍为脏）/ 恢复快照待处理
   | { status: 'memory' }; // 持久化不可用：仅内存编辑，不假报已保存
 
 export interface AutosaverOptions {
   debounceMs?: number;
 }
 
+/** 锁存错误：冲突 / 恢复快照待处理。编辑动作不得自动解除（须显式解决）。 */
+interface LatchedError {
+  uri: string;
+  code: 'revision-conflict' | 'recovery-available';
+  message: string;
+}
+
 export class ProjectAutosaver {
   private store: ProjectStore | null;
   private currentUri: string | null = null;
   private lastSavedRevision = 0;
+  /** 各 uri 已确认落盘的 revision（含已切换走的项目：旧项目保存成功也推进基线） */
+  private readonly committedByUri = new Map<string, number>();
   /** 最新未保存快照（编辑器的只读冻结快照）：编辑后立即捕获，reset/close 后仍可冲刷 */
   private pending: Project | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -46,6 +60,12 @@ export class ProjectAutosaver {
   private debounceMs: number;
   private readonly stateListeners = new Set<(state: AutosaveState) => void>();
   private disposed = false;
+  /** 会话代：open/close/resetTo 递增；异步续体据此识别过期任务并丢弃其结果 */
+  private session = 0;
+  /** 锁存错误（revision 冲突 / 恢复快照待处理）：编辑不得自行转 dirty 隐藏解决入口 */
+  private latched: LatchedError | null = null;
+  /** 切换/关闭时保存失败被保留的旧项目快照（按 uri），重新打开时明示可恢复 */
+  private readonly recovery = new Map<string, Project>();
 
   constructor(
     private readonly editor: SceneEditor,
@@ -108,10 +128,19 @@ export class ProjectAutosaver {
         this.emit({ status: 'memory' });
         return;
       }
+      if (this.latched && this.latched.uri === project.uri) {
+        // 锁存错误期间继续编辑：仍以错误状态呈现（解决入口不被脏状态掩盖）
+        this.emit({ status: 'error', code: this.latched.code, message: this.latched.message });
+        return;
+      }
       this.emit({ status: 'dirty' });
       this.scheduleSave();
     } else {
       this.pending = null;
+      if (this.latched && this.latched.uri === project.uri) {
+        this.emit({ status: 'error', code: this.latched.code, message: this.latched.message });
+        return;
+      }
       this.emit(this.store ? { status: 'clean' } : { status: 'memory' });
     }
   }
@@ -120,16 +149,18 @@ export class ProjectAutosaver {
   private open(project: Project): void {
     const prevUri = this.currentUri;
     const previous = this.pending;
-    const prevExpected = this.lastSavedRevision;
     this.cancelTimer();
+    this.session += 1;
     this.currentUri = project.uri;
     this.lastSavedRevision = project.revision;
     this.pending = null;
     this.saveQueued = false;
+    this.latched = null;
+    this.committedByUri.set(project.uri, project.revision);
     if (prevUri !== null && previous !== null) {
-      this.enqueueDrain(prevUri, previous, prevExpected);
+      this.enqueueDrain(prevUri, previous);
     }
-    // 对账结果决定新项目的真实状态（首存 saving→clean / 冲突 error / 一致 clean）
+    // 对账结果决定新项目的真实状态（首存 saving→clean / 冲突 error / 恢复快照 error / 一致 clean）
     void this.enqueue(() => this.reconcile(project));
   }
 
@@ -137,42 +168,98 @@ export class ProjectAutosaver {
   private close(): void {
     const prevUri = this.currentUri;
     const previous = this.pending;
-    const prevExpected = this.lastSavedRevision;
     this.cancelTimer();
+    this.session += 1;
     this.currentUri = null;
     this.lastSavedRevision = 0;
     this.pending = null;
     this.saveQueued = false;
+    this.latched = null;
     if (prevUri !== null && previous !== null) {
-      this.enqueueDrain(prevUri, previous, prevExpected);
+      this.enqueueDrain(prevUri, previous);
     }
     this.emit({ status: 'idle' });
   }
 
   /**
    * 显式冲突解决「加载较新版本」：以传入项目（存储内容）为基线重开编辑器。
-   * 丢弃未保存变更是用户的显式选择；随后 changed() 走同 uri 净态路径。
+   * 丢弃未保存变更是用户的显式选择：恢复快照一并作废；随后 changed() 走同 uri 净态路径。
    */
   resetTo(project: Project): void {
     this.cancelTimer();
+    this.session += 1;
     this.currentUri = project.uri;
     this.lastSavedRevision = project.revision;
     this.pending = null;
     this.saveQueued = false;
+    this.latched = null;
+    this.committedByUri.set(project.uri, project.revision);
+    this.recovery.delete(project.uri);
     this.emit(this.store ? { status: 'clean' } : { status: 'memory' });
   }
 
-  /** 立即冲刷未保存变更（关闭项目 / 卸载 / 页面隐藏 / 重试）：排空屏障，等待在途保存。 */
-  async flush(): Promise<void> {
-    if (this.disposed) return;
+  /**
+   * 立即冲刷未保存变更（关闭项目 / 卸载 / 页面隐藏 / 重试）：排空屏障，等待在途保存。
+   * 返回类型化结果：失败时调用方不得放行关闭/切换（内容仍在编辑器与恢复快照中）。
+   */
+  async flush(): Promise<SaveOutcome> {
+    if (this.disposed) return { ok: true };
     this.cancelTimer();
     const project = this.pending ?? this.editor.getProject();
     if (project && project.uri === this.currentUri && project.revision !== this.lastSavedRevision) {
-      await this.enqueue(() => this.saveCurrent());
-      return;
+      return this.enqueue(() => this.saveSnapshot(project));
     }
     // 无脏快照时仍等待在途保存（含首存）完成：避免「已保存」早于落盘
     await this.chainTail;
+    return { ok: true };
+  }
+
+  /** 恢复快照（切换/关闭时保存失败的旧项目内容；null = 无）。 */
+  getRecovery(uri: string): Project | null {
+    return this.recovery.get(uri) ?? null;
+  }
+
+  /**
+   * 显式重试保存恢复快照（另存副本之外的第二条出路）：以该 uri 当前已提交基线做 CAS。
+   * 成功清除恢复快照与锁存；失败返回错误（冲突/配额/存储），由调用方明示。
+   */
+  retryRecovery(uri: string): Promise<SaveOutcome> {
+    const snapshot = this.recovery.get(uri);
+    if (!snapshot) {
+      return Promise.resolve({ ok: false, code: 'storage-error', message: '没有可重试的恢复快照' });
+    }
+    return this.enqueue(async () => {
+      if (this.disposed) return { ok: false, code: 'storage-error', message: '自动保存已停用' };
+      const expected = this.committedByUri.get(uri) ?? 0;
+      const result = await this.storeSave(snapshot, expected);
+      if (result.ok) {
+        const prev = this.committedByUri.get(uri) ?? 0;
+        this.committedByUri.set(uri, Math.max(prev, snapshot.revision));
+        this.recovery.delete(uri);
+        if (this.latched?.uri === uri) this.latched = null;
+        if (uri === this.currentUri) {
+          const current = this.editor.getProject();
+          void this.enqueue(() => this.reconcile(current ?? snapshot));
+        }
+      } else if (result.code === 'revision-conflict') {
+        this.latch({ uri, code: 'revision-conflict', message: result.message });
+      }
+      return result;
+    });
+  }
+
+  /**
+   * 清除恢复快照（用户已「另存副本」等显式决定）：删除快照、解除锁存并按现状重报状态。
+   */
+  clearRecovery(uri: string): void {
+    if (!this.recovery.has(uri)) return;
+    this.recovery.delete(uri);
+    if (this.latched?.uri === uri && this.latched.code === 'recovery-available') this.latched = null;
+    if (uri === this.currentUri) {
+      const current = this.editor.getProject();
+      if (current && current.revision !== this.lastSavedRevision) this.emit({ status: 'dirty' });
+      else this.emit(this.store ? { status: 'clean' } : { status: 'memory' });
+    }
   }
 
   async dispose(): Promise<void> {
@@ -220,38 +307,52 @@ export class ProjectAutosaver {
     this.saveQueued = true;
     void this.enqueue(async () => {
       this.saveQueued = false;
-      await this.saveCurrent();
+      if (this.disposed) return;
+      // 执行时若已有更新的快照（同 uri），保存最新内容
+      const target = this.pending && this.pending.uri === project.uri ? this.pending : project;
+      await this.saveSnapshot(target);
     });
   }
 
-  /** 当前项目的保存：执行时捕获最新快照与期望基线（此时点链上任务已按序到达）。 */
-  private async saveCurrent(): Promise<void> {
-    const project = this.pending ?? this.editor.getProject();
-    if (!project || project.uri !== this.currentUri) return;
-    if (!this.store) {
-      this.lastSavedRevision = project.revision;
-      this.pending = null;
-      return;
+  /** 当前会话保存：捕获会话代与执行时基线（已提交基线，非打开时快照）。 */
+  private async saveSnapshot(project: Project): Promise<SaveOutcome> {
+    if (!this.store || this.disposed) {
+      // 仅内存模式：无可持久化内容，视为可继续（关闭不被阻塞）
+      return { ok: true };
     }
-    const expected = this.lastSavedRevision;
-    this.emit({ status: 'saving' });
+    const session = this.session;
+    const expected = this.committedByUri.get(project.uri) ?? 0;
+    if (this.isFresh(project.uri, session)) this.emit({ status: 'saving' });
     const result = await this.storeSave(project, expected);
-    this.applySaveResult(project, result);
+    this.applySaveResult(project, session, result);
+    return result;
   }
 
-  /** 旧项目的排空：绑定捕获时的期望基线；失败明示错误（快照仍在，可另存副本恢复）。 */
-  private enqueueDrain(uri: string, snapshot: Project, expected: number): void {
+  /**
+   * 旧项目的排空：执行时以该 uri 的已提交基线做 CAS（在途结果已推进基线，不会冲突）。
+   * 成功推进基线并清除该 uri 的恢复快照；失败把快照保留为恢复快照（内容不丢），
+   * 不污染当前项目状态。
+   */
+  private enqueueDrain(uri: string, snapshot: Project): void {
+    if (!this.store) return;
     void this.enqueue(async () => {
+      if (this.disposed) return;
+      const expected = this.committedByUri.get(uri) ?? 0;
       const result = await this.storeSave(snapshot, expected);
-      if (!result.ok) {
-        this.emit({ status: 'error', code: result.code, message: result.message });
+      if (result.ok) {
+        const prev = this.committedByUri.get(uri) ?? 0;
+        this.committedByUri.set(uri, Math.max(prev, snapshot.revision));
+        this.recovery.delete(uri);
+      } else {
+        this.recovery.set(uri, snapshot);
       }
     });
   }
 
-  /** 打开时与存储对账：决定真实状态（首存 / 冲突 / 一致），不预设「已保存」。 */
+  /** 打开时与存储对账：决定真实状态（首存 / 冲突 / 恢复快照 / 一致），不预设「已保存」。 */
   private async reconcile(project: Project): Promise<void> {
-    if (this.disposed || project.uri !== this.currentUri) return;
+    const session = this.session;
+    if (this.disposed || !this.isFresh(project.uri, session)) return;
     if (!this.store) {
       this.emit({ status: 'memory' });
       return;
@@ -260,28 +361,51 @@ export class ProjectAutosaver {
     try {
       stored = await this.store.load(project.uri);
     } catch {
-      this.emit({ status: 'memory' });
+      if (this.isFresh(project.uri, session)) this.emit({ status: 'memory' });
       return;
     }
-    if (this.disposed || project.uri !== this.currentUri) return;
+    // await 后复验：过期任务（期间切换/关闭）的结果一律丢弃
+    if (!this.isFresh(project.uri, session)) return;
     if (!stored) {
       // 本地无记录：首存（创建语义）——先 saving，提交成功后才 clean
       const latest = this.pending ?? this.editor.getProject() ?? project;
       this.emit({ status: 'saving' });
       const result = await this.storeSave(latest, null);
-      this.applySaveResult(latest, result);
+      this.applySaveResult(latest, session, result);
       return;
     }
     if (stored.revision !== project.revision) {
-      // 本地保存内容与打开快照分叉（更旧或更新都是分叉）：冲突信号，须显式解决
-      this.emit({
-        status: 'error',
+      this.latch({
+        uri: project.uri,
         code: 'revision-conflict',
         message: `本地保存内容与当前项目不一致（本地 revision ${stored.revision}，当前 ${project.revision}）。请选择「加载较新版本」或「另存副本」`,
       });
       return;
     }
+    // 基线一致；await 期间产生的新编辑直接落盘（expected = 已存 revision）
+    const latest = this.pending ?? this.editor.getProject() ?? project;
+    if (latest.revision !== project.revision) {
+      this.emit({ status: 'saving' });
+      const result = await this.storeSave(latest, stored.revision);
+      this.applySaveResult(latest, session, result);
+      return;
+    }
+    this.committedByUri.set(project.uri, stored.revision);
+    this.lastSavedRevision = stored.revision;
+    if (this.recovery.has(project.uri)) {
+      this.latch({
+        uri: project.uri,
+        code: 'recovery-available',
+        message: '该项目存在未保存的恢复快照（上次保存失败）。可「另存副本」保留未保存内容，或「重试保存」',
+      });
+      return;
+    }
     this.emit({ status: 'clean' });
+  }
+
+  private latch(error: LatchedError): void {
+    this.latched = error;
+    this.emit({ status: 'error', code: error.code, message: error.message });
   }
 
   private async storeSave(project: Project, expected: number | null): Promise<SaveOutcome> {
@@ -295,20 +419,37 @@ export class ProjectAutosaver {
     }
   }
 
-  /** 保存结果回写：仅当结果属于当前打开的项目（{ uri } 绑定），绝不污染切换后的状态。 */
-  private applySaveResult(project: Project, result: SaveOutcome): void {
-    if (project.uri !== this.currentUri) return;
+  /**
+   * 保存结果回写：任何成功都推进该 uri 的已提交基线并清除其恢复快照（含旧会话：
+   * 在途保存→继续编辑→切换 的落盘结果必须推进旧 uri 基线，后续排空才不会冲突）；
+   * 状态广播仅当结果属于当前会话（{ uri, session } 绑定），过期结果不污染新状态。
+   */
+  private applySaveResult(project: Project, session: number, result: SaveOutcome): void {
     if (result.ok) {
+      const prev = this.committedByUri.get(project.uri) ?? 0;
+      this.committedByUri.set(project.uri, Math.max(prev, project.revision));
+      this.recovery.delete(project.uri);
+      if (this.latched?.uri === project.uri) this.latched = null;
+      if (!this.isFresh(project.uri, session)) return;
       this.lastSavedRevision = Math.max(this.lastSavedRevision, project.revision);
       if (this.pending === project) this.pending = null;
       const current = this.editor.getProject();
       const stillDirty =
         current !== null && current.uri === project.uri && current.revision !== this.lastSavedRevision;
       this.emit(stillDirty ? { status: 'dirty' } : { status: 'clean' });
-    } else {
-      // 保存失败（冲突/配额/存储错误）：保持脏状态与快照，绝不覆盖较新内容
-      this.emit({ status: 'error', code: result.code, message: result.message });
+      return;
     }
+    if (!this.isFresh(project.uri, session)) return;
+    if (result.code === 'revision-conflict') {
+      this.latch({ uri: project.uri, code: 'revision-conflict', message: result.message });
+      return;
+    }
+    // 配额 / 存储错误：保持脏状态与快照，绝不覆盖较新内容（不锁存，后续编辑转 dirty 重试）
+    this.emit({ status: 'error', code: result.code, message: result.message });
+  }
+
+  private isFresh(uri: string, session: number): boolean {
+    return this.session === session && uri === this.currentUri;
   }
 
   /** 串行任务链：按序执行，前一任务完成后才启动下一任务。 */

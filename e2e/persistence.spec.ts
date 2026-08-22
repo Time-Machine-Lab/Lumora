@@ -133,9 +133,16 @@ test('AC2 跨标签页冲突：本地计数追平不覆盖较新保存，须显�
   await expect(pageB.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
 });
 
-test('窄屏（375px）：项目菜单与对话框不超出视口、无水平滚动', async ({ page }) => {
+test('窄屏（375px）：菜单与对话框不超出视口，Escape 关闭且不误清背景选择', async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 667 });
   await page.goto('/');
+  // 打开示例项目并选中一个树行：对话框/下拉的 Escape 不得冒泡到全局键处理误清选择
+  await page.getByTestId('open-sample-project').click();
+  const treeRow = page.getByTestId('tree-row-sample-cube');
+  await expect(treeRow).toBeVisible();
+  await treeRow.click();
+  await expect(treeRow).toHaveAttribute('aria-selected', 'true');
+
   await page.getByTestId('project-menu').click();
   const dropdown = page.getByTestId('project-menu-dropdown');
   await expect(dropdown).toBeVisible();
@@ -143,13 +150,27 @@ test('窄屏（375px）：项目菜单与对话框不超出视口、无水平滚
   expect(box.x).toBeGreaterThanOrEqual(0);
   expect(box.x + box.width).toBeLessThanOrEqual(375);
 
-  // 新建项目对话框（含窄屏宽度上限）同样不超出视口
+  // 新建项目对话框：以真实对话框盒（.lumora-project-dialog__box）断言不超出视口，
+  // 而非外层遮罩（此前用 data-testid=project-dialog 断言的是遮罩 div）
   await page.getByTestId('project-new').click();
-  const dialog = page.getByTestId('project-dialog');
-  await expect(dialog).toBeVisible();
-  const dbox = (await dialog.boundingBox())!;
+  const dialogBox = page.locator('.lumora-project-dialog__box');
+  await expect(dialogBox).toBeVisible();
+  const dbox = (await dialogBox.boundingBox())!;
   expect(dbox.x).toBeGreaterThanOrEqual(0);
   expect(dbox.x + dbox.width).toBeLessThanOrEqual(375);
+
+  // 对话框内 Escape：自行消化关闭对话框（stopPropagation），焦点回到打开前元素，
+  // 背景树选择保持（未被全局 Escape 清除）
+  await page.keyboard.press('Escape');
+  await expect(dialogBox).not.toBeVisible();
+  await expect(page.getByTestId('project-new')).toBeFocused();
+  await expect(treeRow).toHaveAttribute('aria-selected', 'true');
+
+  // 下拉内 Escape：关闭下拉，焦点回到「项目」按钮，选择仍保持
+  await page.keyboard.press('Escape');
+  await expect(dropdown).not.toBeVisible();
+  await expect(page.getByTestId('project-menu')).toBeFocused();
+  await expect(treeRow).toHaveAttribute('aria-selected', 'true');
 
   // 全程无水平溢出
   const noHorizontalOverflow = await page.evaluate(

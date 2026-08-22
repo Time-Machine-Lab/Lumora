@@ -131,6 +131,8 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     const onKey = (event: KeyboardEvent) => {
       const onlyInstance = mountedRoots.size === 1 && mountedRoots.has(root);
       if (!root.contains(event.target as Node) && !onlyInstance) return;
+      // 已由内层处理（对话框/下拉等 stopPropagation 的兜底）：全局键处理不得越权执行
+      if (event.defaultPrevented) return;
       const key = event.key.toLowerCase();
       // 命令面板开关先于输入守卫处理：面板打开时焦点在其搜索输入框内，Ctrl+K 仍需能关闭
       if ((event.ctrlKey || event.metaKey) && key === 'k') {

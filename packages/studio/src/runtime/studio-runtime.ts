@@ -27,8 +27,12 @@ export interface StudioRuntime {
   /** 初始化本地存储并接入自动保存（幂等）。 */
   init(options?: { debounceMs?: number; dbName?: string }): Promise<void>;
   openProject(project: Project): void;
-  /** 关闭项目：等待未保存变更全量落盘（排空屏障）后重置编辑器。 */
-  closeProject(): Promise<void>;
+  /**
+   * 关闭项目：等待未保存变更全量落盘（排空屏障）后重置编辑器。
+   * 落盘失败时返回 { ok: false } 且不重置编辑器（未保存内容仍在编辑器中），
+   * 调用方必须阻止关闭/切换。
+   */
+  closeProject(): Promise<{ ok: boolean; message?: string }>;
   getProject(): Project | null;
   dispose(): Promise<void>;
 }
@@ -71,13 +75,15 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
     async closeProject() {
       const current = host.getProject();
       if (current) {
-        // 先等待未保存变更全量落盘（排空屏障，含在途保存），再清空编辑器，
-        // 避免关闭项目时丢失未保存变更
-        await persistence.flushPending();
+        // 先等待未保存变更全量落盘（排空屏障，含在途保存）：失败时保留编辑器
+        // 与未保存内容，放行关闭即丢失（恢复快照也不替代「仍在编辑器」的现场）
+        const outcome = await persistence.flushPending();
+        if (!outcome.ok) return { ok: false, message: outcome.message };
         host.setProject(null);
         host.events.emit('project:closed', { uri: current.uri });
       }
       editor.reset();
+      return { ok: true };
     },
     getProject: () => editor.getProject(),
     async dispose() {
