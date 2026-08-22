@@ -1,7 +1,7 @@
 import { PluginHost, SceneEditor } from '@lumora/core';
 import type { EventMap, Project } from '@lumora/core';
 import { ProjectPersistence } from '../persistence/project-persistence';
-import type { StorageBackend } from '../persistence/project-storage';
+import type { ProjectStorage, StorageBackend } from '../persistence/project-storage';
 
 export interface StudioRuntimeOptions {
   hostVersion?: string;
@@ -27,9 +27,10 @@ export interface StudioRuntime {
   persistence: ProjectPersistence;
   /**
    * 初始化本地存储并接入自动保存（幂等）。
-   * options.storage 选择存储后端（缺省 indexeddb；opfs = Origin Private File System）。
+   * options.storage 选择存储后端（缺省 indexeddb；opfs = Origin Private File System）；
+   * options.store 为测试注入（直接使用给定存储实例，跳过按后端创建）。
    */
-  init(options?: { debounceMs?: number; dbName?: string; storage?: StorageBackend }): Promise<void>;
+  init(options?: { debounceMs?: number; dbName?: string; storage?: StorageBackend; store?: ProjectStorage }): Promise<void>;
   /**
    * 打开/切换项目（可等待的类型化切换屏障）：替换编辑器前先稳定排空当前项目的
    * 未保存变更（flushPending 稳定排空）。落盘失败时返回 { ok: false } 且不触碰

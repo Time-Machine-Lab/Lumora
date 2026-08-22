@@ -17,10 +17,13 @@
 import { TypedEventEmitter, createBlankProject, genId } from '@lumora/core';
 import type { Project, SceneEditor } from '@lumora/core';
 import {
+  CURRENT_PROJECT_SCHEMA_VERSION,
   buildProjectPackage,
   estimatePackageBytes,
+  migrateProjectSchema,
   parseProjectPackage,
   serializeProjectPackage,
+  validateProjectSchema,
 } from '@lumora/core';
 import type { MissingAssetWarning, PackageImportError } from '@lumora/core';
 import { ProjectAutosaver } from './autosave';
@@ -91,12 +94,15 @@ export class ProjectPersistence {
     return this.currentUri;
   }
 
-  /** 初始化：打开存储并接入自动保存。幂等；storage 缺省为 indexeddb。 */
-  async init(options: { debounceMs?: number; dbName?: string; storage?: StorageBackend } = {}): Promise<void> {
+  /** 初始化：打开存储并接入自动保存。幂等；storage 缺省为 indexeddb。
+   *  options.store 为测试注入（跳过按后端创建，直接使用给定存储实例）。 */
+  async init(
+    options: { debounceMs?: number; dbName?: string; storage?: StorageBackend; store?: ProjectStorage } = {},
+  ): Promise<void> {
     if (this.disposed || this.store) return;
-    const backend = options.storage ?? 'indexeddb';
     this.store =
-      backend === 'opfs' ? await OpfsProjectStore.create(options.dbName) : await ProjectStore.create(options.dbName);
+      options.store ??
+      (options.storage === 'opfs' ? await OpfsProjectStore.create(options.dbName) : await ProjectStore.create(options.dbName));
     this.autosaver.setStore(this.store);
     if (options.debounceMs !== undefined) this.autosaver.setDebounceMs(options.debounceMs);
   }
@@ -106,12 +112,31 @@ export class ProjectPersistence {
     return this.store ? this.store.list() : [];
   }
 
-  /** 加载本地项目（打开最近项目）。 */
-  async loadProject(uri: string): Promise<{ ok: true; project: Project } | { ok: false; message: string }> {
+  /**
+   * 加载本地项目（打开最近项目）。本地加载边界执行 schema 迁移（TML-53 第四轮）：
+   * 旧版本（如 v2 无 tracks）记录先逐级迁移到当前版本，校验通过后以已存 revision
+   * 为期望基线 CAS 原子写回 —— 下次加载不再迁移；迁移/校验失败返回可操作错误，
+   * 绝不把旧版本数据原样交给编辑器。
+   */
+  async loadProject(uri: string): Promise<{ ok: true; project: Project; migratedFrom?: number } | { ok: false; message: string }> {
     if (!this.store) return { ok: false, message: '本地持久化不可用' };
-    const project = await this.store.load(uri);
-    if (!project) return { ok: false, message: '本地项目不存在或已损坏' };
-    return { ok: true, project };
+    const stored = await this.store.load(uri);
+    if (!stored) return { ok: false, message: '本地项目不存在或已损坏' };
+    if (stored.schemaVersion < CURRENT_PROJECT_SCHEMA_VERSION) {
+      const migrated = migrateProjectSchema(stored);
+      if (!migrated.ok) {
+        return { ok: false, message: `本地项目数据无法迁移到当前版本：${migrated.error.message}` };
+      }
+      const project = migrated.project as Project;
+      const problem = validateProjectSchema(project);
+      if (problem) {
+        return { ok: false, message: `本地项目数据校验失败：${problem}` };
+      }
+      const result = await this.store.save(project, stored.revision);
+      if (!result.ok) return { ok: false, message: `迁移结果写回失败：${result.message}` };
+      return { ok: true, project, migratedFrom: stored.schemaVersion };
+    }
+    return { ok: true, project: stored };
   }
 
   /** 本地是否已存在同 uri 记录（导入防碰撞：同 uri 视为副本导入）。 */

@@ -207,6 +207,40 @@ describe('工程包凭据清除（NFR-008：嵌套扩展数据递归清除）', 
     expect(b.token).toBeUndefined();
     expect(b.a).toBe(a);
   });
+
+  it('凭据后缀词（privateKey/accessKey/providerKey/cookie/accessToken）清除；token 族配置与 keyframes 保留（第四轮 #5）', async () => {
+    const project = await buildFixtureProject();
+    const rich = {
+      ...project,
+      pluginData: {
+        'com.example': {
+          privateKey: 'sk-private-1',
+          accessKey: 'ak-2',
+          providerKey: 'pk-3',
+          cookie: 'session-cookie-4',
+          accessToken: 'at-6',
+          apiKey: 'sk-7',
+          password: 'pw-8',
+          maxTokens: 2048,
+          tokenizer: 'cl100k',
+          tokenBudget: { max: 999 },
+          keyframes: [1, 2, 3],
+        },
+      },
+    } as Project;
+    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
+    // 凭据（含此前漏网的 privateKey/accessKey/providerKey/cookie）不得进入包
+    for (const leaked of ['sk-private-1', 'ak-2', 'pk-3', 'session-cookie-4', 'at-6', 'sk-7', 'pw-8']) {
+      expect(json).not.toContain(leaked);
+    }
+    // 非凭据配置必须保留：token 族计数/分词配置（不得因「token」误杀）与关键帧数据
+    expect(json).toContain('maxTokens');
+    expect(json).toContain('tokenizer');
+    expect(json).toContain('tokenBudget');
+    expect(json).toContain('"keyframes":[1,2,3]');
+    expect(json).toContain('2048');
+    expect(json).toContain('cl100k');
+  });
 });
 
 describe('parseProjectPackage：导出 → 导入 完整恢复（AC1）', () => {
@@ -229,6 +263,38 @@ describe('parseProjectPackage：导出 → 导入 完整恢复（AC1）', () => 
     for (const track of result.project.tracks) {
       expect(result.project.objects.some((o) => o.id === track.objectId)).toBe(true);
     }
+  });
+
+  it('__proto__ 资产 id：导入→导出→再导入 载荷与引用完整往返，无字节丢失（第四轮 #7）', async () => {
+    const project = await buildFixtureProject();
+    const text = serializeProjectPackage(
+      buildProjectPackage(project, { exportedAt: '2026-08-21T00:00:00.000Z' }),
+    );
+    const first = await parseProjectPackage(text);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    // 把模型资产的 id 改为 __proto__：原型键写入普通对象字典会触发 setter 吞掉载荷
+    const originalId = first.project.assets.find((a) => a.payload !== undefined)!.id;
+    const payload = first.project.assets.find((a) => a.id === originalId)!.payload!;
+    const poisoned: Project = {
+      ...first.project,
+      assets: first.project.assets.map((a) => (a.id === originalId ? { ...a, id: '__proto__' } : a)),
+      objects: first.project.objects.map((o) =>
+        o.type === 'model' && o.assetId === originalId ? { ...o, assetId: '__proto__' } : o,
+      ),
+    };
+
+    // 二次导出：资产载荷必须仍在（字典写入不得被原型 setter 吞掉）
+    const repacked = buildProjectPackage(poisoned);
+    expect(repacked.assets['__proto__']?.payload).toBe(payload);
+    // 再导入：资产与载荷完整恢复，无字节丢失
+    const second = await parseProjectPackage(serializeProjectPackage(repacked));
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    const asset = second.project.assets.find((a) => a.id === '__proto__');
+    expect(asset).toBeDefined();
+    expect(asset!.payload).toBe(payload);
   });
 
   it('缺失资产载荷 → 打开成功但给出缺失明细（缺失资产报告）', async () => {

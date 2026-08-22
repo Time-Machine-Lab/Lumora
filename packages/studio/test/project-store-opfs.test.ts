@@ -60,7 +60,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     await store.save(project('lumora://project/new', '新项目', 2));
     const summaries = await store.list();
     expect(summaries.map((s) => s.uri)).toEqual(['lumora://project/new', 'lumora://project/old']);
-    expect(summaries[0]).toMatchObject({ name: '新项目', revision: 2, schemaVersion: 2 });
+    expect(summaries[0]).toMatchObject({ name: '新项目', revision: 2, schemaVersion: 3 });
     store.close();
   });
 

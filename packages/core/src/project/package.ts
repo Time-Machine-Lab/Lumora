@@ -114,8 +114,42 @@ export function preDecodePayloadFailure(
   return null;
 }
 
-/** 导出时递归清除的凭据族键名（插件扩展数据可携带任意嵌套键） */
-const SENSITIVE_KEY_PATTERN = /(api[_-]?key|secret|password|credential|authorization|token)/i;
+/**
+ * 凭据族敏感词（导出时递归清除；插件扩展数据可携带任意嵌套键）。
+ * 凭据隔离是两层设计：顶层凭据结构（credentials/apiKeys/…）由公开字段白名单
+ * 结构性排除（见 PRIVATE_PROJECT_FIELDS），此处仅兜底嵌套任意键名。
+ * 匹配规则为显式分词后精确匹配（camelCase/连字符/下划线/点分拆分）：
+ * - 任意位置命中：secret/secrets/password/credential/credentials/authorization；
+ * - 键名末词命中：key/keys/token/cookie（XxxKey / XxxToken / XxxCookie 模式）。
+ * 不含 token 的非末词形态（tokenizer/tokenBudget/maxTokens 等 token* 配置是
+ * 常见插件设置，不是凭据；末词 token 才是访问令牌模式），也不含 keyframes
+ * 这类以 key 开头但语义非凭据的词（末词匹配天然排除）。
+ */
+const SENSITIVE_ANY_WORD = new Set([
+  'secret',
+  'secrets',
+  'password',
+  'credential',
+  'credentials',
+  'authorization',
+]);
+const SENSITIVE_SUFFIX_WORD = new Set(['key', 'keys', 'token', 'cookie']);
+
+/** 键名 → 小写分词列表（'access_key'、'privateKey'、'MAXTokens' 均正确拆分） */
+function splitKeyWords(key: string): string[] {
+  return key
+    .split(/[^A-Za-z0-9]+/)
+    .flatMap((part) => part.split(/(?=[A-Z])/))
+    .map((word) => word.toLowerCase())
+    .filter((word) => word.length > 0);
+}
+
+function isSensitiveKey(key: string): boolean {
+  const words = splitKeyWords(key);
+  if (words.some((word) => SENSITIVE_ANY_WORD.has(word))) return true;
+  const last = words[words.length - 1];
+  return last !== undefined && SENSITIVE_SUFFIX_WORD.has(last);
+}
 
 /** 工程包仅携带的公开项目字段（白名单：未知顶层字段一律不进包） */
 const PUBLIC_PROJECT_FIELDS = [
@@ -152,7 +186,7 @@ export function stripSensitiveFields(value: unknown, visited = new WeakSet<objec
     return;
   }
   for (const key of Object.keys(value)) {
-    if (SENSITIVE_KEY_PATTERN.test(key)) {
+    if (isSensitiveKey(key)) {
       delete (value as Record<string, unknown>)[key];
     } else {
       stripSensitiveFields((value as Record<string, unknown>)[key], visited);
@@ -181,7 +215,9 @@ export function buildProjectPackage(project: Project, options: PackageBuildOptio
   if (includePrivate && source.pluginData !== undefined) stripped.pluginData = source.pluginData;
   stripSensitiveFields(stripped);
 
-  const assets: Record<string, ProjectAssetPayload> = {};
+  // 无原型字典：资产 id 是导入包可携带的任意字符串（含 '__proto__'），
+  // 普通 {} 的赋值会走原型 setter 丢字节/污染原型（导入→导出→导入字节丢失）
+  const assets: Record<string, ProjectAssetPayload> = Object.create(null) as Record<string, ProjectAssetPayload>;
   let assetCount = 0;
   const strippedAssets = Array.isArray(stripped.assets)
     ? (stripped.assets as Array<Record<string, unknown>>).map((asset) => {

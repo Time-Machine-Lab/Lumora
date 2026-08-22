@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createGroupObject } from '@lumora/core';
+import type { Project } from '@lumora/core';
 import { createStudioRuntime } from '../src/runtime/studio-runtime';
 import type { StudioRuntime } from '../src/runtime/studio-runtime';
 import { ProjectStore } from '../src/persistence/project-store';
@@ -300,6 +301,48 @@ describe('ProjectPersistence：运行时集成（自动保存链路）', () => {
     const stored = await final!.load(project.uri);
     expect(stored!.revision).toBe(6);
     expect(stored!.name).toBe('较新内容');
+    await runtime.dispose();
+  });
+});
+
+describe('ProjectPersistence：本地加载边界 schema 迁移（TML-53 第四轮 #6）', () => {
+  it('v2 项目记录（无 tracks）重开：加载边界迁移到 v3 补 tracks，并以已存 revision CAS 原子写回', async () => {
+    const runtime = await makeRuntime();
+    // 直接向存储写入 v2 记录（模拟旧版本留下的本地数据，无迁移入口时的形态）
+    const store = await openStandaloneStore();
+    const v3 = runtime.persistence.createProject('旧版项目');
+    const { tracks: _tracks, ...v2 } = v3;
+    const v2Record = { ...v2, schemaVersion: 2 } as unknown as Project;
+    expect((await store!.save(v2Record)).ok).toBe(true);
+
+    // 重开：加载边界迁移 + 校验 + 原子写回（绝不把旧版本数据原样交给编辑器）
+    const loaded = await runtime.persistence.loadProject(v3.uri);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.migratedFrom).toBe(2);
+    expect(loaded.project.schemaVersion).toBe(3);
+    expect(loaded.project.tracks).toEqual([]);
+    expect(loaded.project.objects).toEqual(v3.objects);
+
+    // 写回后的存储记录已是 v3（下次加载不再迁移）
+    const after = await store!.load(v3.uri);
+    expect(after!.schemaVersion).toBe(3);
+    expect(after!.tracks).toEqual([]);
+    await runtime.dispose();
+  });
+
+  it('v2 记录携带非法 tracks（非数组）：迁移保留原值不静默置空，校验明确拒绝打开', async () => {
+    const runtime = await makeRuntime();
+    const store = await openStandaloneStore();
+    const v3 = runtime.persistence.createProject('损坏轨道项目');
+    const { tracks: _tracks, ...v2 } = v3;
+    const bad = { ...v2, schemaVersion: 2, tracks: 'not-an-array' } as unknown as Project;
+    expect((await store!.save(bad)).ok).toBe(true);
+
+    const loaded = await runtime.persistence.loadProject(v3.uri);
+    expect(loaded.ok).toBe(false);
+    if (loaded.ok) return;
+    expect(loaded.message).toContain('tracks');
     await runtime.dispose();
   });
 });

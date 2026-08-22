@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createGroupObject, createSampleProject } from '@lumora/core';
 import { createStudioRuntime } from '../src/runtime/studio-runtime';
 import { ProjectStore } from '../src/persistence/project-store';
+import type { ProjectStorage } from '../src/persistence/project-storage';
 
 describe('StudioRuntime：宿主快照与事件总线随编辑器同步（S-3）', () => {
   it('编辑器每次变更后 host 快照与 project:changed 广播保持当前', () => {
@@ -95,6 +96,100 @@ describe('StudioRuntime：openProject 可等待的类型化切换屏障（TML-53
     // 旧项目保持打开：编辑器与宿主都未被替换
     expect(runtime.editor.getProject()!.uri).toBe('lumora://project/a');
     expect(runtime.host.getProject()!.uri).toBe('lumora://project/a');
+    await runtime.dispose();
+    await ProjectStore.drop(db);
+  });
+});
+
+describe('StudioRuntime：首存失败的切换屏障（TML-53 第四轮 #2 运行时回归）', () => {
+  /** 注入恒失败的存储（save 一律拒绝）：模拟首存即落盘的存储故障 */
+  function alwaysFailingStore(): ProjectStorage {
+    return {
+      kind: 'indexeddb',
+      async list() {
+        return [];
+      },
+      async load() {
+        return null;
+      },
+      async save() {
+        return { ok: false, code: 'quota-exceeded' as const, message: '本地存储空间不足，保存失败' };
+      },
+      async remove() {
+        return false;
+      },
+      async rename() {
+        return { ok: false, code: 'not-found' as const, message: '项目不存在' };
+      },
+      async duplicate() {
+        return { ok: false, code: 'not-found' as const, message: '项目不存在' };
+      },
+      close() {},
+    };
+  }
+
+  it('首存失败（未编辑）后切换：openProject(B) 返回 {ok:false}，旧项目保持打开（曾假成功放行）', async () => {
+    const runtime = createStudioRuntime();
+    await runtime.init({ store: alwaysFailingStore(), debounceMs: 20 });
+    await runtime.openProject(createSampleProject('lumora://project/a', '项目A'));
+    await new Promise((r) => setTimeout(r, 60)); // 首存失败（无假记录）
+
+    const switched = await runtime.openProject(createSampleProject('lumora://project/b', '项目B'));
+    expect(switched.ok).toBe(false);
+    if (switched.ok) return;
+    expect(switched.message).toContain('保存失败');
+    // 旧项目保持打开：未保存内容仍在编辑器与宿主快照
+    expect(runtime.editor.getProject()!.uri).toBe('lumora://project/a');
+    expect(runtime.host.getProject()!.uri).toBe('lumora://project/a');
+    await runtime.dispose();
+  });
+
+  it('首存失败后存储恢复：切换前排空重试成功才放行，内容完整落盘', async () => {
+    const runtime = createStudioRuntime();
+    const db = 'lumora-test-runtime-firstsave';
+    await ProjectStore.drop(db);
+    const real = await ProjectStore.create(db);
+    if (!real) throw new Error('store 创建失败');
+    let firstSaveFailed = false;
+    const flaky: ProjectStorage = {
+      kind: 'indexeddb',
+      async list() {
+        return real.list();
+      },
+      async load(uri) {
+        return real.load(uri);
+      },
+      async save(project, expected) {
+        if (!firstSaveFailed) {
+          firstSaveFailed = true;
+          return { ok: false, code: 'storage-error' as const, message: '磁盘瞬时错误' };
+        }
+        return real.save(project, expected);
+      },
+      async remove(uri) {
+        return real.remove(uri);
+      },
+      async rename(uri, name) {
+        return real.rename(uri, name);
+      },
+      async duplicate(uri, name) {
+        return real.duplicate(uri, name);
+      },
+      close() {
+        real.close();
+      },
+    };
+    await runtime.init({ store: flaky, debounceMs: 20 });
+    await runtime.openProject(createSampleProject('lumora://project/a', '项目A'));
+    await new Promise((r) => setTimeout(r, 60)); // 首存失败
+
+    // 切换：排空重试（存储已恢复）→ 放行，A 完整落盘
+    const switched = await runtime.openProject(createSampleProject('lumora://project/b', '项目B'));
+    expect(switched.ok).toBe(true);
+    const loaded = await runtime.persistence.loadProject('lumora://project/a');
+    expect(loaded.ok).toBe(true);
+    if (loaded.ok) expect(loaded.project.revision).toBe(0);
+    expect(runtime.editor.getProject()!.uri).toBe('lumora://project/b');
     await runtime.dispose();
     await ProjectStore.drop(db);
   });

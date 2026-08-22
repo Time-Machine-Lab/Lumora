@@ -4,6 +4,7 @@ import { migrateProjectSchema } from '../src/project/migrate';
 import { parseProjectPackage, serializeProjectPackage } from '../src/project/package';
 import { buildProjectPackage } from '../src/project/package';
 import { createSampleProject } from '../src/scene/sample-project';
+import { validateProjectSchema } from '../src/scene/validate';
 import type { Project } from '../src/scene/types';
 
 /**
@@ -89,6 +90,19 @@ describe('migrateProjectSchema：版本化 schema 迁移管道（NFR-017）', ()
     const migrated = result.project as Project;
     expect(migrated.schemaVersion).toBe(CURRENT_PROJECT_SCHEMA_VERSION);
     expect(migrated.tracks).toEqual(tracks);
+  });
+
+  it('v2 数据携带非数组 tracks → 迁移原样保留（不静默置空掩盖损坏），v3 校验明确拒绝', () => {
+    const input = v2Fixture();
+    input.tracks = 'corrupted';
+    const result = migrateProjectSchema(input);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const migrated = result.project as unknown as { schemaVersion: number; tracks: unknown };
+    expect(migrated.schemaVersion).toBe(CURRENT_PROJECT_SCHEMA_VERSION);
+    expect(migrated.tracks).toBe('corrupted');
+    // 非法值保留到校验阶段明确拒绝：绝不静默置空
+    expect(validateProjectSchema(migrated)).toContain('tracks');
   });
 
   it('v2 数据携带自定义未知字段时透传保留（不静默丢字段）', () => {

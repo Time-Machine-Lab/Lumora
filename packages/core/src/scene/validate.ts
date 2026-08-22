@@ -199,7 +199,7 @@ export function validateProjectSchema(project: unknown): string | null {
     const problem = validateSceneObjectData(object);
     if (problem) return `对象数据不合法（${problem}）`;
   }
-  if (!Array.isArray(p.tracks)) return 'tracks 缺失';
+  if (!Array.isArray(p.tracks)) return 'tracks 缺失或非数组';
   const trackIds = new Set<string>();
   for (const track of p.tracks) {
     if (!track || typeof track !== 'object') return '轨道条目非法';

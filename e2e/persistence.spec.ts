@@ -6,6 +6,7 @@ import {
   SceneEditor,
   buildProjectPackage,
   compositeContentHash,
+  createCameraObject,
   createSampleProject,
   genId,
   hashBytes,
@@ -32,7 +33,9 @@ interface LumoraPackage {
     formatVersion: number;
     project: { uri: string; name: string; revision: number };
     includePrivate: boolean;
+    assetCount: number;
   };
+  assets?: Record<string, { payload?: string }>;
   project: {
     objects: Array<{ type: string; id: string }>;
     pluginData?: unknown;
@@ -128,6 +131,91 @@ test('AC1 导出→清空→导入：模型、三镜头完整恢复且已持久�
   await page.locator('[data-testid="recent-project"] .lumora-project-menu__recent-open').click();
   await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
   await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
+});
+
+test('AC1b 真实 GLB 模型资产：导入渲染 + 载荷引用往返（TML-53 第四轮 #9）', async ({ page }) => {
+  // 1. Node 端构建含真实小型 GLB 网格（nested-mesh.glb，17KB 真模型）、三镜头与轨道的工程包
+  const editor = new SceneEditor();
+  editor.openProject(createSampleProject());
+  // 追加两台摄像机（共 3 台镜头，与 AC1 一致：镜头都在活动场景，浏览器树可见）
+  editor.addObject(createCameraObject('机位二'));
+  editor.addObject(createCameraObject('机位三'));
+  const glbBytes = readFileSync(join(HERE, '..', 'packages', 'studio', 'test', 'fixtures', 'nested-mesh.glb'));
+  const payload = glbBytes.toString('base64');
+  const assetId = 'real-model-asset';
+  editor.registerAsset({
+    id: assetId,
+    kind: 'gltf',
+    name: '真实模型.glb',
+    format: 'glb',
+    mime: 'model/gltf-binary',
+    hash: await hashBytes(glbBytes),
+    size: glbBytes.length,
+    source: 'file',
+    storageRef: 'blob:runtime-only',
+    payload,
+    createdAt: new Date().toISOString(),
+  });
+  const modelId = 'real-model-obj';
+  editor.addObject({
+    id: modelId,
+    type: 'model',
+    name: '真实模型',
+    parentId: null,
+    transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+    visible: true,
+    locked: false,
+    assetId,
+  });
+  const project = editor.getProject()!;
+  const tracks = [
+    {
+      id: genId('track'),
+      name: '模型位移动画',
+      objectId: modelId,
+      targetPath: 'position' as const,
+      keyframes: [
+        { time: 0, value: [0, 0, 0] as [number, number, number] },
+        { time: 2, value: [0, 2, 0] as [number, number, number] },
+      ],
+    },
+  ];
+  const tmpDir = join(HERE, '.tmp');
+  mkdirSync(tmpDir, { recursive: true });
+  const glbPath = join(tmpDir, 'tml53-ac1b-source.lumora');
+  writeFileSync(
+    glbPath,
+    serializeProjectPackage(buildProjectPackage({ ...project, tracks: [...project.tracks, ...tracks] })),
+    'utf8',
+  );
+
+  // 2. 浏览器导入：真实 GLB 模型行可见、三镜头齐全、项目已持久化
+  await page.goto('/');
+  await expect(page.getByTestId('studio-empty-hint')).toBeVisible();
+  await page.getByTestId('project-menu').click();
+  await page.setInputFiles('[data-testid="project-import-input"]', glbPath);
+  await expect(page.getByTestId('studio-empty-hint')).not.toBeVisible();
+  await expect(page.getByTestId('tree-row-real-model-obj')).toBeVisible();
+  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
+  await expect(page.getByTestId('event-log')).toContainText('项目已打开');
+  await expect(page.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 10_000 });
+
+  // 3. 再导出：GLB 载荷逐字节往返、tracks 完整、模型与三镜头引用未断裂
+  const reexportPromise = page.waitForEvent('download');
+  await page.getByTestId('project-menu').click();
+  await page.getByTestId('project-export').click();
+  const reexport = await reexportPromise;
+  const reexportPath = join(tmpDir, 'tml53-ac1b-reexport.lumora');
+  await reexport.saveAs(reexportPath);
+  const reexported = JSON.parse(readFileSync(reexportPath, 'utf8')) as LumoraPackage;
+  expect(reexported.manifest.assetCount).toBeGreaterThanOrEqual(1);
+  expect(reexported.assets?.[assetId]?.payload).toBe(payload);
+  expect(reexported.project.objects.filter((o) => o.type === 'camera')).toHaveLength(3);
+  expect(reexported.project.objects.some((o) => o.type === 'model' && o.id === modelId)).toBe(true);
+  expect(reexported.project.tracks).toEqual([...project.tracks, ...tracks]);
+  for (const track of reexported.project.tracks!) {
+    expect(reexported.project.objects.some((o) => o.id === track.objectId)).toBe(true);
+  }
 });
 
 test('AC4 源项目含 pluginData 与凭据：默认导出全剥离，includePrivate 仅放行插件设置', async ({ page }) => {

@@ -216,7 +216,13 @@ export class OpfsProjectStore implements ProjectStorage {
               storedRevision: existing.project.revision,
             };
           }
-          if (project.revision === existing.project.revision && !sameProjectContent(project, existing.project)) {
+          // 分叉保护豁免 schema 升级写回（loadProject 迁移：同 revision 内容随
+          // schema 版本合法变化）；revision CAS 仍生效，并发更新依旧被拦截
+          if (
+            project.revision === existing.project.revision &&
+            existing.project.schemaVersion === project.schemaVersion &&
+            !sameProjectContent(project, existing.project)
+          ) {
             return {
               ok: false,
               code: 'revision-conflict',

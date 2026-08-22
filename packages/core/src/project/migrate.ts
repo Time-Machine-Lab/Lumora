@@ -40,8 +40,9 @@ export type ProjectMigration = (data: unknown) => unknown;
  * 不丢弃任何字段。生产数据从首个提交起即为 v2，v1 迁移不会被真实数据触发。
  *
  * v2 → v3：Project 新增 tracks（轨道）字段（v2 无轨道概念，此前以场景/层级
- * 引用替代）。迁移补默认空数组（TML-88）；v2 数据若已携带 tracks（手工构造），
- * 原样透传不丢弃，内容合法性由迁移后的统一校验裁决。
+ * 引用替代）。迁移仅补缺失字段的默认空数组（TML-88）；已存在的非数组值
+ * （损坏/手工构造）原样保留 —— 迁移不静默丢数据也不猜测解释，合法性由迁移后
+ * 的 v3 统一校验明确拒绝（tracks 缺失或非数组）。
  */
 const MIGRATIONS: Record<number, ProjectMigration> = {
   1: (data) => {
@@ -64,7 +65,7 @@ const MIGRATIONS: Record<number, ProjectMigration> = {
     return {
       ...raw,
       schemaVersion: 3,
-      tracks: Array.isArray(raw.tracks) ? raw.tracks : [],
+      ...(raw.tracks === undefined ? { tracks: [] } : {}),
     };
   },
 };

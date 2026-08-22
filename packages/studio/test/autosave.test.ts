@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { SceneEditor, createGroupObject, createSampleProject } from '@lumora/core';
+import { SceneEditor, createGroupObject, createLightObject, createSampleProject } from '@lumora/core';
 import { ProjectAutosaver } from '../src/persistence/autosave';
 import type { AutosaveState } from '../src/persistence/autosave';
 import { ProjectStore } from '../src/persistence/project-store';
@@ -424,7 +424,9 @@ describe('ProjectAutosaver：恢复快照（切换/关闭时保存失败的旧�
 
     const states: AutosaveState[] = [];
     autosaver.onState((s) => states.push(s));
-    editor.openProject({ ...base, name: '项目A' });
+    // 以与已存记录一致的内容重开（改名的分叉内容属「同 revision 不同内容」，
+    // 会按第四轮分叉规则锁存冲突 —— 真实重开走 loadProject 读到的存储记录）
+    editor.openProject({ ...base });
     await settle(60);
     expect(states.at(-1)).toMatchObject({ status: 'error', code: 'recovery-available' });
 
@@ -580,6 +582,95 @@ describe('ProjectAutosaver：撤销回到已保存状态即转净', () => {
     expect(states).toContain('dirty');
     expect(states.at(-1)).toBe('clean');
     expect((await store.load('lumora://project/a'))!.revision).toBe(editor.getProject()!.revision);
+    autosaver.dispose();
+  });
+});
+
+describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 第四轮回归）', () => {
+  it('首存失败后 flush 不再假成功：如实返回失败且无假记录；存储恢复后重试仍按创建语义落盘', async () => {
+    const { editor, store, autosaver } = await wired();
+    vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'quota-exceeded' as const,
+      message: '本地存储空间不足，保存失败',
+    }));
+    editor.openProject(createSampleProject('lumora://project/a'));
+    const states: AutosaveState[] = [];
+    autosaver.onState((s) => states.push(s));
+    const outcome = await autosaver.flush();
+    // 首存失败后 flush 不得以「revision 未变」判净假报成功：调用方据此阻断关闭/切换
+    expect(outcome).toMatchObject({ ok: false, code: 'quota-exceeded' });
+    expect(await store.load('lumora://project/a')).toBeNull();
+
+    // 存储恢复后重试：仍以 null 基线（create-only）发起，不以失败后的数字基线误拒
+    vi.mocked(store.save).mockRestore();
+    const retry = await autosaver.flush();
+    expect(retry.ok).toBe(true);
+    const stored = await store.load('lumora://project/a');
+    expect(stored!.revision).toBe(0);
+    expect(states.at(-1)!.status).toBe('clean');
+    autosaver.dispose();
+  });
+
+  it('同 revision 不同内容分叉：不得以「revision 一致」判净建基线，锁存冲突须显式解决', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    // 预置已存记录（revision 5，内容甲）
+    const stored = { ...createSampleProject(A, '内容甲'), revision: 5 };
+    expect((await store.save(stored)).ok).toBe(true);
+    // 打开同 revision 但内容不同的分叉（内容乙）：以 revision 一致判净会把分叉
+    // 建为基线，后续保存/切换静默吞掉本地分叉内容
+    editor.openProject({ ...createSampleProject(A, '内容乙'), revision: 5 });
+    const states: AutosaveState[] = [];
+    autosaver.onState((s) => states.push(s));
+    await settle(60);
+    expect(states.at(-1)).toMatchObject({ status: 'error', code: 'revision-conflict' });
+    const latched = states.at(-1)!;
+    if (latched.status === 'error') expect(latched.message).toContain('分叉');
+    // 存储未被分叉内容覆盖
+    const after = await store.load(A);
+    expect(after!.revision).toBe(5);
+    expect(after!.name).toBe('内容甲');
+    autosaver.dispose();
+  });
+
+  it('retryRecovery 同 revision 分叉：快照落盘但不静默覆盖当前编辑，锁存冲突引导显式解决', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(10); // rev0 已保存（基线 0）
+
+    // 保存全面失败 → 编辑 rev2 → 切换：恢复快照 = base + 2 group
+    vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    editor.addObject(createGroupObject()); // rev1
+    editor.addObject(createGroupObject()); // rev2
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60);
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+    vi.mocked(store.save).mockRestore();
+
+    // 重开 A（对账基线 0），重试前编辑出同 revision 但内容不同的分叉（light vs group）
+    editor.openProject({ ...base, name: '项目A' });
+    await settle(60);
+    editor.addObject(createLightObject('directional')); // rev1
+    editor.addObject(createGroupObject()); // rev2（内容 ≠ 恢复快照）
+    const outcome = await autosaver.retryRecovery(A);
+    expect(outcome).toMatchObject({ ok: false, code: 'revision-conflict' });
+    // 当前编辑未被恢复快照静默覆盖（同 revision 不得以快照替换编辑器）
+    const current = editor.getProject()!;
+    expect(current.revision).toBe(2);
+    expect(current.objects.length).toBe(base.objects.length + 2);
+    const stored = await store.load(A);
+    expect(stored!.revision).toBe(2);
+    expect(current.objects.filter((o) => o.type === 'light').length).toBe(
+      stored!.objects.filter((o) => o.type === 'light').length + 1,
+    );
     autosaver.dispose();
   });
 });
