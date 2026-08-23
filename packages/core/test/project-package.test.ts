@@ -756,11 +756,8 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         ...project,
         pluginData: {
           'com.example': {
-            api: { key: 'p-1' },
             pass: { word: 'p-2' },
-            private: { key: 'p-3', setting: 'p-4' },
             client: { secret: 'p-5' },
-            access: { token: 'p-6' },
             refresh: { token: 'p-7' },
             auth: { header: 'p-8' },
             stored: { password: 'p-9' },
@@ -784,10 +781,10 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
             // apiKeyboardLayout/accessTokenizerConfig/privateKeyboardShortcuts/
             // compassWordWrap 跨 segment 与单 segment 形态）
             passwordless: 'p-ok-3',
-            access: { tokenizer: { config: 'p-ok-4' } },
-            private: { keyboard: { shortcuts: 'p-ok-5' } },
+            access: { token: 'p-6', tokenizer: { config: 'p-ok-4' } },
+            private: { key: 'p-3', setting: 'p-4', keyboard: { shortcuts: 'p-ok-5' } },
             compass: { word: { wrap: 'p-ok-6' } },
-            api: { keyboard: { layout: 'p-ok-7' } },
+            api: { key: 'p-1', keyboard: { layout: 'p-ok-7' } },
           },
         },
       },
