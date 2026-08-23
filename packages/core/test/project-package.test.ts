@@ -382,7 +382,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     const expected = { ...pluginData['com.example'] };
-    for (const credentialKey of ['passwd', 'authHeader', 'TOKENIZERCONFIG', 'tokenizerConfigModel', 'tokenizerModel']) {
+    for (const credentialKey of ['passwd', 'authHeader', 'TOKENIZERCONFIG', 'tokenizerConfigModel', 'tokenizerModel'] as const) {
       delete expected[credentialKey];
     }
     expect(parsed.project.pluginData).toEqual({ 'com.example': expected });
