@@ -389,7 +389,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(parsed.project.pluginData).toEqual({ 'com.example': expected });
   });
 
-  it('凭据形态判定为任意 token 位置高置信词 + 相邻复合序列 + 无边界复合形态 + CJK 敏感词：分隔符/camelCase/全大写/全角/复数/数字后缀/连写/无边界连写/非 ASCII 敏感键顶层与嵌套路径一律拒绝，tokenBudget/authMode/主题/caféMode 等合法键放行（第十七轮 + 第十八轮 + 第十九轮 + 第二十一轮回归）', async () => {
+  it('凭据形态判定为默认拒绝敏感形态 + 正向豁免：分隔符/camelCase/全大写/全角/复数/数字后缀/连写/无边界连写/多语（繁体/日文/西语）敏感键顶层与嵌套路径一律拒绝，tokenBudget/authMode/主题/caféMode/passwordless/apiKeyboardLayout 等合法键放行（第十七轮 + 第十八轮 + 第十九轮 + 第二十一轮 + 第二十三轮回归）', async () => {
     const project = await buildFixtureProject();
     const pluginData = {
       'com.example': {
@@ -466,6 +466,20 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         'ＡＣＣＥＳＳＴＯＫＥＮ': 'leak-63',
         'ＡＵＴＨＨＥＡＤＥＲ': 'leak-64',
         'ＳＴＯＲＥＤＰＡＳＳＷＯＲＤ': 'leak-65',
+        // 第二十三轮阻断 2：范式反转后常见凭据名不再重入包 —— kind-suffix
+        // 闭合（限定词+token）、X+key 复合对（secret+key）、凭据根词
+        // （passphrase）、多语凭据词（繁体/日文/西语经 NFKD 去变音归一）
+        apiToken: 'leak-66',
+        authToken: 'leak-67',
+        csrfToken: 'leak-68',
+        idToken: 'leak-69',
+        privateToken: 'leak-70',
+        secretkey: 'leak-71',
+        passphrase: 'leak-72',
+        密碼: 'leak-73',
+        秘钥: 'leak-74',
+        パスワード: 'leak-75',
+        contraseña: 'leak-76',
         // 放行组：完整词包含 tokenizer/author/api 的合法键（旧子串匹配误剥）；
         // 第十八轮严重 2：仅含 pass/api 子串且不在任何凭据序列中的复合词放行；
         // 第二十一轮严重 4：token/auth 歧义词分轨，tokenBudget/authMode 恢复放行；
@@ -486,6 +500,14 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         authMode: 'keep-14',
         主题: 'keep-15',
         caféMode: 'keep-16',
+        // 第二十三轮严重 5：无边界复合改有边界判定（整词精确/词边界后缀）后，
+        // 以凭据词开头的合法复合键与「非 kind 后缀」连写全部往返（旧 includes
+        // 匹配误删）
+        passwordless: 'keep-17',
+        apiKeyboardLayout: 'keep-18',
+        accessTokenizerConfig: 'keep-19',
+        privateKeyboardShortcuts: 'keep-20',
+        compassWordWrap: 'keep-21',
       },
     };
     const pkg = buildProjectPackage({ ...project, pluginData }, {
@@ -512,12 +534,18 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(plugin.authMode).toBe('keep-14');
     expect(plugin.主题).toBe('keep-15');
     expect(plugin.caféMode).toBe('keep-16');
+    // 第二十三轮严重 5：5 个合法复合键顶层往返
+    expect(plugin.passwordless).toBe('keep-17');
+    expect(plugin.apiKeyboardLayout).toBe('keep-18');
+    expect(plugin.accessTokenizerConfig).toBe('keep-19');
+    expect(plugin.privateKeyboardShortcuts).toBe('keep-20');
+    expect(plugin.compassWordWrap).toBe('keep-21');
     const json = JSON.stringify(parsed.project);
-    for (let i = 1; i <= 65; i += 1) {
+    for (let i = 1; i <= 76; i += 1) {
       if (i === 9) continue; // 裸 api 不再拒绝（第十八轮严重 2 修正）
       expect(json).not.toContain(`leak-${i}`);
     }
-    for (const i of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]) {
+    for (const i of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]) {
       expect(json).toContain(`keep-${i}`);
     }
     // 嵌套路径声明同判据：路径任意层命中完整凭据序列整条声明拒绝；合法组合词路径放行
@@ -576,6 +604,19 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
               'ＡＣＣＥＳＳＴＯＫＥＮ': 'n-46',
               'ＡＵＴＨＨＥＡＤＥＲ': 'n-47',
               'ＳＴＯＲＥＤＰＡＳＳＷＯＲＤ': 'n-48',
+              // 第二十三轮阻断 2：常见凭据名嵌套路径回归（kind-suffix 闭合/
+              // 复合对/凭据根词/多语凭据词）
+              apiToken: 'n-49',
+              authToken: 'n-50',
+              csrfToken: 'n-51',
+              idToken: 'n-52',
+              privateToken: 'n-53',
+              secretkey: 'n-54',
+              passphrase: 'n-55',
+              密碼: 'n-56',
+              秘钥: 'n-57',
+              パスワード: 'n-58',
+              contraseña: 'n-59',
               // 第二十一轮严重 4/5：tokenBudget/authMode 恢复放行；合法非 ASCII
               // 键（主题/caféMode）放行
               tokenBudget: 'n-ok-5',
@@ -588,6 +629,12 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
               passCount: 'n-ok-7',
               主题: 'n-ok-9',
               caféMode: 'n-ok-10',
+              // 第二十三轮严重 5：5 个合法复合键嵌套路径往返
+              passwordless: 'n-ok-11',
+              apiKeyboardLayout: 'n-ok-12',
+              accessTokenizerConfig: 'n-ok-13',
+              privateKeyboardShortcuts: 'n-ok-14',
+              compassWordWrap: 'n-ok-15',
             },
           },
         },
@@ -643,6 +690,22 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
             ['profile', 'ＡＣＣＥＳＳＴＯＫＥＮ'],
             ['profile', 'ＡＵＴＨＨＥＡＤＥＲ'],
             ['profile', 'ＳＴＯＲＥＤＰＡＳＳＷＯＲＤ'],
+            ['profile', 'apiToken'],
+            ['profile', 'authToken'],
+            ['profile', 'csrfToken'],
+            ['profile', 'idToken'],
+            ['profile', 'privateToken'],
+            ['profile', 'secretkey'],
+            ['profile', 'passphrase'],
+            ['profile', '密碼'],
+            ['profile', '秘钥'],
+            ['profile', 'パスワード'],
+            ['profile', 'contraseña'],
+            ['profile', 'passwordless'],
+            ['profile', 'apiKeyboardLayout'],
+            ['profile', 'accessTokenizerConfig'],
+            ['profile', 'privateKeyboardShortcuts'],
+            ['profile', 'compassWordWrap'],
             ['profile', 'tokenBudget'],
             ['profile', 'authMode'],
             ['profile', 'tokenizerConfig'],
@@ -674,6 +737,11 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         authMode: 'n-ok-8',
         主题: 'n-ok-9',
         caféMode: 'n-ok-10',
+        passwordless: 'n-ok-11',
+        apiKeyboardLayout: 'n-ok-12',
+        accessTokenizerConfig: 'n-ok-13',
+        privateKeyboardShortcuts: 'n-ok-14',
+        compassWordWrap: 'n-ok-15',
       },
     });
   });
@@ -703,8 +771,23 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
             user: { credentials: 'p-14' },
             secret: { value: 'p-15' },
             session: { token: 'p-16' },
-            profile: { api: { version: 'p-ok-1' } },
+            // 第二十三轮阻断 3：嵌套裸 token/auth segment（['profile','token']/
+            // ['profile','auth']）—— 逐 segment 上下文判定拒绝，不再被「整条
+            // 路径 token 总数」稀释
+            profile: {
+              token: 'p-17',
+              auth: 'p-18',
+              api: { version: 'p-ok-1' },
+            },
             render: { pass: 'p-ok-2' },
+            // 第二十三轮严重 5：5 个合法复合键路径数组往返（passwordless/
+            // apiKeyboardLayout/accessTokenizerConfig/privateKeyboardShortcuts/
+            // compassWordWrap 跨 segment 与单 segment 形态）
+            passwordless: 'p-ok-3',
+            access: { tokenizer: { config: 'p-ok-4' } },
+            private: { keyboard: { shortcuts: 'p-ok-5' } },
+            compass: { word: { wrap: 'p-ok-6' } },
+            api: { keyboard: { layout: 'p-ok-7' } },
           },
         },
       },
@@ -728,8 +811,15 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
             ['user', 'credentials'],
             ['secret', 'value'],
             ['session', 'token'],
+            ['profile', 'token'],
+            ['profile', 'auth'],
             ['profile', 'api', 'version'],
             ['render', 'pass'],
+            ['passwordless'],
+            ['access', 'tokenizer', 'config'],
+            ['private', 'keyboard', 'shortcuts'],
+            ['compass', 'word', 'wrap'],
+            ['api', 'keyboard', 'layout'],
           ],
         },
       },
@@ -738,12 +828,18 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     const plugin = (parsed.project.pluginData as Record<string, unknown>)['com.example'];
-    // 十六组路径数组声明全部拒绝：{api:{key}}/{pass:{word}}/{private:{key,setting}}/
-    // {client:{secret}}/{access:{token}} 等不进包
+    // 十八组路径数组声明全部拒绝：{api:{key}}/{pass:{word}}/{private:{key,setting}}/
+    // {client:{secret}}/{access:{token}}/{profile:{token,auth}} 等不进包
     const json = JSON.stringify(parsed.project);
-    for (let i = 1; i <= 16; i += 1) expect(json).not.toContain(`p-${i}`);
-    // 合法跨 segment 组合（api+version、render+pass 不在凭据序列）正常导出
+    for (let i = 1; i <= 18; i += 1) expect(json).not.toContain(`p-${i}`);
+    // 合法跨 segment 组合（api+version、render+pass）与 5 个合法复合键的
+    // 路径数组形态（单 segment 与跨 segment）全部往返
     expect(plugin).toEqual({
+      passwordless: 'p-ok-3',
+      access: { tokenizer: { config: 'p-ok-4' } },
+      private: { keyboard: { shortcuts: 'p-ok-5' } },
+      compass: { word: { wrap: 'p-ok-6' } },
+      api: { keyboard: { layout: 'p-ok-7' } },
       profile: { api: { version: 'p-ok-1' } },
       render: { pass: 'p-ok-2' },
     });
