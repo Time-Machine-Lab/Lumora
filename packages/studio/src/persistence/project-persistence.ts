@@ -502,16 +502,21 @@ export class ProjectPersistence {
     return { ok: true, project: result.project, warnings: result.warnings, migratedFrom: result.migratedFrom };
   }
 
-  /** 卸载：冲刷未保存变更、断开自动保存与存储连接。 */
-  async dispose(): Promise<void> {
-    if (this.disposed) return;
+  /** 卸载：冲刷未保存变更、断开自动保存与存储连接。
+   *  第二十八轮阻断 4：autosaver 冲刷失败时如实返回失败 —— 不得继续 teardown
+   *  （断开监听/关闭存储/清 events），调用方（StudioRuntime）据此保留编辑器与
+   *  存储供重试，绝不「假装已卸载」丢弃未落盘内容。 */
+  async dispose(): Promise<SaveOutcome> {
+    if (this.disposed) return { ok: true };
+    const outcome = await this.autosaver.dispose();
+    if (!outcome.ok) return outcome;
     this.disposed = true;
     this.unsubscribeEditor?.dispose();
     this.unsubscribeEditor = null;
-    await this.autosaver.dispose();
     this.store?.close();
     this.store = null;
     this.currentUri = null;
     this.events.dispose();
+    return { ok: true };
   }
 }

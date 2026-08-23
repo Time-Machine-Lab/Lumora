@@ -46,7 +46,10 @@ export interface StudioRuntime {
    */
   closeProject(): Promise<{ ok: boolean; message?: string }>;
   getProject(): Project | null;
-  dispose(): Promise<void>;
+  /** 卸载：冲刷未保存变更后释放全部资源。第二十八轮阻断 4：冲刷失败时返回
+   *  { ok: false, message } 且不 teardown —— 编辑器与存储保留，调用方可重试或
+   *  引导用户保全内容，绝不「假装已卸载」丢弃未落盘内容。 */
+  dispose(): Promise<{ ok: boolean; message?: string }>;
 }
 
 export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioRuntime {
@@ -111,13 +114,17 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
     },
     getProject: () => editor.getProject(),
     async dispose() {
-      if (disposed) return;
+      if (disposed) return { ok: true };
+      // 第二十八轮阻断 4：先冲刷自动保存（flush 需读取未销毁的编辑器），失败
+      // 时如实返回且不 teardown —— 不置 disposed/不移监听/不销毁编辑器与宿主，
+      // 调用方可重试或引导用户「另存副本」保全未保存内容
+      const outcome = await persistence.dispose();
+      if (!outcome.ok) return { ok: false, message: outcome.message };
       disposed = true;
       unsubscribe.dispose();
-      // 先冲刷自动保存（flush 需读取未销毁的编辑器），再依次释放
-      await persistence.dispose();
       editor.dispose();
       await host.dispose();
+      return { ok: true };
     },
   };
 }

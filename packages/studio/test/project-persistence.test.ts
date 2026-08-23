@@ -44,7 +44,16 @@ beforeEach(async () => {
 afterEach(async () => {
   // 先释放运行时与全部连接再删库：deleteDatabase 会排在未关闭连接之后，
   // 挂起的删除会无限阻塞后续 open（fake-indexeddb 与真实浏览器行为一致）
-  for (const runtime of openRuntimes) await runtime.dispose();
+  for (const runtime of openRuntimes) {
+    const outcome = await runtime.dispose();
+    // 第二十八轮阻断 4：dispose 冲刷失败时不 teardown（连接保留供调用方
+    // 重试/另存副本）——测试隔离要求删库前强制释放连接，否则挂起的
+    // deleteDatabase 永久排队，阻塞后续测试的 open（级联超时）
+    if (!outcome.ok) {
+      const store = (runtime.persistence as unknown as { store: ProjectStorage | null }).store;
+      store?.close();
+    }
+  }
   openRuntimes.length = 0;
   for (const store of openStores) store.close();
   openStores.length = 0;
@@ -1442,6 +1451,222 @@ describe('ProjectPersistence：facade 对存储故障的统一归一（第十七
     const loaded = await persistence.loadProject('lumora://project/a');
     expect(loaded.ok).toBe(false);
     if (!loaded.ok) expect(loaded.message).toContain('本地项目加载失败：idb transaction aborted');
+    await persistence.dispose();
+  });
+});
+
+describe('ProjectPersistence：第二十八轮回归（多 fork 恢复 / drain waiter / dispose 传播 / 锁存语义 / generation 绑定）', () => {
+  it('阻断2：同 uri 多次保存失败各自保留恢复 fork；重试最新成功后旧 fork 保留、旧内容仍可恢复', async () => {
+    const editor = new SceneEditor();
+    const store = await openStandaloneStore();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, store }); // 长防抖隔离自动保存
+
+    const A = 'lumora://project/multifork';
+    const base = createSampleProject(A, '多fork项目');
+    editor.openProject(base);
+    await settle(10); // 首存成功 → 基线 rev0
+
+    const failSpy = vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+
+    // 第一次失败：编辑（rev1）→ 切换走 → drain 失败 → fork1（内容 base+1）
+    editor.addObject(createGroupObject());
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/other1', '其他项目'));
+    await settle(60);
+    expect(persistence.getRecoverySnapshot(A)).not.toBeNull();
+
+    // 第二次失败：重开 A（原内容，对账锁存 recovery-available）→ 编辑两次
+    // （rev2，内容 base+2，与 fork1 指纹不同）→ 切换走 → drain 失败 → fork2
+    editor.openProject({ ...base });
+    await settle(60);
+    editor.addObject(createGroupObject());
+    editor.addObject(createGroupObject());
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/other2', '其他项目二'));
+    await settle(60);
+    failSpy.mockRestore();
+
+    // 两个 fork 各自保留；getRecoverySnapshot 返回最新代（fork2）
+    const latest = persistence.getRecoverySnapshot(A);
+    expect(latest).not.toBeNull();
+    expect(latest!.objects.length).toBe(base.objects.length + 2);
+
+    // 重试最新 fork2 → 成功落盘，只清除本代 fork
+    const outcome = await persistence.retryRecovery(A);
+    expect(outcome.ok).toBe(true);
+    // 旧 fork1 仍在恢复区（内容仅存恢复区，仍可另存副本）
+    const oldFork = persistence.getRecoverySnapshot(A);
+    expect(oldFork).not.toBeNull();
+    expect(oldFork!.objects.length).toBe(base.objects.length + 1);
+    // 旧 fork1 内容已被磁盘较新内容覆盖：重试被 CAS 拒绝（防倒退），fork 保留
+    const oldOutcome = await persistence.retryRecovery(A);
+    expect(oldOutcome.ok).toBe(false);
+    expect(persistence.getRecoverySnapshot(A)).not.toBeNull();
+    await persistence.dispose();
+  });
+
+  it('阻断3：慢保存挂起期间大量 drain 入队（超容量淘汰）时，flush 仍读到本会话代的真实失败，不误报成功', async () => {
+    const editor = new SceneEditor();
+    const store = await openStandaloneStore();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, store });
+
+    const A = 'lumora://project/slow-a';
+    editor.openProject(createSampleProject(A, '慢速项目'));
+    await settle(10); // 首存成功 rev0
+
+    const realSave = store.save.bind(store);
+    let call = 0;
+    const saveSpy = vi.spyOn(store, 'save').mockImplementation(async (project, expected) => {
+      call += 1;
+      if (call === 1) {
+        // flush 自身保存：慢（50ms）→ 真实成功 —— 磁盘推进到 rev1
+        await new Promise((r) => setTimeout(r, 50));
+        return realSave(project, expected);
+      }
+      if (call === 2) {
+        // 切换入队的 superseding drain（本会话代）：慢（50ms）→ 失败 ——
+        // 本代 drain 结果必须是 flush 读到的最终裁决
+        await new Promise((r) => setTimeout(r, 50));
+        return { ok: false, code: 'storage-error' as const, message: '保存失败' };
+      }
+      return realSave(project, expected);
+    });
+
+    editor.addObject(createGroupObject()); // A rev1 → dirty
+    const flushing = persistence.flushPending(); // 不 await：保存挂起中
+    await settle(10); // flush 任务已开始慢保存（call 1）
+    // 挂起期间 17 轮切换：每轮入队一个新 epoch 的 drain（超 DRAIN_OUTCOME_KEEP=16），
+    // 淘汰循环只淘汰无 waiter 的记录 —— 修复前本代记录被淘汰、flush 回落到基线
+    // 比较误报成功；修复后入队时即注册 waiter，读到本代 drain 的真实失败并传播
+    for (let i = 0; i < 17; i += 1) {
+      editor.addObject(createGroupObject());
+      editor.openProject(createSampleProject(`lumora://project/other-${i}`, `其他${i}`));
+      await settle(5);
+    }
+    const outcome = await flushing;
+    expect(outcome.ok).toBe(false);
+    expect(persistence.getRecoverySnapshot(A)).not.toBeNull(); // A 的失败内容已入录恢复区
+    saveSpy.mockRestore();
+    await persistence.dispose();
+  });
+
+  it('阻断4：dispose 冲刷失败如实返回失败且不 teardown；恢复存储后重试 dispose 成功', async () => {
+    const runtime = await makeRuntime();
+    const uri = 'lumora://project/dispose-fail';
+    await runtime.openProject(createSampleProject(uri, 'dispose项目'));
+    await settle(40); // 首存成功
+
+    const store = (runtime.persistence as unknown as { store: ProjectStorage | null }).store!;
+    const saveSpy = vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    try {
+      runtime.editor.addObject(createGroupObject()); // dirty
+      await settle(60); // 自动保存失败 → error 状态
+
+      const outcome = await runtime.dispose();
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) expect(outcome.message).toContain('保存失败');
+      // 不 teardown：编辑器与存储保留（可重试/另存副本），绝不假装已卸载
+      expect(runtime.getProject()).not.toBeNull();
+      expect(runtime.persistence.available).toBe(true);
+    } finally {
+      saveSpy.mockRestore();
+      // 恢复存储后重试 dispose 成功（teardown 完成）
+      const retry = await runtime.dispose();
+      expect(retry.ok).toBe(true);
+    }
+  });
+
+  it('严重5：同 uri 更新代内容落盘成功不清前代恢复 fork —— 仍锁存 recovery-available，绝不发 clean', async () => {
+    const editor = new SceneEditor();
+    const store = await openStandaloneStore();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, store });
+
+    const A = 'lumora://project/s5';
+    const base = createSampleProject(A, 'S5项目');
+    // 全程模拟存储故障：首存失败（无本地记录）→ 编辑 → 切换走 → drain 失败入录 fork
+    const failSpy = vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    editor.openProject(base);
+    await settle(60);
+    editor.addObject(createGroupObject()); // rev1（fork 内容 = base+1）
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/other', '其他项目'));
+    await settle(60);
+    expect(persistence.getRecoverySnapshot(A)).not.toBeNull();
+    failSpy.mockRestore();
+
+    // 重开 A（原内容）：对账发现无本地记录 → 首存（创建语义）成功 →
+    // applySaveResult 成功路径：落盘指纹（base）≠ 前代恢复 fork 指纹（base+1）
+    // → 不清除 fork、仍锁存 recovery-available 且不发 clean —— 修复前直接
+    // 清 latch 发 clean，旧 fork 沉没不可恢复
+    const states: Array<{ status: string; code?: string }> = [];
+    persistence.events.on('save-state', ({ state }) => states.push(state));
+    editor.openProject({ ...base });
+    await settle(60);
+    expect(persistence.getRecoverySnapshot(A)).not.toBeNull(); // 前代 fork 保留
+    expect(states[states.length - 1]?.status).toBe('error');
+    expect(states[states.length - 1]?.code).toBe('recovery-available');
+    expect(states.some((s) => s.status === 'clean')).toBe(false);
+    await persistence.dispose();
+  });
+
+  it('严重6：重试保存挂起期间恢复记录被清除 → 本次重试取消，不 switchOpen、不报 clean', async () => {
+    const editor = new SceneEditor();
+    const store = await openStandaloneStore();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, store });
+
+    const A = 'lumora://project/s6';
+    const base = createSampleProject(A, 'S6项目');
+    editor.openProject(base);
+    await settle(10); // 首存成功 rev0
+
+    // 制造恢复 fork：编辑 → 切换走 → drain 保存失败入录
+    const failSpy = vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    editor.addObject(createGroupObject());
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/other', '其他项目'));
+    await settle(60);
+    failSpy.mockRestore();
+    expect(persistence.getRecoverySnapshot(A)).not.toBeNull();
+
+    // 慢速重试：保存挂起期间恢复记录被清除（用户已「另存副本」等显式决定）
+    const realSave = store.save.bind(store);
+    vi.spyOn(store, 'save').mockImplementationOnce(async (project, expected) => {
+      await new Promise((r) => setTimeout(r, 40));
+      return realSave(project, expected);
+    });
+    const retrying = persistence.retryRecovery(A);
+    await settle(20); // 保存挂起中
+    persistence.clearRecovery(A);
+    const outcome = await retrying;
+    // 该代恢复记录已不存在：本次重试取消（磁盘已推进无害），不触碰 latch/恢复区
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe('revision-conflict');
+      expect(outcome.message).toContain('已取消');
+    }
+    // 编辑器未被 switchOpen 覆盖（仍是其他项目），恢复区已空
+    expect(editor.getProject()!.uri).not.toBe(A);
+    expect(persistence.getRecoverySnapshot(A)).toBeNull();
     await persistence.dispose();
   });
 });

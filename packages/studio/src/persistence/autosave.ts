@@ -68,9 +68,10 @@ interface CommittedBaseline {
   fingerprint: string | null;
 }
 
-/** 恢复记录（第二十三轮阻断 4）：快照 + 内容指纹 + 创建代数。保存成功只清除
- *  「自己覆盖的恢复项」（落盘内容指纹与恢复快照一致）；同 uri 更新代内容落盘
- *  不得清除前代恢复快照 —— 前代内容仅存于恢复区，仍可恢复 */
+/** 恢复记录（第二十三轮阻断 4 + 第二十八轮阻断 2）：快照 + 内容指纹 + 创建代数。
+ *  同一 uri 的多次保存失败各自入录独立 fork（按 generation 区分，同指纹去重）。
+ *  保存成功只清除「自己覆盖的恢复项」（落盘内容指纹与恢复快照一致）；同 uri
+ *  更新代内容落盘不得清除前代恢复快照 —— 前代内容仅存于恢复区，仍可恢复 */
 interface RecoveryRecord {
   snapshot: Project;
   fingerprint: string | null;
@@ -148,11 +149,12 @@ export class ProjectAutosaver {
   private broadcastEpoch = 0;
   /** 锁存错误（revision 冲突 / 恢复快照待处理）：编辑不得自行转 dirty 隐藏解决入口 */
   private latched: LatchedError | null = null;
-  /** 切换/关闭时保存失败被保留的旧项目快照（按 uri），重新打开时明示可恢复。
-   *  记录带内容指纹与创建代数（第二十三轮阻断 4）：保存成功只清除「自己覆盖
-   *  的恢复项」（指纹一致 —— 落盘内容就是该恢复快照）；同 uri 更新代内容落盘
-   *  不得清除前代恢复快照（前代内容仅存于恢复区，仍可恢复）。 */
-  private readonly recovery = new Map<string, RecoveryRecord>();
+  /** 切换/关闭时保存失败被保留的旧项目快照（按 uri → 按 generation 的多 fork），
+   *  重新打开时明示可恢复（第二十八轮阻断 2：同一 uri 多次保存失败各自入录
+   *  独立 fork，保存成功只清除「自己覆盖的恢复项」—— 指纹一致即落盘内容就是
+   *  该恢复快照；同 uri 更新代内容落盘不得清除前代恢复快照，前代内容仅存于
+   *  恢复区仍可恢复）。外层键存在性语义不变（has/get/delete 直接操作） */
+  private readonly recovery = new Map<string, Map<number, RecoveryRecord>>();
   /** 恢复记录创建代数：每次入录递增（记录审计/区分同 uri 先后入录） */
   private recoveryGeneration = 0;
   /** 每代 superseding drain 的一次性结果（第二十一轮阻断 3 + 第二十三轮严重 7）：
@@ -455,74 +457,84 @@ export class ProjectAutosaver {
         // 体执行时与保存 await 后都复验 —— 排队期间/保存挂起期间会话失效都
         // 返回 superseded，由 superseding drain 的结果定论
         const session = this.session;
-        // 第十八轮严重 3：入队任务执行时重读最新内容，不闭包调用时的旧快照 ——
-        // 慢 reconcile/在途保存占队期间 flush 捕获 rev1、等待中继续编辑到 rev2
-        // 时，重放 rev1 会以旧 revision 覆写较新记录触发假 revision-conflict
-        // （锁存后关闭/切换被错误阻断）；与 runSave 任务体一致地按绑定 uri
-        // 取 pending/编辑器最新快照保存，已净（runSave 已落盘最新内容）则直接成功
-        const result = await this.enqueue<FlushTaskResult>(async (): Promise<FlushTaskResult> => {
-          if (this.disposed) return { kind: 'done', outcome: { ok: true } };
-          if (!this.isFresh(uri, session)) {
-            // 排队期间会话失效（关闭/切换）——旧项目未保存内容已由 close/open
-            // 同步排入 superseding drain（drain 排在当前任务之后，任务体直接
-            // await 会自锁，故返回 superseded 由 flush() 等待链尾读取）
-            return { kind: 'superseded', saved: null, outcome: null };
+        // 第二十八轮阻断 3：入队时即登记该会话代的 drain waiter —— 新 drain
+        // 入队时（enqueueDrain 同步段）淘汰最旧且无 waiter 的 epoch 记录；若
+        // 等到 superseded 分支才 observe，慢保存 await 期间新入队 drain 可能
+        // 已把本代记录淘汰（waiter=0），flush 读不到真实失败、回落到基线比较
+        // 误报成功。记录可能尚不存在：仅计数（enqueueDrain 创建记录时计数
+        // 已 ≥1，淘汰循环跳过），try/finally 保证任何路径释放
+        this.drainWaiters.set(session, (this.drainWaiters.get(session) ?? 0) + 1);
+        try {
+          // 第十八轮严重 3：入队任务执行时重读最新内容，不闭包调用时的旧快照 ——
+          // 慢 reconcile/在途保存占队期间 flush 捕获 rev1、等待中继续编辑到 rev2
+          // 时，重放 rev1 会以旧 revision 覆写较新记录触发假 revision-conflict
+          // （锁存后关闭/切换被错误阻断）；与 runSave 任务体一致地按绑定 uri
+          // 取 pending/编辑器最新快照保存，已净（runSave 已落盘最新内容）则直接成功
+          const result = await this.enqueue<FlushTaskResult>(async (): Promise<FlushTaskResult> => {
+            if (this.disposed) return { kind: 'done', outcome: { ok: true } };
+            if (!this.isFresh(uri, session)) {
+              // 排队期间会话失效（关闭/切换）——旧项目未保存内容已由 close/open
+              // 同步排入 superseding drain（drain 排在当前任务之后，任务体直接
+              // await 会自锁，故返回 superseded 由 flush() 等待链尾读取）
+              return { kind: 'superseded', saved: null, outcome: null };
+            }
+            const latest = this.pending ?? this.editor.getProject();
+            if (!latest || latest.uri !== uri) return { kind: 'done', outcome: { ok: true } };
+            if (!this.isUnsaved(latest)) return { kind: 'done', outcome: { ok: true } };
+            const outcome = await this.saveSnapshot(latest);
+            // 第二十一轮阻断 2：保存 await 期间会话可能已失效（继续编辑后关闭/
+            // 切换）——该次保存的成功只代表旧内容落盘，rev2 由 superseding
+            // drain 承载，其结果才决定本轮成败；不得因 rev1 成功返回 done/ok
+            // （否则外层在「当前项目已净/为空」时误报成功，rev2 未落盘被放行）
+            if (!this.isFresh(uri, session)) return { kind: 'superseded', saved: latest, outcome };
+            return { kind: 'done', outcome };
+          });
+          if (result.kind === 'done') {
+            if (!result.outcome.ok) return result.outcome;
+            continue;
           }
-          const latest = this.pending ?? this.editor.getProject();
-          if (!latest || latest.uri !== uri) return { kind: 'done', outcome: { ok: true } };
-          if (!this.isUnsaved(latest)) return { kind: 'done', outcome: { ok: true } };
-          const outcome = await this.saveSnapshot(latest);
-          // 第二十一轮阻断 2：保存 await 期间会话可能已失效（继续编辑后关闭/
-          // 切换）——该次保存的成功只代表旧内容落盘，rev2 由 superseding
-          // drain 承载，其结果才决定本轮成败；不得因 rev1 成功返回 done/ok
-          // （否则外层在「当前项目已净/为空」时误报成功，rev2 未落盘被放行）
-          if (!this.isFresh(uri, session)) return { kind: 'superseded', saved: latest, outcome };
-          return { kind: 'done', outcome };
-        });
-        if (result.kind === 'done') {
-          if (!result.outcome.ok) return result.outcome;
-          continue;
-        }
-        // superseded：会话失效（关闭/切换）。等待链尾（含 superseding drain
-        // 执行）后读取该会话代的一次性结果传播 —— 失败如实返回，不得映射为成功。
-        // 已登记 waiter 共享同一 drain promise/结果（严重 7），无消费者后才清理
-        await this.chainTail;
-        const drained = this.observeDrain(session);
-        if (drained) {
-          const outcome = await drained;
-          this.releaseDrain(session);
-          return outcome;
-        }
-        // 无 drain 记录（绑定内容从未进入排空，如新项目打开后从未编辑、
-        // reconcile 未完成即重置）：以实际保存的 target 判定（严重 6）——
-        // 任务实际落盘的内容已推进基线则成功；保存失败如实返回；任务未保存
-        // 任何内容时回落到 flush 捕获的快照。恢复快照存在与否只影响提示文案
-        // （阻断 4 后遗留的恢复项可能与本轮目标内容不同，不影响放行判定）
-        if (result.outcome && !result.outcome.ok) return result.outcome;
-        const target = result.saved ?? project;
-        const baseline = this.committedByUri.get(uri);
-        const fp = contentFingerprint(target);
-        const persisted =
-          fp !== null &&
-          baseline !== undefined &&
-          baseline !== null &&
-          baseline.revision >= target.revision &&
-          baseline.fingerprint === fp;
-        if (!persisted) {
-          if (this.recovery.has(uri)) {
+          // superseded：会话失效（关闭/切换）。等待链尾（含 superseding drain
+          // 执行）后直读该会话代的一次性结果传播 —— 失败如实返回，不得映射为
+          // 成功。入队时已登记 waiter（记录保证存在，除非 resetTo 无 drain ——
+          // 回落到下方基线判定），已登记 waiter 共享同一 promise/结果
+          await this.chainTail;
+          const drained = this.drainOutcomeByEpoch.get(session);
+          if (drained) {
+            return await drained;
+          }
+          // 无 drain 记录（绑定内容从未进入排空，如新项目打开后从未编辑、
+          // reconcile 未完成即重置）：以实际保存的 target 判定（严重 6）——
+          // 任务实际落盘的内容已推进基线则成功；保存失败如实返回；任务未保存
+          // 任何内容时回落到 flush 捕获的快照。恢复快照存在与否只影响提示文案
+          // （阻断 4 后遗留的恢复项可能与本轮目标内容不同，不影响放行判定）
+          if (result.outcome && !result.outcome.ok) return result.outcome;
+          const target = result.saved ?? project;
+          const baseline = this.committedByUri.get(uri);
+          const fp = contentFingerprint(target);
+          const persisted =
+            fp !== null &&
+            baseline !== undefined &&
+            baseline !== null &&
+            baseline.revision >= target.revision &&
+            baseline.fingerprint === fp;
+          if (!persisted) {
+            if (this.recovery.has(uri)) {
+              return {
+                ok: false,
+                code: 'storage-error',
+                message: '项目未保存内容未能落盘（已保留为恢复快照），请重试',
+              };
+            }
             return {
               ok: false,
               code: 'storage-error',
-              message: '项目未保存内容未能落盘（已保留为恢复快照），请重试',
+              message: '项目未保存内容未能落盘且无恢复快照，请重试',
             };
           }
-          return {
-            ok: false,
-            code: 'storage-error',
-            message: '项目未保存内容未能落盘且无恢复快照，请重试',
-          };
+          return { ok: true };
+        } finally {
+          this.releaseDrain(session);
         }
-        return { ok: true };
       }
       // 无脏快照时仍等待在途保存（含首存）完成，复查后再放行：
       // 等待期间可能落败（下轮重试）或产生新编辑（下轮追平）
@@ -532,24 +544,30 @@ export class ProjectAutosaver {
       // 不得以「编辑器已空/净」假报成功（内容仅存恢复快照仍放行关闭）
       const boundSession = this.session;
       const boundUri = this.currentUri;
-      await this.chainTail;
-      if (boundUri !== null && !this.isFresh(boundUri, boundSession)) {
-        // 等待期间会话失效（关闭/切换/重置）：继续等待新链尾（含 superseding
-        // drain 执行），读取该会话代的共享 drain 结果传播 —— 失败如实返回
+      // 第二十八轮阻断 3：与脏分支同一时机注册 waiter（第一个 await 前）——
+      // 等待期间同栈编辑+关闭入队的 superseding drain 在本代记录被淘汰前已
+      // 被本计数保护（eviction 只淘汰 waiter=0 的记录）
+      this.drainWaiters.set(boundSession, (this.drainWaiters.get(boundSession) ?? 0) + 1);
+      try {
         await this.chainTail;
-        const drained = this.observeDrain(boundSession);
-        if (drained) {
-          const outcome = await drained;
-          this.releaseDrain(boundSession);
-          return outcome;
+        if (boundUri !== null && !this.isFresh(boundUri, boundSession)) {
+          // 等待期间会话失效（关闭/切换/重置）：继续等待新链尾（含 superseding
+          // drain 执行），直读该会话代的共享 drain 结果传播 —— 失败如实返回
+          await this.chainTail;
+          const drained = this.drainOutcomeByEpoch.get(boundSession);
+          if (drained) {
+            return await drained;
+          }
+          // 无 drain 记录（等待期间仅关闭/重置、未产生未保存内容）：flush 进入
+          // 该分支时内容已净（已提交基线覆盖），放行
+          return { ok: true };
         }
-        // 无 drain 记录（等待期间仅关闭/重置、未产生未保存内容）：flush 进入
-        // 该分支时内容已净（已提交基线覆盖），放行
-        return { ok: true };
-      }
-      const latest = this.pending ?? this.editor.getProject();
-      if (!latest || latest.uri !== boundUri || !this.isUnsaved(latest)) {
-        return { ok: true };
+        const latest = this.pending ?? this.editor.getProject();
+        if (!latest || latest.uri !== boundUri || !this.isUnsaved(latest)) {
+          return { ok: true };
+        }
+      } finally {
+        this.releaseDrain(boundSession);
       }
     }
     return {
@@ -559,9 +577,10 @@ export class ProjectAutosaver {
     };
   }
 
-  /** 恢复快照（切换/关闭时保存失败的旧项目内容；null = 无）。 */
+  /** 恢复快照（切换/关闭时保存失败的旧项目内容；null = 无）。多 fork 时返回
+   *  最新代（与 retryRecovery 同一决策）。 */
   getRecovery(uri: string): Project | null {
-    return this.recovery.get(uri)?.snapshot ?? null;
+    return this.latestRecoveryRecord(uri)?.snapshot ?? null;
   }
 
   /**
@@ -585,10 +604,14 @@ export class ProjectAutosaver {
    * 任一保存失败（含 revision 反转）都如实返回，快照与锁存按结果维护。
    */
   retryRecovery(uri: string): Promise<SaveOutcome> {
-    const snapshot = this.recovery.get(uri)?.snapshot ?? null;
-    if (!snapshot) {
+    // 第二十八轮严重 6：绑定具体 fork（generation）—— 执行前与每次保存 await
+    // 后复验该代记录仍在，绝不重试已失效（被清除/被更新代覆盖）的快照
+    const record = this.latestRecoveryRecord(uri);
+    if (!record) {
       return Promise.resolve({ ok: false, code: 'storage-error', message: '没有可重试的恢复快照' });
     }
+    const snapshot = record.snapshot;
+    const generation = record.generation;
     return this.enqueue(async () => {
       if (this.disposed) return { ok: false, code: 'storage-error', message: '自动保存已停用' };
       const session = this.session;
@@ -646,11 +669,25 @@ export class ProjectAutosaver {
         // 按原基线保存快照
         const result = await this.storeSave(snapshot, expected);
         if (result.ok) {
+          // 保存 await 期间该代恢复记录已被清除或更新：本次重试取消（磁盘已
+          // 推进无害 —— 内容真实落盘；不触碰 latch/恢复区，新 fork 可继续重试）
+          if (!this.hasRecoveryGeneration(uri, generation)) {
+            return { ok: false, code: 'revision-conflict', message: '恢复快照已被清除或更新，本次重试已取消' };
+          }
           advanceBaseline(snapshot, snapFp);
           if (!verifyNoChange(current)) return latchStale();
-          // 落盘的就是该恢复快照本身（指纹一致）→ 覆盖本恢复项
-          this.clearRecoveryWhenCovered(uri, snapFp);
-          if (current) {
+          // 落盘的就是该恢复快照本身 → 只清除本代 fork（第二十八轮阻断 2：
+          // 同 uri 其他 fork 保留）
+          this.clearRecoveryGeneration(uri, generation);
+          if (this.recovery.has(uri)) {
+            // 同 uri 其他 fork 仍在恢复区：锁存 recovery-available，不
+            // switchOpen —— switchOpen 的 resetTo 会清空整个 uri 的恢复项，
+            // 其他 fork 内容仍可恢复
+            const message =
+              '该项目存在未保存的恢复快照（上次保存失败）。可「另存副本」保留未保存内容，或「重试保存」';
+            this.latched = { uri, code: 'recovery-available', message };
+            if (uri === this.currentUri) this.emit({ status: 'error', code: 'recovery-available', message });
+          } else if (current) {
             // 复验通过：原子切换到恢复快照（autosaver 重置 + 编辑器提交不广播，
             // 完成后由 changed() 链广播一次），与已落盘内容对齐
             this.switchOpen(snapshot);
@@ -665,11 +702,21 @@ export class ProjectAutosaver {
         // revision 反转时保存失败如实返回，快照保留不删除 —— 不假成功）
         const result = await this.storeSave(current!, expected);
         if (result.ok) {
+          // 第二十八轮严重 6：保存 await 期间该代恢复记录已被清除/更新 → 取消
+          if (!this.hasRecoveryGeneration(uri, generation)) {
+            return { ok: false, code: 'revision-conflict', message: '恢复快照已被清除或更新，本次重试已取消' };
+          }
           advanceBaseline(current!, contentFingerprint(current!));
           if (!verifyNoChange(current!)) return latchStale();
-          // 快照内容 == 已提交基线内容（快照未带来新内容，已落盘）→ 恢复项被覆盖
-          this.clearRecoveryWhenCovered(uri, baseFp ?? null);
-          if (uri === this.currentUri) {
+          // 快照内容 == 已提交基线内容（快照未带来新内容，已落盘）→ 只清除本代
+          this.clearRecoveryGeneration(uri, generation);
+          if (this.recovery.has(uri)) {
+            // 同 uri 其他 fork 仍在恢复区：锁存 recovery-available，不报 clean
+            const message =
+              '该项目存在未保存的恢复快照（上次保存失败）。可「另存副本」保留未保存内容，或「重试保存」';
+            this.latched = { uri, code: 'recovery-available', message };
+            if (uri === this.currentUri) this.emit({ status: 'error', code: 'recovery-available', message });
+          } else if (uri === this.currentUri) {
             this.emit(this.store ? { status: 'clean' } : { status: 'memory' });
           }
         } else if (result.code === 'revision-conflict') {
@@ -693,18 +740,61 @@ export class ProjectAutosaver {
     });
   }
 
+  /** 最新代恢复 fork（第二十八轮阻断 2：同一 uri 多 fork 时以最新代为准）。 */
+  private latestRecoveryRecord(uri: string): RecoveryRecord | null {
+    const forks = this.recovery.get(uri);
+    if (!forks || forks.size === 0) return null;
+    let latest: RecoveryRecord | null = null;
+    for (const record of forks.values()) {
+      if (!latest || record.generation > latest.generation) latest = record;
+    }
+    return latest;
+  }
+
+  private hasRecoveryGeneration(uri: string, generation: number): boolean {
+    return this.recovery.get(uri)?.has(generation) ?? false;
+  }
+
+  /** 清除指定代恢复 fork；该 uri 无剩余 fork 时删除外层键。 */
+  private clearRecoveryGeneration(uri: string, generation: number): void {
+    const forks = this.recovery.get(uri);
+    if (!forks) return;
+    forks.delete(generation);
+    if (forks.size === 0) this.recovery.delete(uri);
+  }
+
+  /** 入录恢复 fork（第二十八轮阻断 2）：同指纹去重（同内容多次保存失败只保留
+   *  一个 fork，防无界增长），每次入录分配新代数 */
+  private recordRecovery(uri: string, snapshot: Project, fp: string | null): void {
+    let forks = this.recovery.get(uri);
+    if (!forks) {
+      forks = new Map();
+      this.recovery.set(uri, forks);
+    }
+    if (fp !== null) {
+      for (const [generation, record] of forks) {
+        if (record.fingerprint === fp) forks.delete(generation);
+      }
+    }
+    const generation = ++this.recoveryGeneration;
+    forks.set(generation, { snapshot, fingerprint: fp, generation });
+  }
+
   /**
-   * 保存成功后的恢复项清除（第二十三轮阻断 4）：只清除「该恢复项覆盖的内容」——
-   * 落盘内容指纹与恢复快照一致（落盘的就是该恢复内容）。同 uri 更新代内容落盘
-   * 不得清除前代恢复快照（前代内容仅存于恢复区，仍可恢复）；指纹不可比（null，
-   * 内容不可编码）时保守不清除 —— 不可编码内容不可能被 store 接受，保留即正确。
+   * 保存成功后的恢复项清除（第二十三轮阻断 4 + 第二十八轮阻断 2）：只清除
+   * 「该恢复项覆盖的内容」—— 落盘内容指纹与恢复快照一致（落盘的就是该恢复
+   * 内容），全部匹配 fork 一并清除；同 uri 更新代内容落盘不得清除前代恢复快照
+   * （前代内容仅存于恢复区，仍可恢复）；指纹不可比（null，内容不可编码）时
+   * 保守不清除 —— 不可编码内容不可能被 store 接受，保留即正确。
    */
   private clearRecoveryWhenCovered(uri: string, savedFp: string | null): void {
     if (savedFp === null) return;
-    const entry = this.recovery.get(uri);
-    if (entry && entry.fingerprint === savedFp) {
-      this.recovery.delete(uri);
+    const forks = this.recovery.get(uri);
+    if (!forks) return;
+    for (const [generation, record] of forks) {
+      if (record.fingerprint === savedFp) forks.delete(generation);
     }
+    if (forks.size === 0) this.recovery.delete(uri);
   }
 
   /**
@@ -721,11 +811,15 @@ export class ProjectAutosaver {
     }
   }
 
-  async dispose(): Promise<void> {
-    if (this.disposed) return;
+  async dispose(): Promise<SaveOutcome> {
+    if (this.disposed) return { ok: true };
     this.cancelTimer();
-    // 先冲刷（flush 需在 disposed 置位前读取编辑器项目），再移除监听
-    await this.flush();
+    // 第二十八轮阻断 4：冲刷失败如实返回 —— 失败后不得继续置 disposed/移除
+    // 监听/清 stateListeners，调用方（ProjectPersistence/StudioRuntime）据此
+    // 保留编辑器与存储供重试，绝不「假装已关闭」丢弃未落盘内容。先冲刷
+    // （flush 需在 disposed 置位前读取编辑器项目），再移除监听
+    const outcome = await this.flush();
+    if (!outcome.ok) return outcome;
     this.disposed = true;
     if (typeof window !== 'undefined') {
       window.removeEventListener('pagehide', this.handlePageHide);
@@ -734,6 +828,7 @@ export class ProjectAutosaver {
       document.removeEventListener('visibilitychange', this.handleVisibility);
     }
     this.stateListeners.clear();
+    return { ok: true };
   }
 
   private readonly handlePageHide = () => {
@@ -833,10 +928,13 @@ export class ProjectAutosaver {
 
   /**
    * 旧项目的排空：执行时以该 uri 的已提交基线做 CAS（在途结果已推进基线，不会冲突）。
-   * 成功推进基线并清除该 uri 的恢复快照；失败把快照保留为恢复快照（内容不丢），
+   * 成功推进基线并清除「落盘内容覆盖的」恢复 fork；失败把快照入录为恢复 fork
+   * （内容不丢，第二十八轮阻断 2：同指纹去重、按 generation 保留多代），
    * 不污染当前项目状态。结果（含失败）记录为该排空服务会话代的一次性结果
    * （drainOutcomeByEpoch，第二十一轮阻断 3）：同 uri 多代 drain 各占独立键，
    * 后代成功不覆盖前代失败；由绑定同一会话代的 flush 读取后消费（删除）。
+   * 淘汰循环只淘汰最旧且无 waiter 的记录 —— 绑定该代的 flush 在入队时已登记
+   * waiter（第二十八轮阻断 3），慢保存期间新 drain 入队不会淘汰其记录。
    */
   private enqueueDrain(uri: string, snapshot: Project, epoch: number): void {
     if (!this.store) return;
@@ -855,11 +953,8 @@ export class ProjectAutosaver {
         // （内容不同）保留 —— 前代内容从未落盘，仍可恢复（第二十三轮阻断 4）
         this.clearRecoveryWhenCovered(uri, fp);
       } else {
-        this.recovery.set(uri, {
-          snapshot,
-          fingerprint: fp,
-          generation: ++this.recoveryGeneration,
-        });
+        // 第二十八轮阻断 2：按 fork 入录（同指纹去重，防同内容多次失败无界增长）
+        this.recordRecovery(uri, snapshot, fp);
       }
       return result;
     });
@@ -962,6 +1057,9 @@ export class ProjectAutosaver {
    * 保存结果回写：任何成功都推进该 uri 的已提交基线并清除其恢复快照（含旧会话：
    * 在途保存→继续编辑→切换 的落盘结果必须推进旧 uri 基线，后续排空才不会冲突）；
    * 状态广播仅当结果属于当前会话（{ uri, session } 绑定），过期结果不污染新状态。
+   * 第二十八轮严重 5：该 uri 仍有恢复 fork（同 uri 其他代内容仅存恢复区）时，
+   * 成功保存也不清 latch、不发 clean —— 以 recovery-available 锁存呈现解决入口，
+   * 绝不假报「已保存」让旧 fork 沉没。
    * suppressErrorEmit（runSave 延迟广播专用，第十三轮严重 #4）：配额/存储错误
    * 的广播由 runSave 在 saveInFlight 清零之后发出。
    */
@@ -976,6 +1074,19 @@ export class ProjectAutosaver {
       // 只清除「落盘内容就是该恢复快照」的恢复项（第二十三轮阻断 4）：同 uri
       // 更新代内容（A2）落盘不得清除前代（A1）恢复快照 —— A1 内容仅存于恢复区
       this.clearRecoveryWhenCovered(project.uri, fp);
+      // 仍有恢复 fork：不清 latch、不发 clean，以 recovery-available 呈现
+      if (this.recovery.has(project.uri)) {
+        const message =
+          '该项目存在未保存的恢复快照（上次保存失败）。可「另存副本」保留未保存内容，或「重试保存」';
+        if (this.latched?.uri !== project.uri || this.latched.code !== 'recovery-available') {
+          this.latched = { uri: project.uri, code: 'recovery-available', message };
+        }
+        if (this.isFresh(project.uri, session)) {
+          if (this.pending === project) this.pending = null;
+          this.emit({ status: 'error', code: 'recovery-available', message });
+        }
+        return;
+      }
       if (this.latched?.uri === project.uri) this.latched = null;
       if (!this.isFresh(project.uri, session)) return;
       if (this.pending === project) this.pending = null;

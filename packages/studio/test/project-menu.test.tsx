@@ -50,11 +50,22 @@ function renderStudio() {
 }
 
 afterEach(async () => {
+  // 先捕获 store 引用：卸载后 React 会清空对象 ref（handle.current = null），
+  // 届时无法再读取运行时 —— 泄漏的连接必须提前抓取
+  const stores = mountPoints.map(
+    (point) =>
+      (point.handle.current?.runtime?.persistence as unknown as { store: ProjectStorage | null } | undefined)?.store ??
+      null,
+  );
   // 卸载后延迟执行的 dispose 会关闭 IndexedDB 连接：等它完成再删库，
   // 否则挂起的 deleteDatabase 会无限阻塞后续测试的 open（fake-indexeddb 与真实浏览器一致）
   for (const point of mountPoints) point.unmount();
-  mountPoints.length = 0;
+  // 第二十八轮阻断 4：dispose 冲刷失败（未保存内容/锁存冲突）时不 teardown ——
+  // 连接保留供调用方重试；测试隔离要求删库前强制释放，否则挂起的
+  // deleteDatabase 永久排队、阻塞后续测试的 open（级联超时）
   await new Promise((r) => setTimeout(r, 30));
+  for (const store of stores) store?.close();
+  mountPoints.length = 0;
   await ProjectStore.drop(DB);
 });
 
