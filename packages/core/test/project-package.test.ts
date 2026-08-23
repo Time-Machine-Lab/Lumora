@@ -342,7 +342,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(credentialJson, '其他实例声明不受影响').toContain('a-theme');
   });
 
-  it('无损往返性质：非凭据键显式 allowlist 放行时导出→导入逐键一致；凭据形态键声明拒绝（第十一轮严重 #2 + 第十三轮 + 第十五轮阻断 1）', async () => {
+  it('无损往返性质：非凭据键显式 allowlist 放行时导出→导入逐键一致；凭据形态键声明拒绝（第十一轮严重 #2 + 第十三轮 + 第十五轮阻断 1 + 第十七轮阻断 1）', async () => {
     const project = await buildFixtureProject();
     const pluginData = {
       'com.example': {
@@ -371,9 +371,10 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     if (!emptyParsed.ok) return;
     expect(emptyParsed.project.pluginData).toBeUndefined();
     // 显式 allowlist（宿主核验过的全部键）：非凭据键逐键无损往返，值不被改动；
-    // 凭据形态键（passwd/authHeader/TOKENIZERCONFIG/tokenizerConfigModel/
-    // tokenizerModel 含 passwd/auth/token 形态子串）声明逐条拒绝 —— allowlist
-    // 放行不豁免凭据形态（第十五轮阻断 1）
+    // 凭据形态键（pass_word/passwd/authHeader 含 pass/passwd/auth 分词）声明
+    // 逐条拒绝 —— allowlist 放行不豁免凭据形态（第十五轮阻断 1）；完整词
+    // 匹配下 tokenizer*/keyboard* 等合法键（旧子串检测误剥）正常往返
+    // （第十七轮阻断 1/严重 2）
     const pkg = buildProjectPackage({ ...project, pluginData }, {
       includePrivate: true,
       publicKeysByPlugin: { 'com.example': Object.keys(pluginData['com.example']) },
@@ -382,10 +383,114 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     const expected = { ...pluginData['com.example'] };
-    for (const credentialKey of ['passwd', 'authHeader', 'TOKENIZERCONFIG', 'tokenizerConfigModel', 'tokenizerModel'] as const) {
+    for (const credentialKey of ['pass_word', 'passwd', 'authHeader'] as const) {
       delete expected[credentialKey];
     }
     expect(parsed.project.pluginData).toEqual({ 'com.example': expected });
+  });
+
+  it('凭据形态判定为完整词匹配：分隔符/camelCase 组合词顶层与嵌套路径一律拒绝，含 token/auth 子串的合法键放行（第十七轮阻断 1/严重 2 回归）', async () => {
+    const project = await buildFixtureProject();
+    const pluginData = {
+      'com.example': {
+        // 拒绝组：snake/kebab/dot/plain 分隔符组合词与 camelCase 组合词
+        api_key: 'leak-1',
+        pass_word: 'leak-2',
+        private_key: 'leak-3',
+        'api.key': 'leak-4',
+        'pass-word': 'leak-5',
+        apiKey: 'leak-6',
+        password: 'leak-7',
+        passwd: 'leak-8',
+        api: 'leak-9',
+        credentials: 'leak-10',
+        accessToken: 'leak-11',
+        clientSecret: 'leak-12',
+        authHeader: 'leak-13',
+        auth: 'leak-14',
+        // privateSettings 显式拒绝语义保留（'private' 分词命中）
+        privateSettings: 'leak-15',
+        // 放行组：完整词包含 token/auth 的合法键（旧子串匹配误剥）
+        tokenizerConfig: 'keep-1',
+        tokenizerModel: 'keep-2',
+        authorName: 'keep-3',
+        authorizationMode: 'keep-4',
+        tokenizerConfigModel: 'keep-5',
+        keyboardLayout: 'keep-6',
+        MONKEYPATCH: 'keep-7',
+        HOTKEYMAP: 'keep-8',
+      },
+    };
+    const pkg = buildProjectPackage({ ...project, pluginData }, {
+      includePrivate: true,
+      publicKeysByPlugin: { 'com.example': Object.keys(pluginData['com.example']) },
+    });
+    const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, Record<string, string>>)['com.example'];
+    expect(plugin.tokenizerConfig).toBe('keep-1');
+    expect(plugin.tokenizerModel).toBe('keep-2');
+    expect(plugin.authorName).toBe('keep-3');
+    expect(plugin.authorizationMode).toBe('keep-4');
+    expect(plugin.tokenizerConfigModel).toBe('keep-5');
+    expect(plugin.keyboardLayout).toBe('keep-6');
+    expect(plugin.MONKEYPATCH).toBe('keep-7');
+    expect(plugin.HOTKEYMAP).toBe('keep-8');
+    const json = JSON.stringify(parsed.project);
+    for (let i = 1; i <= 15; i += 1) expect(json).not.toContain(`leak-${i}`);
+    for (let i = 1; i <= 8; i += 1) expect(json).toContain(`keep-${i}`);
+    // 嵌套路径声明同判据：路径任意层命中凭据词整条声明拒绝；合法组合词路径放行
+    const nestedPkg = buildProjectPackage(
+      {
+        ...project,
+        pluginData: {
+          'com.example': {
+            profile: {
+              username: 'alice',
+              api_key: 'n-1',
+              pass_word: 'n-2',
+              'api.key': 'n-3',
+              'pass-word': 'n-4',
+              private_key: 'n-5',
+              apiKey: 'n-6',
+              tokenizerConfig: 'n-ok-1',
+              authorName: 'n-ok-2',
+              authorizationMode: 'n-ok-3',
+            },
+          },
+        },
+      },
+      {
+        includePrivate: true,
+        publicKeysByPlugin: {
+          'com.example': [
+            ['profile', 'username'],
+            ['profile', 'api_key'],
+            ['profile', 'pass_word'],
+            ['profile', 'api.key'],
+            ['profile', 'pass-word'],
+            ['profile', 'private_key'],
+            ['profile', 'apiKey'],
+            ['profile', 'tokenizerConfig'],
+            ['profile', 'authorName'],
+            ['profile', 'authorizationMode'],
+          ],
+        },
+      },
+    );
+    const nestedParsed = await parseProjectPackage(serializeProjectPackage(nestedPkg));
+    expect(nestedParsed.ok).toBe(true);
+    if (!nestedParsed.ok) return;
+    const nested = (nestedParsed.project.pluginData as Record<string, { profile: Record<string, string> }>)['com.example'];
+    expect(nested).toEqual({
+      profile: {
+        username: 'alice',
+        tokenizerConfig: 'n-ok-1',
+        authorName: 'n-ok-2',
+        authorizationMode: 'n-ok-3',
+      },
+    });
   });
 
   it('未知顶层字段不进入工程包（公开字段白名单）；tracks 属公开数据随包携带', async () => {
@@ -417,7 +522,14 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     const pkg = buildProjectPackage(rich, {
       includePrivate: true,
       publicKeysByPlugin: {
-        'com.example': ['keyboardLayout', 'monkeyPatch', 'apiKey', 'accessToken', 'clientSecret'],
+        'com.example': [
+          'keyboardLayout',
+          'monkeyPatch',
+          'tokenizerConfig',
+          'apiKey',
+          'accessToken',
+          'clientSecret',
+        ],
       },
     });
     const text = serializeProjectPackage(pkg);
@@ -430,9 +542,10 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(plugin.monkeyPatch).toBe('off');
     expect(plugin.hotkeyMap).toBeUndefined();
     expect(plugin.shortcutKey).toBeUndefined();
-    // 凭据形态键声明（apiKey/accessToken/clientSecret 含 apikey/token/secret、
-    // tokenizerConfig 含 token 形态子串）逐条拒绝，值绝不进包（第十五轮阻断 1）
-    expect(plugin.tokenizerConfig).toBeUndefined();
+    // 完整词匹配（第十七轮阻断 1/严重 2）：tokenizerConfig 是合法键（含 token
+    // 子串但不构成凭据词），声明即放行；apiKey/accessToken/clientSecret 分词
+    // 命中 api/token/secret，声明逐条拒绝，值绝不进包（第十五轮阻断 1）
+    expect(plugin.tokenizerConfig).toBe('cl100k-base');
     expect(plugin.apiKey).toBeUndefined();
     expect(plugin.accessToken).toBeUndefined();
     expect(plugin.clientSecret).toBeUndefined();
@@ -440,7 +553,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(json).not.toContain('sk-leak-1');
     expect(json).not.toContain('tok-leak-2');
     expect(json).not.toContain('client-secret-3');
-    expect(json).not.toContain('cl100k-base');
+    expect(json).toContain('cl100k-base');
     expect(json).toContain('kb-intl');
   });
 });
@@ -627,12 +740,17 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
     // trie 归一：祖先声明（profile）覆盖冗余后代路径声明，与声明顺序无关 ——
     // 旧 merge 实现会原地改写投影中的源引用，冻结项目下先祖先后路径的顺序抛
     // TypeError，反序成功、结果互异；纯函数投影下两种顺序都不抛错且结果一致
+    // 两次构建注入同一 exportedAt（第十七轮一般 5）：manifest 导出时刻取当前
+    // 毫秒，不注入时两次构建的完整包 JSON 因毫秒差异偶发不相等（聚焦复跑 flaky）
+    const fixedExportedAt = '2026-01-01T00:00:00.000Z';
     const order1 = buildProjectPackage(frozen, {
       includePrivate: true,
+      exportedAt: fixedExportedAt,
       publicKeysByPlugin: { 'com.example': ['profile', ['profile', 'username']] },
     });
     const order2 = buildProjectPackage(frozen, {
       includePrivate: true,
+      exportedAt: fixedExportedAt,
       publicKeysByPlugin: { 'com.example': [['profile', 'username'], 'profile'] },
     });
     expect(order1.project.pluginData).toBeUndefined();

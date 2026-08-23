@@ -3,8 +3,19 @@ import { createBlankProject, migrateProjectSchema } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import { OpfsProjectStore, projectFileName } from '../src/persistence/project-store-opfs';
 import { MemDirectoryHandle, MemFileHandle, stubOpfsNavigator } from './opfs-fs-shim';
+import type { ProjectStorage, ProjectSummary } from '../src/persistence/project-storage';
 
 const DB = 'lumora-test-opfs';
+/** 便捷读取/列表（第十七轮严重 4：list/load 收口为类型化结果后直接取数据字段） */
+async function loadStored(store: ProjectStorage, uri: string): Promise<Project | null> {
+  const result = await store.load(uri);
+  return result.ok ? result.project : null;
+}
+
+async function listStored(store: ProjectStorage): Promise<ProjectSummary[]> {
+  const result = await store.list();
+  return result.ok ? result.items : [];
+}
 
 function project(uri: string, name: string, revision: number) {
   return { ...createBlankProject(uri, name), revision };
@@ -32,11 +43,11 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     const reopened = await OpfsProjectStore.create(DB);
     expect(reopened).not.toBeNull();
     if (!reopened) return;
-    const loaded = await reopened.load('lumora://project/a');
+    const loaded = await loadStored(reopened, 'lumora://project/a');
     expect(loaded).toEqual(saved);
     // load 返回可自由修改的副本，不得影响存储中的记录
     loaded!.name = '被调用方修改';
-    expect((await reopened.load('lumora://project/a'))!.name).toBe('持久化项目');
+    expect((await loadStored(reopened, 'lumora://project/a'))!.name).toBe('持久化项目');
     reopened.close();
   });
 
@@ -46,7 +57,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     await store.save(project('lumora://project/old', '旧项目', 1));
     await new Promise((r) => setTimeout(r, 5));
     await store.save(project('lumora://project/new', '新项目', 2));
-    const summaries = await store.list();
+    const summaries = await listStored(store);
     expect(summaries.map((s) => s.uri)).toEqual(['lumora://project/new', 'lumora://project/old']);
     expect(summaries[0]).toMatchObject({ name: '新项目', revision: 2, schemaVersion: 3 });
     store.close();
@@ -67,7 +78,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     expect(result.message).toContain('5');
 
     // 存储内容未被旧数据覆盖（名称仍是较新的保存内容）
-    expect((await store.load('lumora://project/a'))!.name).toBe('较新');
+    expect((await loadStored(store, 'lumora://project/a'))!.name).toBe('较新');
     store.close();
   });
 
@@ -85,12 +96,12 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     expect(result.ok).toBe(false);
     if (result.ok || result.code !== 'revision-conflict') return;
     expect(result.storedRevision).toBe(5);
-    expect((await store.load('lumora://project/a'))!.name).toBe('较新');
+    expect((await loadStored(store, 'lumora://project/a'))!.name).toBe('较新');
 
     // 期望基线匹配（= 已存 5）时允许写入
     const fresh = project('lumora://project/a', '新内容', 6);
     expect((await store.save(fresh, 5)).ok).toBe(true);
-    expect((await store.load('lumora://project/a'))!.name).toBe('新内容');
+    expect((await loadStored(store, 'lumora://project/a'))!.name).toBe('新内容');
     store.close();
   });
 
@@ -104,7 +115,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     const result = await store.save(second, null);
     expect(result.ok).toBe(false);
     if (result.ok || result.code !== 'revision-conflict') return;
-    expect((await store.load('lumora://project/a'))!.name).toBe('首个');
+    expect((await loadStored(store, 'lumora://project/a'))!.name).toBe('首个');
     store.close();
   });
 
@@ -117,7 +128,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     // 期望基线 = 已存 7 → 匹配；内容逐字节一致（自动保存抖动重发同一内容）→ 允许重存
     const jitter = { ...same };
     expect((await store.save(jitter, 7)).ok).toBe(true);
-    expect((await store.load('lumora://project/a'))!.name).toBe('同名');
+    expect((await loadStored(store, 'lumora://project/a'))!.name).toBe('同名');
     store.close();
   });
 
@@ -132,7 +143,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     expect(result.ok).toBe(false);
     if (result.ok || result.code !== 'revision-conflict') return;
     expect(result.storedRevision).toBe(7);
-    expect((await store.load('lumora://project/a'))!.name).toBe('分叉前');
+    expect((await loadStored(store, 'lumora://project/a'))!.name).toBe('分叉前');
     store.close();
   });
 
@@ -140,9 +151,9 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     const store = await OpfsProjectStore.create(DB);
     if (!store) return;
     await store.save(project('lumora://project/a', '待删除', 1));
-    expect(await store.remove('lumora://project/a')).toBe(true);
-    expect(await store.load('lumora://project/a')).toBeNull();
-    expect(await store.remove('lumora://project/a')).toBe(false);
+    expect(await store.remove('lumora://project/a')).toEqual({ ok: true, removed: true });
+    expect(await loadStored(store, 'lumora://project/a')).toBeNull();
+    expect(await store.remove('lumora://project/a')).toEqual({ ok: true, removed: false });
     store.close();
   });
 
@@ -152,7 +163,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     await store.save(project('lumora://project/a', '原名', 1));
     const result = await store.rename('lumora://project/a', '新名');
     expect(result.ok).toBe(true);
-    const loaded = await store.load('lumora://project/a');
+    const loaded = await loadStored(store, 'lumora://project/a');
     expect(loaded!.name).toBe('新名');
     // 重命名也是一次变更：revision 递增
     expect(loaded!.revision).toBe(2);
@@ -174,11 +185,11 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     expect(result.summary.uri).not.toBe('lumora://project/a');
     expect(result.summary.name).toBe('源项目 副本');
     expect(result.summary.revision).toBe(0);
-    const copy = await store.load(result.summary.uri);
+    const copy = await loadStored(store, result.summary.uri);
     expect(copy).not.toBeNull();
     expect(copy!.name).toBe('源项目 副本');
     expect(copy!.revision).toBe(0);
-    expect((await store.list()).map((s) => s.uri).sort()).toEqual(['lumora://project/a', result.summary.uri]);
+    expect((await listStored(store)).map((s) => s.uri).sort()).toEqual(['lumora://project/a', result.summary.uri]);
     store.close();
   });
 
@@ -206,12 +217,12 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     expect(result.ok).toBe(false);
     if (result.ok || result.code !== 'revision-conflict') return;
     expect(result.storedRevision).toBe(5);
-    expect((await storeA.load('lumora://project/a'))!.name).toBe('A 的较新内容');
+    expect((await loadStored(storeA, 'lumora://project/a'))!.name).toBe('A 的较新内容');
 
     // B 重新打开（读到 rev5）后以新基线保存成功
     const fresh = project('lumora://project/a', 'B 基于较新内容', 6);
     expect((await storeB.save(fresh, 5)).ok).toBe(true);
-    expect((await storeA.load('lumora://project/a'))!.name).toBe('B 基于较新内容');
+    expect((await loadStored(storeA, 'lumora://project/a'))!.name).toBe('B 基于较新内容');
     storeA.close();
     storeB.close();
   });
@@ -225,15 +236,15 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     const projectsDir = await rootDir.getDirectoryHandle('projects');
     await projectsDir.getFileHandle(projectFileName('lumora://project/broken'), { create: true });
 
-    expect(await store.load('lumora://project/broken')).toBeNull();
+    expect(await loadStored(store, 'lumora://project/broken')).toBeNull();
     // 创建语义与 CAS 都拒绝覆盖损坏记录
     const result = await store.save(project('lumora://project/broken', '试图覆盖', 1), null);
     expect(result.ok).toBe(false);
     if (result.ok || result.code !== 'storage-error') return;
     expect(result.message).toContain('损坏');
     // remove 删除损坏文件（用户修复路径）
-    expect(await store.remove('lumora://project/broken')).toBe(true);
-    expect((await store.list()).map((s) => s.uri)).toEqual([]);
+    expect(await store.remove('lumora://project/broken')).toEqual({ ok: true, removed: true });
+    expect((await listStored(store)).map((s) => s.uri)).toEqual([]);
     store.close();
   });
 
@@ -260,15 +271,15 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     );
     await writable2.close();
 
-    expect(await store.load('lumora://project/incomplete')).toBeNull();
-    expect(await store.load('lumora://project/mismatch')).toBeNull();
+    expect(await loadStored(store, 'lumora://project/incomplete')).toBeNull();
+    expect(await loadStored(store, 'lumora://project/mismatch')).toBeNull();
     // list 跳过结构损坏记录，不把半写数据当项目
-    expect((await store.list()).map((s) => s.uri)).toEqual([]);
+    expect((await listStored(store)).map((s) => s.uri)).toEqual([]);
     const result = await store.save(project('lumora://project/incomplete', '试图覆盖', 1), null);
     expect(result.ok).toBe(false);
     if (result.ok || result.code !== 'storage-error') return;
     expect(result.message).toContain('损坏');
-    expect(await store.remove('lumora://project/incomplete')).toBe(true);
+    expect(await store.remove('lumora://project/incomplete')).toEqual({ ok: true, removed: true });
     store.close();
   });
 
@@ -281,7 +292,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     expect(resultUndefined).toMatchObject({ ok: false, code: 'storage-error' });
     if (resultUndefined.ok || resultUndefined.code !== 'storage-error') return;
     expect(resultUndefined.message).toContain('undefined');
-    expect(await store.load('lumora://project/a')).toBeNull();
+    expect(await loadStored(store, 'lumora://project/a')).toBeNull();
 
     const badNaN = project('lumora://project/b', '非有限数值', 1);
     badNaN.settings = { ...badNaN.settings, fps: NaN };
@@ -355,10 +366,10 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
 
     const saved = project('lumora://project/a', '降级保存', 3);
     expect((await store.save(saved)).ok).toBe(true);
-    expect((await store.load('lumora://project/a'))).toEqual(saved);
+    expect((await loadStored(store, 'lumora://project/a'))).toEqual(saved);
     // 覆盖写入（CAS 通过）也走降级路径
     expect((await store.save(project('lumora://project/a', '降级更新', 4), 3)).ok).toBe(true);
-    expect((await store.load('lumora://project/a'))!.name).toBe('降级更新');
+    expect((await loadStored(store, 'lumora://project/a'))!.name).toBe('降级更新');
     store.close();
   });
 
@@ -420,9 +431,9 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
 
     const saved = project('lumora://project/a', '降级保存', 3);
     expect((await store.save(saved)).ok).toBe(true);
-    expect((await store.load('lumora://project/a'))).toEqual(saved);
+    expect((await loadStored(store, 'lumora://project/a'))).toEqual(saved);
     expect((await store.save(project('lumora://project/a', '降级更新', 4), 3)).ok).toBe(true);
-    expect((await store.load('lumora://project/a'))!.name).toBe('降级更新');
+    expect((await loadStored(store, 'lumora://project/a'))!.name).toBe('降级更新');
     // 仅对明确能力错误降级后不留 .tmp
     const rootDir = await root.getDirectoryHandle(DB);
     const projectsDir = await rootDir.getDirectoryHandle('projects');
@@ -460,10 +471,10 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     };
     await writeFile('lumora://project/orphan', orphan);
 
-    expect(await store.load('lumora://project/missing-sections')).toBeNull();
-    expect(await store.load('lumora://project/orphan')).toBeNull();
+    expect(await loadStored(store, 'lumora://project/missing-sections')).toBeNull();
+    expect(await loadStored(store, 'lumora://project/orphan')).toBeNull();
     // 最近列表不出现损坏记录
-    expect((await store.list()).map((s) => s.uri)).toEqual([]);
+    expect((await listStored(store)).map((s) => s.uri)).toEqual([]);
     // rename/duplicate 不得传播损坏内容
     expect(await store.rename('lumora://project/missing-sections', '改名')).toMatchObject({
       ok: false,
@@ -492,13 +503,13 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     await writable.close();
 
     // 不做猜测校验、不折叠：raw 原样返回（facade 的 migrate 失败自然给出升级提示）
-    const loaded = await store.load('lumora://project/future');
+    const loaded = await loadStored(store, 'lumora://project/future');
     expect(loaded).not.toBeNull();
     expect(loaded!.schemaVersion).toBe(99);
     expect(loaded!.name).toBe('合法项目');
     expect(loaded!.revision).toBe(3);
     // 最近列表同样呈现（list 不因版本折叠未来记录）
-    expect((await store.list()).map((s) => s.uri)).toEqual(['lumora://project/future']);
+    expect((await listStored(store)).map((s) => s.uri)).toEqual(['lumora://project/future']);
     store.close();
   });
 
@@ -518,7 +529,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     const v2: Record<string, unknown> = { ...v3, schemaVersion: 2 };
     delete v2.tracks; // v2 无 tracks 字段
     await writeFile('lumora://project/v2', v2);
-    const loaded = await store.load('lumora://project/v2');
+    const loaded = await loadStored(store, 'lumora://project/v2');
     expect(loaded).not.toBeNull();
     // raw/source schema 保留：适配器层不提前迁移（否则迁移写回与 migratedFrom 丢失）
     expect(loaded!.schemaVersion).toBe(2);
@@ -532,7 +543,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
       schemaVersion: 2,
       revision: 0,
     });
-    expect(await store.load('lumora://project/v2bad')).toBeNull();
+    expect(await loadStored(store, 'lumora://project/v2bad')).toBeNull();
     store.close();
   });
 
@@ -562,14 +573,14 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     const forked = await store.save(divergent, 7);
     expect(forked.ok).toBe(false);
     if (forked.ok || forked.code !== 'revision-conflict') return;
-    expect((await store.load('lumora://project/a'))!.schemaVersion).toBe(2);
+    expect((await loadStored(store, 'lumora://project/a'))!.schemaVersion).toBe(2);
 
     // 精确迁移结果（migrateProjectSchema(baseline)）：放行（facade loadProject 的迁移写回）
     const migrated = migrateProjectSchema(baseline);
     expect(migrated.ok).toBe(true);
     if (!migrated.ok) return;
     expect((await store.save(migrated.project as Project, 7)).ok).toBe(true);
-    const stored = await store.load('lumora://project/a');
+    const stored = await loadStored(store, 'lumora://project/a');
     expect(stored!.schemaVersion).toBe(3);
     expect(stored!.revision).toBe(7);
     store.close();
@@ -589,12 +600,12 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     await writable.close();
 
     // 显式比对请求 uri 与记录 uri：错误文件不得返回错误记录
-    expect(await store.load('lumora://project/real')).toBeNull();
+    expect(await loadStored(store, 'lumora://project/real')).toBeNull();
     // list 跳过错位记录（不把错误文件当最近项目）
-    expect((await store.list()).map((s) => s.uri)).toEqual([]);
+    expect((await listStored(store)).map((s) => s.uri)).toEqual([]);
     // save 到正确文件名不受错位文件影响（创建语义）
     expect((await store.save(good, null)).ok).toBe(true);
-    expect((await store.load('lumora://project/real'))).toEqual(good);
+    expect((await loadStored(store, 'lumora://project/real'))).toEqual(good);
     store.close();
   });
 
@@ -667,7 +678,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     expect(result.ok).toBe(false);
     if (result.ok || result.code !== 'storage-error') return;
     // 旧记录保持原样；.tmp 被尽力清理
-    expect((await store.load('lumora://project/a'))).toEqual(saved);
+    expect((await loadStored(store, 'lumora://project/a'))).toEqual(saved);
     const names: string[] = [];
     for await (const [name] of projectsDir.entries()) names.push(name);
     expect(names.filter((n) => n.endsWith('.tmp'))).toEqual([]);
@@ -684,7 +695,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     expect(result).toMatchObject({ ok: false, code: 'schema-downgrade' });
     if (result.ok || result.code !== 'schema-downgrade') return;
     expect(result.message).toContain('schema');
-    const stored = await store.load('lumora://project/a');
+    const stored = await loadStored(store, 'lumora://project/a');
     expect(stored!.schemaVersion).toBe(3);
     store.close();
   });
@@ -707,7 +718,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     expect(resultArr).toMatchObject({ ok: false, code: 'storage-error' });
     if (resultArr.ok || resultArr.code !== 'storage-error') return;
     expect(resultArr.message).toContain('array-extra-keys');
-    expect(await store.load('lumora://project/b')).toBeNull();
+    expect(await loadStored(store, 'lumora://project/b')).toBeNull();
     store.close();
   });
 
@@ -737,9 +748,9 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     expect(result.ok).toBe(false);
     if (result.ok || result.code !== 'quota-exceeded') return;
     // 原子写保护：旧记录未被半写覆盖
-    expect((await store.load('lumora://project/a'))!.name).toBe('已落盘内容');
+    expect((await loadStored(store, 'lumora://project/a'))!.name).toBe('已落盘内容');
     // 临时文件被清理：list 不受影响
-    expect((await store.list()).map((s) => s.uri)).toEqual(['lumora://project/a']);
+    expect((await listStored(store)).map((s) => s.uri)).toEqual(['lumora://project/a']);
     const names: string[] = [];
     for await (const [name] of projectsDir.entries()) names.push(name);
     expect(names.filter((n) => n.endsWith('.tmp'))).toEqual([]);
@@ -793,7 +804,8 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     if (!store) return;
     expect((await store.save(project('lumora://project/chain', '队列项目', 1))).ok).toBe(true);
 
-    // 第一个任务在锁内 reject：list 的目录 entries 抛错（list 无内部归一 → 异常向外传播）
+    // 第一个任务在锁内 reject：list 的目录 entries 抛错 —— 第十七轮严重 4 起
+    // list 与其余方法一样把锁内故障收口为类型化结果，异常不再向外传播
     const rootDir = await root.getDirectoryHandle(DB);
     const projectsDir = await rootDir.getDirectoryHandle('projects');
     const originalEntries = projectsDir.entries;
@@ -806,13 +818,16 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
         };
       },
     })) as unknown as typeof projectsDir.entries;
-    await expect(store.list()).rejects.toThrow('entries boom');
+    const listOutcome = await store.list();
+    expect(listOutcome.ok).toBe(false);
+    if (listOutcome.ok) return;
+    expect(listOutcome.message).toContain('entries boom');
     projectsDir.entries = originalEntries;
 
     // 修复前：前序任务 reject 使退化锁链上的 gate 无人 release，后续任务永久挂起；
     // 修复后：队列前进，后续保存照常执行
     expect((await store.save(project('lumora://project/chain', '队列项目', 2), 1)).ok).toBe(true);
-    expect((await store.load('lumora://project/chain'))!.revision).toBe(2);
+    expect((await loadStored(store, 'lumora://project/chain'))!.revision).toBe(2);
     store.close();
   });
 
@@ -838,6 +853,38 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     }
   });
 
+  it('Web Locks 获取失败（锁管理器 reject）：list/load/save/remove/rename/removeIfUnchanged/duplicate 公开 API 矩阵全部类型化失败，无一向上 reject（第十七轮严重 4）', async () => {
+    const store = await OpfsProjectStore.create(DB);
+    expect(store).not.toBeNull();
+    if (!store) return;
+    await store.save(project('lumora://project/a', '矩阵项目', 1));
+    const locks = (navigator as unknown as { locks: { request: (...args: unknown[]) => Promise<unknown> } }).locks;
+    const realRequest = locks.request.bind(locks);
+    locks.request = async () => {
+      throw new Error('locks unavailable');
+    };
+    try {
+      const checks: Array<{ name: string; run: () => Promise<unknown> }> = [
+        { name: 'list', run: () => store.list() },
+        { name: 'load', run: () => store.load('lumora://project/a') },
+        { name: 'save', run: () => store.save(project('lumora://project/b', '矩阵保存', 1), null) },
+        { name: 'remove', run: () => store.remove('lumora://project/a') },
+        { name: 'rename', run: () => store.rename('lumora://project/a', '矩阵改名') },
+        { name: 'removeIfUnchanged', run: () => store.removeIfUnchanged('lumora://project/a', 'fp') },
+        { name: 'duplicate', run: () => store.duplicate('lumora://project/a') },
+      ];
+      for (const { name, run } of checks) {
+        const outcome = await run();
+        const typed = outcome as { ok: boolean; message?: string };
+        expect(typed.ok, `${name} 应返回类型化失败，不得向上 reject`).toBe(false);
+        expect(typed.message, `${name} 的失败消息应如实包含锁故障原因`).toContain('locks unavailable');
+      }
+    } finally {
+      locks.request = realRequest;
+      store.close();
+    }
+  });
+
   it('save 同步不可变快照（第八轮 #1）：保存挂起期间改写入参 uri 不改变落盘目标（OPFS）', async () => {
     const store = await OpfsProjectStore.create(DB);
     if (!store) return;
@@ -852,8 +899,8 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     });
     const result = await store.save(p, null);
     expect(result.ok).toBe(true);
-    expect(await store.load('lumora://project/a')).not.toBeNull();
-    expect(await store.load('lumora://project/b')).toBeNull();
+    expect(await loadStored(store, 'lumora://project/a')).not.toBeNull();
+    expect(await loadStored(store, 'lumora://project/b')).toBeNull();
     vi.mocked(store.save).mockRestore();
     store.close();
   });
@@ -880,8 +927,8 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
       if (result.ok) return;
       expect(result.code).toBe('storage-error');
       expect(result.message).toContain('accessor-property');
-      expect(await store.load('lumora://project/a')).toBeNull();
-      expect(await store.load('lumora://project/b')).toBeNull();
+      expect(await loadStored(store, 'lumora://project/a')).toBeNull();
+      expect(await loadStored(store, 'lumora://project/b')).toBeNull();
     } finally {
       store.close();
     }
@@ -904,7 +951,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     });
     const result = await store.save(p, null);
     expect(result.ok).toBe(true);
-    const loaded = await store.load('lumora://project/a');
+    const loaded = await loadStored(store, 'lumora://project/a');
     expect(loaded).not.toBeNull();
     expect((loaded as Project & Record<string, unknown>).pluginData?.cyclic).toBeUndefined();
     store.close();
@@ -926,10 +973,10 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     expect(duplicated.ok).toBe(false);
     if (!duplicated.ok) expect(duplicated.code).toBe('storage-error');
 
-    const loaded = await store.load('lumora://project/a');
+    const loaded = await loadStored(store, 'lumora://project/a');
     expect(loaded!.schemaVersion).toBe(99);
     expect(loaded!.name).toBe('未来版本');
-    expect((await store.list()).map((s) => s.uri)).toEqual(['lumora://project/a']);
+    expect((await listStored(store)).map((s) => s.uri)).toEqual(['lumora://project/a']);
     store.close();
   });
 });
@@ -972,8 +1019,8 @@ describe('反射预检先于克隆（第九轮 #2）：结构化克隆会删除/
         expect(result.code).toBe('storage-error');
         expect(result.message).toContain(shape.problem);
         // 预检在任何克隆/写入之前：拒绝后无任何记录
-        expect(await store.load('lumora://project/a')).toBeNull();
-        expect(await store.list()).toEqual([]);
+        expect(await loadStored(store, 'lumora://project/a')).toBeNull();
+        expect(await listStored(store)).toEqual([]);
       } finally {
         store.close();
       }
@@ -993,7 +1040,7 @@ describe('复制后验证/清理异常安全（第九轮 #5，OPFS）', () => {
       loadCount += 1;
       if (loadCount === 2) {
         copyUri = uri;
-        throw new Error('读取验证失败');
+        return { ok: false, message: '读取验证失败' };
       }
       return realLoad(uri);
     });
@@ -1006,8 +1053,8 @@ describe('复制后验证/清理异常安全（第九轮 #5，OPFS）', () => {
     }
     vi.mocked(store.load).mockRestore();
     expect(copyUri).not.toBeNull();
-    expect(await store.load(copyUri!)).toBeNull(); // 半成品副本确实被删除
-    expect((await store.list()).map((s) => s.uri)).toEqual(['lumora://project/a']);
+    expect(await loadStored(store, copyUri!)).toBeNull(); // 半成品副本确实被删除
+    expect((await listStored(store)).map((s) => s.uri)).toEqual(['lumora://project/a']);
     store.close();
   });
 
@@ -1022,7 +1069,7 @@ describe('复制后验证/清理异常安全（第九轮 #5，OPFS）', () => {
       loadCount += 1;
       if (loadCount === 2) {
         copyUri = uri;
-        return null; // 校验失败路径进入清理
+        return { ok: true, project: null }; // 校验失败路径进入清理
       }
       return realLoad(uri);
     });
@@ -1037,7 +1084,7 @@ describe('复制后验证/清理异常安全（第九轮 #5，OPFS）', () => {
         expect(result.message).not.toContain('已清理');
       }
       expect(copyUri).not.toBeNull();
-      expect(await store.load(copyUri!)).not.toBeNull(); // 清理失败：副本记录确实保留
+      expect(await loadStored(store, copyUri!)).not.toBeNull(); // 清理失败：副本记录确实保留
     } finally {
       vi.mocked(store.removeIfUnchanged).mockRestore();
       vi.mocked(store.load).mockRestore();

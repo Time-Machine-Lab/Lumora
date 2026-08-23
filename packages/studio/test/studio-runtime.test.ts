@@ -107,16 +107,16 @@ describe('StudioRuntime：首存失败的切换屏障（TML-53 第四轮 #2 运�
     return {
       kind: 'indexeddb',
       async list() {
-        return [];
+        return { ok: true, items: [] };
       },
       async load() {
-        return null;
+        return { ok: true, project: null };
       },
       async save() {
         return { ok: false, code: 'quota-exceeded' as const, message: '本地存储空间不足，保存失败' };
       },
       async remove() {
-        return false;
+        return { ok: true, removed: false };
       },
       async removeIfUnchanged() {
         return { ok: true, outcome: 'missing' };

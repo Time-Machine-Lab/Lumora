@@ -634,4 +634,61 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
       cleanupSpy.mockRestore();
     }
   });
+
+  it('存储故障 toast 回归：刷新/打开/重命名/删除一律 catch 并提示，绝不静默（第十七轮严重 4）', async () => {
+    const handle = renderStudio();
+    const runtime = await waitPersistence(handle);
+    await openMenu();
+    await createProjectViaMenu('toast 回归项目');
+    await waitRecent(runtime, 'toast 回归项目');
+    await runtime.closeProject();
+    // 先以真实存储打开一次菜单，让最近项目列表就位（后续刷新故障不影响列表状态）
+    await openMenu();
+    await screen.findByTestId('recent-project');
+
+    const persistence = runtime.persistence;
+    const listSpy = vi.spyOn(persistence, 'listRecent').mockRejectedValue(new Error('locks unavailable'));
+    const loadSpy = vi.spyOn(persistence, 'loadProject').mockRejectedValue(new Error('locks unavailable'));
+    try {
+      // 刷新：toggle 菜单触发 refreshRecent → reject → toast
+      screen.getByTestId('project-menu').click(); // 先关闭
+      await waitFor(() => expect(screen.queryByTestId('project-menu-dropdown')).not.toBeInTheDocument());
+      await openMenu(); // 再打开触发刷新
+      await waitFor(() => expect(screen.getByText(/^locks unavailable$/)).toBeInTheDocument());
+      // 打开：loadProject reject → catch → 带项目名的上下文 toast
+      (document.querySelector('.lumora-project-menu__recent-open') as HTMLButtonElement).click();
+      await waitFor(() =>
+        expect(screen.getByText(/无法打开「toast 回归项目」：locks unavailable/)).toBeInTheDocument(),
+      );
+    } finally {
+      listSpy.mockRestore();
+      loadSpy.mockRestore();
+    }
+
+    // 重命名：renameProject reject → catch → toast
+    const renameSpy = vi.spyOn(persistence, 'renameProject').mockRejectedValue(new Error('locks unavailable'));
+    try {
+      screen.getByTestId('recent-rename').click();
+      const input = await screen.findByTestId('project-name-input');
+      fireEvent.change(input, { target: { value: '改名失败项目' } });
+      screen.getByTestId('project-name-confirm').click();
+      await waitFor(() =>
+        expect(screen.getByText(/重命名失败：locks unavailable/)).toBeInTheDocument(),
+      );
+    } finally {
+      renameSpy.mockRestore();
+    }
+
+    // 删除：deleteProject reject → catch → toast（项目已关闭，不经 closeProject 分支）
+    const deleteSpy = vi.spyOn(persistence, 'deleteProject').mockRejectedValue(new Error('locks unavailable'));
+    try {
+      fireEvent.click(await screen.findByTestId('recent-delete'));
+      fireEvent.click(await screen.findByTestId('confirm-delete'));
+      await waitFor(() =>
+        expect(screen.getByText(/删除失败：locks unavailable/)).toBeInTheDocument(),
+      );
+    } finally {
+      deleteSpy.mockRestore();
+    }
+  });
 });

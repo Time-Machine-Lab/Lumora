@@ -6,8 +6,15 @@ import type { StudioRuntime } from '../src/runtime/studio-runtime';
 import { ProjectStore } from '../src/persistence/project-store';
 import { OpfsProjectStore } from '../src/persistence/project-store-opfs';
 import { MemDirectoryHandle, stubOpfsNavigator } from './opfs-fs-shim';
+import type { ProjectStorage } from '../src/persistence/project-storage';
 
 const DB = 'lumora-test-persist-opfs';
+/** 便捷读取/列表（第十七轮严重 4：list/load 收口为类型化结果后直接取数据字段） */
+async function loadStored(store: ProjectStorage, uri: string): Promise<Project | null> {
+  const result = await store.load(uri);
+  return result.ok ? result.project : null;
+}
+
 
 async function settle(ms = 40): Promise<void> {
   await new Promise((r) => setTimeout(r, ms));
@@ -148,7 +155,7 @@ describe('ProjectPersistence：OPFS 后端（可配置切换，行为与 Indexed
     // 冲突解除：后续编辑可正常保存为 rev6（不覆盖较新内容）
     runtime.editor.addObject(createGroupObject());
     await settle(60);
-    const final = await store.load(project.uri);
+    const final = await loadStored(store, project.uri);
     expect(final!.revision).toBe(6);
     expect(final!.name).toBe('较新内容');
     store.close();
@@ -164,7 +171,7 @@ describe('ProjectPersistence：OPFS 后端（可配置切换，行为与 Indexed
     expect((await store.save({ ...v2, schemaVersion: 2 } as unknown as Project)).ok).toBe(true);
 
     // 适配器层不提前迁移：raw/source schema 原样返回
-    const raw = await store.load(v3.uri);
+    const raw = await loadStored(store, v3.uri);
     expect(raw!.schemaVersion).toBe(2);
     // facade loadProject：迁移 → 校验 → 以已存 revision CAS 写回（migratedFrom 如实报告）
     const loaded = await runtime.persistence.loadProject(v3.uri);
@@ -174,7 +181,7 @@ describe('ProjectPersistence：OPFS 后端（可配置切换，行为与 Indexed
     expect(loaded.project.schemaVersion).toBe(3);
     expect(loaded.project.tracks).toEqual([]);
     // 写回后的存储记录已是 v3（下次加载不再迁移）
-    const after = await store.load(v3.uri);
+    const after = await loadStored(store, v3.uri);
     expect(after!.schemaVersion).toBe(3);
     expect(after!.revision).toBe(0);
     store.close();

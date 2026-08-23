@@ -114,9 +114,13 @@ export class ProjectPersistence {
     if (options.debounceMs !== undefined) this.autosaver.setDebounceMs(options.debounceMs);
   }
 
-  /** 最近项目列表（按保存时间倒序）。 */
+  /** 最近项目列表（按保存时间倒序）。存储/锁故障抛归一化错误（UI catch 后
+   *  toast，第十七轮严重 4）——绝不静默返回空列表掩盖失败。 */
   async listRecent(): Promise<ProjectSummary[]> {
-    return this.store ? this.store.list() : [];
+    if (!this.store) return [];
+    const result = await this.store.list();
+    if (!result.ok) throw new Error(`最近项目加载失败：${result.message}`);
+    return result.items;
   }
 
   /**
@@ -129,7 +133,9 @@ export class ProjectPersistence {
    */
   async loadProject(uri: string): Promise<{ ok: true; project: Project; migratedFrom?: number } | { ok: false; message: string }> {
     if (!this.store) return { ok: false, message: '本地持久化不可用' };
-    const stored = await this.store.load(uri);
+    const loaded = await this.store.load(uri);
+    if (!loaded.ok) return { ok: false, message: `本地项目加载失败：${loaded.message}` };
+    const stored = loaded.project;
     if (!stored) return { ok: false, message: '本地项目不存在或已损坏' };
     const migrated = migrateProjectSchema(stored);
     if (!migrated.ok) {
@@ -153,10 +159,13 @@ export class ProjectPersistence {
     return { ok: true, project };
   }
 
-  /** 本地是否已存在同 uri 记录（导入防碰撞：同 uri 视为副本导入）。 */
+  /** 本地是否已存在同 uri 记录（导入防碰撞：同 uri 视为副本导入）。
+   *  存储/锁故障无法判定时如实抛错（调用方 importPackage 的 catch 兜底，第十七轮严重 4）。 */
   async hasLocal(uri: string): Promise<boolean> {
     if (!this.store) return false;
-    return (await this.store.load(uri)) !== null;
+    const loaded = await this.store.load(uri);
+    if (!loaded.ok) throw new Error(`项目存在性检查失败：${loaded.message}`);
+    return loaded.project !== null;
   }
 
   /**
@@ -345,9 +354,14 @@ export class ProjectPersistence {
     return { ok: true, project: loaded.project };
   }
 
-  /** 删除项目（仅存储记录；已打开的当前项目由调用方先 closeProject）。 */
+  /** 删除项目（仅存储记录；已打开的当前项目由调用方先 closeProject）。
+   *  存储/锁故障抛归一化错误（UI catch 后 toast，第十七轮严重 4）——绝不静默
+   *  报「未找到」掩盖失败。 */
   async deleteProject(uri: string): Promise<boolean> {
-    return this.store ? this.store.remove(uri) : false;
+    if (!this.store) return false;
+    const result = await this.store.remove(uri);
+    if (!result.ok) throw new Error(`项目删除失败：${result.message}`);
+    return result.removed;
   }
 
   /** 副本验证与清理的异常安全封装（第十二轮严重 #5 + 第十三轮严重 5 + 第十四轮

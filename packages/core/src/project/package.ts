@@ -312,23 +312,40 @@ function isSafeExportKey(key: string): boolean {
   return key !== '__proto__' && key !== 'constructor' && key !== 'prototype';
 }
 
-/** 凭据形态键名（第十五轮阻断 1）：公开声明路径任意层出现这些键名（不区分
- *  大小写、子串匹配）即整条声明拒绝 —— 「凭据永不导出」不依赖插件自觉声明
- *  privateSettings，显式声明凭据键也不是放行依据。 */
-const CREDENTIAL_SHAPE_PATTERNS = [
+/** 凭据形态词（第十五轮阻断 1 + 第十七轮阻断 1/严重 2）：公开声明路径任意层
+ *  出现凭据形态词即整条声明拒绝 —— 「凭据永不导出」不依赖插件自觉声明
+ *  privateSettings，显式声明凭据键也不是放行依据。形态判定为 NFKC 规范化 +
+ *  分隔符/camelCase 分词后的完整词匹配（第十七轮阻断 1）：旧实现按子串匹配
+ *  （lowered.includes(pattern)），api_key/pass_word/private_key/api.key/pass-word
+ *  等组合词绕过检测进包，tokenizerConfig/tokenizerModel/authorName/
+ *  authorizationMode 等合法键反而因含 token/auth 子串被误剥。分词规则：
+ *  非字母数字分隔符（-_. 空格等）切分后，每段再按大写边界切分
+ *  （apiKey → api|Key），全部小写后与完整词集合比对 —— 仅完整词/组合词
+ *  组成部分命中才拒绝。 */
+const CREDENTIAL_SHAPE_WORDS = new Set([
+  'api',
   'apikey',
+  'auth',
+  'credential',
+  'credentials',
+  'pass',
   'password',
   'passwd',
-  'token',
-  'secret',
-  'credential',
+  'private',
   'privatekey',
-  'auth',
-] as const;
+  'secret',
+  'token',
+]);
 
 function isCredentialShapeKey(key: string): boolean {
-  const lowered = key.toLowerCase();
-  return CREDENTIAL_SHAPE_PATTERNS.some((pattern) => lowered.includes(pattern));
+  const words = key
+    .normalize('NFKC')
+    .replace(/[^a-zA-Z0-9]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .flatMap((word) => word.split(/(?=[A-Z])/));
+  return words.some((word) => CREDENTIAL_SHAPE_WORDS.has(word.toLowerCase()));
 }
 
 /** 整值导出仅允许 JSON primitive 叶值（第十五轮阻断 1）：对象/数组整值导出会

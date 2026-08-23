@@ -1,10 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SceneEditor, createGroupObject, createLightObject, createSampleProject } from '@lumora/core';
+import type { Project } from '@lumora/core';
 import { ProjectAutosaver } from '../src/persistence/autosave';
 import type { AutosaveState } from '../src/persistence/autosave';
 import { ProjectStore } from '../src/persistence/project-store';
+import type { ProjectStorage } from '../src/persistence/project-storage';
 
 const DB = 'lumora-test-autosave';
+/** 便捷读取/列表（第十七轮严重 4：list/load 收口为类型化结果后直接取数据字段） */
+async function loadStored(store: ProjectStorage, uri: string): Promise<Project | null> {
+  const result = await store.load(uri);
+  return result.ok ? result.project : null;
+}
+
 const DEBOUNCE = 20;
 
 /** 编辑器事件 → 自动保存直连（与 ProjectPersistence.init 相同的接线方式） */
@@ -52,7 +60,7 @@ describe('ProjectAutosaver：2 秒防抖自动保存（FR-011）', () => {
 
     await settle(60);
     expect(states.at(-1)).toBe('clean');
-    const stored = await store.load('lumora://project/a');
+    const stored = await loadStored(store, 'lumora://project/a');
     expect(stored!.revision).toBe(editor.getProject()!.revision);
     expect(stored!.objects.length).toBe(createSampleProject().objects.length + 1);
     autosaver.dispose();
@@ -82,7 +90,7 @@ describe('ProjectAutosaver：2 秒防抖自动保存（FR-011）', () => {
     await settle(10);
     editor.addObject(createGroupObject());
     await autosaver.flush();
-    const stored = await store.load('lumora://project/a');
+    const stored = await loadStored(store, 'lumora://project/a');
     expect(stored!.revision).toBe(editor.getProject()!.revision);
     autosaver.dispose();
   });
@@ -94,7 +102,7 @@ describe('ProjectAutosaver：2 秒防抖自动保存（FR-011）', () => {
     editor.addObject(createGroupObject());
     editor.reset(); // 触发 changed(null)
     await settle(40);
-    const stored = await store.load('lumora://project/a');
+    const stored = await loadStored(store, 'lumora://project/a');
     expect(stored!.revision).toBe(editor.getProject()?.revision ?? stored!.revision);
     expect(stored!.objects.length).toBeGreaterThan(createSampleProject().objects.length);
     autosaver.dispose();
@@ -132,12 +140,12 @@ describe('ProjectAutosaver：切换排空与首存诚实（阻断项回归）', 
     await settle(60);
 
     // A 的未保存对象已落盘（期望基线 0 → rev1 正常写入）
-    const storedA = await store.load('lumora://project/a');
+    const storedA = await loadStored(store, 'lumora://project/a');
     expect(storedA).not.toBeNull();
     expect(storedA!.revision).toBe(1);
     expect(storedA!.objects.length).toBe(createSampleProject().objects.length + 1);
     // B 首存成功且状态干净（A 的保存结果未污染 B）
-    const storedB = await store.load('lumora://project/b');
+    const storedB = await loadStored(store, 'lumora://project/b');
     expect(storedB).not.toBeNull();
     expect(storedB!.revision).toBe(0);
     expect(states.at(-1)).toBe('clean');
@@ -160,7 +168,7 @@ describe('ProjectAutosaver：切换排空与首存诚实（阻断项回归）', 
     const { editor, store, autosaver } = await wired();
     editor.openProject(createSampleProject('lumora://project/a'));
     await autosaver.flush();
-    const stored = await store.load('lumora://project/a');
+    const stored = await loadStored(store, 'lumora://project/a');
     expect(stored).not.toBeNull();
     expect(stored!.revision).toBe(0);
     autosaver.dispose();
@@ -184,7 +192,7 @@ describe('ProjectAutosaver：保存失败保持脏且不覆盖（AC2 / NFR-003�
     expect(error).toBeDefined();
     expect(error!.code).toBe('revision-conflict');
     expect(error!.message).toContain('加载较新版本');
-    const stored = await store.load('lumora://project/a');
+    const stored = await loadStored(store, 'lumora://project/a');
     expect(stored!.revision).toBe(5);
     expect(stored!.name).toBe('较新内容');
 
@@ -194,12 +202,12 @@ describe('ProjectAutosaver：保存失败保持脏且不覆盖（AC2 / NFR-003�
     editor.addObject(createGroupObject()); // rev5
     await settle(60);
     expect(states.at(-1)!.status).toBe('error');
-    const afterTally = await store.load('lumora://project/a');
+    const afterTally = await loadStored(store, 'lumora://project/a');
     expect(afterTally!.revision).toBe(5);
     expect(afterTally!.name).toBe('较新内容');
 
     // 显式解决「加载较新版本」：以存储内容为基线重开（resetTo 先重设基线 → 编辑器重开走净态路径）
-    const storedAfter = await store.load('lumora://project/a');
+    const storedAfter = await loadStored(store, 'lumora://project/a');
     autosaver.resetTo(storedAfter!);
     editor.openProject(storedAfter!);
     await settle(10);
@@ -208,7 +216,7 @@ describe('ProjectAutosaver：保存失败保持脏且不覆盖（AC2 / NFR-003�
     // 解决后正常编辑保存：期望基线 = 已存 5 → 写入 rev6
     editor.addObject(createGroupObject());
     await settle(60);
-    const final = await store.load('lumora://project/a');
+    const final = await loadStored(store, 'lumora://project/a');
     expect(final!.revision).toBe(6);
     expect(states.at(-1)!.status).toBe('clean');
     autosaver.dispose();
@@ -242,7 +250,7 @@ describe('ProjectAutosaver：保存失败保持脏且不覆盖（AC2 / NFR-003�
 
     expect(states.at(-1)).toMatchObject({ status: 'error', code: 'quota-exceeded' });
     // 脏状态保持：内容未丢
-    expect(store.load('lumora://project/a')).not.toBeNull();
+    expect(await loadStored(store, 'lumora://project/a')).not.toBeNull();
     autosaver.dispose();
   });
 });
@@ -269,11 +277,11 @@ describe('ProjectAutosaver：在途保存→继续编辑→切换（阻断项回
     slowSave.mockRestore();
 
     // 旧 URI 成功结果推进基线 → 排空以执行时基线 CAS → rev2 完整落盘
-    const storedA = await store.load('lumora://project/a');
+    const storedA = await loadStored(store, 'lumora://project/a');
     expect(storedA!.revision).toBe(2);
     expect(storedA!.objects.length).toBe(createSampleProject().objects.length + 2);
     // 新项目首存不受影响
-    const storedB = await store.load('lumora://project/b');
+    const storedB = await loadStored(store, 'lumora://project/b');
     expect(storedB).not.toBeNull();
     autosaver.dispose();
   });
@@ -288,7 +296,7 @@ describe('ProjectAutosaver：在途保存→继续编辑→切换（阻断项回
       .spyOn(store, 'load')
       .mockImplementationOnce(async () => {
         await new Promise((r) => setTimeout(r, 30));
-        return base;
+        return { ok: true, project: base };
       });
     editor.openProject(base);
     await settle(5); // reconcile 挂起在慢 load 上
@@ -297,7 +305,7 @@ describe('ProjectAutosaver：在途保存→继续编辑→切换（阻断项回
     slowLoad.mockRestore();
 
     // 编辑未因对账的「已保存」而被掩盖：以对账读到的存储基线 CAS 落盘
-    const stored = await store.load('lumora://project/a');
+    const stored = await loadStored(store, 'lumora://project/a');
     expect(stored!.revision).toBe(1);
     expect(stored!.objects.length).toBe(createSampleProject().objects.length + 1);
     autosaver.dispose();
@@ -315,7 +323,7 @@ describe('ProjectAutosaver：flush 返回类型化结果（关闭/切换阻断�
     const outcome = await autosaver.flush();
     expect(outcome).toMatchObject({ ok: false, code: 'revision-conflict' });
     // 存储未被覆盖（CAS 防倒退）
-    expect((await store.load('lumora://project/a'))!.revision).toBe(5);
+    expect((await loadStored(store, 'lumora://project/a'))!.revision).toBe(5);
     autosaver.dispose();
   });
 
@@ -400,7 +408,7 @@ describe('ProjectAutosaver：恢复快照（切换/关闭时保存失败的旧�
     const outcome = await autosaver.retryRecovery(A);
     expect(outcome).toMatchObject({ ok: false, code: 'revision-conflict' });
     expect(autosaver.getRecovery(A)).not.toBeNull(); // 快照保留（未预持久化）
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored!.revision).toBe(0); // 磁盘未被推进，保持已提交基线
     expect(stored!.objects.length).toBe(base.objects.length);
     expect(editor.getProject()!.revision).toBe(1); // 锁存期间编辑保持（未覆盖）
@@ -463,7 +471,7 @@ describe('ProjectAutosaver：首存失败 / flush 稳定排空 / retryRecovery �
     await settle(60);
     // 首存失败如实呈现，且未产生任何「假已保存」记录
     expect(states.at(-1)).toMatchObject({ status: 'error', code: 'quota-exceeded' });
-    expect(await store.load('lumora://project/b')).toBeNull();
+    expect(await loadStored(store, 'lumora://project/b')).toBeNull();
 
     // 重试：仍以 null 基线（create-only）发起，不以失败后的数字基线 CAS 误拒
     editor.addObject(createGroupObject()); // rev1
@@ -471,7 +479,7 @@ describe('ProjectAutosaver：首存失败 / flush 稳定排空 / retryRecovery �
     const bCalls = saveSpy.mock.calls.filter((call) => (call[0] as { uri: string }).uri === 'lumora://project/b');
     expect(bCalls).toHaveLength(2); // 首存失败 + 重试
     expect(bCalls.every((call) => call[1] === null)).toBe(true);
-    const stored = await store.load('lumora://project/b');
+    const stored = await loadStored(store, 'lumora://project/b');
     expect(stored).not.toBeNull();
     expect(stored!.revision).toBe(1);
     autosaver.dispose();
@@ -486,7 +494,7 @@ describe('ProjectAutosaver：首存失败 / flush 稳定排空 / retryRecovery �
     editor.addObject(createGroupObject()); // rev2：排空期间的新编辑
     const outcome = await flushing;
     expect(outcome.ok).toBe(true);
-    const stored = await store.load('lumora://project/a');
+    const stored = await loadStored(store, 'lumora://project/a');
     expect(stored!.revision).toBe(2);
     expect(stored!.objects.length).toBe(createSampleProject().objects.length + 2);
     autosaver.dispose();
@@ -534,7 +542,7 @@ describe('ProjectAutosaver：首存失败 / flush 稳定排空 / retryRecovery �
     // 写入前决策（第六轮 #4）：三方分叉不落盘 —— 磁盘保持基线，快照保留在
     // 恢复区（可重试/另存副本），当前编辑不被静默覆盖
     expect(autosaver.getRecovery(A)).not.toBeNull();
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored!.revision).toBe(0);
     expect(stored!.objects.length).toBe(base.objects.length);
     expect(editor.getProject()!.revision).toBe(2);
@@ -574,7 +582,7 @@ describe('ProjectAutosaver：首存失败 / flush 稳定排空 / retryRecovery �
     expect(outcome.ok).toBe(true);
     // 快照 == 旧基线内容（未带来新内容）→ 编辑器内容向前保存
     await autosaver.flush();
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored!.revision).toBe(3);
     expect(stored!.objects.length).toBe(base.objects.length + 3);
     expect(editor.getProject()!.revision).toBe(3);
@@ -604,7 +612,7 @@ describe('ProjectAutosaver：首存失败 / flush 稳定排空 / retryRecovery �
     const outcome = await autosaver.retryRecovery(A);
     expect(outcome.ok).toBe(true);
     // 编辑器不新于恢复快照 → 重开恢复快照：编辑器内容 = 已落盘的恢复快照（rev1）
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored!.revision).toBe(1);
     expect(stored!.objects.length).toBe(base.objects.length + 1);
     expect(editor.getProject()!.revision).toBe(1);
@@ -620,7 +628,7 @@ describe('ProjectAutosaver：撤销回到已保存状态即转净', () => {
     await settle(10);
     editor.addObject(createGroupObject());
     await settle(60);
-    expect((await store.load('lumora://project/a'))!.revision).toBe(1);
+    expect((await loadStored(store, 'lumora://project/a'))!.revision).toBe(1);
 
     const states: string[] = [];
     autosaver.onState((s) => states.push(s.status));
@@ -628,7 +636,7 @@ describe('ProjectAutosaver：撤销回到已保存状态即转净', () => {
     await settle(60);
     expect(states).toContain('dirty');
     expect(states.at(-1)).toBe('clean');
-    expect((await store.load('lumora://project/a'))!.revision).toBe(editor.getProject()!.revision);
+    expect((await loadStored(store, 'lumora://project/a'))!.revision).toBe(editor.getProject()!.revision);
     autosaver.dispose();
   });
 });
@@ -647,13 +655,13 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     const outcome = await autosaver.flush();
     // 首存失败后 flush 不得以「revision 未变」判净假报成功：调用方据此阻断关闭/切换
     expect(outcome).toMatchObject({ ok: false, code: 'quota-exceeded' });
-    expect(await store.load('lumora://project/a')).toBeNull();
+    expect(await loadStored(store, 'lumora://project/a')).toBeNull();
 
     // 存储恢复后重试：仍以 null 基线（create-only）发起，不以失败后的数字基线误拒
     vi.mocked(store.save).mockRestore();
     const retry = await autosaver.flush();
     expect(retry.ok).toBe(true);
-    const stored = await store.load('lumora://project/a');
+    const stored = await loadStored(store, 'lumora://project/a');
     expect(stored!.revision).toBe(0);
     expect(states.at(-1)!.status).toBe('clean');
     autosaver.dispose();
@@ -675,7 +683,7 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     const latched = states.at(-1)!;
     if (latched.status === 'error') expect(latched.message).toContain('分叉');
     // 存储未被分叉内容覆盖
-    const after = await store.load(A);
+    const after = await loadStored(store, A);
     expect(after!.revision).toBe(5);
     expect(after!.name).toBe('内容甲');
     autosaver.dispose();
@@ -695,7 +703,7 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     await settle(60);
     // 内容指纹不同 → 判为未保存 → 保存被存储层同 revision 分叉保护拒绝 → 锁存冲突
     expect(states.at(-1)).toMatchObject({ status: 'error', code: 'revision-conflict' });
-    const after = await store.load(A);
+    const after = await loadStored(store, A);
     expect(after!.name).toBe('原项目'); // 磁盘未被替换内容覆盖
     expect(editor.getProject()!.name).toBe('替换项目'); // 编辑器保留替换内容供显式解决
     autosaver.dispose();
@@ -738,7 +746,7 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     expect(current.objects.filter((o) => o.type === 'light').length).toBe(
       base.objects.filter((o) => o.type === 'light').length + 1,
     );
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored!.revision).toBe(0);
     expect(stored!.objects.length).toBe(base.objects.length);
     autosaver.dispose();
@@ -777,7 +785,7 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     editor.addObject(createGroupObject()); // rev2
     const outcome = await autosaver.retryRecovery(A);
     expect(outcome.ok).toBe(true);
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored!.revision).toBe(2); // 当前编辑内容落盘，而非快照的 rev8
     expect(stored!.objects.length).toBe(base.objects.length + 2);
     expect(editor.getProject()!.revision).toBe(2); // 编辑器不被重开覆盖
@@ -832,7 +840,7 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     // 锁存冲突且不报 clean
     expect(states.at(-1)).toMatchObject({ status: 'error', code: 'revision-conflict' });
     // 磁盘已推进到决策时内容（rev1），恢复快照保留（未清除）
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored!.revision).toBe(1);
     expect(stored!.objects.length).toBe(base.objects.length + 1);
     expect(autosaver.getRecovery(A)).not.toBeNull();
@@ -880,7 +888,7 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     expect(editor.getProject()!.name).toBe('项目C');
     // 恢复快照保留；磁盘已推进（恢复快照落盘 rev1）
     expect(autosaver.getRecovery(A)).not.toBeNull();
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored!.revision).toBe(1);
     expect(stored!.objects.length).toBe(base.objects.length + 1);
     autosaver.dispose();
@@ -915,7 +923,7 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
       expect(last).toMatchObject({ status: 'error', code: 'storage-error' });
       if (last.status === 'error') expect(last.message).toContain('无法本地保存');
       expect(states.some((s) => s.status === 'clean')).toBe(false);
-      expect(await store.load(A)).toBeNull();
+      expect(await loadStored(store, A)).toBeNull();
       const outcome = await autosaver.flush();
       expect(outcome).toMatchObject({ ok: false, code: 'storage-error' });
       autosaver.dispose();
@@ -968,7 +976,7 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     expect(current.objects.length).toBe(base.objects.length);
     expect(states.at(-1)).toMatchObject({ status: 'error', code: 'revision-conflict' });
     // 磁盘已推进到决策时内容（恢复快照 rev1）；恢复快照保留（未清除）
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored!.revision).toBe(1);
     expect(stored!.objects.length).toBe(base.objects.length + 1);
     expect(autosaver.getRecovery(A)).not.toBeNull();
@@ -1013,7 +1021,7 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     expect(reentered).toBe(true);
 
     await settle(60); // 重入编辑经防抖落盘
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored!.revision).toBe(2);
     expect(stored!.objects.length).toBe(base.objects.length + 2);
     expect(autosaver.getRecovery(A)).toBeNull();
@@ -1066,7 +1074,7 @@ describe('ProjectAutosaver：切换广播守卫与代际失效（第九轮 #1 �
     // 回滚后自动保存照常工作：新编辑按 A 的原基线落盘（rev1）
     editor.addObject(createGroupObject());
     await settle(60);
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored!.revision).toBe(1);
     expect(stored!.objects.length).toBe(base.objects.length + 1);
     autosaver.dispose();
@@ -1133,7 +1141,7 @@ describe('ProjectAutosaver：switchOpen 失败回滚恢复防抖保存（第十�
     // 自动落盘（第十二轮一般 #7：仅恢复 reset 前真实存在的 timer，保存恰好一次）
     await settle(100);
     expect(saveSpy).toHaveBeenCalledTimes(1);
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored).not.toBeNull();
     expect(stored!.revision).toBe(1);
     expect(stored!.objects.length).toBe(base.objects.length + 1);
@@ -1174,7 +1182,7 @@ describe('ProjectAutosaver：switchOpen 失败回滚恢复防抖保存（第十�
     await settle(80);
     // 释放阻塞后调用次数不翻倍：在途任务是唯一一次保存
     expect(slowSave).toHaveBeenCalledTimes(1);
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored).not.toBeNull();
     expect(stored!.revision).toBe(1);
     slowSave.mockRestore();
@@ -1196,7 +1204,7 @@ describe('ProjectAutosaver：switchOpen 失败回滚恢复防抖保存（第十�
     editor.addObject(createGroupObject()); // dirty
     await settle(40); // debounce 到期 → 保存失败 → error 状态
     expect(failingSave).toHaveBeenCalledTimes(1);
-    expect((await store.load(A))!.revision).toBe(0); // 旧内容未落盘
+    expect((await loadStored(store, A))!.revision).toBe(0); // 旧内容未落盘
     failingSave.mockRestore();
 
     // 切换失败 → 回滚：三个调度态皆无但内容未保存 → 重新调度（第十二轮一般 #7）
@@ -1209,7 +1217,7 @@ describe('ProjectAutosaver：switchOpen 失败回滚恢复防抖保存（第十�
     // 不再编辑：防抖窗口过后保存自动重试成功（修复前停留在 rev0）
     await settle(100);
     expect(saveSpy).toHaveBeenCalledTimes(1);
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored).not.toBeNull();
     expect(stored!.revision).toBe(1);
     expect(stored!.objects.length).toBe(base.objects.length + 1);
@@ -1248,14 +1256,14 @@ describe('ProjectAutosaver：保存失败错误广播与监听器同步重入（
     editor.addObject(createGroupObject()); // dirty
     await settle(40); // debounce 到期 → 保存失败 → error 广播（含监听器同步重入）
     expect(failingSave).toHaveBeenCalledTimes(1);
-    expect((await store.load(A))!.revision).toBe(0); // 旧内容未落盘
+    expect((await loadStored(store, A))!.revision).toBe(0); // 旧内容未落盘
     failingSave.mockRestore();
 
     // 不再编辑：回滚分支重新调度后自动重试落盘（修复前停止在 rev0）
     const saveSpy = vi.spyOn(store, 'save');
     await settle(100);
     expect(saveSpy).toHaveBeenCalledTimes(1);
-    const stored = await store.load(A);
+    const stored = await loadStored(store, A);
     expect(stored).not.toBeNull();
     expect(stored!.revision).toBe(1);
     expect(stored!.objects.length).toBe(base.objects.length + 1);
@@ -1300,7 +1308,7 @@ describe('ProjectAutosaver：慢保存失败的延迟错误广播按 {uri, sessi
     expect(states).not.toContain('error');
     // switchOpen 丢弃 A 的 pending（排空由调用方 flush 负责）：A 保持首存基线，
     // 失败不产生假记录；这正是「旧项目慢失败不覆盖任何状态」的落点
-    const storedA = await store.load(A);
+    const storedA = await loadStored(store, A);
     expect(storedA).not.toBeNull();
     expect(storedA!.revision).toBe(0);
     expect(storedA!.objects.length).toBe(base.objects.length);
@@ -1343,7 +1351,7 @@ describe('ProjectAutosaver：慢保存失败的延迟错误广播按 {uri, sessi
     // 关闭后不得回弹错误状态（修复前无条件广播 error 覆盖 idle）
     expect(states).not.toContain('error');
     // 关闭时排空任务以真实存储重试成功：A 的未保存内容最终落盘（不丢）
-    const storedA = await store.load(A);
+    const storedA = await loadStored(store, A);
     expect(storedA).not.toBeNull();
     expect(storedA!.revision).toBe(1);
     expect(storedA!.objects.length).toBe(base.objects.length + 1);
@@ -1386,13 +1394,82 @@ describe('ProjectAutosaver：队列占位期间 A→B→A 的会话代捕获（�
     const aSaves = saveSpy.mock.calls.filter(([p]) => p.uri === A);
     expect(aSaves.length).toBe(0);
     // 存储仍是首轮对账的 rev0 原内容（未被已丢弃快照覆盖）
-    const storedA = await store.load(A);
+    const storedA = await loadStored(store, A);
     expect(storedA).not.toBeNull();
     expect(storedA!.revision).toBe(0);
     expect(storedA!.objects.length).toBe(base.objects.length);
     // 编辑器保持 A0 打开（未被打断）
     expect(editor.getProject()!.uri).toBe(A);
     expect(editor.getProject()!.revision).toBe(0);
+    saveSpy.mockRestore();
+    autosaver.dispose();
+  });
+
+  it('慢 reconcile 占队期间切换 + 新会话连续编辑：旧会话排队任务不吞新会话占位、不重复排队、不重放旧快照、不假冲突（第十七轮严重 3）', async () => {
+    const editor = new SceneEditor();
+    const store = await ProjectStore.create(DB);
+    expect(store).not.toBeNull();
+    if (!store) return;
+    openStores.push(store);
+    const saveSpy = vi.spyOn(store, 'save');
+    const realLoad = store.load.bind(store);
+    const realSave = store.save.bind(store);
+    let delayFirstLoad = true;
+    let delayDrain = true;
+    const A_URI = 'lumora://project/a';
+    // 首轮 reconcile 的 load 延迟 120ms（占住串行链）；切换排空（A 的保存）
+    // 再延迟 150ms —— 旧会话保存任务执行时新会话任务仍在排队（吞占位窗口）
+    store.load = async (uri) => {
+      if (delayFirstLoad) {
+        delayFirstLoad = false;
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      return realLoad(uri);
+    };
+    store.save = async (p, expected) => {
+      if (p.uri === A_URI && delayDrain) {
+        delayDrain = false;
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      return realSave(p, expected);
+    };
+    const autosaver = new ProjectAutosaver(editor, store, { debounceMs: DEBOUNCE });
+    editor.events.on('project:changed', ({ project }) => autosaver.changed(project));
+    const states: string[] = [];
+    autosaver.onState((s) => states.push(s.status));
+
+    const projectA = createSampleProject('lumora://project/a', '项目A');
+    const projectB = createSampleProject('lumora://project/b', '项目B');
+    const B_URI = projectB.uri;
+    editor.openProject(projectA);
+    await settle(5);
+    editor.addObject(createGroupObject()); // A rev1
+    await settle(25); // 防抖到点：A 会话保存任务入队（链被慢 reconcile 占用）
+    editor.openProject(projectB);
+    await settle(5);
+    editor.addObject(createGroupObject()); // B rev1
+    await settle(25); // B 会话保存任务入队（占位 { 会话 B, ticket }）
+    await settle(150); // 慢 reconcile 结束、旧 A 任务已执行（吞占位窗口）
+    editor.addObject(createGroupObject()); // B rev2 —— 修复前此处会重复排队
+    await settle(25);
+    await settle(250); // 全部排空
+
+    // 修复前：A 旧任务无条件清位 → B 的占位被吞 → B rev2 重复排队（B 保存 3 次）；
+    // 修复后占位只被持有者清理 → B 仅 reconcile 首存 + runSave 任务各一次
+    const bSaves = saveSpy.mock.calls.filter(([p]) => p.uri === B_URI);
+    expect(bSaves.length, '新会话同一防抖只排队一次保存').toBe(2);
+    // 无旧快照重放：B 落盘内容始终是 B 的（A 的 rev1 快照不得写入 B）
+    const storedB = await loadStored(store, B_URI);
+    expect(storedB?.name).toBe('项目B');
+    expect(storedB?.objects.length).toBe(createSampleProject().objects.length + 2);
+    // 无假冲突：全程无 error 状态广播（旧实现 B 任务以触发时快照执行，
+    // 撞上 reconcile 已写入的较新 revision 会报 revision-conflict）
+    expect(states).not.toContain('error');
+    // 切换/关闭不被错误阻断：flush 立即放行
+    expect((await autosaver.flush()).ok).toBe(true);
+    // A 的未保存对象仍由切换排空正常落盘
+    const storedA = await loadStored(store, projectA.uri);
+    expect(storedA?.objects.length).toBe(createSampleProject().objects.length + 1);
     saveSpy.mockRestore();
     autosaver.dispose();
   });

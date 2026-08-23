@@ -17,9 +17,11 @@ import type { Project } from '@lumora/core';
 import { genId } from '@lumora/core';
 import type {
   DuplicateOutcome,
+  ListOutcome,
+  LoadOutcome,
   ProjectStorage,
-  ProjectSummary,
   RemoveIfOutcome,
+  RemoveOutcome,
   RenameOutcome,
   SaveOutcome,
   StoredProject,
@@ -101,26 +103,37 @@ export class ProjectStore implements ProjectStorage {
     });
   }
 
-  /** 最近项目列表（按保存时间倒序）。 */
-  async list(): Promise<ProjectSummary[]> {
-    const records = await request(this.db.transaction(PROJECTS_STORE).objectStore(PROJECTS_STORE).getAll() as IDBRequest<StoredProject[]>);
-    return records
-      .map((record) => ({
-        uri: record.uri,
-        name: record.project.name,
-        savedAt: record.savedAt,
-        revision: record.project.revision,
-        schemaVersion: record.project.schemaVersion,
-      }))
-      .sort((a, b) => (a.savedAt < b.savedAt ? 1 : a.savedAt > b.savedAt ? -1 : 0));
+  /** 最近项目列表（按保存时间倒序）；事务创建/读取故障返回类型化失败（第十七轮严重 4）。 */
+  async list(): Promise<ListOutcome> {
+    try {
+      const records = await request(this.db.transaction(PROJECTS_STORE).objectStore(PROJECTS_STORE).getAll() as IDBRequest<StoredProject[]>);
+      return {
+        ok: true,
+        items: records
+          .map((record) => ({
+            uri: record.uri,
+            name: record.project.name,
+            savedAt: record.savedAt,
+            revision: record.project.revision,
+            schemaVersion: record.project.schemaVersion,
+          }))
+          .sort((a, b) => (a.savedAt < b.savedAt ? 1 : a.savedAt > b.savedAt ? -1 : 0)),
+      };
+    } catch (error) {
+      return { ok: false, message: failureMessage(error) };
+    }
   }
 
-  /** 加载项目（返回调用方可自由修改的副本）。 */
-  async load(uri: string): Promise<Project | null> {
-    const record = await request(
-      this.db.transaction(PROJECTS_STORE).objectStore(PROJECTS_STORE).get(uri) as IDBRequest<StoredProject | undefined>,
-    );
-    return record?.project ? structuredClone(record.project) : null;
+  /** 加载项目（返回调用方可自由修改的副本）；事务创建/读取故障返回类型化失败（第十七轮严重 4）。 */
+  async load(uri: string): Promise<LoadOutcome> {
+    try {
+      const record = await request(
+        this.db.transaction(PROJECTS_STORE).objectStore(PROJECTS_STORE).get(uri) as IDBRequest<StoredProject | undefined>,
+      );
+      return { ok: true, project: record?.project ? structuredClone(record.project) : null };
+    } catch (error) {
+      return { ok: false, message: failureMessage(error) };
+    }
   }
 
   /**
@@ -158,9 +171,11 @@ export class ProjectStore implements ProjectStorage {
         message: `项目无法本地保存（不可结构化克隆）：${failureMessage(error)}`,
       };
     }
-    const transaction = this.db.transaction(PROJECTS_STORE, 'readwrite');
-    const store = transaction.objectStore(PROJECTS_STORE);
     try {
+      // 事务创建（连接已关闭时同步抛错）必须落在异常边界内（第十七轮严重 4）：
+      // 与锁内 I/O 一样收口为类型化失败，绝不向上 reject
+      const transaction = this.db.transaction(PROJECTS_STORE, 'readwrite');
+      const store = transaction.objectStore(PROJECTS_STORE);
       const existing = await request(store.get(snapshot.uri) as IDBRequest<StoredProject | undefined>);
       const storedRevision = existing?.project.revision;
       const mismatch =
@@ -234,17 +249,22 @@ export class ProjectStore implements ProjectStorage {
     }
   }
 
-  /** 删除项目；返回是否真的存在并删除。以事务提交为删除完成边界（第九轮 #5）：
-   *  请求成功 ≠ 事务已提交 —— 调用方（复制清理）仅在事务提交后才有权声称
-   *  「已清理」；事务中止/出错时如实拒绝（抛错），绝不在删除未落定时报成功。 */
-  async remove(uri: string): Promise<boolean> {
-    const transaction = this.db.transaction(PROJECTS_STORE, 'readwrite');
-    const store = transaction.objectStore(PROJECTS_STORE);
-    const existing = await request(store.get(uri) as IDBRequest<StoredProject | undefined>);
-    if (!existing) return false;
-    await request(store.delete(uri) as IDBRequest<undefined>);
-    await transactionDone(transaction);
-    return true;
+  /** 删除项目；返回是否真的存在并删除（removed）。以事务提交为删除完成边界
+   *  （第九轮 #5）：请求成功 ≠ 事务已提交 —— 调用方（复制清理）仅在事务提交后
+   *  才有权声称「已清理」；事务中止/出错/创建失败（连接已关闭）返回类型化失败，
+   *  绝不在删除未落定时报成功（第十七轮严重 4）。 */
+  async remove(uri: string): Promise<RemoveOutcome> {
+    try {
+      const transaction = this.db.transaction(PROJECTS_STORE, 'readwrite');
+      const store = transaction.objectStore(PROJECTS_STORE);
+      const existing = await request(store.get(uri) as IDBRequest<StoredProject | undefined>);
+      if (!existing) return { ok: true, removed: false };
+      await request(store.delete(uri) as IDBRequest<undefined>);
+      await transactionDone(transaction);
+      return { ok: true, removed: true };
+    } catch (error) {
+      return { ok: false, message: failureMessage(error) };
+    }
   }
 
   /** 条件删除（第十四轮严重 4 CAS + 第十五轮严重 4/一般 7）：读-比-删与提交在
@@ -271,7 +291,9 @@ export class ProjectStore implements ProjectStorage {
    *  写前先迁移/校验（第八轮 #4：未来 schema 拒绝写前变更）；以迁移后的 revision
    *  为 CAS 期望：读-改-写间被其他写入推进时拒绝，防倒退。 */
   async rename(uri: string, name: string): Promise<RenameOutcome> {
-    const project = await this.load(uri);
+    const loaded = await this.load(uri);
+    if (!loaded.ok) return { ok: false, code: 'storage-error', message: loaded.message };
+    const project = loaded.project;
     if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
     const prepared = prepareWriteChange(project, 'rename');
     if (!prepared.ok) return prepared;
@@ -292,7 +314,9 @@ export class ProjectStore implements ProjectStorage {
     // 入口级异常归一（第十五轮严重 5）：源加载/克隆/指纹/save 的意外 reject
     // 一律返回类型化 storage-error —— adapter 契约不向上抛异常，UI 无需兜底
     try {
-      const project = await this.load(uri);
+      const loaded = await this.load(uri);
+      if (!loaded.ok) return { ok: false, code: 'storage-error', message: `复制失败：${loaded.message}` };
+      const project = loaded.project;
       if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
       const prepared = prepareWriteChange(project, 'duplicate');
       if (!prepared.ok) return prepared;
@@ -307,17 +331,16 @@ export class ProjectStore implements ProjectStorage {
       const fingerprint = stableStringify(copy);
       const result = await this.save(copy, null);
       if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
-      let loaded: Project | null;
-      try {
-        loaded = await this.load(copy.uri);
-      } catch (error) {
+      const reloaded = await this.load(copy.uri);
+      if (!reloaded.ok) {
         return {
           ok: false,
           code: 'storage-error',
-          message: `复制成功但副本无法加载验证（${failureMessage(error)}），${await this.cleanupCopy(copy.uri, fingerprint)}`,
+          message: `复制成功但副本无法加载验证（${reloaded.message}），${await this.cleanupCopy(copy.uri, fingerprint)}`,
         };
       }
-      if (!loaded || validateProjectSchema(loaded) || validateProjectStructure(loaded)) {
+      const loadedCopy = reloaded.project;
+      if (!loadedCopy || validateProjectSchema(loadedCopy) || validateProjectStructure(loadedCopy)) {
         return {
           ok: false,
           code: 'storage-error',

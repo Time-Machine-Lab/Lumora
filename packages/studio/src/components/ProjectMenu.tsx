@@ -97,7 +97,13 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
   }, [persistence]);
 
   const refreshRecent = async () => {
-    setRecent(await persistence.listRecent());
+    try {
+      setRecent(await persistence.listRecent());
+    } catch (error) {
+      // 第十七轮严重 4：列表加载失败（存储/锁故障）toast 呈现 —— 刷新经
+      // void 触发（toggleMenu），不 catch 即未处理 Promise 且无任何提示
+      showToast(error instanceof Error ? error.message : String(error), 'error');
+    }
   };
 
   const toggleMenu = () => {
@@ -126,6 +132,10 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
         return;
       }
       setOpen(false);
+    } catch (error) {
+      // 第十七轮严重 4：打开链路（loadProject/切换）意外 reject 兜底 toast，
+      // 不产生未处理 Promise
+      showToast(`无法打开「${summary.name}」：${error instanceof Error ? error.message : String(error)}`, 'error');
     } finally {
       setBusy(false);
     }
@@ -160,6 +170,9 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
       } else {
         showToast(result.message, 'error');
       }
+    } catch (error) {
+      // 第十七轮严重 4：存储/锁故障（rename 类型化失败之外）兜底 toast
+      showToast(`重命名失败：${error instanceof Error ? error.message : String(error)}`, 'error');
     } finally {
       setBusy(false);
     }
@@ -215,6 +228,9 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
       await persistence.deleteProject(summary.uri);
       showToast(`已删除「${summary.name}」`, 'success');
       void refreshRecent();
+    } catch (error) {
+      // 第十七轮严重 4：删除失败（facade 归一化后抛错）toast 呈现
+      showToast(`删除失败：${error instanceof Error ? error.message : String(error)}`, 'error');
     } finally {
       setBusy(false);
       // 删除后焦点回到常驻「项目」按钮（被删行的删除按钮已随列表移除，不落 BODY）

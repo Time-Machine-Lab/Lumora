@@ -101,7 +101,12 @@ export class ProjectAutosaver {
   /** 最新未保存快照（编辑器的只读冻结快照）：编辑后立即捕获，reset/close 后仍可冲刷 */
   private pending: Project | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
-  private saveQueued = false;
+  /** 排队占位（第十七轮严重 3，所有权化）：{ 入队会话代, 一次性 ticket } ——
+   *  - 新会话 runSave 遇同会话占位即 return；旧会话占位不阻塞，直接覆盖重入队；
+   *  - 任务执行时仅清理自己持有的 ticket：旧会话任务无条件清位会吞掉新会话
+   *    占位，新会话随后的编辑会重复排队（同一防抖多任务保存）；
+   *  占位在任务开始时清除，在途阶段由 saveInFlight 识别。 */
+  private saveQueued: { session: number; ticket: object } | null = null;
   /** 保存是否在途（第十二轮一般 #7）：runSave 的任务已开始执行但尚未完成 ——
    *  saveQueued 在任务开始时即清位，在途阶段只能由该标志识别 */
   private saveInFlight = false;
@@ -213,7 +218,7 @@ export class ProjectAutosaver {
     this.session += 1;
     this.currentUri = project.uri;
     this.pending = null;
-    this.saveQueued = false;
+    this.saveQueued = null;
     this.latched = null;
     // 新项目尚无「已确认落盘」记录：基线置 null（create-only 语义），数字基线
     // 仅由对账的 load/保存成功建立 —— 首存失败不被吞，后续保存仍按创建语义重试
@@ -233,7 +238,7 @@ export class ProjectAutosaver {
     this.session += 1;
     this.currentUri = null;
     this.pending = null;
-    this.saveQueued = false;
+    this.saveQueued = null;
     this.latched = null;
     if (prevUri !== null && previous !== null) {
       this.enqueueDrain(prevUri, previous);
@@ -253,7 +258,7 @@ export class ProjectAutosaver {
     this.session += 1;
     this.currentUri = project.uri;
     this.pending = null;
-    this.saveQueued = false;
+    this.saveQueued = null;
     this.latched = null;
     this.committedByUri.set(project.uri, { revision: project.revision, fingerprint: contentFingerprint(project) });
     this.recovery.delete(project.uri);
@@ -573,7 +578,9 @@ export class ProjectAutosaver {
   }
 
   private runSave(): void {
-    if (this.saveQueued) return;
+    // 第十七轮严重 3：占位带会话所有权 —— 同会话已有排队占位时不重复排队；
+    // 旧会话占位不阻断新会话（覆盖重入队，新会话编辑绝不因旧占位被吞）
+    if (this.saveQueued?.session === this.session) return;
     const project = this.pending ?? this.editor.getProject();
     if (!project || project.uri !== this.currentUri) return;
     // 第十五轮严重 3：目标会话代在入队前捕获 —— 队列被慢 reconcile/其他任务
@@ -582,9 +589,12 @@ export class ProjectAutosaver {
     // 复验，旧代任务直接作废（未落盘内容由切换时的排空/恢复快照承载，已落盘
     // 内容不受影响）
     const capturedSession = this.session;
-    this.saveQueued = true;
+    const ticket = {};
+    this.saveQueued = { session: capturedSession, ticket };
     void this.enqueue(async () => {
-      this.saveQueued = false;
+      // 仅清理自己持有的占位：慢任务链上旧会话任务执行时，占位可能已被新会话
+      // 覆盖（新任务已排队）—— 无条件清位会吞掉新会话占位，导致重复排队
+      if (this.saveQueued?.ticket === ticket) this.saveQueued = null;
       if (this.disposed) return;
       // 复验：切换/关闭（会话代递增）后旧代任务作废，绝不写回已丢弃快照
       if (!this.isFresh(project.uri, capturedSession)) return;
@@ -592,8 +602,17 @@ export class ProjectAutosaver {
       let outcome: SaveOutcome | null = null;
       const targetUri = project.uri;
       try {
-        // 执行时若已有更新的快照（同 uri），保存最新内容
-        const target = this.pending && this.pending.uri === project.uri ? this.pending : project;
+        // 执行时以同会话同 uri 的最新内容为准（第十五轮 + 第十七轮严重 3）：
+        // 慢链期间 reconcile 等任务可能已保存并清空 pending —— 仍用触发时
+        // 快照会以旧 revision 覆写较新记录（假冲突）；会话复验已保证编辑器
+        // 当前项目即同 uri 项目，可直接取用
+        const current = this.editor.getProject();
+        const target =
+          this.pending && this.pending.uri === project.uri
+            ? this.pending
+            : current && current.uri === project.uri
+              ? current
+              : project;
         outcome = await this.saveSnapshot(target, true, capturedSession);
       } finally {
         this.saveInFlight = false;
@@ -662,13 +681,14 @@ export class ProjectAutosaver {
       this.emit({ status: 'memory' });
       return;
     }
-    let stored: Project | null = null;
-    try {
-      stored = await this.store.load(project.uri);
-    } catch {
+    // 第十七轮严重 4：load 已收口为类型化结果（锁/存储故障不再 reject）——
+    // 读取失败与存储不可用同态处理：降级为仅内存模式（保持编辑器不中断）
+    const loaded = await this.store.load(project.uri);
+    if (!loaded.ok) {
       if (this.isFresh(project.uri, session)) this.emit({ status: 'memory' });
       return;
     }
+    const stored = loaded.project;
     // await 后复验：过期任务（期间切换/关闭）的结果一律丢弃
     if (!this.isFresh(project.uri, session)) return;
     if (!stored) {

@@ -85,17 +85,28 @@ export type RenameOutcome =
   | { ok: true }
   | { ok: false; code: 'not-found' | 'storage-error'; message: string };
 
-/** 项目本地存储适配器：IndexedDB（ProjectStore）与 OPFS（OpfsProjectStore）的共同契约 */
+/** 最近项目列表结果（第十七轮严重 4：锁获取/读取失败一律类型化，绝不向上 reject） */
+export type ListOutcome = { ok: true; items: ProjectSummary[] } | { ok: false; message: string };
+
+/** 加载结果（第十七轮严重 4：锁获取/读取失败一律类型化，绝不向上 reject） */
+export type LoadOutcome = { ok: true; project: Project | null } | { ok: false; message: string };
+
+/** 删除结果（第十七轮严重 4：锁获取/删除失败一律类型化，绝不向上 reject） */
+export type RemoveOutcome = { ok: true; removed: boolean } | { ok: false; message: string };
+
+/** 项目本地存储适配器：IndexedDB（ProjectStore）与 OPFS（OpfsProjectStore）的共同契约。
+ *  全部方法的存储/锁故障都以类型化结果返回（或通过调用方显式 catch 处理），
+ *  不产生未处理的 reject（第十七轮严重 4）。 */
 export interface ProjectStorage {
   readonly kind: StorageBackend;
-  /** 最近项目列表（按保存时间倒序）。 */
-  list(): Promise<ProjectSummary[]>;
-  /** 加载项目（返回调用方可自由修改的副本）。 */
-  load(uri: string): Promise<Project | null>;
+  /** 最近项目列表（按保存时间倒序）；存储/锁故障返回类型化失败。 */
+  list(): Promise<ListOutcome>;
+  /** 加载项目（返回调用方可自由修改的副本）；存储/锁故障返回类型化失败。 */
+  load(uri: string): Promise<LoadOutcome>;
   /** 保存项目（CAS，见文件头语义）；失败返回类型化错误，绝不静默覆盖较新内容。 */
   save(project: Project, expectedStoredRevision?: number | null): Promise<SaveOutcome>;
-  /** 删除项目；返回是否真的存在并删除。 */
-  remove(uri: string): Promise<boolean>;
+  /** 删除项目；返回是否真的存在并删除（removed）；存储/锁故障返回类型化失败。 */
+  remove(uri: string): Promise<RemoveOutcome>;
   /** 条件删除（第十四轮严重 4）：仅当记录内容指纹与期望一致时删除（副本验证
    *  失败后的清理不得误删另一标签页已打开并保存的更新后合法记录）。
    *  实现与 save 同一原子边界：IndexedDB 在 readwrite 事务内读-比-删并以事务

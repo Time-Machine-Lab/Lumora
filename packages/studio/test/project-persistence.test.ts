@@ -6,9 +6,15 @@ import type { StudioRuntime } from '../src/runtime/studio-runtime';
 import { ProjectStore } from '../src/persistence/project-store';
 import { ProjectPersistence } from '../src/persistence/project-persistence';
 import { buildProjectPackage, serializeProjectPackage } from '@lumora/core';
-import type { ProjectStorage } from '../src/persistence/project-storage';
+import type { ListOutcome, LoadOutcome, ProjectStorage, RemoveOutcome } from '../src/persistence/project-storage';
 
 const DB = 'lumora-test-persist';
+/** 便捷读取/列表（第十七轮严重 4：list/load 收口为类型化结果后直接取数据字段） */
+async function loadStored(store: ProjectStorage, uri: string): Promise<Project | null> {
+  const result = await store.load(uri);
+  return result.ok ? result.project : null;
+}
+
 
 async function settle(ms = 40): Promise<void> {
   await new Promise((r) => setTimeout(r, ms));
@@ -77,7 +83,7 @@ describe('ProjectPersistence：新建 / 最近项目 / 重命名 / 复制 / 删�
     expect(runtime.editor.getProject()!.name).toBe('新名字');
     await settle(60);
     const stored = await openStandaloneStore();
-    expect((await stored!.load(project.uri))!.name).toBe('新名字');
+    expect((await loadStored(stored!, project.uri))!.name).toBe('新名字');
     await runtime.dispose();
   });
 
@@ -91,7 +97,7 @@ describe('ProjectPersistence：新建 / 最近项目 / 重命名 / 复制 / 删�
     const ok = await runtime.persistence.renameProject(project.uri, '改名不打开');
     expect(ok.ok).toBe(true);
     const reopened = await openStandaloneStore();
-    expect((await reopened!.load(project.uri))!.name).toBe('改名不打开');
+    expect((await loadStored(reopened!, project.uri))!.name).toBe('改名不打开');
 
     const empty = await runtime.persistence.renameProject(project.uri, '   ');
     expect(empty.ok).toBe(false);
@@ -114,7 +120,7 @@ describe('ProjectPersistence：新建 / 最近项目 / 重命名 / 复制 / 删�
 
     // 复制出的项目同样可被打开编辑
     const copy = await openStandaloneStore();
-    const copyProject = await copy!.load(dup.summary.uri);
+    const copyProject = await loadStored(copy!, dup.summary.uri);
     expect(copyProject!.revision).toBe(0);
 
     expect(await runtime.persistence.deleteProject(dup.summary.uri)).toBe(true);
@@ -199,7 +205,7 @@ describe('ProjectPersistence：运行时集成（自动保存链路）', () => {
     // 不等待防抖，直接卸载
     await runtime.dispose();
     const store = await openStandaloneStore();
-    const stored = await store!.load(project.uri);
+    const stored = await loadStored(store!, project.uri);
     expect(stored!.revision).toBeGreaterThan(0);
   });
 
@@ -210,7 +216,7 @@ describe('ProjectPersistence：运行时集成（自动保存链路）', () => {
     runtime.editor.addObject(createGroupObject());
     await runtime.closeProject();
     const store = await openStandaloneStore();
-    const stored = await store!.load(project.uri);
+    const stored = await loadStored(store!, project.uri);
     expect(stored).not.toBeNull();
     expect(stored!.objects.length).toBeGreaterThan(project.objects.length);
     await runtime.dispose();
@@ -245,7 +251,7 @@ describe('ProjectPersistence：运行时集成（自动保存链路）', () => {
     await runtime.init({ debounceMs: 10, dbName: DB });
     await settle(80);
     const store = await openStandaloneStore();
-    const stored = await store!.load(project.uri);
+    const stored = await loadStored(store!, project.uri);
     expect(stored).not.toBeNull();
     expect(stored!.revision).toBe(runtime.editor.getProject()!.revision);
     expect(stored!.objects.length).toBe(project.objects.length + 1);
@@ -263,7 +269,7 @@ describe('ProjectPersistence：运行时集成（自动保存链路）', () => {
     expect(dup.ok).toBe(true);
     if (!dup.ok) return;
     const copy = await openStandaloneStore();
-    const copyProject = await copy!.load(dup.summary.uri);
+    const copyProject = await loadStored(copy!, dup.summary.uri);
     // 副本来自编辑器快照：含未保存的新增对象
     expect(copyProject).not.toBeNull();
     expect(copyProject!.objects.length).toBe(project.objects.length + 1);
@@ -300,7 +306,7 @@ describe('ProjectPersistence：运行时集成（自动保存链路）', () => {
     runtime.editor.addObject(createGroupObject());
     await settle(60);
     const final = await openStandaloneStore();
-    const stored = await final!.load(project.uri);
+    const stored = await loadStored(final!, project.uri);
     expect(stored!.revision).toBe(6);
     expect(stored!.name).toBe('较新内容');
     await runtime.dispose();
@@ -336,7 +342,7 @@ describe('ProjectPersistence：运行时集成（自动保存链路）', () => {
     expect(runtime.editor.getProject()!.objects.length).toBe(project.objects.length + 2);
     // 自动保存未被触碰（无锁存冲突）：新编辑随后正常落盘
     await settle(60);
-    const stored = await store.load(project.uri);
+    const stored = await loadStored(store, project.uri);
     expect(stored!.revision).toBe(2);
     expect(stored!.objects.length).toBe(project.objects.length + 2);
     await runtime.dispose();
@@ -371,7 +377,7 @@ describe('ProjectPersistence：运行时集成（自动保存链路）', () => {
     expect(runtime.editor.getProject()!.uri).toBe(other.uri);
     expect(runtime.editor.getProject()!.name).toBe('另一项目');
     await settle(60);
-    const otherStored = await store.load(other.uri);
+    const otherStored = await loadStored(store, other.uri);
     expect(otherStored).not.toBeNull(); // 新项目自身照常落盘
     await runtime.dispose();
   });
@@ -397,7 +403,7 @@ describe('ProjectPersistence：本地加载边界 schema 迁移（TML-53 第四�
     expect(loaded.project.objects).toEqual(v3.objects);
 
     // 写回后的存储记录已是 v3（下次加载不再迁移）
-    const after = await store!.load(v3.uri);
+    const after = await loadStored(store!, v3.uri);
     expect(after!.schemaVersion).toBe(3);
     expect(after!.tracks).toEqual([]);
     await runtime.dispose();
@@ -433,7 +439,7 @@ describe('ProjectPersistence：本地加载边界统一「迁移 → 校验」�
     expect(loaded.message).toContain('tracks');
 
     // 磁盘记录保持原样（无写回尝试），下次加载仍被拒绝
-    const after = await store!.load(v3.uri);
+    const after = await loadStored(store!, v3.uri);
     expect(after!.tracks).toBe('not-an-array');
     await runtime.dispose();
   });
@@ -750,12 +756,12 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     if (!saved.ok) return;
     persistence.clearRecovery(A);
 
-    const copyLoaded = await store!.load(saved.project.uri);
+    const copyLoaded = await loadStored(store!, saved.project.uri);
     expect(copyLoaded).not.toBeNull();
     expect(copyLoaded!.revision).toBe(0);
     expect(copyLoaded!.objects.length).toBe(base.objects.length + 2);
     // 旧恢复快照内容为 base+1（未被误当副本源）；重试保存已把快照落盘到 A
-    const storedA = await store!.load(A);
+    const storedA = await loadStored(store!, A);
     expect(storedA!.objects.length).toBe(base.objects.length + 1);
     expect(persistence.getRecoverySnapshot(A)).toBeNull();
     await persistence.dispose();
@@ -996,10 +1002,10 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     );
     const store: ProjectStorage = {
       kind: 'indexeddb',
-      list: vi.fn(async () => []),
-      load: vi.fn(async () => corruptRecord),
+      list: vi.fn(async (): Promise<ListOutcome> => ({ ok: true, items: [] })),
+      load: vi.fn(async () => ({ ok: true, project: corruptRecord } as const)),
       save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
-      remove: vi.fn(async () => true),
+      remove: vi.fn(async () => ({ ok: true, removed: true } as const)),
       removeIfUnchanged,
       rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
       duplicate: vi.fn(
@@ -1056,12 +1062,12 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     );
     const store: ProjectStorage = {
       kind: 'indexeddb',
-      list: vi.fn(async () => []),
+      list: vi.fn(async (): Promise<ListOutcome> => ({ ok: true, items: [] })),
       load: vi.fn(async () => {
         throw new Error('idb transaction aborted');
       }),
       save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
-      remove: vi.fn(async () => true),
+      remove: vi.fn(async () => ({ ok: true, removed: true } as const)),
       removeIfUnchanged,
       rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
       duplicate: vi.fn(
@@ -1099,10 +1105,10 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     });
     const store: ProjectStorage = {
       kind: 'indexeddb',
-      list: vi.fn(async () => []),
-      load: vi.fn(async () => corruptRecord),
+      list: vi.fn(async (): Promise<ListOutcome> => ({ ok: true, items: [] })),
+      load: vi.fn(async () => ({ ok: true, project: corruptRecord } as const)),
       save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
-      remove: vi.fn(async () => true),
+      remove: vi.fn(async () => ({ ok: true, removed: true } as const)),
       removeIfUnchanged,
       rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
       duplicate: vi.fn(
@@ -1129,7 +1135,7 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     // 残留记录断言：CAS 清理被拒 → 损坏副本记录仍在存储中（load 仍可读到）
     expect(removeIfUnchanged).toHaveBeenCalledTimes(1);
     expect(copyUri).toMatch(/^lumora:\/\/project\//);
-    expect(await store.load(copyUri)).not.toBeNull();
+    expect(await loadStored(store, copyUri)).not.toBeNull();
     await persistence.dispose();
   });
 
@@ -1144,10 +1150,10 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     );
     const store: ProjectStorage = {
       kind: 'indexeddb',
-      list: vi.fn(async () => []),
-      load: vi.fn(async () => corruptRecord),
+      list: vi.fn(async (): Promise<ListOutcome> => ({ ok: true, items: [] })),
+      load: vi.fn(async () => ({ ok: true, project: corruptRecord } as const)),
       save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
-      remove: vi.fn(async () => true),
+      remove: vi.fn(async () => ({ ok: true, removed: true } as const)),
       removeIfUnchanged,
       rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
       duplicate: vi.fn(
@@ -1184,12 +1190,12 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     );
     const store: ProjectStorage = {
       kind: 'indexeddb',
-      list: vi.fn(async () => []),
+      list: vi.fn(async (): Promise<ListOutcome> => ({ ok: true, items: [] })),
       load: vi.fn(async () => {
         throw new Error('idb transaction aborted');
       }),
       save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
-      remove: vi.fn(async () => true),
+      remove: vi.fn(async () => ({ ok: true, removed: true } as const)),
       removeIfUnchanged,
       rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
       duplicate: vi.fn(
@@ -1215,10 +1221,10 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
   function okStore(overrides: Partial<ProjectStorage> = {}): ProjectStorage {
     const store: ProjectStorage = {
       kind: 'indexeddb',
-      list: vi.fn(async () => []),
-      load: vi.fn(async () => null),
+      list: vi.fn(async (): Promise<ListOutcome> => ({ ok: true, items: [] })),
+      load: vi.fn(async () => ({ ok: true, project: null } as const)),
       save: vi.fn(async () => ({ ok: true }) as const),
-      remove: vi.fn(async () => true),
+      remove: vi.fn(async () => ({ ok: true, removed: true } as const)),
       removeIfUnchanged: vi.fn(async () => ({ ok: true, outcome: 'removed' }) as const),
       rename: vi.fn(async () => ({ ok: true }) as const),
       duplicate: vi.fn(async () => ({ ok: false, code: 'not-found', message: 'not mocked' }) as const),
@@ -1397,5 +1403,36 @@ describe('ProjectPersistence：exportCurrent 全链路逐层负向回归（第�
       spy.mockRestore();
       await persistence.dispose();
     }
+  });
+});
+
+describe('ProjectPersistence：facade 对存储故障的统一归一（第十七轮严重 4）', () => {
+  it('listRecent/loadProject/deleteProject/hasLocal：存储类型化失败 → 带上下文错误或类型化失败，绝不向上抛裸值', async () => {
+    const editor = new SceneEditor();
+    const store: ProjectStorage = {
+      kind: 'indexeddb',
+      list: vi.fn(async (): Promise<ListOutcome> => ({ ok: false, message: 'idb transaction aborted' })),
+      load: vi.fn(async (): Promise<LoadOutcome> => ({ ok: false, message: 'idb transaction aborted' })),
+      save: vi.fn(async () => ({ ok: true }) as const),
+      remove: vi.fn(async (): Promise<RemoveOutcome> => ({ ok: false, message: 'idb transaction aborted' })),
+      removeIfUnchanged: vi.fn(async () => ({ ok: true, outcome: 'removed' }) as const),
+      rename: vi.fn(async () => ({ ok: true }) as const),
+      duplicate: vi.fn(async () => ({ ok: false, code: 'not-found', message: 'not mocked' }) as const),
+      close: vi.fn(),
+    };
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ store });
+
+    await expect(persistence.listRecent()).rejects.toThrow('最近项目加载失败：idb transaction aborted');
+    await expect(persistence.hasLocal('lumora://project/a')).rejects.toThrow(
+      '项目存在性检查失败：idb transaction aborted',
+    );
+    await expect(persistence.deleteProject('lumora://project/a')).rejects.toThrow(
+      '项目删除失败：idb transaction aborted',
+    );
+    const loaded = await persistence.loadProject('lumora://project/a');
+    expect(loaded.ok).toBe(false);
+    if (!loaded.ok) expect(loaded.message).toContain('本地项目加载失败：idb transaction aborted');
+    await persistence.dispose();
   });
 });

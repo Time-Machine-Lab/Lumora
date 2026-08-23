@@ -28,9 +28,12 @@ import type { Project } from '@lumora/core';
 import { CURRENT_PROJECT_SCHEMA_VERSION, genId, migrateProjectSchema, validateProjectSchema, validateProjectStructure } from '@lumora/core';
 import type {
   DuplicateOutcome,
+  ListOutcome,
+  LoadOutcome,
   ProjectStorage,
   ProjectSummary,
   RemoveIfOutcome,
+  RemoveOutcome,
   RenameOutcome,
   SaveOutcome,
   StoredProject,
@@ -198,35 +201,48 @@ export class OpfsProjectStore implements ProjectStorage {
     }
   }
 
-  /** 最近项目列表（按保存时间倒序；跳过损坏记录与临时文件）。 */
-  async list(): Promise<ProjectSummary[]> {
-    return this.withLock(async () => {
-      const summaries: ProjectSummary[] = [];
-      for await (const [name, handle] of this.projectsDir.entries()) {
-        if (handle.kind !== 'file' || name.startsWith('.')) continue;
-        const record = await this.readRecord(name);
-        if (!record) continue;
-        summaries.push({
-          uri: record.uri,
-          name: record.project.name,
-          savedAt: record.savedAt,
-          revision: record.project.revision,
-          schemaVersion: record.project.schemaVersion,
-        });
-      }
-      return summaries.sort((a, b) => (a.savedAt < b.savedAt ? 1 : a.savedAt > b.savedAt ? -1 : 0));
-    });
+  /** 最近项目列表（按保存时间倒序；跳过损坏记录与临时文件）。
+   *  锁获取与锁内 I/O 故障一律收口为类型化结果（第十七轮严重 4）。 */
+  async list(): Promise<ListOutcome> {
+    try {
+      return await this.withLock(async () => {
+        const summaries: ProjectSummary[] = [];
+        for await (const [name, handle] of this.projectsDir.entries()) {
+          if (handle.kind !== 'file' || name.startsWith('.')) continue;
+          const record = await this.readRecord(name);
+          if (!record) continue;
+          summaries.push({
+            uri: record.uri,
+            name: record.project.name,
+            savedAt: record.savedAt,
+            revision: record.project.revision,
+            schemaVersion: record.project.schemaVersion,
+          });
+        }
+        return {
+          ok: true,
+          items: summaries.sort((a, b) => (a.savedAt < b.savedAt ? 1 : a.savedAt > b.savedAt ? -1 : 0)),
+        };
+      });
+    } catch (error) {
+      return { ok: false, message: failureMessage(error) };
+    }
   }
 
   /** 加载项目（返回调用方可自由修改的副本；损坏记录视为缺失）。
-   *  显式比对请求 uri 与记录 uri（哈希文件名错位时视为缺失，第七轮 #8）。 */
-  async load(uri: string): Promise<Project | null> {
-    return this.withLock(async () => {
-      const record = await this.readRecord(projectFileName(uri));
-      if (!record) return null;
-      if (record.uri !== uri) return null;
-      return record.project ? structuredClone(record.project) : null;
-    });
+   *  显式比对请求 uri 与记录 uri（哈希文件名错位时视为缺失，第七轮 #8）。
+   *  锁获取与锁内 I/O 故障一律收口为类型化结果（第十七轮严重 4）。 */
+  async load(uri: string): Promise<LoadOutcome> {
+    try {
+      return await this.withLock(async () => {
+        const record = await this.readRecord(projectFileName(uri));
+        if (!record) return { ok: true, project: null };
+        if (record.uri !== uri) return { ok: true, project: null };
+        return { ok: true, project: record.project ? structuredClone(record.project) : null };
+      });
+    } catch (error) {
+      return { ok: false, message: failureMessage(error) };
+    }
   }
 
   /**
@@ -262,9 +278,11 @@ export class OpfsProjectStore implements ProjectStorage {
         message: `项目无法本地保存（不可结构化克隆）：${failureMessage(error)}`,
       };
     }
-    return this.withLock(async () => {
-      const name = projectFileName(snapshot.uri);
-      try {
+    // 锁获取本身（locks.request reject / 进程内链故障）也在异常边界内（第十七轮
+    // 严重 4）：与锁内 I/O 一样收口为类型化失败，绝不向上 reject
+    try {
+      return await this.withLock(async () => {
+        const name = projectFileName(snapshot.uri);
         const record = await this.readRecord(name);
         if (record === null) {
           return {
@@ -334,24 +352,29 @@ export class OpfsProjectStore implements ProjectStorage {
           project: snapshot,
         });
         return { ok: true };
-      } catch (error) {
-        if (isQuotaError(error)) {
-          return { ok: false, code: 'quota-exceeded', message: '本地存储空间不足，保存失败' };
-        }
-        return { ok: false, code: 'storage-error', message: `保存失败：${failureMessage(error)}` };
+      });
+    } catch (error) {
+      if (isQuotaError(error)) {
+        return { ok: false, code: 'quota-exceeded', message: '本地存储空间不足，保存失败' };
       }
-    });
+      return { ok: false, code: 'storage-error', message: `保存失败：${failureMessage(error)}` };
+    }
   }
 
-  /** 删除项目；返回是否真的存在并删除（损坏记录同样可删除，作为修复路径）。 */
-  async remove(uri: string): Promise<boolean> {
-    return this.withLock(async () => {
-      const name = projectFileName(uri);
-      const record = await this.readRecord(name);
-      if (record === undefined) return false;
-      await this.projectsDir.removeEntry(name);
-      return true;
-    });
+  /** 删除项目；返回是否真的存在并删除（removed；损坏记录同样可删除，作为修复
+   *  路径）。锁获取与锁内 I/O 故障一律收口为类型化结果（第十七轮严重 4）。 */
+  async remove(uri: string): Promise<RemoveOutcome> {
+    try {
+      return await this.withLock(async () => {
+        const name = projectFileName(uri);
+        const record = await this.readRecord(name);
+        if (record === undefined) return { ok: true, removed: false };
+        await this.projectsDir.removeEntry(name);
+        return { ok: true, removed: true };
+      });
+    } catch (error) {
+      return { ok: false, message: failureMessage(error) };
+    }
   }
 
   /** 条件删除（第十四轮严重 4 CAS + 第十五轮严重 4/一般 7 四态）：互斥锁内
@@ -381,7 +404,9 @@ export class OpfsProjectStore implements ProjectStorage {
   /** 直接重命名已存储项目（仅适用于未打开的项目）；语义与 ProjectStore 一致。
    *  写前先迁移/校验（第八轮 #4：未来 schema 拒绝写前变更）。 */
   async rename(uri: string, name: string): Promise<RenameOutcome> {
-    const project = await this.load(uri);
+    const loaded = await this.load(uri);
+    if (!loaded.ok) return { ok: false, code: 'storage-error', message: loaded.message };
+    const project = loaded.project;
     if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
     const prepared = prepareWriteChange(project, 'rename');
     if (!prepared.ok) return prepared;
@@ -401,7 +426,9 @@ export class OpfsProjectStore implements ProjectStorage {
     // 入口级异常归一（第十五轮严重 5）：源加载/克隆/指纹/save 的意外 reject
     // 一律返回类型化 storage-error —— adapter 契约不向上抛异常，UI 无需兜底
     try {
-      const project = await this.load(uri);
+      const loaded = await this.load(uri);
+      if (!loaded.ok) return { ok: false, code: 'storage-error', message: `复制失败：${loaded.message}` };
+      const project = loaded.project;
       if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
       const prepared = prepareWriteChange(project, 'duplicate');
       if (!prepared.ok) return prepared;
@@ -416,17 +443,16 @@ export class OpfsProjectStore implements ProjectStorage {
       const fingerprint = stableStringify(copy);
       const result = await this.save(copy, null);
       if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
-      let loaded: Project | null;
-      try {
-        loaded = await this.load(copy.uri);
-      } catch (error) {
+      const reloaded = await this.load(copy.uri);
+      if (!reloaded.ok) {
         return {
           ok: false,
           code: 'storage-error',
-          message: `复制成功但副本无法加载验证（${failureMessage(error)}），${await this.cleanupCopy(copy.uri, fingerprint)}`,
+          message: `复制成功但副本无法加载验证（${reloaded.message}），${await this.cleanupCopy(copy.uri, fingerprint)}`,
         };
       }
-      if (!loaded || validateProjectSchema(loaded) || validateProjectStructure(loaded)) {
+      const loadedCopy = reloaded.project;
+      if (!loadedCopy || validateProjectSchema(loadedCopy) || validateProjectStructure(loadedCopy)) {
         return {
           ok: false,
           code: 'storage-error',
