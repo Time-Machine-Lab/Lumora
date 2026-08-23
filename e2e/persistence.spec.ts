@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
 import {
+  PackageBuildError,
   SceneEditor,
   buildProjectPackage,
   compositeContentHash,
@@ -298,10 +299,11 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
     expect(declaredJson).not.toContain(`"${key}"`);
   }
 
-  // 1d. 整对象声明剥离 + 凭据形态键名拒绝（第十五轮阻断 1 回归）：声明
-  //     ['users']（整对象/数组）被叶值校验剥离 —— 显式登记也无法携带嵌套
-  //     值；声明 ['apiKey','clientSecret']（凭据形态键名）一律拒绝 ——
-  //     凭据绝无声明通道，即使插件显式点名导出
+  // 1d. 整对象声明剥离 + 凭据形态键名声明命中（第十五轮阻断 1 + 第二十五轮
+  //     指令 3 回归）：声明 ['users']（整对象/数组）被叶值校验剥离 —— 显式
+  //     登记也无法携带嵌套值；声明 ['apiKey','clientSecret']（凭据形态键名）
+  //     命中 → 构建校验失败（不再静默丢弃），凭据绝无声明通道，即使插件显式
+  //     点名导出
   const credentialShape: Record<string, unknown> = {
     [pluginId]: {
       theme: 'dark',
@@ -318,15 +320,22 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
   expect(wholeJson).toContain('"theme":"dark"');
   expect(wholeJson).not.toContain('"users"');
   for (const secret of Object.values(secrets)) expect(wholeJson).not.toContain(secret);
-  const credentialKeyDecl = buildProjectPackage(
-    { ...sourceBase, uri: 'lumora://project/ac4-cred', name: 'AC4 凭据形态键声明', pluginData: credentialShape },
-    { includePrivate: true, publicKeysByPlugin: { [pluginId]: ['apiKey', 'clientSecret', 'theme'] } },
-  );
-  const credentialJson = JSON.stringify(credentialKeyDecl);
-  expect(credentialJson).toContain('"theme":"dark"');
-  expect(credentialJson).not.toContain('"apiKey"');
-  expect(credentialJson).not.toContain('"clientSecret"');
-  for (const secret of Object.values(secrets)) expect(credentialJson).not.toContain(secret);
+  let credentialError: unknown = null;
+  try {
+    buildProjectPackage(
+      { ...sourceBase, uri: 'lumora://project/ac4-cred', name: 'AC4 凭据形态键声明', pluginData: credentialShape },
+      { includePrivate: true, publicKeysByPlugin: { [pluginId]: ['apiKey', 'clientSecret', 'theme'] } },
+    );
+  } catch (caught) {
+    credentialError = caught;
+  }
+  expect(credentialError).toBeInstanceOf(PackageBuildError);
+  const credentialBuildError = credentialError as PackageBuildError;
+  expect(credentialBuildError.code).toBe('credential-declaration-rejected');
+  expect(credentialBuildError.declarations).toHaveLength(2);
+  expect(credentialBuildError.declarations).toContainEqual({ plugin: pluginId, path: '"apiKey"' });
+  expect(credentialBuildError.declarations).toContainEqual({ plugin: pluginId, path: '"clientSecret"' });
+  expect(credentialBuildError.message).toContain('凭据永不导出');
 
   // 2. 浏览器导入源项目：插件私有设置（含嵌套凭据）成为编辑器与本地持久化状态
   await page.goto('/');

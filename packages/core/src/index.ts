@@ -117,6 +117,10 @@ export {
   parseProjectPackage,
   serializeProjectPackage,
 } from './project/package';
+export {
+  PackageBuildError,
+  type PackageBuildErrorCode,
+} from './project/package';
 export type {
   MissingAssetWarning,
   PackageBuildOptions,

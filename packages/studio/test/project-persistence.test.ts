@@ -884,11 +884,20 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     expect(rawExport.text).not.toContain('client-secret-2');
 
     // 显式 allowlist：只有声明的键进包，未声明键排除；凭据形态键名（apiKey/
-    // clientSecret）的声明本身被拒绝（第十五轮阻断 1）—— 即使显式声明也不得
-    // 进包，绝不出现「插件声明了就放行」的凭据出口
-    const exported = runtime.persistence.exportCurrent({
+    // clientSecret）的声明命中 → 导出失败（第二十五轮指令 3：不再静默丢弃，
+    // 插件作者可见的带错误码校验失败）—— 即使显式声明也不得进包，绝不出现
+    // 「插件声明了就放行」的凭据出口
+    const rejectedExport = runtime.persistence.exportCurrent({
       includePrivate: true,
       publicKeysByPlugin: { 'com.example': ['keyboardLayout', 'monkeyPatch', 'apiKey', 'clientSecret'] },
+    });
+    expect(rejectedExport.ok).toBe(false);
+    if (rejectedExport.ok) return;
+    expect(rejectedExport.message).toContain('凭据永不导出');
+    expect(rejectedExport.message).toContain('apiKey');
+    const exported = runtime.persistence.exportCurrent({
+      includePrivate: true,
+      publicKeysByPlugin: { 'com.example': ['keyboardLayout', 'monkeyPatch'] },
     });
     expect(exported.ok).toBe(true);
     if (!exported.ok) return;

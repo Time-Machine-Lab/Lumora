@@ -64,6 +64,28 @@ export interface PackageImportError {
   detail?: string;
 }
 
+export type PackageBuildErrorCode = 'credential-declaration-rejected';
+
+/** 工程包构建校验失败（第二十五轮：凭据形态公开声明不再静默丢弃）。构建期
+ *  抛错（与 import 侧 PackageImportError 结果类型对应）：插件作者必须看到
+ *  自己的公开声明被拒、改走安全通道 —— 「凭据永不导出」不依赖插件自觉声明，
+ *  也不静默产出缺少字段的包。 */
+export class PackageBuildError extends Error {
+  readonly code: PackageBuildErrorCode;
+  /** 全部被拒声明（跨插件聚合，一次构建报全） */
+  readonly declarations: ReadonlyArray<{ plugin: string; path: string }>;
+  constructor(
+    code: PackageBuildErrorCode,
+    message: string,
+    declarations: ReadonlyArray<{ plugin: string; path: string }>,
+  ) {
+    super(message);
+    this.name = 'PackageBuildError';
+    this.code = code;
+    this.declarations = declarations;
+  }
+}
+
 export interface MissingAssetWarning {
   assetId: string;
   name: string;
@@ -325,12 +347,13 @@ function isSafeExportKey(key: string): boolean {
  *  1. 正向豁免：叶键精确命中 BENIGN_CREDENTIAL_KEYS（tokenBudget/authMode）
  *     即放行 —— 歧义字段的合法公开契约白名单（第二十三轮阻断 2）；
  *  2. 凭据类词（kind：token/secret/password/passwd/passphrase/credential(s)/
- *     auth）作为「语义角色」参与有边界判定 —— 键的最后一个 token 为 kind 词
- *     （kind-suffix 闭合规则，覆盖 apiToken/authToken/csrfToken/idToken/
- *     privateToken 等一切「限定词 + kind」形态）或 kind 词后接纯数字
- *     （token1/auth0）即拒绝；key 语义过泛不入 kind 集（shortcutKey/hotkey
- *     合法），X+key 形态由相邻复合对闭合（api+key/private+key/auth+key/
- *     pass+key/secret+key）；
+ *     auth）作为「语义角色」参与有边界判定 —— 任意 token 位置精确匹配（含
+ *     单复数归一）即拒绝（第二十五轮：替代旧「末位 kind + 纯数字后缀」判定，
+ *     覆盖 apiToken/authToken/csrfToken/idToken/privateToken 等「限定词 +
+ *     kind」形态与 tokenValue/tokenHash/apiTokenV2 等 X+kind+Y 形态）；
+ *     tokenizerConfig/authorizationMode/renderPass 等以词边界精确匹配不误伤；
+ *     key 语义过泛不入 kind 集（shortcutKey/hotkey 合法），X+key 形态由相邻
+ *     复合对闭合（api+key/private+key/auth+key/pass+key/secret+key）；
  *  3. 高置信凭据根词（多语言表）：Latin 根词（password/passwd/passphrase/
  *     passcode/secret/credential(s)/contrasena）对 token 整词精确匹配（含
  *     单复数归一，绝无子串匹配）；CJK/日文等无词边界语言（密码/密碼/口令/
@@ -347,21 +370,29 @@ function isSafeExportKey(key: string): boolean {
  *  6. 无边界复合形态（第二十一轮阻断 1 保留，第二十三轮严重 5 改精确相等）：
  *     整键归一化+去分隔后与派生候选（复合对/敏感限定组合拼接表）精确相等
  *     才拒绝 —— authheader/privatesetting/secretvalue 等连写；绝不 includes
- *     （accessTokenizerConfig 不再误中 accesstoken）。
+ *     （accessTokenizerConfig 不再误中 accesstoken）。数字/版本后缀变体剥除后
+ *     命中候选表同样拒绝（apikey2/authkey2/accesstoken2/api2key/apikeyv2，
+ *     第二十五轮）；apiVersion3 → apiversion ∉ 候选表，放行。
  *  任意命中即拒绝。tokenizerConfig/tokenizerModel/authorName/authorizationMode/
  *  apiVersion/MONKEYPATCH/HOTKEYMAP/keyboardLayout/shortcutKey 等仅含
  *  tokenizer/author/api/key 等非凭据形态的键放行。连续大写缩写保留为一个
  *  token（APIKey → api|key、PASSWORD → password、API_KEY → api|key，
- *  第十八轮阻断 1）。 */
+ *  第十八轮阻断 1）。
+ *  凭据形态**公开声明**命中时（顶层字符串声明或路径数组声明，含逐 segment
+ *  判定），工程包构建抛 PackageBuildError（code=credential-declaration-rejected，
+ *  跨插件聚合列出全部被拒声明）—— 不再静默丢弃（第二十五轮 manifest 显式
+ *  校验）；豁免叶键 tokenBudget/authMode 的声明不受影响（含
+ *  ['profile','tokenBudget'] 等路径声明，其叶键 token 不参与跨 segment 判定）。 */
 
 /** 可审计 benign 契约正向豁免（第二十三轮阻断 2 范式反转）：token/auth 语义
  *  两可的合法公开字段白名单 —— 叶键精确命中即放行。判定对敏感形态默认拒绝，
  *  合法歧义字段必须显式登记于此表（随产品公开契约演进，可审计） */
 const BENIGN_CREDENTIAL_KEYS = new Set(['tokenBudget', 'authMode']);
 
-/** 凭据类词（kind）：作为「语义角色」参与有边界判定 —— 键的最后一个 token
- *  为 kind 词（kind-suffix 闭合）、kind 词独立成键、或 kind 词后接纯数字时
- *  默认拒绝。token/auth 语义两可（合法字段经 BENIGN_CREDENTIAL_KEYS 豁免），
+/** 凭据类词（kind）：作为「语义角色」参与有边界判定 —— 任意 token 位置精确
+ *  匹配（含单复数归一）即拒绝（第二十五轮，替代旧「末位 + 纯数字后缀」判定）：
+ *  apiToken/tokenValue/tokenHash/apiTokenV2 等 kind 词落任意位均默认拒绝。
+ *  token/auth 语义两可（合法字段经 BENIGN_CREDENTIAL_KEYS 豁免），
  *  secret/password/passphrase 等无歧义。key 不入本集（shortcutKey/hotkey 等
  *  合法键以 key 结尾，误伤面过大），X+key 形态由 CREDENTIAL_COMPOUND_PAIRS
  *  闭合 */
@@ -540,30 +571,19 @@ function isCredentialShapeTokens(joined: string, tokens: string[]): boolean {
   // 无词边界语言（CJK/日文）凭据根词：NFKC 后包含即拒绝；主题/caféMode 等
   // 合法非 ASCII 键不再因 blanket fail-closed 被误删
   if (containsCredentialCjkRoot(joined)) return true;
-  // kind-suffix 扩展后逐 token 做高置信根词精确匹配（含单复数归一）
+  // kind-suffix 扩展后逐 token 做凭据类词与高置信根词精确匹配（含单复数归一）。
+  // kind 词任意 token 位置命中即拒绝（第二十五轮）：X+kind+Y 形态
+  // （tokenValue/tokenHash/apiTokenV2）kind 词落中间位同样闭合 —— 替代旧的
+  // 「末位 kind + 纯数字后缀」判定；tokenizerConfig/authorizationMode/
+  // renderPass 等以词边界精确匹配不误伤。tokenBudget/authMode 等豁免叶键在
+  // 调用方放行（跨 segment 判定剥离豁免叶键的 token，见 buildExportTrie），
+  // 此处不会因歧义词产生误拒
   const expanded = expandKindSuffixTokens(tokens);
   for (const token of expanded) {
+    if (isCredentialKindWord(token)) return true;
     for (const root of CREDENTIAL_LATIN_ROOTS) {
       if (matchesCredentialWord(token, root)) return true;
     }
-  }
-  // kind-suffix 闭合：键的最后一个 token 以凭据类词（含复数形）结尾 —— 裸
-  // token/auth 与「限定词 + kind」形态（apiToken/authToken/csrfToken/idToken/
-  // privateToken/bearertoken/databasepassword/clientsecret）默认拒绝；
-  // tokenBudget/authMode 经豁免表放行（叶键精确命中）。判定只看原始 token 列表
-  // 的末位（键的实际词尾）：joined 分词丢失 camelCase 边界时（profile+
-  // tokenBudget → profiletoken+budget），中间 token 的 kind 后缀拆分（profile
-  // +token）若进扩展列表末位会被误当作键尾
-  const lastToken = tokens[tokens.length - 1];
-  if (lastToken !== undefined && isCredentialKindWord(lastToken)) return true;
-  for (const kind of CREDENTIAL_KIND_WORDS) {
-    const plural = kind.endsWith('s') ? kind : `${kind}s`;
-    if (lastToken !== undefined && lastToken.length > kind.length && lastToken.endsWith(kind)) return true;
-    if (lastToken !== undefined && lastToken.length > plural.length && lastToken.endsWith(plural)) return true;
-  }
-  // kind 词后接纯数字（token1/auth0）
-  for (let i = 0; i < expanded.length - 1; i += 1) {
-    if (isCredentialKindWord(expanded[i]) && /^[0-9]+$/.test(expanded[i + 1])) return true;
   }
   // 相邻复合对（api+key/pass+word/secret+key 等）：无 kind 结尾的明确凭据序列
   for (let i = 0; i < tokens.length - 1; i += 1) {
@@ -574,7 +594,17 @@ function isCredentialShapeTokens(joined: string, tokens: string[]): boolean {
     }
   }
   // 无边界复合形态：整键规范化后精确相等（绝不子串 includes，第二十三轮严重 5）
-  if (CREDENTIAL_COLLAPSED_FORMS.has(collapsedCredentialForm(joined))) return true;
+  const collapsed = collapsedCredentialForm(joined);
+  if (CREDENTIAL_COLLAPSED_FORMS.has(collapsed)) return true;
+  // 第二十五轮：复合对 + 数字/版本后缀变体 —— 剥掉数字（含词中）或尾部版本
+  // 后缀后仍命中候选表即拒绝（apikey2/authkey2/accesstoken2/api2key/apikeyv2）；
+  // apiVersion3 → apiversion ∉ 候选表，放行
+  const digitless = collapsed.replace(/[0-9]+/g, '');
+  if (digitless.length > 0 && CREDENTIAL_COLLAPSED_FORMS.has(digitless)) return true;
+  const versionStripped = collapsed.replace(/[a-z]*[0-9]+$/, '');
+  if (versionStripped.length > 0 && versionStripped !== collapsed && CREDENTIAL_COLLAPSED_FORMS.has(versionStripped)) {
+    return true;
+  }
   return false;
 }
 
@@ -597,19 +627,24 @@ type ExportTrie = Map<string, ExportTrie | 'leaf'>;
 
 /** 声明列表规范化为 trie（纯数据，无合并/原地改写）：顶层字符串声明置 leaf
  *  （祖先覆盖：其下路径声明忽略）；路径数组逐层建分支。任一路径键含原型键、
- *  privateSettings 重叠时整条声明拒绝；凭据形态判定以完整路径统一 token 化
- *  执行（跨 segment 相邻序列，第十九轮阻断 2）—— 命中即整条声明拒绝
- *  （fail-closed）。 */
+ *  privateSettings 重叠时整条声明拒绝（静默 fail-closed）；凭据形态判定以完整
+ *  路径统一 token 化执行（跨 segment 相邻序列，第十九轮阻断 2）—— 命中即整条
+ *  声明拒绝并记入 rejections（第二十五轮：构建校验失败，不再静默丢弃 ——
+ *  插件作者必须看到自己的公开声明被拒）。 */
 function buildExportTrie(
   declarations: readonly (string | readonly string[])[],
   privateKeys: readonly string[],
+  rejections: Array<{ plugin: string; path: string }>,
+  plugin: string,
 ): ExportTrie | null {
   const root: ExportTrie = new Map();
   for (const declaration of declarations) {
     if (typeof declaration === 'string') {
-      if (!isSafeExportKey(declaration) || privateKeys.includes(declaration) || isCredentialShapeKey(declaration)) {
+      if (isCredentialShapeKey(declaration)) {
+        rejections.push({ plugin, path: JSON.stringify(declaration) });
         continue;
       }
+      if (!isSafeExportKey(declaration) || privateKeys.includes(declaration)) continue;
       root.set(declaration, 'leaf');
       continue;
     }
@@ -622,14 +657,41 @@ function buildExportTrie(
     // joined 判定闭合 —— 两种 token 化缺一不可：全小写 segment 拼接会合并成
     // 一个 token（'private'+'setting' → privatesetting，逐段 flatMap 保边界）；
     // 而跨 segment 的 camelCase 边界（'ap'+'iKey' → apiKey）只有整串拼接才能还原
-    if (declaration.some((segment) => typeof segment === 'string' && isCredentialShapeKey(segment))) continue;
-    const joinedPath = declaration.join('');
-    const perSegmentTokens = declaration.flatMap((segment) => credentialTokens(segment));
-    if (
-      isCredentialShapeTokens(joinedPath, credentialTokens(joinedPath)) ||
-      isCredentialShapeTokens(joinedPath, perSegmentTokens)
-    ) {
+    if (declaration.some((segment) => typeof segment === 'string' && isCredentialShapeKey(segment))) {
+      rejections.push({ plugin, path: JSON.stringify(declaration) });
       continue;
+    }
+    const joinedPath = declaration.join('');
+    // 第二十五轮：豁免叶键（tokenBudget/authMode）的 token 不参与跨 segment
+    // 判定 —— ['profile','tokenBudget'] 的 kind 词（token）落中间位不得触发
+    // kind 任意位置拒绝；段内 kind 词已被逐 segment standalone 判定覆盖
+    // （segment 为裸 kind 词时上面已拒绝）。豁免叶键只做前缀序列判定：
+    // joined 重分词会把 'profile'+'tokenBudget' 的边界抹掉还原成
+    // 'profiletoken'（kind-suffix 扩展拆出 token）误拒；前缀本身按统一判据
+    // 判定（kind/复合对/无边界形态/数字后缀变体全覆盖），合法歧义字段继续
+    // 走 BENIGN_CREDENTIAL_KEYS 显式豁免
+    const leaf = declaration[declaration.length - 1];
+    const leafBenign = typeof leaf === 'string' && BENIGN_CREDENTIAL_KEYS.has(leaf);
+    if (leafBenign) {
+      const prefix = declaration.slice(0, -1);
+      const prefixJoined = prefix.join('');
+      const prefixTokens = prefix.flatMap((segment) => credentialTokens(segment));
+      if (
+        isCredentialShapeTokens(prefixJoined, credentialTokens(prefixJoined)) ||
+        isCredentialShapeTokens(prefixJoined, prefixTokens)
+      ) {
+        rejections.push({ plugin, path: JSON.stringify(declaration) });
+        continue;
+      }
+    } else {
+      const perSegmentTokens = declaration.flatMap((segment) => credentialTokens(segment));
+      if (
+        isCredentialShapeTokens(joinedPath, credentialTokens(joinedPath)) ||
+        isCredentialShapeTokens(joinedPath, perSegmentTokens)
+      ) {
+        rejections.push({ plugin, path: JSON.stringify(declaration) });
+        continue;
+      }
     }
     let node = root;
     let rejected = false;
@@ -694,9 +756,11 @@ function applyPublicPluginData(
   value: unknown,
   declarations: readonly (string | readonly string[])[],
   privateKeys: readonly string[],
+  plugin: string,
+  rejections: Array<{ plugin: string; path: string }>,
 ): Record<string, unknown> | undefined {
   if (!isPlainRecord(value)) return undefined;
-  const trie = buildExportTrie(declarations, privateKeys);
+  const trie = buildExportTrie(declarations, privateKeys, rejections, plugin);
   if (!trie) return undefined;
   const out: Record<string, unknown> = {};
   for (const [key, node] of trie) {
@@ -716,9 +780,12 @@ function applyPublicPluginData(
  *   没有 manifest 公开声明的来源数据没有进入包的依据；
  * - 空/畸形声明（[] / 非数组）→ 整段排除（拒绝把畸形声明当作放行依据）；
  * - instanceId 或路径键为 '__proto__' 等原型键 → 排除（原型污染矢量）；
- * - 声明与 manifest.privateSettings（privateKeysByPlugin 原样传入）重叠、
- *   或声明路径含凭据形态键（apiKey/password/token/secret/…）→ 整条声明
- *   拒绝 —— 「凭据永不导出」不依赖插件自觉声明；
+ * - 声明与 manifest.privateSettings（privateKeysByPlugin 原样传入）重叠 →
+ *   整条声明拒绝（静默）；声明路径含凭据形态键（apiKey/password/token/
+ *   secret/…）→ 整条声明拒绝并记录 —— 存在任一被拒声明时本次构建抛
+ *   PackageBuildError（code=credential-declaration-rejected，跨插件聚合列出
+ *   全部被拒声明，第二十五轮：不再静默丢弃，「凭据永不导出」不依赖插件自觉
+ *   声明，插件作者必须看到自己的公开声明被拒）；
  * - 整值声明仅允许 primitive 叶值：对象/数组整值导出被强制递归投影拒绝。
  * 声明查询以 Object.hasOwn 判定 + Array.isArray 防护；命名空间值经
  * readOwnDataField 读取（descriptor 语义，不执行 getter）。投影只读源、
@@ -731,6 +798,7 @@ function projectPublicPluginData(
 ): Record<string, unknown> | undefined {
   if (!publicKeysByPlugin) return undefined;
   const out: Record<string, unknown> = {};
+  const rejections: Array<{ plugin: string; path: string }> = [];
   for (const instanceId of Object.keys(pluginData)) {
     if (instanceId === '__proto__' || !Object.hasOwn(publicKeysByPlugin, instanceId)) continue;
     const declarations = publicKeysByPlugin[instanceId];
@@ -739,8 +807,17 @@ function projectPublicPluginData(
       privateKeysByPlugin && Array.isArray(privateKeysByPlugin[instanceId]) ? privateKeysByPlugin[instanceId] : [];
     const read = readOwnDataField(pluginData, instanceId);
     if (!read.present) continue;
-    const projected = applyPublicPluginData(read.value, declarations, privateKeys);
+    const projected = applyPublicPluginData(read.value, declarations, privateKeys, instanceId, rejections);
     if (projected) out[instanceId] = projected;
+  }
+  if (rejections.length > 0) {
+    throw new PackageBuildError(
+      'credential-declaration-rejected',
+      `${rejections.length} 条公开声明命中凭据形态键，工程包构建失败（凭据永不导出）：` +
+        rejections.map((r) => `${r.plugin} ${r.path}`).join('；') +
+        '。请将凭据移出公开设置或改走安全通道后重试。',
+      rejections,
+    );
   }
   if (Object.keys(out).length === 0) return undefined;
   return out;

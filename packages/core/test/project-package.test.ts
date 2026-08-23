@@ -8,6 +8,7 @@ import {
   MAX_ASSET_PARTS,
   MAX_ASSETS_PER_PROJECT,
   MAX_OBJECTS_PER_PROJECT,
+  PackageBuildError,
   buildProjectPackage,
   parseProjectPackage,
   serializeProjectPackage,
@@ -70,6 +71,21 @@ async function buildFixtureProject(): Promise<Project> {
     ],
   };
   return { ...project, tracks: [...project.tracks, track] };
+}
+
+/** 第二十五轮：凭据形态公开声明命中 → 构建校验失败（错误码 + 被拒声明）——
+ *  不再静默丢弃；返回错误便于继续断言被拒声明列表 */
+function expectCredentialDeclarationRejected(build: () => unknown): PackageBuildError {
+  let error: unknown = null;
+  try {
+    build();
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error).toBeInstanceOf(PackageBuildError);
+  const buildError = error as PackageBuildError;
+  expect(buildError.code).toBe('credential-declaration-rejected');
+  return buildError;
 }
 
 /** 不含可保存载荷的资产（URL 来源，可重建缓存场景） */
@@ -279,8 +295,9 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(objectJson, '整对象声明不得导出子树').not.toContain('density');
 
     // 凭据形态键声明（顶层键或路径任意段含 apikey/password/token/secret/auth
-    // 等形态子串）→ 整条声明拒绝：即使显式 allowlist 声明，值也不得进包
-    const credentialJson = JSON.stringify(
+    // 等形态子串）→ 整条声明命中 → 构建校验失败（第二十五轮指令 3，第十五轮
+    // 阻断 1 语义保留）：即使显式 allowlist 声明，值也不得进包
+    const error = expectCredentialDeclarationRejected(() =>
       buildProjectPackage(rich, {
         includePrivate: true,
         publicKeysByPlugin: {
@@ -288,10 +305,9 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         },
       }),
     );
-    for (const leaked of ['sk-declared-1', 'cs-declared-2', 'at-declared-3', 'nested-4', 'nested-5']) {
-      expect(credentialJson, `凭据形态键值 ${leaked} 不得进入包`).not.toContain(leaked);
-    }
-    expect(credentialJson, '凭据声明拒绝后整段不残留').not.toContain('apiKey');
+    expect(error.declarations).toHaveLength(5);
+    expect(error.declarations).toContainEqual({ plugin: 'com.example', path: '"apiKey"' });
+    expect(error.declarations).toContainEqual({ plugin: 'com.example', path: '["auth","apiKey"]' });
   });
 
   it('声明只作用于声明的插件实例：未知命名空间与空声明实例一律排除（第十三轮阻断 2）', async () => {
@@ -331,15 +347,15 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(explicitJson).toContain('b-theme');
     expect(explicitJson).not.toContain('b-keep-1');
     expect(explicitJson).not.toContain('a-leak-1');
-    // com.b 显式声明凭据形态键（apiKey）：声明被拒，值不得进包（第十五轮阻断 1）
-    const credentialJson = JSON.stringify(
+    // com.b 显式声明凭据形态键（apiKey）：构建校验失败并列出被拒声明
+    // （第二十五轮：不再静默丢弃）
+    const error = expectCredentialDeclarationRejected(() =>
       buildProjectPackage(rich, {
         includePrivate: true,
         publicKeysByPlugin: { 'com.a': ['theme'], 'com.b': ['apiKey'] },
       }),
     );
-    expect(credentialJson, '凭据形态键声明拒绝').not.toContain('b-keep-1');
-    expect(credentialJson, '其他实例声明不受影响').toContain('a-theme');
+    expect(error.declarations).toContainEqual({ plugin: 'com.b', path: '"apiKey"' });
   });
 
   it('无损往返性质：非凭据键显式 allowlist 放行时导出→导入逐键一致；凭据形态键声明拒绝（第十一轮严重 #2 + 第十三轮 + 第十五轮阻断 1 + 第十七轮阻断 1）', async () => {
@@ -370,14 +386,17 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(emptyParsed.ok).toBe(true);
     if (!emptyParsed.ok) return;
     expect(emptyParsed.project.pluginData).toBeUndefined();
-    // 显式 allowlist（宿主核验过的全部键）：非凭据键逐键无损往返，值不被改动；
+    // 显式 allowlist（宿主核验过的合法键）：非凭据键逐键无损往返，值不被改动；
     // 凭据形态键（pass_word/passwd/authHeader 含 pass/passwd/auth 分词）声明
-    // 逐条拒绝 —— allowlist 放行不豁免凭据形态（第十五轮阻断 1）；完整词
-    // 匹配下 tokenizer*/keyboard* 等合法键（旧子串检测误剥）正常往返
-    // （第十七轮阻断 1/严重 2）
+    // 命中 → 构建校验失败（第二十五轮：不再静默丢弃，allowlist 放行不豁免凭据
+    // 形态，第十五轮阻断 1 语义保留）；完整词匹配下 tokenizer*/keyboard* 等
+    // 合法键（旧子串检测误剥）正常往返（第十七轮阻断 1/严重 2）
+    const legalDeclarations = Object.keys(pluginData['com.example']).filter(
+      (key) => !['pass_word', 'passwd', 'authHeader'].includes(key),
+    );
     const pkg = buildProjectPackage({ ...project, pluginData }, {
       includePrivate: true,
-      publicKeysByPlugin: { 'com.example': Object.keys(pluginData['com.example']) },
+      publicKeysByPlugin: { 'com.example': legalDeclarations },
     });
     const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
     expect(parsed.ok).toBe(true);
@@ -387,11 +406,17 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
       delete expected[credentialKey];
     }
     expect(parsed.project.pluginData).toEqual({ 'com.example': expected });
+    expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project, pluginData }, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': ['pass_word', 'passwd', 'authHeader'] },
+      }),
+    );
   });
 
   it('凭据形态判定为默认拒绝敏感形态 + 正向豁免：分隔符/camelCase/全大写/全角/复数/数字后缀/连写/无边界连写/多语（繁体/日文/西语）敏感键顶层与嵌套路径一律拒绝，tokenBudget/authMode/主题/caféMode/passwordless/apiKeyboardLayout 等合法键放行（第十七轮 + 第十八轮 + 第十九轮 + 第二十一轮 + 第二十三轮回归）', async () => {
     const project = await buildFixtureProject();
-    const pluginData = {
+    const pluginData: Record<string, Record<string, string>> = {
       'com.example': {
         // 拒绝组：snake/kebab/dot/plain 分隔符组合词与 camelCase 组合词
         api_key: 'leak-1',
@@ -510,36 +535,37 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         compassWordWrap: 'keep-21',
       },
     };
+    // 凭据形态键整表声明命中 → 构建校验失败（第二十五轮指令 3：不再静默丢弃，
+    // 逐条上报插件名与声明路径；allowlist 放行不豁免凭据形态）
+    const error = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project, pluginData }, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': Object.keys(pluginData['com.example']) },
+      }),
+    );
+    const leakKeys = Object.entries(pluginData['com.example'])
+      .filter(([, value]) => value.startsWith('leak-'))
+      .map(([key]) => key);
+    expect(error.declarations).toHaveLength(leakKeys.length);
+    for (const key of leakKeys) {
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(key) });
+    }
+    expect(error.message).toContain('凭据永不导出');
+    // 仅声明合法键：逐键无损往返，值不被改动
+    const keepKeys = Object.entries(pluginData['com.example'])
+      .filter(([, value]) => value.startsWith('keep-'))
+      .map(([key]) => key);
     const pkg = buildProjectPackage({ ...project, pluginData }, {
       includePrivate: true,
-      publicKeysByPlugin: { 'com.example': Object.keys(pluginData['com.example']) },
+      publicKeysByPlugin: { 'com.example': keepKeys },
     });
     const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     const plugin = (parsed.project.pluginData as Record<string, Record<string, string>>)['com.example'];
-    expect(plugin.tokenizerConfig).toBe('keep-1');
-    expect(plugin.tokenizerModel).toBe('keep-2');
-    expect(plugin.authorName).toBe('keep-3');
-    expect(plugin.authorizationMode).toBe('keep-4');
-    expect(plugin.tokenizerConfigModel).toBe('keep-5');
-    expect(plugin.keyboardLayout).toBe('keep-6');
-    expect(plugin.MONKEYPATCH).toBe('keep-7');
-    expect(plugin.HOTKEYMAP).toBe('keep-8');
-    expect(plugin.api).toBe('keep-9');
-    expect(plugin.apiVersion).toBe('keep-10');
-    expect(plugin.tokenBudget).toBe('keep-11');
-    expect(plugin.renderPass).toBe('keep-12');
-    expect(plugin.passCount).toBe('keep-13');
-    expect(plugin.authMode).toBe('keep-14');
-    expect(plugin.主题).toBe('keep-15');
-    expect(plugin.caféMode).toBe('keep-16');
-    // 第二十三轮严重 5：5 个合法复合键顶层往返
-    expect(plugin.passwordless).toBe('keep-17');
-    expect(plugin.apiKeyboardLayout).toBe('keep-18');
-    expect(plugin.accessTokenizerConfig).toBe('keep-19');
-    expect(plugin.privateKeyboardShortcuts).toBe('keep-20');
-    expect(plugin.compassWordWrap).toBe('keep-21');
+    for (const key of keepKeys) {
+      expect(plugin[key]).toBe(pluginData['com.example'][key]);
+    }
     const json = JSON.stringify(parsed.project);
     for (let i = 1; i <= 76; i += 1) {
       if (i === 9) continue; // 裸 api 不再拒绝（第十八轮严重 2 修正）
@@ -549,176 +575,106 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
       expect(json).toContain(`keep-${i}`);
     }
     // 嵌套路径声明同判据：路径任意层命中完整凭据序列整条声明拒绝；合法组合词路径放行
+    const profileData: Record<string, string> = {
+      username: 'alice',
+      api_key: 'n-1',
+      pass_word: 'n-2',
+      'api.key': 'n-3',
+      'pass-word': 'n-4',
+      private_key: 'n-5',
+      apiKey: 'n-6',
+      API_KEY: 'n-7',
+      APIKey: 'n-8',
+      PASSWORD: 'n-9',
+      ACCESS_TOKEN: 'n-10',
+      PRIVATE_KEY: 'n-11',
+      'ＡＰＩ＿ＫＥＹ': 'n-12',
+      accessTokens: 'n-13',
+      clientSecrets: 'n-14',
+      storedPasswords: 'n-15',
+      privateKeys: 'n-16',
+      // 第十九轮阻断 1：多 token 键任意位置高置信词、数字后缀、非 ASCII
+      databasePassword: 'n-17',
+      passwordHash: 'n-18',
+      password1: 'n-19',
+      bearerToken: 'n-20',
+      sessionToken: 'n-21',
+      oauthToken: 'n-22',
+      jwtSecret: 'n-23',
+      webhookSecret: 'n-24',
+      secretValue: 'n-25',
+      userCredentials: 'n-26',
+      token1: 'n-27',
+      密码: 'n-28',
+      访问令牌: 'n-29',
+      密钥: 'n-30',
+      // 第二十一轮阻断 1：无边界复合形态嵌套路径（全小写 + 全角连写）
+      clientsecret: 'n-33',
+      accesstoken: 'n-34',
+      refreshtoken: 'n-35',
+      authheader: 'n-36',
+      privatesetting: 'n-37',
+      storedpassword: 'n-38',
+      bearertoken: 'n-39',
+      databasepassword: 'n-40',
+      jwtsecret: 'n-41',
+      usercredentials: 'n-42',
+      webhooksecret: 'n-43',
+      secretvalue: 'n-44',
+      'ＣＬＩＥＮＴＳＥＣＲＥＴ': 'n-45',
+      'ＡＣＣＥＳＳＴＯＫＥＮ': 'n-46',
+      'ＡＵＴＨＨＥＡＤＥＲ': 'n-47',
+      'ＳＴＯＲＥＤＰＡＳＳＷＯＲＤ': 'n-48',
+      // 第二十三轮阻断 2：常见凭据名嵌套路径回归（kind-suffix 闭合/
+      // 复合对/凭据根词/多语凭据词）
+      apiToken: 'n-49',
+      authToken: 'n-50',
+      csrfToken: 'n-51',
+      idToken: 'n-52',
+      privateToken: 'n-53',
+      secretkey: 'n-54',
+      passphrase: 'n-55',
+      密碼: 'n-56',
+      秘钥: 'n-57',
+      パスワード: 'n-58',
+      contraseña: 'n-59',
+      // 第二十一轮严重 4/5：tokenBudget/authMode 恢复放行；合法非 ASCII
+      // 键（主题/caféMode）放行
+      tokenBudget: 'n-ok-5',
+      authMode: 'n-ok-8',
+      tokenizerConfig: 'n-ok-1',
+      authorName: 'n-ok-2',
+      authorizationMode: 'n-ok-3',
+      apiVersion: 'n-ok-4',
+      renderPass: 'n-ok-6',
+      passCount: 'n-ok-7',
+      主题: 'n-ok-9',
+      caféMode: 'n-ok-10',
+      // 第二十三轮严重 5：5 个合法复合键嵌套路径往返
+      passwordless: 'n-ok-11',
+      apiKeyboardLayout: 'n-ok-12',
+      accessTokenizerConfig: 'n-ok-13',
+      privateKeyboardShortcuts: 'n-ok-14',
+      compassWordWrap: 'n-ok-15',
+    };
+    const nestedLeakPaths = Object.entries(profileData)
+      .filter(([, value]) => /^n-\d+$/.test(value))
+      .map(([key]) => ['profile', key]);
+    const nestedKeepPaths = Object.entries(profileData)
+      .filter(([, value]) => value.startsWith('n-ok-'))
+      .map(([key]) => ['profile', key]);
+    nestedKeepPaths.unshift(['profile', 'username']);
+    const nestedError = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage(
+        { ...project, pluginData: { 'com.example': { profile: profileData } } },
+        { includePrivate: true, publicKeysByPlugin: { 'com.example': nestedLeakPaths } },
+      ),
+    );
+    expect(nestedError.declarations).toHaveLength(nestedLeakPaths.length);
+    expect(nestedError.declarations).toContainEqual({ plugin: 'com.example', path: '["profile","apiToken"]' });
     const nestedPkg = buildProjectPackage(
-      {
-        ...project,
-        pluginData: {
-          'com.example': {
-            profile: {
-              username: 'alice',
-              api_key: 'n-1',
-              pass_word: 'n-2',
-              'api.key': 'n-3',
-              'pass-word': 'n-4',
-              private_key: 'n-5',
-              apiKey: 'n-6',
-              API_KEY: 'n-7',
-              APIKey: 'n-8',
-              PASSWORD: 'n-9',
-              ACCESS_TOKEN: 'n-10',
-              PRIVATE_KEY: 'n-11',
-              'ＡＰＩ＿ＫＥＹ': 'n-12',
-              accessTokens: 'n-13',
-              clientSecrets: 'n-14',
-              storedPasswords: 'n-15',
-              privateKeys: 'n-16',
-              // 第十九轮阻断 1：多 token 键任意位置高置信词、数字后缀、非 ASCII
-              databasePassword: 'n-17',
-              passwordHash: 'n-18',
-              password1: 'n-19',
-              bearerToken: 'n-20',
-              sessionToken: 'n-21',
-              oauthToken: 'n-22',
-              jwtSecret: 'n-23',
-              webhookSecret: 'n-24',
-              secretValue: 'n-25',
-              userCredentials: 'n-26',
-              token1: 'n-27',
-              密码: 'n-28',
-              访问令牌: 'n-29',
-              密钥: 'n-30',
-              // 第二十一轮阻断 1：无边界复合形态嵌套路径（全小写 + 全角连写）
-              clientsecret: 'n-33',
-              accesstoken: 'n-34',
-              refreshtoken: 'n-35',
-              authheader: 'n-36',
-              privatesetting: 'n-37',
-              storedpassword: 'n-38',
-              bearertoken: 'n-39',
-              databasepassword: 'n-40',
-              jwtsecret: 'n-41',
-              usercredentials: 'n-42',
-              webhooksecret: 'n-43',
-              secretvalue: 'n-44',
-              'ＣＬＩＥＮＴＳＥＣＲＥＴ': 'n-45',
-              'ＡＣＣＥＳＳＴＯＫＥＮ': 'n-46',
-              'ＡＵＴＨＨＥＡＤＥＲ': 'n-47',
-              'ＳＴＯＲＥＤＰＡＳＳＷＯＲＤ': 'n-48',
-              // 第二十三轮阻断 2：常见凭据名嵌套路径回归（kind-suffix 闭合/
-              // 复合对/凭据根词/多语凭据词）
-              apiToken: 'n-49',
-              authToken: 'n-50',
-              csrfToken: 'n-51',
-              idToken: 'n-52',
-              privateToken: 'n-53',
-              secretkey: 'n-54',
-              passphrase: 'n-55',
-              密碼: 'n-56',
-              秘钥: 'n-57',
-              パスワード: 'n-58',
-              contraseña: 'n-59',
-              // 第二十一轮严重 4/5：tokenBudget/authMode 恢复放行；合法非 ASCII
-              // 键（主题/caféMode）放行
-              tokenBudget: 'n-ok-5',
-              authMode: 'n-ok-8',
-              tokenizerConfig: 'n-ok-1',
-              authorName: 'n-ok-2',
-              authorizationMode: 'n-ok-3',
-              apiVersion: 'n-ok-4',
-              renderPass: 'n-ok-6',
-              passCount: 'n-ok-7',
-              主题: 'n-ok-9',
-              caféMode: 'n-ok-10',
-              // 第二十三轮严重 5：5 个合法复合键嵌套路径往返
-              passwordless: 'n-ok-11',
-              apiKeyboardLayout: 'n-ok-12',
-              accessTokenizerConfig: 'n-ok-13',
-              privateKeyboardShortcuts: 'n-ok-14',
-              compassWordWrap: 'n-ok-15',
-            },
-          },
-        },
-      },
-      {
-        includePrivate: true,
-        publicKeysByPlugin: {
-          'com.example': [
-            ['profile', 'username'],
-            ['profile', 'api_key'],
-            ['profile', 'pass_word'],
-            ['profile', 'api.key'],
-            ['profile', 'pass-word'],
-            ['profile', 'private_key'],
-            ['profile', 'apiKey'],
-            ['profile', 'API_KEY'],
-            ['profile', 'APIKey'],
-            ['profile', 'PASSWORD'],
-            ['profile', 'ACCESS_TOKEN'],
-            ['profile', 'PRIVATE_KEY'],
-            ['profile', 'ＡＰＩ＿ＫＥＹ'],
-            ['profile', 'accessTokens'],
-            ['profile', 'clientSecrets'],
-            ['profile', 'storedPasswords'],
-            ['profile', 'privateKeys'],
-            ['profile', 'databasePassword'],
-            ['profile', 'passwordHash'],
-            ['profile', 'password1'],
-            ['profile', 'bearerToken'],
-            ['profile', 'sessionToken'],
-            ['profile', 'oauthToken'],
-            ['profile', 'jwtSecret'],
-            ['profile', 'webhookSecret'],
-            ['profile', 'secretValue'],
-            ['profile', 'userCredentials'],
-            ['profile', 'token1'],
-            ['profile', '密码'],
-            ['profile', '访问令牌'],
-            ['profile', '密钥'],
-            ['profile', 'clientsecret'],
-            ['profile', 'accesstoken'],
-            ['profile', 'refreshtoken'],
-            ['profile', 'authheader'],
-            ['profile', 'privatesetting'],
-            ['profile', 'storedpassword'],
-            ['profile', 'bearertoken'],
-            ['profile', 'databasepassword'],
-            ['profile', 'jwtsecret'],
-            ['profile', 'usercredentials'],
-            ['profile', 'webhooksecret'],
-            ['profile', 'secretvalue'],
-            ['profile', 'ＣＬＩＥＮＴＳＥＣＲＥＴ'],
-            ['profile', 'ＡＣＣＥＳＳＴＯＫＥＮ'],
-            ['profile', 'ＡＵＴＨＨＥＡＤＥＲ'],
-            ['profile', 'ＳＴＯＲＥＤＰＡＳＳＷＯＲＤ'],
-            ['profile', 'apiToken'],
-            ['profile', 'authToken'],
-            ['profile', 'csrfToken'],
-            ['profile', 'idToken'],
-            ['profile', 'privateToken'],
-            ['profile', 'secretkey'],
-            ['profile', 'passphrase'],
-            ['profile', '密碼'],
-            ['profile', '秘钥'],
-            ['profile', 'パスワード'],
-            ['profile', 'contraseña'],
-            ['profile', 'passwordless'],
-            ['profile', 'apiKeyboardLayout'],
-            ['profile', 'accessTokenizerConfig'],
-            ['profile', 'privateKeyboardShortcuts'],
-            ['profile', 'compassWordWrap'],
-            ['profile', 'tokenBudget'],
-            ['profile', 'authMode'],
-            ['profile', 'tokenizerConfig'],
-            ['profile', 'authorName'],
-            ['profile', 'authorizationMode'],
-            ['profile', 'apiVersion'],
-            ['profile', 'renderPass'],
-            ['profile', 'passCount'],
-            ['profile', '主题'],
-            ['profile', 'caféMode'],
-          ],
-        },
-      },
+      { ...project, pluginData: { 'com.example': { profile: profileData } } },
+      { includePrivate: true, publicKeysByPlugin: { 'com.example': nestedKeepPaths } },
     );
     const nestedParsed = await parseProjectPackage(serializeProjectPackage(nestedPkg));
     expect(nestedParsed.ok).toBe(true);
@@ -750,76 +706,78 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     const project = await buildFixtureProject();
     // ['api','key'] ≡ api_key：逐段判定均非凭据词（api/key 不在高置信集合），
     // 但完整路径 token 化后相邻序列 api+key 命中 —— 修复前整组放行；
-    // 第二十一轮阻断 1：['client','secret'] ≡ clientsecret 的无边界形态同样命中
+    // 第二十一轮阻断 1：['client','secret'] ≡ clientsecret 的无边界形态同样命中；
+    // 第二十五轮：命中声明不再静默丢弃，构建校验失败并逐条上报
+    const nestedData: Record<string, unknown> = {
+      pass: { word: 'p-2' },
+      client: { secret: 'p-5' },
+      refresh: { token: 'p-7' },
+      auth: { header: 'p-8' },
+      stored: { password: 'p-9' },
+      bearer: { token: 'p-10' },
+      database: { password: 'p-11' },
+      jwt: { secret: 'p-12' },
+      webhook: { secret: 'p-13' },
+      user: { credentials: 'p-14' },
+      secret: { value: 'p-15' },
+      session: { token: 'p-16' },
+      // 第二十三轮阻断 3：嵌套裸 token/auth segment（['profile','token']/
+      // ['profile','auth']）—— 逐 segment 上下文判定拒绝，不再被「整条
+      // 路径 token 总数」稀释
+      profile: {
+        token: 'p-17',
+        auth: 'p-18',
+        api: { version: 'p-ok-1' },
+      },
+      render: { pass: 'p-ok-2' },
+      // 第二十三轮严重 5：5 个合法复合键路径数组往返（passwordless/
+      // apiKeyboardLayout/accessTokenizerConfig/privateKeyboardShortcuts/
+      // compassWordWrap 跨 segment 与单 segment 形态）
+      passwordless: 'p-ok-3',
+      access: { token: 'p-6', tokenizer: { config: 'p-ok-4' } },
+      private: { key: 'p-3', setting: 'p-4', keyboard: { shortcuts: 'p-ok-5' } },
+      compass: { word: { wrap: 'p-ok-6' } },
+      api: { key: 'p-1', keyboard: { layout: 'p-ok-7' } },
+    };
+    const leakPaths: Array<Array<string>> = [
+      ['api', 'key'],
+      ['pass', 'word'],
+      ['private', 'key'],
+      ['private', 'setting'],
+      ['client', 'secret'],
+      ['access', 'token'],
+      ['refresh', 'token'],
+      ['auth', 'header'],
+      ['stored', 'password'],
+      ['bearer', 'token'],
+      ['database', 'password'],
+      ['jwt', 'secret'],
+      ['webhook', 'secret'],
+      ['user', 'credentials'],
+      ['secret', 'value'],
+      ['session', 'token'],
+      ['profile', 'token'],
+      ['profile', 'auth'],
+    ];
+    const keepPaths: Array<Array<string>> = [
+      ['profile', 'api', 'version'],
+      ['render', 'pass'],
+      ['passwordless'],
+      ['access', 'tokenizer', 'config'],
+      ['private', 'keyboard', 'shortcuts'],
+      ['compass', 'word', 'wrap'],
+      ['api', 'keyboard', 'layout'],
+    ];
+    const error = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage(
+        { ...project, pluginData: { 'com.example': nestedData } },
+        { includePrivate: true, publicKeysByPlugin: { 'com.example': [...leakPaths, ...keepPaths] } },
+      ),
+    );
+    expect(error.declarations).toHaveLength(leakPaths.length);
     const pkg = buildProjectPackage(
-      {
-        ...project,
-        pluginData: {
-          'com.example': {
-            pass: { word: 'p-2' },
-            client: { secret: 'p-5' },
-            refresh: { token: 'p-7' },
-            auth: { header: 'p-8' },
-            stored: { password: 'p-9' },
-            bearer: { token: 'p-10' },
-            database: { password: 'p-11' },
-            jwt: { secret: 'p-12' },
-            webhook: { secret: 'p-13' },
-            user: { credentials: 'p-14' },
-            secret: { value: 'p-15' },
-            session: { token: 'p-16' },
-            // 第二十三轮阻断 3：嵌套裸 token/auth segment（['profile','token']/
-            // ['profile','auth']）—— 逐 segment 上下文判定拒绝，不再被「整条
-            // 路径 token 总数」稀释
-            profile: {
-              token: 'p-17',
-              auth: 'p-18',
-              api: { version: 'p-ok-1' },
-            },
-            render: { pass: 'p-ok-2' },
-            // 第二十三轮严重 5：5 个合法复合键路径数组往返（passwordless/
-            // apiKeyboardLayout/accessTokenizerConfig/privateKeyboardShortcuts/
-            // compassWordWrap 跨 segment 与单 segment 形态）
-            passwordless: 'p-ok-3',
-            access: { token: 'p-6', tokenizer: { config: 'p-ok-4' } },
-            private: { key: 'p-3', setting: 'p-4', keyboard: { shortcuts: 'p-ok-5' } },
-            compass: { word: { wrap: 'p-ok-6' } },
-            api: { key: 'p-1', keyboard: { layout: 'p-ok-7' } },
-          },
-        },
-      },
-      {
-        includePrivate: true,
-        publicKeysByPlugin: {
-          'com.example': [
-            ['api', 'key'],
-            ['pass', 'word'],
-            ['private', 'key'],
-            ['private', 'setting'],
-            ['client', 'secret'],
-            ['access', 'token'],
-            ['refresh', 'token'],
-            ['auth', 'header'],
-            ['stored', 'password'],
-            ['bearer', 'token'],
-            ['database', 'password'],
-            ['jwt', 'secret'],
-            ['webhook', 'secret'],
-            ['user', 'credentials'],
-            ['secret', 'value'],
-            ['session', 'token'],
-            ['profile', 'token'],
-            ['profile', 'auth'],
-            ['profile', 'api', 'version'],
-            ['render', 'pass'],
-            ['passwordless'],
-            ['access', 'tokenizer', 'config'],
-            ['private', 'keyboard', 'shortcuts'],
-            ['compass', 'word', 'wrap'],
-            ['api', 'keyboard', 'layout'],
-          ],
-        },
-      },
+      { ...project, pluginData: { 'com.example': nestedData } },
+      { includePrivate: true, publicKeysByPlugin: { 'com.example': keepPaths } },
     );
     const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
     expect(parsed.ok).toBe(true);
@@ -842,6 +800,60 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     });
   });
 
+  it('第二十五轮：kind 词任意位置精确匹配 + 复合对/后缀变体判定闭合残余绕过；凭据形态声明命中返回带错误码的校验失败（apiTokenV2/tokenValue/tokenHash/apikey2/authkey2/accesstoken2 拒绝，apiVersion3 放行）', async () => {
+    const project = await buildFixtureProject();
+    const pluginData = {
+      'com.example': {
+        apiTokenV2: 'r-1',
+        tokenValue: 'r-2',
+        tokenHash: 'r-3',
+        apikey2: 'r-4',
+        authkey2: 'r-5',
+        accesstoken2: 'r-6',
+        apiVersion3: 'r-keep-1',
+      },
+    };
+    const leakKeys = ['apiTokenV2', 'tokenValue', 'tokenHash', 'apikey2', 'authkey2', 'accesstoken2'];
+    // 整表声明：6 个残余绕过键逐一命中，错误码/插件名/声明路径逐条上报
+    const error = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project, pluginData }, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': Object.keys(pluginData['com.example']) },
+      }),
+    );
+    expect(error.declarations).toHaveLength(leakKeys.length);
+    for (const key of leakKeys) {
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(key) });
+    }
+    expect(error.message).toContain('apiTokenV2');
+    // 单键声明同样拒绝
+    for (const key of leakKeys) {
+      expectCredentialDeclarationRejected(() =>
+        buildProjectPackage({ ...project, pluginData }, {
+          includePrivate: true,
+          publicKeysByPlugin: { 'com.example': [key] },
+        }),
+      );
+    }
+    // apiVersion3 合法：仅声明它时正常往返（api+version 组合、数字后缀版本号）
+    const pkg = buildProjectPackage({ ...project, pluginData }, {
+      includePrivate: true,
+      publicKeysByPlugin: { 'com.example': ['apiVersion3'] },
+    });
+    const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, Record<string, string>>)['com.example'];
+    expect(plugin.apiVersion3).toBe('r-keep-1');
+    // 嵌套声明同样命中：['profile','tokenValue'] 整条声明拒绝
+    expectCredentialDeclarationRejected(() =>
+      buildProjectPackage(
+        { ...project, pluginData: { 'com.example': { profile: { tokenValue: 'r-7' } } } },
+        { includePrivate: true, publicKeysByPlugin: { 'com.example': [['profile', 'tokenValue']] } },
+      ),
+    );
+  });
+
   it('未知顶层字段不进入工程包（公开字段白名单）；tracks 属公开数据随包携带', async () => {
     const project = await buildFixtureProject();
     const rich = { ...project, runtimeCache: { x: 1 }, internalNote: 'zzz' } as Project & Record<string, unknown>;
@@ -851,7 +863,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(JSON.parse(json)).toMatchObject({ project: { tracks: project.tracks } });
   });
 
-  it('导出导入往返 + 键级 allowlist：显式声明的键随包往返保留，未声明键（benign 组合词）与凭据形态键声明不进入包（第九轮 #4 契约化 + 第十三轮阻断 2 + 第十五轮阻断 1）', async () => {
+  it('导出导入往返 + 键级 allowlist：显式声明的键随包往返保留，未声明键（benign 组合词）排除；凭据形态键声明命中构建校验失败（第九轮 #4 契约化 + 第十三轮阻断 2 + 第十五轮阻断 1 + 第二十五轮指令 3）', async () => {
     const project = await buildFixtureProject();
     const rich = {
       ...project,
@@ -868,32 +880,30 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         },
       },
     } as Project;
+    // 完整词匹配（第十七轮阻断 1/严重 2）：tokenizerConfig 是合法键（含 token
+    // 子串但不构成凭据词），声明即放行；apiKey/accessToken/clientSecret 分词
+    // 命中 api/token/secret，声明命中 → 构建校验失败（第二十五轮指令 3，
+    // 第十五轮阻断 1 语义保留），值绝不进包
+    expectCredentialDeclarationRejected(() =>
+      buildProjectPackage(rich, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': ['apiKey', 'accessToken', 'clientSecret'] },
+      }),
+    );
     const pkg = buildProjectPackage(rich, {
       includePrivate: true,
-      publicKeysByPlugin: {
-        'com.example': [
-          'keyboardLayout',
-          'monkeyPatch',
-          'tokenizerConfig',
-          'apiKey',
-          'accessToken',
-          'clientSecret',
-        ],
-      },
+      publicKeysByPlugin: { 'com.example': ['keyboardLayout', 'monkeyPatch', 'tokenizerConfig'] },
     });
     const text = serializeProjectPackage(pkg);
     const parsed = await parseProjectPackage(text);
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     const plugin = (parsed.project.pluginData as Record<string, Record<string, string>>)['com.example'];
-    // 声明的非凭据键随包往返保留；未声明键（benign 组合词）一律排除
+    // 声明的非凭据键随包往返保留；未声明键（benign 组合词）与凭据键一律排除
     expect(plugin.keyboardLayout).toBe('kb-intl');
     expect(plugin.monkeyPatch).toBe('off');
     expect(plugin.hotkeyMap).toBeUndefined();
     expect(plugin.shortcutKey).toBeUndefined();
-    // 完整词匹配（第十七轮阻断 1/严重 2）：tokenizerConfig 是合法键（含 token
-    // 子串但不构成凭据词），声明即放行；apiKey/accessToken/clientSecret 分词
-    // 命中 api/token/secret，声明逐条拒绝，值绝不进包（第十五轮阻断 1）
     expect(plugin.tokenizerConfig).toBe('cl100k-base');
     expect(plugin.apiKey).toBeUndefined();
     expect(plugin.accessToken).toBeUndefined();
@@ -1000,7 +1010,7 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
     expect(json).toContain('theme');
     // 声明表以 __proto__ own 键注入 + pluginData 值同拥 own __proto__：
     // '__proto__' 不得被当作合法 allowlist 项放行（原型污染矢量），正常声明不受影响；
-    // apiKey 凭据形态声明一并拒绝（第十五轮阻断 1）
+    // apiKey 凭据形态声明命中 → 构建校验失败（第二十五轮指令 3，第十五轮阻断 1 语义保留）
     const declarations = Object.create(null) as Record<string, string[]>;
     declarations['__proto__'] = ['apiKey'];
     declarations['com.example'] = ['apiKey', '__proto__', 'theme'];
@@ -1009,11 +1019,18 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
     poisonedValue['theme'] = 'dark';
     poisonedValue['__proto__'] = { pollute: 'proto-polluted' };
     const rich = { ...project, pluginData: { 'com.example': poisonedValue } } as Project;
-    const strippedJson = JSON.stringify(
+    expectCredentialDeclarationRejected(() =>
       buildProjectPackage(rich, { includePrivate: true, publicKeysByPlugin: declarations }),
     );
+    // 剔除凭据声明后：__proto__ 声明注入仍不放行（原型污染矢量），正常声明不受影响
+    const legalDeclarations = Object.create(null) as Record<string, string[]>;
+    legalDeclarations['__proto__'] = ['theme'];
+    legalDeclarations['com.example'] = ['__proto__', 'theme'];
+    const strippedJson = JSON.stringify(
+      buildProjectPackage(rich, { includePrivate: true, publicKeysByPlugin: legalDeclarations }),
+    );
     expect(strippedJson).toContain('dark');
-    expect(strippedJson, '凭据形态键声明拒绝（第十五轮阻断 1）').not.toContain('sk-strip-1');
+    expect(strippedJson).not.toContain('sk-strip-1');
     expect(strippedJson).not.toContain('proto-polluted');
     expect(strippedJson).not.toContain('"__proto__"');
   });
@@ -1031,7 +1048,7 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
     expect(json).not.toContain('theme');
   });
 
-  it('路径 schema：声明路径导出嵌套公开字段，未声明路径与嵌套凭据排除；凭据形态路径声明整条拒绝（第十四轮阻断 1 + 第十五轮阻断 1）', async () => {
+  it('路径 schema：声明路径导出嵌套公开字段，未声明路径与嵌套凭据排除；凭据形态路径声明命中构建校验失败（第十四轮阻断 1 + 第十五轮阻断 1 + 第二十五轮指令 3）', async () => {
     const project = await buildFixtureProject();
     const rich = {
       ...project,
@@ -1047,7 +1064,9 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
         },
       },
     } as Project;
-    const json = JSON.stringify(
+    // 路径含凭据形态键（auth/apiKey）的整条声明命中 → 构建校验失败
+    // （第二十五轮指令 3，第十五轮阻断 1 语义保留）—— sk-nested-2 绝不进包
+    expectCredentialDeclarationRejected(() =>
       buildProjectPackage(rich, {
         includePrivate: true,
         publicKeysByPlugin: {
@@ -1055,8 +1074,13 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
         },
       }),
     );
-    // 顶层键整值导出；路径末端键按路径导出；路径含凭据形态键（auth/apiKey）
-    // 的整条声明拒绝 —— sk-nested-2 绝不进包（第十五轮阻断 1）
+    const json = JSON.stringify(
+      buildProjectPackage(rich, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': ['theme', ['profile', 'username']] },
+      }),
+    );
+    // 顶层键整值导出；路径末端键按路径导出
     for (const kept of ['dark', 'alice']) {
       expect(json, `声明键值 ${kept} 必须进入包`).toContain(kept);
     }
