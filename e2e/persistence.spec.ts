@@ -218,10 +218,10 @@ test('AC1b 真实 GLB 模型资产：导入渲染 + 载荷引用往返（TML-53 
   }
 });
 
-test('AC4 源项目含 pluginData 与凭据：默认导出全剥离，includePrivate 仅放行插件设置', async ({ page }) => {
-  // 1. Node 端构造「含 AI 凭据与插件私有设置」的源工程包。buildProjectPackage 会剥离
-  //    凭据族字段，故先以 includePrivate 构建出正确的包结构，再把嵌套凭据写回包内
-  //    project.pluginData —— 模拟插件把私有设置（含凭据）存入项目本地状态的真实形态
+test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，includePrivate 按插件声明剥离（第十一轮契约制）', async ({ page }) => {
+  // 1. Node 端构造「含 AI 凭据与插件私有设置」的源工程包。契约制下 buildProjectPackage
+  //    仅按插件显式声明（privateKeysByPlugin）剥离 —— 此处不声明，包内完整携带
+  //    pluginData（含嵌套凭据），模拟插件把私有设置（含凭据）存入项目本地状态的真实形态
   const pluginId = 'com.example.ai-assistant';
   const secrets = {
     apiKey: 'sk-lumora-ac4-1f7a9c3d',
@@ -240,9 +240,12 @@ test('AC4 源项目含 pluginData 与凭据：默认导出全剥离，includePri
       credentials: { provider: secrets.providerKey },
     },
   };
+  const tmpDir = join(HERE, '.tmp');
+  mkdirSync(tmpDir, { recursive: true });
+  const sourcePath = join(tmpDir, 'tml53-ac4-source.lumora');
   const sourceEditor = new SceneEditor();
   sourceEditor.openProject(createSampleProject());
-  const pkg = buildProjectPackage(
+  const sourcePkg = buildProjectPackage(
     {
       ...sourceEditor.getProject()!,
       uri: 'lumora://project/ac4-source',
@@ -251,12 +254,7 @@ test('AC4 源项目含 pluginData 与凭据：默认导出全剥离，includePri
     },
     { includePrivate: true },
   );
-  const raw = JSON.parse(serializeProjectPackage(pkg)) as { project: { pluginData?: Record<string, unknown> } };
-  raw.project.pluginData = sourcePluginData;
-  const tmpDir = join(HERE, '.tmp');
-  mkdirSync(tmpDir, { recursive: true });
-  const sourcePath = join(tmpDir, 'tml53-ac4-source.lumora');
-  writeFileSync(sourcePath, JSON.stringify(raw), 'utf8');
+  writeFileSync(sourcePath, serializeProjectPackage(sourcePkg), 'utf8');
 
   // 2. 浏览器导入源项目：插件私有设置（含嵌套凭据）成为编辑器与本地持久化状态
   await page.goto('/');
@@ -297,7 +295,8 @@ test('AC4 源项目含 pluginData 与凭据：默认导出全剥离，includePri
   expect(storedPlugin?.theme).toBe('dark');
   expect(storedPlugin?.auth).toEqual({ apiKey: secrets.apiKey, accessToken: secrets.accessToken });
 
-  // 4. 默认导出：工程包内无插件私有设置、无任何凭据（凭据与敏感键名都不出现）
+  // 4. 默认导出：工程包内无插件私有设置、无任何凭据（结构性隔离 —— pluginData
+  //    整体不进包，凭据随其隔离）
   await page.getByTestId('project-menu').click();
   const downloadDefault = page.waitForEvent('download');
   await page.getByTestId('project-export').click();
@@ -314,7 +313,9 @@ test('AC4 源项目含 pluginData 与凭据：默认导出全剥离，includePri
     expect(defaultText).not.toContain(key);
   }
 
-  // 5. includePrivate 显式开启：插件私有设置可包含，凭据仍被剥离
+  // 5. includePrivate 显式开启：插件私有设置随包导出。浏览器未注册任何插件 ——
+  //    无 manifest.privateSettings 声明即不剥离（契约不猜测键名，凭据形态键与
+  //    嵌套值原样保留）；剥离由插件显式声明驱动
   await page.getByTestId('project-export-include-private').check();
   await expect(page.getByTestId('project-export-include-private')).toBeChecked();
   const downloadPrivate = page.waitForEvent('download');
@@ -330,10 +331,8 @@ test('AC4 源项目含 pluginData 与凭据：默认导出全剥离，includePri
     | undefined)?.[pluginId];
   expect(plugin?.theme).toBe('dark');
   expect(plugin?.model).toBe('claude-sonnet-5');
-  for (const secret of Object.values(secrets)) expect(privateText).not.toContain(secret);
-  for (const key of ['apiKey', 'accessToken', 'authorization', 'password', 'credentials']) {
-    expect(privateText).not.toContain(key);
-  }
+  expect(plugin?.auth).toEqual({ apiKey: secrets.apiKey, accessToken: secrets.accessToken });
+  for (const secret of Object.values(secrets)) expect(privateText).toContain(secret);
 });
 
 test('AC2 跨标签页冲突：本地计数追平不覆盖较新保存，须显式「加载较新版本」解决', async ({ context }) => {

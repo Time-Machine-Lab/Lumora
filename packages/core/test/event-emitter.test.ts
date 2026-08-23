@@ -70,4 +70,65 @@ describe('TypedEventEmitter', () => {
     expect(bus.handlerCount).toBe(0);
     expect(() => bus.emit('project:closed', { uri: 'a' })).not.toThrow();
   });
+
+  it('同事件名嵌套 emit 使外层分发终止：陈旧 payload 不送达剩余监听器（第十轮 #1）', () => {
+    const bus: Bus = new TypedEventEmitter();
+    let nested = false;
+    // listener1 在收到外层载荷时同步嵌套发布同事件（模拟状态监听器回调内编辑）
+    const listener1 = vi.fn((_payload: { uri: string }) => {
+      if (!nested) {
+        nested = true;
+        bus.emit('project:closed', { uri: 'inner' });
+      }
+    });
+    bus.on('project:closed', listener1);
+    const listener2 = vi.fn();
+    bus.on('project:closed', listener2);
+    bus.emit('project:closed', { uri: 'outer' });
+    // listener2 只收到嵌套分发的新值，绝不收到外层旧值（倒序送达）
+    expect(listener1).toHaveBeenCalledTimes(2);
+    expect(listener1).toHaveBeenNthCalledWith(1, { uri: 'outer' });
+    expect(listener1).toHaveBeenNthCalledWith(2, { uri: 'inner' });
+    expect(listener2).toHaveBeenCalledTimes(1);
+    expect(listener2).toHaveBeenCalledWith({ uri: 'inner' });
+  });
+
+  it('同事件名嵌套后 onAny 同样终止外层分发', () => {
+    const bus: Bus = new TypedEventEmitter();
+    const anyReceived: string[] = [];
+    let nested = false;
+    bus.on('project:closed', () => {
+      if (!nested) {
+        nested = true;
+        bus.emit('project:closed', { uri: 'inner' });
+      }
+    });
+    bus.onAny((event, payload) => {
+      anyReceived.push(`${event}:${(payload as { uri: string }).uri}`);
+    });
+    bus.emit('project:closed', { uri: 'outer' });
+    expect(anyReceived).toEqual(['project:closed:inner']);
+  });
+
+  it('不同事件名的嵌套 emit 不影响外层分发', () => {
+    const bus: Bus = new TypedEventEmitter();
+    const closed: string[] = [];
+    bus.on('project:closed', (payload) => {
+      closed.push(payload.uri);
+      // 嵌套其他事件：同事件分发不被终止（生成代按事件名隔离）
+      bus.emit('command:executed', { id: 'x', ok: true });
+    });
+    bus.on('project:closed', (payload) => closed.push(payload.uri));
+    bus.emit('project:closed', { uri: 'a' });
+    expect(closed).toEqual(['a', 'a']);
+  });
+
+  it('串行 emit（非嵌套）各自完整分发，生成代不串扰', () => {
+    const bus: Bus = new TypedEventEmitter();
+    const uris: string[] = [];
+    bus.on('project:closed', (payload) => uris.push(payload.uri));
+    bus.emit('project:closed', { uri: 'a' });
+    bus.emit('project:closed', { uri: 'b' });
+    expect(uris).toEqual(['a', 'b']);
+  });
 });

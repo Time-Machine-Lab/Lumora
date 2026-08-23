@@ -215,7 +215,16 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
   };
 
   const exportCurrent = async () => {
-    const exported = persistence.exportCurrent({ includePrivate });
+    // 私有设置剥离声明（第十一轮）：各插件 manifest.privateSettings 显式声明的
+    // pluginData 顶层键不随包导出；未注册插件的键（凭据形态键名亦然）随包完整往返
+    const privateKeysByPlugin: Record<string, string[]> = {};
+    for (const info of runtime.host.listPlugins()) {
+      const manifest = runtime.host.getPluginManifest(info.instanceId);
+      if (manifest?.privateSettings && manifest.privateSettings.length > 0) {
+        privateKeysByPlugin[info.instanceId] = manifest.privateSettings;
+      }
+    }
+    const exported = persistence.exportCurrent({ includePrivate, privateKeysByPlugin });
     if (!exported.ok) {
       showToast(exported.message, 'error');
       return;
@@ -318,12 +327,15 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
         return;
       }
       const loaded = await persistence.loadProject(dup.summary.uri);
-      if (loaded.ok) {
-        const opened = await runtime.openProject(loaded.project, { flush: false });
-        if (!opened.ok) {
-          showToast(`无法打开副本：${opened.message}`, 'error');
-          return;
-        }
+      if (!loaded.ok) {
+        // 副本写入成功但数据无法通过校验（故障存储）：不得静默报成功
+        showToast(`副本校验失败：${loaded.message}`, 'error');
+        return;
+      }
+      const opened = await runtime.openProject(loaded.project, { flush: false });
+      if (!opened.ok) {
+        showToast(`无法打开副本：${opened.message}`, 'error');
+        return;
       }
       setOpen(false);
       showToast(`未保存更改已另存为「${dup.summary.name}」`, 'success');

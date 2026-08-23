@@ -21,6 +21,9 @@ export const manifestSchema = z
       .optional(),
     contributes: z.array(z.enum(['panel', 'command', 'toolbar', 'assetLoader', 'aiProvider', 'exporter'])).optional(),
     enabled: z.boolean().optional(),
+    /** 插件显式声明 pluginData[instanceId] 下这些顶层键为私有（导出含私有设置时
+     *  剥离，不进工程包）。仅声明才剥离 —— 凭据隔离是结构化契约（第十一轮）。 */
+    privateSettings: z.array(z.string()).optional(),
   })
   .strict();
 

@@ -2,7 +2,8 @@
  * `.lumora` 工程包构建与解析（FR-011）：
  *
  * 导出 = 打包：project.json 按公开字段白名单构建（私有字段与运行时缓存引用剥离，
- *         扩展数据递归清除凭据族键）+ manifest + assets 载荷段。
+ *         settings 按契约字段投影、pluginData 默认排除并按插件声明剥离私有键）
+ *         + manifest + assets 载荷段。
  * 导入 = 解析：文本长度上限 → JSON → manifest 校验 → schema 迁移 → 载荷完整性校验
  *         （先于解码的长度上限 / 规范 base64 / size 精确核对 / 组合内容哈希 /
  *         资源上限）→ 载荷回挂 → 完整校验 → 缺失资产报告（warning 明细，不阻断）。
@@ -19,8 +20,13 @@ import { PACKAGE_FORMAT_VERSION, PROJECT_PACKAGE_FORMAT, CURRENT_PROJECT_SCHEMA_
 import type { ProjectAssetPayload, ProjectPackage } from './schema';
 
 export interface PackageBuildOptions {
-  /** 是否包含插件私有设置（pluginData）。凭据族字段任何情况下都不包含（NFR-008）。 */
+  /** 是否包含插件私有设置（pluginData）。默认不含：pluginData 结构性排除（NFR-008）。 */
   includePrivate?: boolean;
+  /** includePrivate 时按插件显式声明剥离 pluginData[instanceId] 的顶层键：
+   *  键为插件 instanceId，值为该插件 manifest.privateSettings 声明的私有键。
+   *  仅显式声明才剥离 —— 凭据隔离是结构化契约（第十一轮），不再依赖不完备的
+   *  键名词表猜测；未声明的键（含凭据形态键名）随包完整往返。 */
+  privateKeysByPlugin?: Record<string, string[]>;
   appName?: string;
   appVersion?: string;
   /** 可注入导出时刻（测试确定性）；缺省取当前时间 */
@@ -114,105 +120,6 @@ export function preDecodePayloadFailure(
   return null;
 }
 
-/**
- * 凭据族敏感词（导出时递归清除；插件扩展数据可携带任意嵌套键）。
- * 凭据隔离是两层设计：顶层凭据结构（credentials/apiKeys/…）由公开字段白名单
- * 结构性排除（见 PUBLIC_PROJECT_FIELDS），此处仅兜底嵌套任意键名。
- * 匹配规则（第七轮 #3 重构 + 第八轮 #3 收紧 + 第九轮 #3 扩族）为
- * 「组合敏感默认 + 白名单窄例外」，全部敏感族（key/token/cookie/secret/
- * password/credential/authorization）统一用同一组合词策略，不再枚举：
- * - 任意位置精确命中敏感词：secret/secrets/password/passwords/credential/
- *   credentials/authorization（白名单不豁免）；
- * - 核心词（key/keys/token/tokens/cookie/secret/secrets/password/passwords/
- *   credential/credentials/authorization）在**词内任意位置包含**即默认敏感 ——
- *   不再依赖有限的枚举/前缀证明安全（refreshToken/githubToken/bearerToken/
- *   clientSecret/serviceCredential 等 provider 限定词不可枚举，枚举必然漏；
- *   SUPERSECRETVALUE/DBPASSWORDVALUE/servicecredentialvalue/OAUTHCLIENTSECRETVALUE
- *   等无分隔符拼接形态拆不出词边界，含核心词子串即拒绝）；
- * - 白名单窄例外：规范化键名（小写词 join('_')）精确匹配的普通配置
- *   （shortcutKey/keyboardKey/primaryKey/cacheKey/maxToken/tokenBudget/
- *   keyframes/tokenizer/maxOutputTokens/tokenBudgetPerScene/keyBinding/
- *   keyboardLayout/monkeyPatch/hotkeyMap/tokenizerConfig 等）放行。
- * 无核心词的键（keyframes/apiUrl/endpoint 等）天然保留。
- */
-const SENSITIVE_ANY_WORD = new Set([
-  'secret',
-  'secrets',
-  'password',
-  'passwords',
-  'credential',
-  'credentials',
-  'authorization',
-]);
-/** 组合敏感核心词：词内包含任一核心词即默认敏感（凭据语义；cookie 无例外）。
- *  secret 族与 key/token/cookie 同权 —— clientSecret/serviceCredential/
- *  OAUTHCLIENTSECRETVALUE 等紧凑拼接由核心词子串覆盖（第九轮 #3），不再依赖
- *  显式枚举兜底 */
-const SENSITIVE_CORE_WORDS = [
-  'key',
-  'keys',
-  'token',
-  'tokens',
-  'cookie',
-  'secret',
-  'secrets',
-  'password',
-  'passwords',
-  'credential',
-  'credentials',
-  'authorization',
-];
-/** 白名单窄例外：规范化键名（小写词 join('_')）精确匹配。仅放行经确认的普通配置 */
-const ALLOWED_CONFIG_KEYS = new Set([
-  'shortcut_key',
-  'keyboard_key',
-  'primary_key',
-  'cache_key',
-  'max_token',
-  'max_tokens',
-  'maxtokens',
-  'token_budget',
-  'token_count',
-  'tokens_per_sec',
-  'token_limit',
-  'max_output_tokens',
-  'token_budget_per_scene',
-  'key_binding',
-  'tokenizer',
-  'keyframes',
-  'keyframe_rate',
-  // 第九轮 #4：含核心词子串（key/token）但为普通配置的组合词，精确匹配放行
-  'keyboard_layout', // keyboardLayout
-  'monkey_patch', // monkeyPatch
-  'hotkey_map', // hotkeyMap
-  'tokenizer_config', // tokenizerConfig
-]);
-
-/**
- * 键名 → 小写分词列表。边界规则：分隔符（_/-/./空格）+ 驼峰边界，且连续大写段
- * 保持整体（缩写）：APIKey → api|key（而非 a|p|i|key）、MAXTokens → max|tokens；
- * 全大写/全小写拼接形态（APIKEY）保持为单个词，由核心词子串匹配兜底。
- */
-function splitKeyWords(key: string): string[] {
-  return key
-    .split(/[^A-Za-z0-9]+/)
-    .flatMap((part) => part.split(/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/))
-    .map((word) => word.toLowerCase())
-    .filter((word) => word.length > 0);
-}
-
-function isSensitiveKey(key: string): boolean {
-  const words = splitKeyWords(key);
-  if (words.some((word) => SENSITIVE_ANY_WORD.has(word))) return true;
-  // 核心词子串匹配（第八轮 #3 + 第九轮 #3）：词内包含 key/token/cookie/secret/
-  // password/credential/authorization 即默认敏感 —— 覆盖无分隔符拼接形态
-  // （OPENAIAPIKEYVALUE/SUPERSECRETVALUE/DBPASSWORDVALUE/servicecredentialvalue
-  // 是单一连续段，单词相等与后缀枚举都漏）；仅规范化键名精确命中白名单的
-  // 普通配置放行
-  if (!words.some((word) => SENSITIVE_CORE_WORDS.some((core) => word.includes(core)))) return false;
-  return !ALLOWED_CONFIG_KEYS.has(words.join('_'));
-}
-
 /** 工程包仅携带的公开项目字段（白名单：未知顶层字段一律不进包）。
  *  导出预检（project-persistence.exportCurrent）按同一名单投影原项目的导出字段，
  *  与 buildProjectPackage 的包内容保持单一事实来源（第九轮 #2）。 */
@@ -230,6 +137,11 @@ export const PUBLIC_PROJECT_FIELDS = [
   'assets',
 ] as const;
 
+/** 工程包携带的公开设置字段（契约，第十一轮）：ProjectSettings 是强类型
+ *  {fps, aspect}，契约外键（无论键名形态，含凭据类键名）任何情况下不得进入包 ——
+ *  凭据隔离是结构性契约而非键名猜测。 */
+export const PUBLIC_SETTINGS_FIELDS = ['fps', 'aspect'] as const;
+
 function failure(code: PackageImportErrorCode, message: string, detail?: string): PackageParseResult {
   return { ok: false, error: { code, message, detail } };
 }
@@ -238,31 +150,27 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-/**
- * 递归清除敏感键（凭据族，NFR-008）：命中敏感键名即删除整个子树。
- * 循环引用安全（visited 集）；仅用于导出克隆，不影响原始项目。
- */
-export function stripSensitiveFields(value: unknown, visited = new WeakSet<object>()): void {
-  if (!value || typeof value !== 'object' || visited.has(value)) return;
-  visited.add(value);
-  if (Array.isArray(value)) {
-    for (const item of value) stripSensitiveFields(item, visited);
-    return;
-  }
-  for (const key of Object.keys(value)) {
-    if (isSensitiveKey(key)) {
-      delete (value as Record<string, unknown>)[key];
-    } else {
-      stripSensitiveFields((value as Record<string, unknown>)[key], visited);
-    }
+/** 声明制剥离：按插件 manifest.privateSettings 声明删除 pluginData[instanceId]
+ *  的顶层键（仅声明处剥离；整棵子树随声明键删除 —— 插件对其私有数据拥有完整
+ *  控制）。在导出克隆上原地删除，不影响原始项目。 */
+function stripDeclaredPrivateKeys(
+  pluginData: unknown,
+  privateKeysByPlugin?: Record<string, string[]>,
+): void {
+  if (!privateKeysByPlugin || !isPlainRecord(pluginData)) return;
+  for (const [instanceId, value] of Object.entries(pluginData)) {
+    const declared = privateKeysByPlugin[instanceId];
+    if (!declared || !isPlainRecord(value)) continue;
+    for (const key of declared) delete value[key];
   }
 }
 
 /**
  * 构建工程包：
- * - 白名单构建 project 段：仅公开字段进入包；pluginData 默认排除（includePrivate
- *   时保留）；凭据族键名（apiKey/token/secret/…）在任何嵌套深度递归清除
- *   （NFR-008：API Key 不写入工程包）；
+ * - 白名单构建 project 段：仅公开字段进入包；settings 按契约字段投影
+ *   （PUBLIC_SETTINGS_FIELDS，契约外键结构性排除）；pluginData 默认排除
+ *   （includePrivate 时按插件显式声明剥离私有键后保留 —— 未声明键无损往返，
+ *   不再递归猜测键名，NFR-008）；
  * - 资产字节从 project.json 摘出，按 assetId 挂入 assets 段；
  * - storageRef 为运行期缓存引用（object URL），跨环境不可重建，导出恒置空。
  */
@@ -270,14 +178,25 @@ export function buildProjectPackage(project: Project, options: PackageBuildOptio
   const includePrivate = options.includePrivate ?? false;
   const exportedAt = options.exportedAt ?? new Date().toISOString();
 
-  // 深克隆后构造白名单字段（未知顶层字段一律丢弃），随后递归清除凭据族键
+  // 深克隆后构造白名单字段（未知顶层字段一律丢弃）
   const source = structuredClone(project) as unknown as Record<string, unknown>;
   const stripped: Record<string, unknown> = {};
   for (const field of PUBLIC_PROJECT_FIELDS) {
     if (source[field] !== undefined) stripped[field] = source[field];
   }
-  if (includePrivate && source.pluginData !== undefined) stripped.pluginData = source.pluginData;
-  stripSensitiveFields(stripped);
+  if (includePrivate && source.pluginData !== undefined) {
+    stripped.pluginData = source.pluginData;
+    stripDeclaredPrivateKeys(stripped.pluginData, options.privateKeysByPlugin);
+  }
+  // settings 契约投影：仅公开契约字段进入包（结构上排除契约外键，含凭据类键名）
+  if (isPlainRecord(stripped.settings)) {
+    const settings: Record<string, unknown> = {};
+    for (const field of PUBLIC_SETTINGS_FIELDS) {
+      const value = stripped.settings[field];
+      if (value !== undefined) settings[field] = value;
+    }
+    stripped.settings = settings;
+  }
 
   // 无原型字典：资产 id 是导入包可携带的任意字符串（含 '__proto__'），
   // 普通 {} 的赋值会走原型 setter 丢字节/污染原型（导入→导出→导入字节丢失）

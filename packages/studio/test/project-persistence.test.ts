@@ -6,6 +6,7 @@ import type { StudioRuntime } from '../src/runtime/studio-runtime';
 import { ProjectStore } from '../src/persistence/project-store';
 import { ProjectPersistence } from '../src/persistence/project-persistence';
 import { buildProjectPackage, serializeProjectPackage } from '@lumora/core';
+import type { ProjectStorage } from '../src/persistence/project-storage';
 
 const DB = 'lumora-test-persist';
 
@@ -535,6 +536,59 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     await runtime.dispose();
   });
 
+  it('exportCurrent 根级反射：访问器顶层字段 → 类型化失败，getter 副作用不发生（第十一轮一般 #6）', async () => {
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, dbName: DB }); // 超长防抖：注入期间无保存读取
+    let getterCalled = 0;
+    const withAccessor = createSampleProject('lumora://project/getter', '访问器项目');
+    Object.defineProperty(withAccessor, 'name', {
+      configurable: true,
+      get() {
+        getterCalled += 1;
+        return '读取到的名字';
+      },
+    });
+    const spy = vi.spyOn(editor, 'getProject').mockReturnValue(withAccessor);
+    try {
+      const result = persistence.exportCurrent();
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.message).toContain('访问器属性');
+      expect(result.message).toContain('name');
+      // 预检在属性读取之前拒绝：getter 副作用未发生（修复前 project[field] 会先触发）
+      expect(getterCalled).toBe(0);
+    } finally {
+      spy.mockRestore();
+      await persistence.dispose();
+    }
+  });
+
+  it('exportCurrent 根级反射：Proxy 的 getOwnPropertyDescriptor trap 抛错 → 类型化失败（第十一轮一般 #6）', async () => {
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, dbName: DB });
+    const target = createSampleProject('lumora://project/proxy', '代理项目');
+    const proxy = new Proxy(target, {
+      ownKeys() {
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor() {
+        throw new Error('trap boom');
+      },
+    });
+    const spy = vi.spyOn(editor, 'getProject').mockReturnValue(proxy);
+    try {
+      const result = persistence.exportCurrent();
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.message).toContain('无法反射');
+    } finally {
+      spy.mockRestore();
+      await persistence.dispose();
+    }
+  });
+
   it('exportCurrent 编码预检：循环引用扩展字段 → 类型化失败', async () => {
     const runtime = await makeRuntime();
     const project = runtime.persistence.createProject('循环项目');
@@ -654,7 +708,7 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     await runtime.dispose();
   });
 
-  it('导出导入往返回归（第九轮 #4）：benign 组合词设置随包往返保留，凭据族不进入包', async () => {
+  it('导出导入往返 + 声明制剥离（第十一轮）：声明键不进入包，benign 组合词随包保留', async () => {
     const runtime = await makeRuntime();
     const project = runtime.persistence.createProject('往返回归');
     runtime.openProject({
@@ -672,7 +726,18 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     } as Project);
     await settle(40);
 
-    const exported = runtime.persistence.exportCurrent({ includePrivate: true });
+    // 无声明：未声明的键（含凭据形态键名）随包完整往返 —— 契约不猜测键名
+    const rawExport = runtime.persistence.exportCurrent({ includePrivate: true });
+    expect(rawExport.ok).toBe(true);
+    if (!rawExport.ok) return;
+    expect(rawExport.text).toContain('sk-leak-1');
+    expect(rawExport.text).toContain('client-secret-2');
+
+    // 显式声明剥离：声明的顶层键不进入包
+    const exported = runtime.persistence.exportCurrent({
+      includePrivate: true,
+      privateKeysByPlugin: { 'com.example': ['apiKey', 'clientSecret'] },
+    });
     expect(exported.ok).toBe(true);
     if (!exported.ok) return;
     expect(exported.text).not.toContain('sk-leak-1');
@@ -694,5 +759,142 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     await settle(40);
     expect(runtime.editor.getProject()!.name).toBe('往返回归');
     await runtime.dispose();
+  });
+});
+
+describe('ProjectPersistence：facade 事件桥代际失效（第十轮 #1 阻断回归）', () => {
+  it('persistence.events 双监听器同步重入 —— 陈旧 clean 不穿过事件桥送达监听器 2', async () => {
+    const runtime = await makeRuntime();
+    const base = runtime.persistence.createProject('facade 重入');
+    runtime.openProject(base);
+    await settle(60); // 首存落盘 → clean
+
+    const events = runtime.persistence.events;
+    const seq2: string[] = [];
+    let reentered = false;
+    // 监听器 1 在最终 clean 广播中同步提交编辑（嵌套 dirty 分发立即开始）；
+    // 修复前 autosaver 内层代际失效只终止 autosaver 自己的监听器迭代 —— bridge
+    // 转发到 persistence.events 后，外层 TypedEventEmitter 分发不终止，监听器 2
+    // 在嵌套 dirty 之后仍收到陈旧的 clean（倒置序列 dirty → clean）
+    events.on('save-state', (e) => {
+      if (e.state.status === 'clean' && !reentered) {
+        reentered = true;
+        runtime.editor.addObject(createGroupObject());
+      }
+    });
+    events.on('save-state', (e) => seq2.push(e.state.status));
+
+    runtime.editor.addObject(createGroupObject()); // 触发一次保存 → 完成后广播 clean
+    await settle(120);
+    expect(reentered).toBe(true);
+
+    const statuses = seq2;
+    for (let i = 0; i < statuses.length - 1; i += 1) {
+      expect([statuses[i], statuses[i + 1]]).not.toEqual(['dirty', 'clean']);
+    }
+    expect(seq2).toContain('dirty');
+    expect(seq2.at(-1)).toBe('clean');
+    // 重入编辑保留（两次编辑都在，未被陈旧分发覆盖）
+    expect(runtime.editor.getProject()!.objects.length).toBe(base.objects.length + 2);
+    await runtime.dispose();
+  });
+
+  it('onAny 同边界 —— 陈旧 clean 同样不送达 onAny 监听器', async () => {
+    const runtime = await makeRuntime();
+    const base = runtime.persistence.createProject('facade onAny');
+    runtime.openProject(base);
+    await settle(60);
+
+    const events = runtime.persistence.events;
+    const anySeq: string[] = [];
+    let reentered = false;
+    events.on('save-state', (e) => {
+      if (e.state.status === 'clean' && !reentered) {
+        reentered = true;
+        runtime.editor.addObject(createGroupObject());
+      }
+    });
+    events.onAny((event, payload) => {
+      if (event === 'save-state') {
+        anySeq.push((payload as { state: { status: string } }).state.status);
+      }
+    });
+
+    runtime.editor.addObject(createGroupObject());
+    await settle(120);
+    expect(reentered).toBe(true);
+
+    const statuses = anySeq;
+    for (let i = 0; i < statuses.length - 1; i += 1) {
+      expect([statuses[i], statuses[i + 1]]).not.toEqual(['dirty', 'clean']);
+    }
+    expect(anySeq).toContain('dirty');
+    expect(anySeq.at(-1)).toBe('clean');
+    expect(runtime.editor.getProject()!.objects.length).toBe(base.objects.length + 2);
+    await runtime.dispose();
+  });
+});
+
+describe('ProjectPersistence：复制路径保存后统一验证与失败清理（第十一轮严重 #3 回归）', () => {
+  /** 故障存储探针：save 永远成功（写入成功 ≠ 数据可用），load 返回损坏记录
+   *  （settings.fps 非法 → 校验拒绝），remove 由断言观测。 */
+  function corruptStore(): { store: ProjectStorage; remove: ReturnType<typeof vi.fn> } {
+    const corruptRecord: Project = {
+      ...createSampleProject('lumora://project/corrupt', '损坏副本'),
+      settings: { fps: 'bad' } as unknown as Project['settings'],
+    };
+    const remove = vi.fn(async () => true);
+    const store: ProjectStorage = {
+      kind: 'indexeddb',
+      list: vi.fn(async () => []),
+      load: vi.fn(async () => corruptRecord),
+      save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
+      remove,
+      rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
+      duplicate: vi.fn(
+        async (_uri: string, _name?: string) =>
+          ({ ok: false, code: 'not-found', message: 'not mocked' }) as const,
+      ),
+      close: vi.fn(),
+    };
+    return { store, remove };
+  }
+
+  it('saveSnapshotAsNew：保存成功但副本无法通过校验 → 返回错误并清除记录', async () => {
+    const editor = new SceneEditor();
+    const { store, remove } = corruptStore();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ store });
+
+    const result = await persistence.saveSnapshotAsNew(
+      createSampleProject('lumora://project/src', '源项目'),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.message).toContain('副本保存失败');
+    expect(result.message).toContain('校验');
+    expect(store.save).toHaveBeenCalledTimes(1);
+    // 清理探针：副本记录被移除 —— 未通过的副本不得留在最近项目列表
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith(expect.stringMatching(/^lumora:\/\/project\//));
+    await persistence.dispose();
+  });
+
+  it('duplicateProject（当前项目分支）：保存成功但副本无法通过校验 → 返回 storage-error 并清除记录', async () => {
+    const editor = new SceneEditor();
+    const { store, remove } = corruptStore();
+    const persistence = new ProjectPersistence(editor);
+    // 先接监听再打开：openProject 的 project:changed 需被 facade 捕获（currentUri 分流）
+    editor.openProject(createSampleProject('lumora://project/open', '打开中项目'));
+    await persistence.init({ store });
+
+    const result = await persistence.duplicateProject('lumora://project/open');
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('storage-error');
+    expect(result.message).toContain('副本保存失败');
+    expect(result.message).toContain('校验');
+    expect(remove).toHaveBeenCalledTimes(1);
+    await persistence.dispose();
   });
 });

@@ -11,7 +11,6 @@ import {
   buildProjectPackage,
   parseProjectPackage,
   serializeProjectPackage,
-  stripSensitiveFields,
 } from '../src/project/package';
 import { CURRENT_PROJECT_SCHEMA_VERSION, PACKAGE_FORMAT_VERSION, PROJECT_PACKAGE_FORMAT } from '../src/project/schema';
 import type { AssetData, AssetPartData, Project, SceneObjectData } from '../src/scene/types';
@@ -105,10 +104,10 @@ function normalized(project: Project): Project {
 }
 
 describe('buildProjectPackage：私有数据默认排除（FR-011 / NFR-008）', () => {
-  it('默认导出不含 pluginData 与凭据族字段；includePrivate 仅放行 pluginData', async () => {
+  it('默认导出不含 pluginData 与白名单外字段；includePrivate 仅放行 pluginData', async () => {
     const project = await buildFixtureProject();
-    // NFR-008 防御：凭据族字段不属于 Project schema（凭据走独立本地配置），
-    // 即使非法数据进入项目，任何情况下也不得进入包
+    // NFR-008 结构性隔离：凭据族字段不属于 Project schema（凭据走独立本地配置），
+    // 即使非法数据混入项目，顶层白名单也保证其不进包
     const rich = {
       ...project,
       pluginData: { 'com.example': { theme: 'dark' } },
@@ -127,10 +126,12 @@ describe('buildProjectPackage：私有数据默认排除（FR-011 / NFR-008）',
     expect(serialized).not.toContain('credentials');
     expect(serialized).not.toContain('blob:runtime-only');
 
+    // includePrivate：pluginData 放行（无声明时键原样保留 —— 契约不猜测键名）
     const privatePkg = buildProjectPackage(rich, { includePrivate: true });
     const privateJson = JSON.stringify(privatePkg);
     expect(privateJson).toContain('pluginData');
     expect(privateJson).toContain('theme');
+    // 顶层白名单仍排除白名单外字段（credentials 不属于 Project schema）
     expect(privateJson).not.toContain('sk-secret-value-xyz');
     expect(privateJson).not.toContain('credentials');
   });
@@ -151,42 +152,134 @@ describe('buildProjectPackage：私有数据默认排除（FR-011 / NFR-008）',
   });
 });
 
-describe('工程包凭据清除（NFR-008：嵌套扩展数据递归清除）', () => {
-  it('pluginData 深层嵌套的凭据族键被清除；非敏感字段保留（includePrivate）', async () => {
+describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥离，第十一轮）', () => {
+  it('settings 契约投影：契约外键（含凭据类键名与嵌套形态）任何情况下不进包，fps/aspect 保留', async () => {
+    const project = await buildFixtureProject();
+    const rich = {
+      ...project,
+      settings: {
+        ...project.settings,
+        pass_word: 'pw-secret-1',
+        passwd: 'pw-secret-2',
+        authHeader: 'Bearer leak-3',
+        apiKey: 'sk-leak-4',
+        extraNested: { password: 'pw-secret-5' },
+      },
+    } as Project;
+    for (const includePrivate of [false, true]) {
+      const pkg = buildProjectPackage(rich, { includePrivate });
+      const json = JSON.stringify(pkg);
+      const settings = (pkg.project as unknown as { settings: Record<string, unknown> }).settings;
+      expect(settings).toEqual({ fps: project.settings.fps, aspect: project.settings.aspect });
+      for (const leaked of [
+        'pw-secret-1',
+        'pw-secret-2',
+        'Bearer leak-3',
+        'sk-leak-4',
+        'pw-secret-5',
+        'pass_word',
+        'passwd',
+        'authHeader',
+        'extraNested',
+      ]) {
+        expect(json, `契约外键 ${leaked} 不得进入包`).not.toContain(leaked);
+      }
+    }
+  });
+
+  it('pluginData 默认整体排除；includePrivate 且无声明时凭据形态键无损保留（契约不猜测键名）', async () => {
     const project = await buildFixtureProject();
     const rich = {
       ...project,
       pluginData: {
         'com.example': {
           theme: 'dark',
-          settings: { accessToken: 'tok-secret-abc', apiKey: 'key-secret-xyz' },
-          api: { authorization: 'Bearer abc' },
-          users: [{ name: 'u1' }, { name: 'u2', password: 'pwd-1' }],
+          apiKey: 'sk-keep-1',
+          authHeader: 'Bearer keep-2',
+          passwd: 'pw-keep-3',
         },
       },
     } as Project;
-    const pkg = buildProjectPackage(rich, { includePrivate: true });
-    const json = JSON.stringify(pkg);
-    expect(json).toContain('theme');
-    expect(json).toContain('u1');
-    expect(json).not.toContain('tok-secret-abc');
-    expect(json).not.toContain('key-secret-xyz');
-    expect(json).not.toContain('Bearer abc');
-    expect(json).not.toContain('pwd-1');
-    expect(json).not.toContain('accessToken');
-    expect(json).not.toContain('authorization');
+    const text = serializeProjectPackage(buildProjectPackage(rich));
+    expect(text).not.toContain('pluginData');
+    expect(text).not.toContain('sk-keep-1');
+
+    const privateJson = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
+    expect(privateJson).toContain('theme');
+    expect(privateJson).toContain('sk-keep-1');
+    expect(privateJson).toContain('Bearer keep-2');
+    expect(privateJson).toContain('pw-keep-3');
   });
 
-  it('对象扩展字段（customFields）中的凭据族键被递归清除', async () => {
+  it('includePrivate + 声明剥离：manifest.privateSettings 声明的顶层键（含整棵子树）被剥除，未声明键保留', async () => {
     const project = await buildFixtureProject();
     const rich = {
       ...project,
-      objects: project.objects.map((o) => ({ ...o, customFields: { note: '保留', apiKey: 'sk-secret-456' } })),
+      pluginData: {
+        'com.example': {
+          theme: 'dark',
+          apiKey: 'sk-declared-1',
+          clientSecret: 'cs-declared-2',
+          accessToken: 'at-declared-3',
+          auth: { apiKey: 'nested-4', accessToken: 'nested-5' },
+        },
+      },
     } as Project;
-    const json = JSON.stringify(buildProjectPackage(rich));
-    expect(json).toContain('保留');
-    expect(json).not.toContain('sk-secret-456');
-    expect(json).not.toContain('apiKey');
+    const json = JSON.stringify(
+      buildProjectPackage(rich, {
+        includePrivate: true,
+        privateKeysByPlugin: { 'com.example': ['apiKey', 'clientSecret', 'accessToken', 'auth'] },
+      }),
+    );
+    for (const leaked of ['sk-declared-1', 'cs-declared-2', 'at-declared-3', 'nested-4', 'nested-5']) {
+      expect(json, `声明键值 ${leaked} 不得进入包`).not.toContain(leaked);
+    }
+    for (const key of ['"apiKey"', '"clientSecret"', '"accessToken"', '"auth"']) {
+      expect(json, `声明键名 ${key} 不得进入包`).not.toContain(key);
+    }
+    expect(json).toContain('theme');
+  });
+
+  it('声明只作用于声明的插件实例：其他实例未声明的同形键保留', async () => {
+    const project = await buildFixtureProject();
+    const rich = {
+      ...project,
+      pluginData: {
+        'com.a': { apiKey: 'a-leak-1' },
+        'com.b': { apiKey: 'b-keep-1' },
+      },
+    } as Project;
+    const json = JSON.stringify(
+      buildProjectPackage(rich, { includePrivate: true, privateKeysByPlugin: { 'com.a': ['apiKey'] } }),
+    );
+    expect(json).not.toContain('a-leak-1');
+    expect(json).toContain('b-keep-1');
+  });
+
+  it('无损往返性质：pass_word/passwd/authHeader 与 benign 组合词及后缀变体未声明时导出→导入逐键一致（第十一轮严重 #2）', async () => {
+    const project = await buildFixtureProject();
+    const pluginData = {
+      'com.example': {
+        pass_word: 'pw-1',
+        passwd: 'pw-2',
+        authHeader: 'Bearer x',
+        KEYBOARDLAYOUT: 'kb-1',
+        keyboardLayoutIntl: 'kb-2',
+        TOKENIZERCONFIG: 'tok-1',
+        tokenizerConfigModel: 'tok-2',
+        MONKEYPATCH: 'mp-1',
+        HOTKEYMAP: 'hk-1',
+        shortcutKeys: 'Ctrl+K',
+        keyframeInterpolation: 'bezier',
+        hotkeyMode: 'combo',
+        tokenizerModel: 'cl100k',
+      },
+    };
+    const pkg = buildProjectPackage({ ...project, pluginData }, { includePrivate: true });
+    const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.project.pluginData).toEqual(pluginData);
   });
 
   it('未知顶层字段不进入工程包（公开字段白名单）；tracks 属公开数据随包携带', async () => {
@@ -198,235 +291,7 @@ describe('工程包凭据清除（NFR-008：嵌套扩展数据递归清除）', 
     expect(JSON.parse(json)).toMatchObject({ project: { tracks: project.tracks } });
   });
 
-  it('stripSensitiveFields 对循环引用安全：不崩溃且敏感键清除', () => {
-    const a: Record<string, unknown> = {};
-    const b: Record<string, unknown> = { a, token: 'secret' };
-    a.b = b;
-    stripSensitiveFields(a);
-    expect(a.b).toBe(b);
-    expect(b.token).toBeUndefined();
-    expect(b.a).toBe(a);
-  });
-
-  it('凭据后缀词（privateKey/accessKey/providerKey/cookie/accessToken）清除；token 族配置与 keyframes 保留（第四轮 #5）', async () => {
-    const project = await buildFixtureProject();
-    const rich = {
-      ...project,
-      pluginData: {
-        'com.example': {
-          privateKey: 'sk-private-1',
-          accessKey: 'ak-2',
-          providerKey: 'pk-3',
-          cookie: 'session-cookie-4',
-          accessToken: 'at-6',
-          apiKey: 'sk-7',
-          password: 'pw-8',
-          maxTokens: 2048,
-          tokenizer: 'cl100k',
-          tokenBudget: { max: 999 },
-          keyframes: [1, 2, 3],
-        },
-      },
-    } as Project;
-    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
-    // 凭据（含此前漏网的 privateKey/accessKey/providerKey/cookie）不得进入包
-    for (const leaked of ['sk-private-1', 'ak-2', 'pk-3', 'session-cookie-4', 'at-6', 'sk-7', 'pw-8']) {
-      expect(json).not.toContain(leaked);
-    }
-    // 非凭据配置必须保留：token 族计数/分词配置（不得因「token」误杀）与关键帧数据
-    expect(json).toContain('maxTokens');
-    expect(json).toContain('tokenizer');
-    expect(json).toContain('tokenBudget');
-    expect(json).toContain('"keyframes":[1,2,3]');
-    expect(json).toContain('2048');
-    expect(json).toContain('cl100k');
-  });
-
-  it('凭据键名大小写/命名风格矩阵：分隔符/驼峰/首字母大写/全大写/紧凑别名全部清除（第五轮 #2）', async () => {
-    const project = await buildFixtureProject();
-    const stripped: Record<string, string> = {};
-    const preserved: Record<string, string> = {};
-    // 凭据族各命名风格：snake/kebab/小驼峰/大驼峰/全大写/全小写紧凑/全大写紧凑
-    for (const key of [
-      'api_key', 'api-key', 'apiKey', 'ApiKey', 'APIKey', 'API_KEY', 'apikey', 'APIKEY',
-      'access_token', 'access-token', 'accessToken', 'AccessToken', 'ACCESS_TOKEN',
-      'accesstoken', 'ACCESSTOKEN', 'access_keys', 'accessKeys', 'ACCESS_KEYS',
-      'secret_key', 'secretKey', 'SecretKey', 'SECRET_KEY', 'secretkey', 'SECRETKEY',
-      'client_secret', 'clientSecret', 'ClientSecret', 'CLIENT_SECRET',
-      'clientsecret', 'CLIENTSECRET',
-      'private_key', 'privateKey', 'PrivateKey', 'PRIVATE_KEY', 'PRIVATEKEY',
-      'provider_key', 'providerKey', 'PROVIDER_KEY',
-      'auth_cookie', 'authCookie', 'AUTH_COOKIE', 'session_cookie',
-      'session_token', 'sessionToken', 'SESSION_TOKEN', 'token', 'TOKEN',
-      'password', 'PASSWORD', 'Password',
-      'credential', 'CREDENTIAL', 'Credentials', 'credentials',
-      'authorization', 'AUTHORIZATION', 'Authorization',
-      'secret', 'SECRET', 'Secret', 'secrets', 'SECRETS',
-      'api_keys', 'API_KEYS', 'apikeys', 'APIKEYS',
-    ]) {
-      stripped[key] = `sensitive-${key}`;
-    }
-    // 非凭据配置：token 族计数/分词、key 前缀的词、普通配置（含全大写形态）
-    for (const key of [
-      'maxTokens', 'MAXTOKENS', 'max_tokens', 'max-tokens', 'MaxTokens',
-      'tokenizer', 'TOKENIZER', 'tokenBudget', 'token_budget', 'tokenCount',
-      'tokensPerSec', 'token_limit',
-      'keyframes', 'KEYFRAMES', 'keyframeRate',
-      '2048', 'cl100k', 'sampleRate', 'SAMPLE_RATE', 'apiUrl', 'API_URL', 'APIURL',
-      'endpoint', 'url', 'URL',
-    ]) {
-      preserved[key] = `safe-${key}`;
-    }
-    const rich = { ...project, pluginData: { 'com.example': { ...stripped, ...preserved } } } as Project;
-    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
-    for (const key of Object.keys(stripped)) {
-      expect(json, `凭据键 ${key} 必须被清除`).not.toContain(`sensitive-${key}`);
-    }
-    for (const key of Object.keys(preserved)) {
-      expect(json, `非凭据键 ${key} 必须保留`).toContain(`safe-${key}`);
-    }
-  });
-
-  it('provider/token 组合矩阵（第七轮 #3）：任意 provider 限定的 token 族键默认敏感清除，不依赖有限前缀枚举；白名单普通配置保留', async () => {
-    const project = await buildFixtureProject();
-    const stripped: Record<string, string> = {};
-    // provider/协议限定词 + token 的组合不可枚举（refreshToken/githubToken/
-    // bearerToken/jwtToken/idToken/refresh_token 等）：核心词任意位置出现即默认敏感
-    for (const key of [
-      'refreshToken', 'refresh_token', 'refresh-token', 'RefreshToken', 'REFRESH_TOKEN',
-      'githubToken', 'gitHubToken', 'GITHUB_TOKEN',
-      'bearerToken', 'bearer_token', 'BEARER_TOKEN',
-      'jwtToken', 'jwt_token', 'JWT_TOKEN',
-      'idToken', 'id_token', 'ID_TOKEN',
-      'anthropicApiKey', 'openaiApiKey', 'claudeToken', 'geminiToken', 'groqToken', 'xaiToken',
-      'awsAccessKey', 'firebaseToken', 'stripeToken', 'slackToken', 'discordToken', 'oauthToken',
-      'sessionToken', 'SESSION_TOKEN',
-    ]) {
-      stripped[key] = `secret-${key}`;
-    }
-    // 白名单窄例外：经确认的普通配置（快捷键/计数/关键帧）不受「核心词默认敏感」误杀
-    const preserved: Record<string, string> = {};
-    for (const key of ['shortcutKey', 'keyboardKey', 'primaryKey', 'cacheKey', 'maxToken', 'maxTokens', 'tokenBudget', 'tokenizer', 'keyframes']) {
-      preserved[key] = `safe-${key}`;
-    }
-    const rich = { ...project, pluginData: { 'com.example': { ...stripped, ...preserved } } } as Project;
-    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
-    for (const key of Object.keys(stripped)) {
-      expect(json, `凭据键 ${key} 必须被清除`).not.toContain(`secret-${key}`);
-    }
-    for (const key of Object.keys(preserved)) {
-      expect(json, `普通键 ${key} 必须保留`).toContain(`safe-${key}`);
-    }
-  });
-
-  it('组合式规则（第六轮 #3）：provider 前缀 + value/pem 后缀的凭据键清除；普通 key/token 词保留', async () => {
-    const project = await buildFixtureProject();
-    const stripped: Record<string, string> = {};
-    // 前缀限定词（api/access/ssh/private/provider）+ 后缀（Value/Pem）组合的凭据键：
-    // 任意位置的 key/token 核心词在前词为敏感限定词时同样清除
-    for (const key of [
-      'OPENAIAPIKEY', 'openaiApiKey', 'apiKeyValue', 'apiKeyPem',
-      'accessTokenValue', 'accessKeyId', 'sshPrivateKeyPem', 'providerKeyValue',
-    ]) {
-      stripped[key] = `secret-${key}`;
-    }
-    // 普通设置：非限定词的 key/token 末词（快捷键/主键/缓存键/计数）必须保留
-    const preserved: Record<string, string> = {};
-    for (const key of ['shortcutKey', 'keyboardKey', 'primaryKey', 'cacheKey', 'maxToken', 'tokenBudget', 'tokenizer']) {
-      preserved[key] = `safe-${key}`;
-    }
-    const rich = { ...project, pluginData: { 'com.example': { ...stripped, ...preserved } } } as Project;
-    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
-    for (const key of Object.keys(stripped)) {
-      expect(json, `凭据键 ${key} 必须被清除`).not.toContain(`secret-${key}`);
-    }
-    for (const key of Object.keys(preserved)) {
-      expect(json, `普通键 ${key} 必须保留`).toContain(`safe-${key}`);
-    }
-  });
-
-  it('紧凑拼接形态：OPENAIAPIKEYVALUE/REFRESHTOKENVALUE 清除（核心词子串覆盖，第八轮 #3）；常见非凭据键保留', async () => {
-    const project = await buildFixtureProject();
-    // 无分隔符连续段拆不出词边界：OPENAIAPIKEYVALUE 是单一词，单词相等/后缀枚举
-    // 都漏 —— 核心词（key/token）词内子串匹配必须兜住
-    const stripped: Record<string, string> = {};
-    for (const key of ['OPENAIAPIKEYVALUE', 'REFRESHTOKENVALUE', 'openaiapikeyvalue', 'refreshtokenvalue']) {
-      stripped[key] = `secret-${key}`;
-    }
-    // 含核心词子串但属常见非凭据配置：规范化名精确命中白名单必须保留
-    const preserved: Record<string, string> = {};
-    for (const key of ['maxOutputTokens', 'tokenBudgetPerScene', 'keyBinding', 'maxTokens', 'tokenizer', 'keyframes']) {
-      preserved[key] = `safe-${key}`;
-    }
-    const rich = { ...project, pluginData: { 'com.example': { ...stripped, ...preserved } } } as Project;
-    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
-    for (const key of Object.keys(stripped)) {
-      expect(json, `凭据键 ${key} 必须被清除`).not.toContain(`secret-${key}`);
-    }
-    for (const key of Object.keys(preserved)) {
-      expect(json, `普通键 ${key} 必须保留`).toContain(`safe-${key}`);
-    }
-  });
-
-  it('secret 族组合词矩阵（第九轮 #3）：全部敏感族（secret/password/credential/authorization）按同一组合词策略清除，含大小写与 provider 前后缀', async () => {
-    const project = await buildFixtureProject();
-    const stripped: Record<string, string> = {
-      // 无分隔符连续串：单一词，必须由核心词子串覆盖（不再依赖有限枚举）
-      SUPERSECRETVALUE: 'supersecret-1',
-      DBPASSWORDVALUE: 'dbpassword-2',
-      servicecredentialvalue: 'svc-cred-3',
-      OAUTHCLIENTSECRETVALUE: 'oauth-secret-4',
-      // 大小写变体
-      SuperSecretValue: 'supersecret-5',
-      dbPasswordValue: 'dbpassword-6',
-      serviceCredential: 'svc-cred-7',
-      authorizationToken: 'auth-tok-8',
-      // provider 前缀/后缀
-      openaiClientSecret: 'openai-secret-9',
-      clientSecretForAnthropic: 'anthropic-secret-10',
-      databasePassword: 'db-pwd-11',
-      bearerAuthorization: 'bearer-auth-12',
-      xAuthSecret: 'x-auth-13',
-      authPassword: 'auth-pwd-14',
-      credentialsJson: 'creds-15',
-    };
-    const rich = {
-      ...project,
-      pluginData: { 'com.example': { ...stripped, nested: { ...stripped } } },
-    } as Project;
-    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
-    for (const value of Object.values(stripped)) {
-      expect(json, `凭据族值 ${value} 不得进入包`).not.toContain(value);
-    }
-  });
-
-  it('普通插件设置组合词保留（第九轮 #4）：keyboardLayout/tokenizerConfig/monkeyPatch/hotkeyMap 及大小写/分隔符变体不被凭据启发式误删', async () => {
-    const project = await buildFixtureProject();
-    const preserved: Record<string, string> = {
-      keyboardLayout: 'layout-1',
-      tokenizerConfig: 'tokenizer-1',
-      monkeyPatch: 'monkey-1',
-      hotkeyMap: 'hotkey-1',
-      // 大小写/分隔符变体（规范化后同入白名单）
-      KeyboardLayout: 'layout-2',
-      KEYBOARD_LAYOUT: 'layout-3',
-      keyboard_layout: 'layout-4',
-      tokenizer_config: 'tokenizer-2',
-      TOKENIZER_CONFIG: 'tokenizer-3',
-      MonkeyPatch: 'monkey-2',
-      monkey_patch: 'monkey-3',
-      HotkeyMap: 'hotkey-2',
-      HOTKEY_MAP: 'hotkey-3',
-      hotkey_map: 'hotkey-4',
-    };
-    const rich = { ...project, pluginData: { 'com.example': preserved } } as Project;
-    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
-    for (const value of Object.values(preserved)) {
-      expect(json, `普通设置值 ${value} 必须保留`).toContain(value);
-    }
-  });
-
-  it('导出导入往返回归（第九轮 #4）：benign 组合词随包往返保留，敏感族不进入包', async () => {
+  it('导出导入往返 + 声明剥离：benign 组合词随包往返保留，声明键不进入包（第九轮 #4 契约化）', async () => {
     const project = await buildFixtureProject();
     const rich = {
       ...project,
@@ -443,7 +308,10 @@ describe('工程包凭据清除（NFR-008：嵌套扩展数据递归清除）', 
         },
       },
     } as Project;
-    const pkg = buildProjectPackage(rich, { includePrivate: true });
+    const pkg = buildProjectPackage(rich, {
+      includePrivate: true,
+      privateKeysByPlugin: { 'com.example': ['apiKey', 'accessToken', 'clientSecret'] },
+    });
     const text = serializeProjectPackage(pkg);
     const parsed = await parseProjectPackage(text);
     expect(parsed.ok).toBe(true);

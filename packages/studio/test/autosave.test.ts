@@ -1108,3 +1108,68 @@ describe('ProjectAutosaver：切换广播守卫与代际失效（第九轮 #1 �
     autosaver.dispose();
   });
 });
+
+describe('ProjectAutosaver：switchOpen 失败回滚恢复防抖保存（第十轮 #1 严重回归）', () => {
+  it('dirty → 切换失败 → 不再编辑 → 自动落盘仍发生（存储 revision 推进）', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(60); // 基线落盘（rev0）
+
+    editor.addObject(createGroupObject()); // dirty（防抖 20ms 窗口内）
+    await settle(5);
+
+    // 切换到结构损坏的项目：openProject 原子失败并上抛；修复前 resetTo 的
+    // cancelTimer 使旧项目的防抖保存被永久取消 —— 不再编辑后存储停留在 rev0
+    const broken = createSampleProject('lumora://project/b', '项目B');
+    (broken as { activeSceneId: string }).activeSceneId = '不存在的场景';
+    expect(() => autosaver.switchOpen(broken)).toThrow();
+    expect(editor.getProject()?.uri).toBe(A);
+
+    // 不再编辑：修复后回滚会重新 scheduleSave，防抖窗口过后旧内容自动落盘
+    await settle(100);
+    const stored = await store.load(A);
+    expect(stored).not.toBeNull();
+    expect(stored!.revision).toBe(1);
+    expect(stored!.objects.length).toBe(base.objects.length + 1);
+    autosaver.dispose();
+  });
+
+  it('dirty 且在途保存（saveQueued）时回滚不重复调度，在途保存完成落盘', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(60);
+
+    // 在途保存：慢速保存挂起期间切换失败 —— 回滚后不重复 scheduleSave，
+    // 在途保存任务完成旧内容落盘（CAS 不冲突，基线未变）
+    editor.addObject(createGroupObject());
+    let releaseSave!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    const realSave = store.save.bind(store);
+    const slowSave = vi
+      .spyOn(store, 'save')
+      .mockImplementation(async (incoming, expected) => {
+        await gate;
+        return realSave(incoming, expected);
+      });
+    await settle(40); // debounce 到期 → runSave → saveQueued = true 且保存挂起
+    expect(slowSave).toHaveBeenCalledTimes(1);
+
+    const broken = createSampleProject('lumora://project/b', '项目B');
+    (broken as { activeSceneId: string }).activeSceneId = '不存在的场景';
+    expect(() => autosaver.switchOpen(broken)).toThrow();
+
+    releaseSave();
+    await settle(80);
+    const stored = await store.load(A);
+    expect(stored).not.toBeNull();
+    expect(stored!.revision).toBe(1);
+    slowSave.mockRestore();
+    autosaver.dispose();
+  });
+});

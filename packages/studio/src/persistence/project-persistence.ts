@@ -58,6 +58,28 @@ function safeFilename(name: string): string {
   return cleaned.length > 0 ? cleaned : '未命名项目';
 }
 
+/** 根级导出字段的反射读取（第十一轮一般 #6）：以 property descriptor 判定字段
+ *  存在与可导出性 —— 不执行属性读取（getter/Proxy trap 不得在预检前产生副作用）；
+ *  访问器字段直接拒绝（JSON.stringify/structuredClone 都会调用 getter，结果不可
+ *  预测，与 findJsonEncodingProblem 的 accessor-property 语义一致）；反射抛错
+ *  （getOwnPropertyDescriptor trap）归一为类型化失败。 */
+function reflectProjectField(
+  project: Project,
+  field: string,
+): { ok: true; value?: unknown } | { ok: false; message: string } {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Reflect.getOwnPropertyDescriptor(project, field);
+  } catch {
+    return { ok: false, message: `项目字段 ${field} 无法反射（代理陷阱抛错），导出被拒绝` };
+  }
+  if (!descriptor) return { ok: true };
+  if ('get' in descriptor || 'set' in descriptor) {
+    return { ok: false, message: `项目字段 ${field} 是访问器属性，无法安全导出` };
+  }
+  return { ok: true, value: descriptor.value };
+}
+
 export class ProjectPersistence {
   private store: ProjectStorage | null = null;
   private readonly autosaver: ProjectAutosaver;
@@ -192,7 +214,10 @@ export class ProjectPersistence {
     this.autosaver.clearRecovery(uri);
   }
 
-  /** 把恢复快照（或当前编辑器内容）另存为全新项目：以副本保留未保存内容（新 uri，revision 0）。 */
+  /** 把恢复快照（或当前编辑器内容）另存为全新项目：以副本保留未保存内容（新 uri，revision 0）。
+   *  保存成功后复用统一加载管道（load → 迁移 → 校验）验证副本可打开：存储写入成功
+   *  ≠ 数据可用（故障存储可写入损坏记录），验证失败即清除该记录并返回可操作错误 ——
+   *  副本未产生，调用方不得报成功。 */
   async saveSnapshotAsNew(
     project: Project,
     name?: string,
@@ -207,7 +232,12 @@ export class ProjectPersistence {
     };
     const result = await this.store.save(copy, null);
     if (!result.ok) return { ok: false, message: result.message };
-    return { ok: true, project: copy };
+    const verified = await this.loadProject(copy.uri);
+    if (!verified.ok) {
+      await this.store.remove(copy.uri);
+      return { ok: false, message: `副本保存失败（数据无法通过校验）：${verified.message}` };
+    }
+    return { ok: true, project: verified.project };
   }
 
   /**
@@ -271,6 +301,17 @@ export class ProjectPersistence {
       };
       const result = await this.store.save(copy, null);
       if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
+      // 与 saveSnapshotAsNew 同一验证管道（第十一轮严重 #3）：存储写入成功 ≠ 可打开，
+      // 失败即清除记录 —— 副本未产生，调用方不得报成功
+      const verified = await this.loadProject(copy.uri);
+      if (!verified.ok) {
+        await this.store.remove(copy.uri);
+        return {
+          ok: false,
+          code: 'storage-error',
+          message: `副本保存失败（数据无法通过校验）：${verified.message}`,
+        };
+      }
       return {
         ok: true,
         summary: {
@@ -306,31 +347,42 @@ export class ProjectPersistence {
 
   /**
    * 导出当前项目为 `.lumora` 工程包（同步纯构建，绝不抛异常）。
-   * includePrivate 显式开启时允许包含插件私有设置（pluginData）；
-   * 凭据族字段（apiKey/token/secret/…）任何情况下都不进入包（NFR-008）。
+   * includePrivate 显式开启时允许包含插件私有设置（pluginData）；凭据隔离是
+   * 结构化契约（第十一轮）：settings 按契约字段投影、pluginData 仅按插件
+   * manifest.privateSettings 显式声明剥离（privateKeysByPlugin），默认导出时
+   * pluginData 整体不进包 —— 不再依赖键名词表猜测（NFR-008）。
    * 编码预检（第九轮 #2）作用于「将被导出字段的原始值」而非构建后的克隆包：
    * buildProjectPackage 先 structuredClone 再投影 —— Symbol 键/不可枚举属性/
    * 访问器已在克隆中被删除或物化，克隆后再检查看不到原输入问题，会静默产出
    * 丢字段的包。此处先按同一白名单（PUBLIC_PROJECT_FIELDS + 可选 pluginData）
    * 从原项目投影导出字段（引用原值，反射检查看到的就是原图），预检通过后才
    * 构建；构建/序列化抛错（DataCloneError/getter 副作用）归一为类型化失败。
+   * 根级投影基于 property descriptor（第十一轮一般 #6）：字段存在/可导出性以
+   * getOwnPropertyDescriptor 判定，不执行属性读取 —— getter 副作用不得发生在
+   * 预检之前；访问器字段与反射异常（Proxy trap）在读取前被拒绝为类型化失败。
    */
-  exportCurrent(options: { includePrivate?: boolean } = {}): ExportResult {
+  exportCurrent(options: { includePrivate?: boolean; privateKeysByPlugin?: Record<string, string[]> } = {}): ExportResult {
     const project = this.editor.getProject();
     if (!project) return { ok: false, message: '当前没有打开的项目' };
     const includePrivate = options.includePrivate ?? false;
     const projected: Record<string, unknown> = {};
     for (const field of PUBLIC_PROJECT_FIELDS) {
-      if (project[field] !== undefined) projected[field] = project[field];
+      const reflected = reflectProjectField(project, field);
+      if (!reflected.ok) return reflected;
+      if (reflected.value !== undefined) projected[field] = reflected.value;
     }
-    if (includePrivate && project.pluginData !== undefined) projected.pluginData = project.pluginData;
+    if (includePrivate) {
+      const reflected = reflectProjectField(project, 'pluginData');
+      if (!reflected.ok) return reflected;
+      if (reflected.value !== undefined) projected.pluginData = reflected.value;
+    }
     const problem = findJsonEncodingProblem(projected);
     if (problem) {
       return { ok: false, message: `项目包含无法导出的数据（${problem}），导出被拒绝` };
     }
     let pkg: ProjectPackage;
     try {
-      pkg = buildProjectPackage(project, { includePrivate });
+      pkg = buildProjectPackage(project, { includePrivate, privateKeysByPlugin: options.privateKeysByPlugin });
     } catch (error) {
       return { ok: false, message: `项目无法导出（构建失败）：${failureMessage(error)}` };
     }

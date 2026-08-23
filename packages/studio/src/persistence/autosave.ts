@@ -292,6 +292,13 @@ export class ProjectAutosaver {
       else this.committedByUri.delete(project.uri);
       if (prevRecoveryHas) this.recovery.set(project.uri, prevRecovery!);
       else this.recovery.delete(project.uri);
+      // 回滚时恢复待执行保存（第十轮 #1 严重）：resetTo 已取消防抖定时器且未恢复
+      // —— 旧项目仍有未落盘内容（isUnsaved）且无在途保存时，不重新 scheduleSave
+      // 则切换失败后自动落盘永远不触发（用户不再编辑，存储停留在旧 revision）
+      const rolledBack = this.editor.getProject();
+      if (rolledBack && rolledBack.uri === this.currentUri && this.isUnsaved(rolledBack) && !this.saveQueued) {
+        this.scheduleSave();
+      }
       throw error;
     }
     this.broadcastGuard -= 1;

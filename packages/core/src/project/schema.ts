@@ -32,9 +32,10 @@ export const PROJECT_PACKAGE_FORMAT = 'lumora.project';
 export const PACKAGE_FORMAT_VERSION = 1;
 
 /** 默认工程包排除的私有字段：随项目本地持久化、不随包迁移。
- *  pluginData 为插件私有设置，includePrivate 时允许包含；
- *  credentials/apiKeys/secrets/tokens 属凭据族，NFR-008 硬性要求任何情况下
- *  不得写入工程包（includePrivate 也不放行）。 */
+ *  pluginData 为插件私有设置，includePrivate 时允许包含（按插件声明剥离）；
+ *  credentials/apiKeys/secrets/tokens 等凭据族顶层结构不属于 Project schema，
+ *  由公开字段白名单结构性排除 —— 任何情况下不得写入工程包（NFR-008；第十一轮
+ *  契约制：结构化隔离取代键名词表猜测）。 */
 export const PRIVATE_PROJECT_FIELDS = [
   'pluginData',
   'credentials',

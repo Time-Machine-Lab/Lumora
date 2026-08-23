@@ -17,6 +17,11 @@ export class TypedEventEmitter<E extends Record<string, unknown>> implements Dis
   private readonly anyHandlers = new Set<(event: string, payload: unknown) => void>();
   private readonly onError: (event: string, error: unknown) => void;
   private disposedFlag = false;
+  /** 各事件名的分发生成代（第十轮 #1）：监听器回调内同步触发同一事件的嵌套
+   *  emit 时，外层正在分发的 payload 已陈旧（新 payload 已先送达部分监听器），
+   *  剩余监听器不得再收到旧值 —— 嵌套发生后外层分发立即终止（生成代不复原）。
+   *  不同事件名的嵌套互不影响；串行 emit 各自持有新代，不受先前分发影响。 */
+  private readonly emitGenerations = new Map<string, number>();
 
   constructor(options: TypedEventEmitterOptions = {}) {
     this.onError =
@@ -59,11 +64,15 @@ export class TypedEventEmitter<E extends Record<string, unknown>> implements Dis
 
   emit<K extends keyof E & string>(event: K, payload: E[K]): void {
     if (this.disposedFlag) return;
+    const generation = (this.emitGenerations.get(event) ?? 0) + 1;
+    this.emitGenerations.set(event, generation);
     const set = this.handlers.get(event);
     if (set) {
       for (const handler of [...set]) {
-        // 每个 handler 前检查终态：dispose 重入（监听器内释放）立即停止剩余监听器
-        if (this.disposedFlag) break;
+        // 每个 handler 前检查终态与生成代：dispose 重入立即停止剩余监听器；
+        // 同事件名的嵌套 emit（监听器内同步触发）使外层分发立即终止 ——
+        // 陈旧 payload 不得在更新 payload 之后送达其余监听器
+        if (this.disposedFlag || this.emitGenerations.get(event) !== generation) break;
         try {
           handler(payload);
         } catch (error) {
@@ -72,7 +81,7 @@ export class TypedEventEmitter<E extends Record<string, unknown>> implements Dis
       }
     }
     for (const handler of [...this.anyHandlers]) {
-      if (this.disposedFlag) break;
+      if (this.disposedFlag || this.emitGenerations.get(event) !== generation) break;
       try {
         handler(event, payload);
       } catch (error) {

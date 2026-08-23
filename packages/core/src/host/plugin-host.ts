@@ -254,6 +254,12 @@ export class PluginHost {
     return this.plugins.get(instanceId)?.info();
   }
 
+  /** 按 instanceId 返回插件 Manifest（导出时收集 privateSettings 剥离声明用；
+   *  未知插件返回 undefined）。 */
+  getPluginManifest(instanceId: string): Manifest | undefined {
+    return this.plugins.get(instanceId)?.manifest;
+  }
+
   /**
    * 注册并加载一个插件。Manifest 非法 / 引擎不兼容 / 无入口时进入 failed 状态，
    * 且不会加载（import）入口模块；enabled: false 的插件注册后保持 disabled，
