@@ -582,6 +582,9 @@ export class ProjectAutosaver {
       if (this.disposed) return;
       this.saveInFlight = true;
       let outcome: SaveOutcome | null = null;
+      // 保存目标与目标会话代在任务执行时捕获：广播的新鲜度校验依据
+      const targetUri = project.uri;
+      const session = this.session;
       try {
         // 执行时若已有更新的快照（同 uri），保存最新内容
         const target = this.pending && this.pending.uri === project.uri ? this.pending : project;
@@ -592,7 +595,10 @@ export class ProjectAutosaver {
       // error 广播推迟到 saveInFlight 清零之后（第十三轮严重 #4）：错误监听器
       // 同步执行失败 switchOpen 时回滚捕获的 prevInFlight 已是 false —— 旧项目
       // 未落盘且无任何调度时回滚分支才会重新调度，自动保存不会因清零时序停止
-      if (outcome && !outcome.ok && outcome.code !== 'revision-conflict') {
+      // 且仅在目标仍 fresh 时广播（第十四轮严重 3）：慢保存失败期间切换/关闭
+      // （会话代递增）后，旧项目的失败不得覆盖新项目的真实状态 —— 旧 uri 的
+      // 失败已由排空/恢复快照机制承载，关闭后也不得回弹错误状态
+      if (outcome && !outcome.ok && outcome.code !== 'revision-conflict' && this.isFresh(targetUri, session)) {
         this.emit({ status: 'error', code: outcome.code, message: outcome.message });
       }
     });

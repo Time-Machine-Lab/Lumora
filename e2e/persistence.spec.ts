@@ -218,12 +218,13 @@ test('AC1b 真实 GLB 模型资产：导入渲染 + 载荷引用往返（TML-53 
   }
 });
 
-test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，includePrivate 键级 allowlist 制（第十二轮阻断 2 + 第十三轮反转）', async ({ page }) => {
-  // 1. Node 端构造「含 AI 凭据与插件私有设置」的源工程包。键级 allowlist 制
-  //    （第十三轮阻断 2）：privateKeysByPlugin 是「显式可导出字段 allowlist」——
-  //    显式登记全部键后包内完整携带 pluginData（含嵌套凭据），模拟插件把私有
-  //    设置（含凭据）存入项目本地状态的真实形态；空/漏声明 = 无公开字段 =
-  //    整段排除（已注册但空/漏声明绝不整段放行，凭据无从经声明缺口进入包）
+test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，includePrivate 显式公开契约制（第十二轮阻断 2 + 第十三轮反转 + 第十四轮阻断 1/2）', async ({ page }) => {
+  // 1. Node 端构造「含 AI 凭据与插件私有设置」的源工程包。显式公开契约制
+  //    （第十四轮阻断 1/2）：publicKeysByPlugin 是「显式可导出字段声明」——
+  //    显式登记全部键（顶层键字符串 = 整值导出）后包内完整携带 pluginData
+  //    （含嵌套凭据），模拟插件把私有设置（含凭据）存入项目本地状态的真实
+  //    形态；空/漏声明 = 无公开字段 = 整段排除（已注册但空/漏声明绝不整段
+  //    放行，凭据无从经声明缺口进入包）
   const pluginId = 'com.example.ai-assistant';
   const secrets = {
     apiKey: 'sk-lumora-ac4-1f7a9c3d',
@@ -254,11 +255,11 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
       name: 'AC4 源项目',
       pluginData: sourcePluginData,
     },
-    { includePrivate: true, privateKeysByPlugin: { [pluginId]: Object.keys(sourcePluginData[pluginId]!) } },
+    { includePrivate: true, publicKeysByPlugin: { [pluginId]: Object.keys(sourcePluginData[pluginId]!) } },
   );
   writeFileSync(sourcePath, serializeProjectPackage(sourcePkg), 'utf8');
 
-  // 1b. 已注册但空/漏声明（第十三轮阻断 2 反转）：同一源数据以空 allowlist 或
+  // 1b. 已注册但空/漏声明（第十三轮阻断 2 反转）：同一源数据以空声明或
   //     缺失映射构建 → pluginData 整段排除，凭据形态值绝不进包
   const sourceBase = {
     ...sourceEditor.getProject()!,
@@ -266,7 +267,7 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
   } as Parameters<typeof buildProjectPackage>[0];
   const emptyDecl = buildProjectPackage(
     { ...sourceBase, uri: 'lumora://project/ac4-empty', name: 'AC4 空声明' },
-    { includePrivate: true, privateKeysByPlugin: { [pluginId]: [] } },
+    { includePrivate: true, publicKeysByPlugin: { [pluginId]: [] } },
   ) as { project: Record<string, unknown> };
   expect(emptyDecl.project.pluginData).toBeUndefined();
   const noDecl = buildProjectPackage(
@@ -277,6 +278,21 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
   for (const secret of Object.values(secrets)) {
     expect(JSON.stringify(emptyDecl)).not.toContain(secret);
     expect(JSON.stringify(noDecl)).not.toContain(secret);
+  }
+
+  // 1c. 已注册插件仅声明公开键（theme/model）：直接及嵌套凭据一律排除
+  //     （第十四轮阻断 1 核心回归）—— 声明只放行显式列出的字段，auth/api/
+  //     users/credentials 整段与其中凭据绝无声明缺口可循
+  const declaredOnly = buildProjectPackage(
+    { ...sourceBase, uri: 'lumora://project/ac4-declared', name: 'AC4 仅声明公开键' },
+    { includePrivate: true, publicKeysByPlugin: { [pluginId]: ['theme', 'model'] } },
+  );
+  const declaredJson = JSON.stringify(declaredOnly);
+  expect(declaredJson).toContain('"theme":"dark"');
+  expect(declaredJson).toContain('"model":"claude-sonnet-5"');
+  for (const secret of Object.values(secrets)) expect(declaredJson).not.toContain(secret);
+  for (const key of ['auth', 'credentials', 'users', 'api']) {
+    expect(declaredJson).not.toContain(`"${key}"`);
   }
 
   // 2. 浏览器导入源项目：插件私有设置（含嵌套凭据）成为编辑器与本地持久化状态

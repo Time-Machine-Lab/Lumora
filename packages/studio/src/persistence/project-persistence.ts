@@ -32,7 +32,7 @@ import { ProjectAutosaver } from './autosave';
 import type { AutosaveState } from './autosave';
 import { ProjectStore } from './project-store';
 import { OpfsProjectStore } from './project-store-opfs';
-import { estimateStorage, failureMessage } from './project-storage';
+import { estimateStorage, failureMessage, stableStringify } from './project-storage';
 import type { DuplicateOutcome, ProjectStorage, ProjectSummary, SaveOutcome, StorageBackend } from './project-storage';
 
 export interface PersistenceEventMap extends Record<string, unknown> {
@@ -198,8 +198,9 @@ export class ProjectPersistence {
 
   /** 把恢复快照（或当前编辑器内容）另存为全新项目：以副本保留未保存内容（新 uri，revision 0）。
    *  保存成功后复用统一加载管道（load → 迁移 → 校验）验证副本可打开：存储写入成功
-   *  ≠ 数据可用（故障存储可写入损坏记录），验证/清理经异常安全封装（verifyCopy）——
-   *  验证失败或 reject 均清除记录并返回可操作错误，副本未产生，调用方不得报成功。 */
+   *  ≠ 数据可用（故障存储可写入损坏记录），验证/清理经异常安全封装（verifyCopy，
+   *  清理为 CAS —— 第十四轮严重 4）—— 验证失败或 reject 均清除记录并返回可操作
+   *  错误，副本未产生，调用方不得报成功。 */
   async saveSnapshotAsNew(
     project: Project,
     name?: string,
@@ -214,7 +215,7 @@ export class ProjectPersistence {
     };
     const result = await this.store.save(copy, null);
     if (!result.ok) return { ok: false, message: result.message };
-    return this.verifyCopy(copy.uri);
+    return this.verifyCopy(copy.uri, stableStringify(copy));
   }
 
   /**
@@ -261,7 +262,8 @@ export class ProjectPersistence {
   }
 
   /** 复制项目：返回新项目供调用方打开（store 不可用时返回 not-found 语义错误）。
-   *  打开中的项目以编辑器快照为准（磁盘记录可能落后于未保存变更）；未打开的走存储。 */
+   *  打开中的项目以编辑器快照为准（磁盘记录可能落后于未保存变更）；未打开的走存储。
+   *  返回副本内容指纹（调用方二次加载失败时的 CAS 清理依据，第十四轮严重 4/5）。 */
   async duplicateProject(uri: string, name?: string): Promise<DuplicateOutcome> {
     if (!this.store) {
       return { ok: false, code: 'not-found', message: '本地持久化不可用' };
@@ -276,12 +278,13 @@ export class ProjectPersistence {
         createdAt: new Date().toISOString(),
         revision: 0,
       };
+      const fingerprint = stableStringify(copy);
       const result = await this.store.save(copy, null);
       if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
       // 与 saveSnapshotAsNew 同一验证管道（第十一轮严重 #3 + 第十二轮严重 #5）：
       // 存储写入成功 ≠ 可打开，验证/清理经异常安全封装（verifyCopy）—— 失败
-      // 或 reject 均清除记录，副本未产生，调用方不得报成功
-      const verified = await this.verifyCopy(copy.uri);
+      // 或 reject 均清除记录（CAS），副本未产生，调用方不得报成功
+      const verified = await this.verifyCopy(copy.uri, fingerprint);
       if (!verified.ok) {
         return { ok: false, code: 'storage-error', message: verified.message };
       }
@@ -294,9 +297,38 @@ export class ProjectPersistence {
           revision: 0,
           schemaVersion: copy.schemaVersion,
         },
+        fingerprint,
       };
     }
     return this.store.duplicate(uri, name);
+  }
+
+  /**
+   * 复制后加载副本的统一边界（第十四轮严重 5）：duplicateProject 返回后 UI 还需
+   * 二次加载副本以打开 —— load 的 reject（故障存储抛错）与校验失败都归一为
+   * 类型化失败，并尝试 CAS 清理副本（清理状态如实报告）；「最近项目复制」与
+   * 「另存副本」的存储复制分支共用，绝不产生未处理的 reject。
+   */
+  async loadCopyForOpen(
+    uri: string,
+    expectedFingerprint: string,
+  ): Promise<{ ok: true; project: Project } | { ok: false; message: string }> {
+    let loaded: Awaited<ReturnType<ProjectPersistence['loadProject']>>;
+    try {
+      loaded = await this.loadProject(uri);
+    } catch (error) {
+      return {
+        ok: false,
+        message: `无法打开副本（${failureMessage(error)}）${await this.reportCopyCleanup(uri, expectedFingerprint)}`,
+      };
+    }
+    if (!loaded.ok) {
+      return {
+        ok: false,
+        message: `无法打开副本：${loaded.message}${await this.reportCopyCleanup(uri, expectedFingerprint)}`,
+      };
+    }
+    return { ok: true, project: loaded.project };
   }
 
   /** 删除项目（仅存储记录；已打开的当前项目由调用方先 closeProject）。 */
@@ -304,44 +336,45 @@ export class ProjectPersistence {
     return this.store ? this.store.remove(uri) : false;
   }
 
-  /** 副本验证与清理的异常安全封装（第十二轮严重 #5 + 第十三轮严重 5）：存储写入
-   *  成功 ≠ 数据可用（故障存储可写入损坏记录），统一以「load → 迁移 → 校验」
-   *  管道验证副本可打开；loadProject / store.remove 的 reject（故障存储抛错）
-   *  归一为类型化失败 —— 绝不遗留损坏副本、绝不把未捕获异常上抛给调用方；
-   *  清理本身失败时如实报告「记录保留、可手动删除」，不假装已清理。 */
+  /** 副本验证与清理的异常安全封装（第十二轮严重 #5 + 第十三轮严重 5 + 第十四轮
+   *  严重 4）：存储写入成功 ≠ 数据可用（故障存储可写入损坏记录），统一以
+   *  「load → 迁移 → 校验」管道验证副本可打开；loadProject 的 reject（故障存储
+   *  抛错）归一为类型化失败 —— 绝不遗留损坏副本、绝不把未捕获异常上抛给调用方。
+   *  清理为 CAS：仅当记录内容指纹与创建时一致才删除 —— 验证挂起期间另一标签页
+   *  已打开并保存副本时，更新后的合法记录保留（如实报告）；清理本身失败时如实
+   *  报告「记录保留、可手动删除」，不假装已清理。 */
   private async verifyCopy(
     uri: string,
+    expectedFingerprint: string | null,
   ): Promise<{ ok: true; project: Project } | { ok: false; message: string }> {
     let verified: Awaited<ReturnType<ProjectPersistence['loadProject']>>;
     try {
       verified = await this.loadProject(uri);
     } catch (error) {
-      const removed = await this.removeCopy(uri);
       return {
         ok: false,
-        message: `副本保存失败（验证异常）：${failureMessage(error)}${removed ? '' : '；清理失败，损坏记录保留，可手动删除'}`,
+        message: `副本保存失败（验证异常）：${failureMessage(error)}${await this.reportCopyCleanup(uri, expectedFingerprint)}`,
       };
     }
     if (!verified.ok) {
-      const removed = await this.removeCopy(uri);
       return {
         ok: false,
-        message: `副本保存失败（数据无法通过校验）：${verified.message}${removed ? '' : '；清理失败，损坏记录保留，可手动删除'}`,
+        message: `副本保存失败（数据无法通过校验）：${verified.message}${await this.reportCopyCleanup(uri, expectedFingerprint)}`,
       };
     }
     return { ok: true, project: verified.project };
   }
 
-  /** 副本清理（验证失败时移除损坏记录）：返回清理状态 —— remove 的 reject
-   *  不掩盖验证失败结论，但调用方必须知道记录是否残留。 */
-  private async removeCopy(uri: string): Promise<boolean> {
-    if (!this.store) return true;
-    try {
-      await this.store.remove(uri);
-      return true;
-    } catch {
-      return false;
-    }
+  /** 副本清理的报告后缀（验证失败时移除损坏记录；第十四轮严重 4 CAS）：
+   *  已删除返回空串；记录已变化（另一会话已保存）返回「已保留」提示；存储故障
+   *  返回「记录保留、可手动删除」—— removeIfUnchanged 的失败不掩盖验证失败
+   *  结论，但调用方必须知道记录是否残留。 */
+  private async reportCopyCleanup(uri: string, expectedFingerprint: string | null): Promise<string> {
+    if (!this.store) return '；清理失败，损坏记录保留，可手动删除';
+    const outcome = await this.store.removeIfUnchanged(uri, expectedFingerprint);
+    if (outcome.ok && outcome.removed) return '';
+    if (outcome.ok) return '；副本记录已变化（可能已被其他会话保存），已保留该记录，可手动删除';
+    return `；清理失败，损坏记录保留，可手动删除（${outcome.message}）`;
   }
 
   /** 重命名：打开中的项目走编辑器提交（一步历史 + revision 递增 + 自动保存落盘）。 */
@@ -361,25 +394,32 @@ export class ProjectPersistence {
   /**
    * 导出当前项目为 `.lumora` 工程包（同步纯构建，绝不抛异常）。
    * includePrivate 显式开启时允许包含插件私有设置（pluginData）；凭据隔离是
-   * 结构化契约（第十一轮 + 第十二轮阻断 1/2）：settings 按契约字段投影、
-   * scenes/objects/tracks/资产元数据逐层公开 DTO 契约投影、pluginData 仅按命名
-   * 空间 allowlist + manifest.privateSettings 显式声明剥离，默认导出时 pluginData
-   * 整体不进包 —— 不再依赖键名词表猜测（NFR-008）。
+   * 结构化契约（第十一轮 + 第十二轮阻断 1/2 + 第十四轮阻断 1/2）：settings 按
+   * 契约字段投影、scenes/objects/tracks/资产元数据逐层公开 DTO 契约投影、
+   * pluginData 仅按命名空间 + 路径 schema 显式公开声明（manifest.exportableSettings
+   * 原样传入 publicKeysByPlugin，宿主不做减法过滤；缺失/空/畸形声明整段排除，
+   * 公开对象按路径递归投影），默认导出时 pluginData 整体不进包 —— 不再依赖
+   * 键名词表猜测（NFR-008）。
    * 编码预检在最终投影视图之后（第十二轮一般 #10）：buildProjectPackage 先完成
    * 全部白名单投影与剥离（settings 契约外键 / 未声明 pluginData 命名空间 / 每层
    * DTO 契约外字段 / 访问器与反射异常都在构建期处理），再对构建产物检查 ——
    * 预检与序列化看到同一张图；位于被剥离/排除字段中的不可编码数据（私有
    * BigInt / 循环引用）不阻断导出，被保留字段中的不可编码数据仍如实拒绝。
    * 构建/序列化抛错（DataCloneError/getter 副作用）归一为类型化失败。
+   * 文件名与包内同名图（第十四轮一般 6）：从构建产物的 manifest（投影视图）
+   * 读取 —— 源对象 getter/Proxy 陷阱已在构建期经描述符预检隔离，文件名读取
+   * 不再二次触碰源对象，绝不裸抛。
    */
-  exportCurrent(options: { includePrivate?: boolean; privateKeysByPlugin?: Record<string, string[]> } = {}): ExportResult {
+  exportCurrent(
+    options: { includePrivate?: boolean; publicKeysByPlugin?: Record<string, readonly (string | readonly string[])[]> } = {},
+  ): ExportResult {
     const project = this.editor.getProject();
     if (!project) return { ok: false, message: '当前没有打开的项目' };
     let pkg: ProjectPackage;
     try {
       pkg = buildProjectPackage(project, {
         includePrivate: options.includePrivate ?? false,
-        privateKeysByPlugin: options.privateKeysByPlugin,
+        publicKeysByPlugin: options.publicKeysByPlugin,
       });
     } catch (error) {
       return { ok: false, message: `项目无法导出（构建失败）：${failureMessage(error)}` };
@@ -397,7 +437,12 @@ export class ProjectPersistence {
     } catch (error) {
       return { ok: false, message: `项目无法导出（序列化失败）：${failureMessage(error)}` };
     }
-    return { ok: true, text, filename: `${safeFilename(project.name)}.lumora`, bytes: estimatePackageBytes(text) };
+    return {
+      ok: true,
+      text,
+      filename: `${safeFilename(pkg.manifest.project.name)}.lumora`,
+      bytes: estimatePackageBytes(text),
+    };
   }
 
   /** 配额估算（导出预检；浏览器不支持时返回 null）。 */

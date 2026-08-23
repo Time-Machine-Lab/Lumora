@@ -23,15 +23,19 @@ import type { ProjectAssetPayload, ProjectPackage } from './schema';
 export interface PackageBuildOptions {
   /** 是否包含插件私有设置（pluginData）。默认不含：pluginData 结构性排除（NFR-008）。 */
   includePrivate?: boolean;
-  /** includePrivate 时的命名空间 + 键级显式可导出字段 allowlist（第十三轮阻断 2）：
-   *  键为插件 instanceId，值为该命名空间允许随包导出的顶层键列表。仅映射中
-   *  存在的命名空间（已注册插件）可进入包 —— 未知命名空间（未注册插件）默认
-   *  排除，隔离绝不 fail-open；键级同样 fail-closed：只保留显式声明的键，未
-   *  声明键（含凭据形态键名）一律不进包，空/漏声明 = 无公开字段 = 整段排除。
-   *  映射由宿主生成并验证（宿主按 manifest.privateSettings 与实际 pluginData
-   *  键计算可导出键，见 ProjectMenu.exportCurrent），core 端不再把「未声明键」
-   *  默认为可导出。 */
-  privateKeysByPlugin?: Record<string, string[]>;
+  /** includePrivate 时的命名空间 + 显式公开导出契约（第十四轮阻断 1/2，破坏式
+   *  改名自第十三轮的 privateKeysByPlugin —— 名称即语义，旧名调用编译失败，
+   *  不再存在「按名传 {plugin: ['apiKey']} 导出 apiKey」的反向语义）：
+   *  键为插件 instanceId，值为该命名空间允许随包导出的字段路径列表。每条声明
+   *  是顶层键字符串（如 'theme'，整值导出）或路径数组（如 ['profile',
+   *  'username']，逐层递归投影 —— 中间层必须是普通对象，路径外的字段不进包）。
+   *  缺失映射 / 空数组 / 非数组（畸形）/ 路径含 __proto__ 等原型键 → 该命名
+   *  空间整段排除（fail-closed 到底）：只有显式声明的公开字段进包，已注册但
+   *  空/漏声明绝不整段放行；插件未声明任何公开字段时整个命名空间不导出，
+   *  「凭据永不导出」不依赖插件自觉声明。
+   *  声明由宿主直接读取 manifest.exportableSettings 原样传入（宿主不再做减法
+   *  过滤），core 端负责路径投影与克隆。 */
+  publicKeysByPlugin?: Record<string, readonly (string | readonly string[])[]>;
   appName?: string;
   appVersion?: string;
   /** 可注入导出时刻（测试确定性）；缺省取当前时间 */
@@ -298,55 +302,105 @@ function projectAssetPartArray(value: unknown): AssetPartData[] | undefined {
   return value.map((part) => projectDto(part, PUBLIC_ASSET_PART_FIELDS)) as AssetPartData[];
 }
 
+/** 原型污染防护：显式公开声明中的这些键一律不作为导出路径（赋值到普通对象
+ *  会触发原型 setter / 污染）。 */
+function isSafeExportKey(key: string): boolean {
+  return key !== '__proto__' && key !== 'constructor' && key !== 'prototype';
+}
+
+/** 单个命名空间的路径 schema 显式公开投影（第十四轮阻断 1）：
+ *  - 顶层键字符串（'theme'）：该键整值导出（插件的显式公开契约，值可以是任意
+ *    JSON 可编码类型）；
+ *  - 路径数组（['profile', 'username']）：逐层递归投影 —— 中间层必须是普通
+ *    对象，只导出路径末端键；路径中途缺失/非对象/含原型键时整条路径失败，
+ *    已写入的部分投影一并回滚（fail-closed，绝不产出半投影）。
+ *  返回 undefined = 无可导出内容（调用方整段排除）。
+ *  字段读取统一走 readOwnDataField（descriptor 语义：访问器/反射异常拒绝）。 */
+function applyPublicPluginData(
+  value: unknown,
+  declarations: readonly (string | readonly string[])[],
+): Record<string, unknown> | undefined {
+  if (!isPlainRecord(value)) return undefined;
+  const out: Record<string, unknown> = {};
+  const merge = (base: Record<string, unknown>, patch: Record<string, unknown>): void => {
+    for (const key of Object.keys(patch)) {
+      if (isPlainRecord(base[key]) && isPlainRecord(patch[key])) {
+        merge(base[key] as Record<string, unknown>, patch[key] as Record<string, unknown>);
+      } else {
+        base[key] = patch[key];
+      }
+    }
+  };
+  for (const declaration of declarations) {
+    if (typeof declaration === 'string') {
+      if (!isSafeExportKey(declaration)) continue;
+      const read = readOwnDataField(value, declaration);
+      if (read.present && read.value !== undefined) out[declaration] = read.value;
+      continue;
+    }
+    if (!Array.isArray(declaration) || declaration.length === 0) continue; // 畸形/空路径：忽略
+    // 多元素路径在独立对象上构建，整条路径成功后才合并 —— 中途失败不残留部分投影
+    const nested: Record<string, unknown> = {};
+    let cursor: unknown = value;
+    let target = nested;
+    let failed = false;
+    for (let i = 0; i < declaration.length; i += 1) {
+      const key = declaration[i];
+      if (typeof key !== 'string' || !isSafeExportKey(key)) {
+        failed = true;
+        break;
+      }
+      const read = readOwnDataField(cursor, key);
+      if (!read.present || read.value === undefined) {
+        failed = true;
+        break;
+      }
+      if (i === declaration.length - 1) {
+        target[key] = read.value;
+      } else {
+        if (!isPlainRecord(read.value)) {
+          failed = true;
+          break;
+        }
+        const next: Record<string, unknown> = {};
+        target[key] = next;
+        cursor = read.value;
+        target = next;
+      }
+    }
+    if (!failed) merge(out, nested);
+  }
+  if (Object.keys(out).length === 0) return undefined;
+  return out;
+}
+
 /**
- * 命名空间 + 键级显式可导出字段 allowlist（第十三轮阻断 2 / 一般 7）：映射值 =
- * 该命名空间允许随包导出的顶层键列表，只保留显式声明的键 —— 未声明键（含凭据
- * 形态键名）一律不进包（键级 fail-closed）；空/漏声明（[] / 非数组 / 映射缺失）
- * = 无公开字段 = 整段排除，已注册但空/漏声明绝不整段放行。隔离绝不 fail-open：
- * - instanceId 不在映射（未注册插件）→ 整体排除；
- * - 畸形声明（值非数组）→ 整段排除（拒绝把畸形声明当作放行依据）；
- * - pluginData 与声明表同拥 own '__proto__' 时不得把 '__proto__' 当合法
- *   allowlist 项放行（原型污染矢量）：instanceId 与声明键为 '__proto__' 一律排除。
- * 声明查询以 Object.hasOwn 判定 + Array.isArray 防护。调用方传入克隆后的
- * pluginData 顶层：剥离/重建在克隆上原地执行，绝不修改源项目对象（多次构建/
- * 深冻结项目不得互相污染）。
+ * 命名空间 + 路径 schema 显式公开导出投影（第十四轮阻断 1/2，破坏式改名自
+ * 第十三轮 privateKeysByPlugin）：映射值 = 该命名空间允许随包导出的字段路径
+ * 列表（顶层键字符串或 [父键, 子键, …] 路径数组，逐层递归投影）。隔离绝不
+ * fail-open：
+ * - instanceId 不在映射（未注册插件）或映射整体缺失 → 全部命名空间排除，
+ *   没有 manifest 公开声明的来源数据没有进入包的依据；
+ * - 空/畸形声明（[] / 非数组）→ 整段排除（拒绝把畸形声明当作放行依据）；
+ * - instanceId 或路径键为 '__proto__' 等原型键 → 排除（原型污染矢量）。
+ * 声明查询以 Object.hasOwn 判定 + Array.isArray 防护。投影在调用方传入的
+ * 克隆上执行，绝不修改源项目对象（多次构建/深冻结项目不得互相污染）。
  */
-function stripDeclaredPrivateKeys(
-  pluginData: unknown,
-  privateKeysByPlugin?: Record<string, string[]>,
-): void {
-  if (!isPlainRecord(pluginData)) return;
-  if (!privateKeysByPlugin) {
-    // 无声明映射（includePrivate 未携带任何插件声明）：fail-closed —— 全部命名
-    // 空间排除，绝不把没有 manifest 声明的来源数据带入包
-    for (const instanceId of Object.keys(pluginData)) delete pluginData[instanceId];
-    return;
-  }
+function projectPublicPluginData(
+  pluginData: Record<string, unknown>,
+  publicKeysByPlugin?: Record<string, readonly (string | readonly string[])[]>,
+): Record<string, unknown> | undefined {
+  if (!publicKeysByPlugin) return undefined;
+  const out: Record<string, unknown> = {};
   for (const instanceId of Object.keys(pluginData)) {
-    if (!Object.hasOwn(privateKeysByPlugin, instanceId) || instanceId === '__proto__') {
-      // 未知命名空间（未注册插件）与原型污染矢量：默认排除 —— 没有 manifest
-      // 声明的数据没有进入包的依据，凭据隔离不得 fail-open
-      delete pluginData[instanceId];
-      continue;
-    }
-    const allowlist = privateKeysByPlugin[instanceId];
-    const value = pluginData[instanceId];
-    if (!Array.isArray(allowlist) || !isPlainRecord(value)) {
-      // 畸形声明（非数组）：拒绝放行 —— 整段排除
-      delete pluginData[instanceId];
-      continue;
-    }
-    // 逐命名空间按 allowlist 重建（显式可导出字段）：不在列表中的键不进包；
-    // 不得在源项目对象上原地删除
-    const clone: Record<string, unknown> = {};
-    for (const key of allowlist) {
-      if (typeof key !== 'string' || key === '__proto__') continue;
-      if (Object.hasOwn(value, key)) clone[key] = value[key];
-    }
-    // 空 allowlist / 未命中任何键 = 无公开字段 → 整段排除（不保留空对象占位）
-    if (Object.keys(clone).length === 0) delete pluginData[instanceId];
-    else pluginData[instanceId] = clone;
+    if (instanceId === '__proto__' || !Object.hasOwn(publicKeysByPlugin, instanceId)) continue;
+    const declarations = publicKeysByPlugin[instanceId];
+    if (!Array.isArray(declarations) || declarations.length === 0) continue;
+    const projected = applyPublicPluginData(pluginData[instanceId], declarations);
+    if (projected) out[instanceId] = projected;
   }
+  if (Object.keys(out).length === 0) return undefined;
+  return out;
 }
 
 /**
@@ -356,9 +410,10 @@ function stripDeclaredPrivateKeys(
  *   排除）；scenes/objects/tracks/资产元数据按各自公开 DTO 契约逐层投影
  *   （transform/geometry/material/light/camera/keyframes 子结构与 assets[].parts[]
  *   分件元素同契约）—— 嵌套未知字段（含凭据形态键名）任何情况下不得进入包；
- *   pluginData 默认排除（includePrivate 时按命名空间 + 键级显式可导出字段
- *   allowlist 保留，未知命名空间/空漏声明/未声明键 fail-closed 排除 —— 不再
- *   递归猜测键名，NFR-008）；
+ *   pluginData 默认排除（includePrivate 时按命名空间 + 路径 schema 显式公开
+ *   声明投影（manifest.exportableSettings 原样传入，第十四轮阻断 1/2），
+ *   未知命名空间/空漏声明/畸形声明/未声明路径 fail-closed 排除 —— 不再递归
+ *   猜测键名，NFR-008）；
  * - 投影基于 property descriptor（第十二轮一般 #8）：以 getOwnPropertyDescriptor
  *   读取 own 数据字段，访问器/反射异常在读取时拒绝 —— descriptor 预检与后续
  *   structuredClone 基于同一投影视图，克隆不物化预检未看到的字段；manifest 与
@@ -387,12 +442,12 @@ export function buildProjectPackage(project: Project, options: PackageBuildOptio
   if (includePrivate) {
     const read = readOwnDataField(project, 'pluginData');
     if (read.present && read.value !== undefined) {
-      // 顶层浅克隆后剥离：strip 的删除一律发生在克隆上，绝不修改源项目对象；
-      // 全部命名空间被排除（无任何已注册插件）时 pluginData 键整体不进包
+      // 顶层浅克隆后投影：删除/重建一律发生在克隆上，绝不修改源项目对象；
+      // 全部命名空间被排除（无任何已注册插件或声明）时 pluginData 键整体不进包
       const pluginData = isPlainRecord(read.value) ? { ...read.value } : read.value;
       if (isPlainRecord(pluginData)) {
-        stripDeclaredPrivateKeys(pluginData, options.privateKeysByPlugin);
-        if (Object.keys(pluginData).length > 0) stripped.pluginData = pluginData;
+        const projected = projectPublicPluginData(pluginData, options.publicKeysByPlugin);
+        if (projected) stripped.pluginData = projected;
       }
     }
   }

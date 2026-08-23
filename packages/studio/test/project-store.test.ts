@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildProjectPackage, createBlankProject, migrateProjectSchema } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import { ProjectStore } from '../src/persistence/project-store';
-import { OpfsProjectStore } from '../src/persistence/project-store-opfs';
+import { OpfsProjectStore, projectFileName } from '../src/persistence/project-store-opfs';
 import { MemDirectoryHandle } from './opfs-fs-shim';
 import { findJsonEncodingProblem, sameProjectContent, stableStringify } from '../src/persistence/project-storage';
 
@@ -395,6 +395,66 @@ describe('schema 升级写回豁免 isMigrationWriteback（第七轮 #5，两个
   });
 });
 
+describe('removeIfUnchanged：条件删除 CAS（第十四轮严重 4）', () => {
+  it('IDB：指纹一致删除、记录已变化保留、记录不存在保留（同事务内读-比-删）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const record = project('lumora://project/cas', 'CAS 项目', 2);
+    expect((await store.save(record)).ok).toBe(true);
+
+    // 指纹不一致（验证挂起期间另一标签页已打开并保存更新后的记录）→ 保留
+    expect(await store.removeIfUnchanged('lumora://project/cas', 'stale-fingerprint')).toEqual({
+      ok: true,
+      removed: false,
+    });
+    expect((await store.load('lumora://project/cas'))!.name).toBe('CAS 项目');
+
+    // 指纹一致（记录仍是创建时的内容）→ 删除
+    expect(await store.removeIfUnchanged('lumora://project/cas', stableStringify(record))).toEqual({
+      ok: true,
+      removed: true,
+    });
+    expect(await store.load('lumora://project/cas')).toBeNull();
+
+    // 记录不存在 → removed:false（幂等，不报错）
+    expect(await store.removeIfUnchanged('lumora://project/cas', null)).toEqual({ ok: true, removed: false });
+    store.close();
+  });
+
+  it('OPFS：指纹一致删除、记录已变化保留、损坏记录保留（互斥锁内读-比-删，fail-closed）', async () => {
+    const root = new MemDirectoryHandle('root');
+    const opfs = await OpfsProjectStore.create(DB, root);
+    if (!opfs) return;
+    const record = project('lumora://project/opfs-cas', 'CAS 项目', 2);
+    expect((await opfs.save(record)).ok).toBe(true);
+
+    // 指纹不一致 → 保留
+    expect(await opfs.removeIfUnchanged('lumora://project/opfs-cas', 'stale')).toEqual({
+      ok: true,
+      removed: false,
+    });
+    expect((await opfs.load('lumora://project/opfs-cas'))!.name).toBe('CAS 项目');
+
+    // 指纹一致 → 删除
+    expect(await opfs.removeIfUnchanged('lumora://project/opfs-cas', stableStringify(record))).toEqual({
+      ok: true,
+      removed: true,
+    });
+    expect(await opfs.load('lumora://project/opfs-cas')).toBeNull();
+
+    // 损坏记录（空文件，无法验证指纹）→ 保留：绝不误删无法验证的记录
+    const rootDir = await root.getDirectoryHandle(DB, { create: true });
+    const projectsDir = await rootDir.getDirectoryHandle('projects', { create: true });
+    await projectsDir.getFileHandle(projectFileName('lumora://project/opfs-broken'), { create: true });
+    expect(await opfs.removeIfUnchanged('lumora://project/opfs-broken', 'whatever')).toEqual({
+      ok: true,
+      removed: false,
+    });
+    expect(await opfs.load('lumora://project/opfs-broken')).toBeNull();
+    opfs.close();
+  });
+});
+
 describe('JSON 编码契约三路共享矩阵（第七轮 #4：IDB / OPFS / 导出 对同一数据一致拒绝）', () => {
   const cases: Array<[string, () => unknown, string, string]> = [
     ['Date', () => ({ d: new Date('2026-01-01T00:00:00Z') }), 'non-plain-object', 'd'],
@@ -442,7 +502,7 @@ describe('JSON 编码契约三路共享矩阵（第七轮 #4：IDB / OPFS / 导�
       exportProject.pluginData = { 'com.example': corrupt() };
       const pkg = buildProjectPackage(exportProject as Project, {
         includePrivate: true,
-        privateKeysByPlugin: { 'com.example': [allowKey] },
+        publicKeysByPlugin: { 'com.example': [allowKey] },
       });
       const encodingProblem = findJsonEncodingProblem(pkg);
       expect(encodingProblem).not.toBeNull();
@@ -647,7 +707,7 @@ describe('未打开项目的写前变更管道（第八轮 #4）：未来 schema
     store.close();
   });
 
-  it('duplicate：副本清理 remove 抛错 —— 如实说明清理失败与副本保留，绝不掩盖（第九轮 #5）', async () => {
+  it('duplicate：副本清理 removeIfUnchanged 抛错 —— 如实说明清理失败与副本保留，绝不掩盖（第九轮 #5）', async () => {
     const store = await ProjectStore.create(DB);
     if (!store) return;
     await store.save(project('lumora://project/a', '源项目', 1));
@@ -662,20 +722,23 @@ describe('未打开项目的写前变更管道（第八轮 #4）：未来 schema
       }
       return realLoad(uri);
     });
-    vi.spyOn(store, 'remove').mockRejectedValue(new Error('删除事务中止'));
-    const result = await store.duplicate('lumora://project/a');
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('storage-error');
-      expect(result.message).toContain('副本清理失败');
-      expect(result.message).toContain('副本记录保留');
-      expect(result.message).not.toContain('已清理');
+    vi.spyOn(store, 'removeIfUnchanged').mockResolvedValue({ ok: false, message: '删除事务中止' });
+    try {
+      const result = await store.duplicate('lumora://project/a');
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe('storage-error');
+        expect(result.message).toContain('副本清理失败');
+        expect(result.message).toContain('副本记录保留');
+        expect(result.message).not.toContain('已清理');
+      }
+      expect(copyUri).not.toBeNull();
+      expect(await store.load(copyUri!)).not.toBeNull(); // 清理失败：副本记录确实保留
+    } finally {
+      vi.mocked(store.removeIfUnchanged).mockRestore();
+      vi.mocked(store.load).mockRestore();
+      store.close();
     }
-    vi.mocked(store.remove).mockRestore();
-    vi.mocked(store.load).mockRestore();
-    expect(copyUri).not.toBeNull();
-    expect(await store.load(copyUri!)).not.toBeNull(); // 清理失败：副本记录确实保留
-    store.close();
   });
 });
 

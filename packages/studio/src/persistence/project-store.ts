@@ -19,6 +19,7 @@ import type {
   DuplicateOutcome,
   ProjectStorage,
   ProjectSummary,
+  RemoveIfOutcome,
   RenameOutcome,
   SaveOutcome,
   StoredProject,
@@ -30,6 +31,7 @@ import {
   isQuotaError,
   prepareWriteChange,
   sameProjectContent,
+  stableStringify,
 } from './project-storage';
 import { validateProjectSchema, validateProjectStructure } from '@lumora/core';
 
@@ -245,6 +247,25 @@ export class ProjectStore implements ProjectStorage {
     return true;
   }
 
+  /** 条件删除（第十四轮严重 4）：读-比-删与提交在同一 readwrite 事务内 ——
+   *  副本验证失败后的清理不得误删另一标签页已打开并保存的更新后合法记录；
+   *  内容指纹一致才删除，已变化/不存在时保留（removed:false），存储故障返回
+   *  类型化失败（记录可能残留）。 */
+  async removeIfUnchanged(uri: string, expectedFingerprint: string | null): Promise<RemoveIfOutcome> {
+    const transaction = this.db.transaction(PROJECTS_STORE, 'readwrite');
+    const store = transaction.objectStore(PROJECTS_STORE);
+    try {
+      const existing = await request(store.get(uri) as IDBRequest<StoredProject | undefined>);
+      if (!existing) return { ok: true, removed: false };
+      if (stableStringify(existing.project) !== expectedFingerprint) return { ok: true, removed: false };
+      await request(store.delete(uri) as IDBRequest<undefined>);
+      await transactionDone(transaction);
+      return { ok: true, removed: true };
+    } catch (error) {
+      return { ok: false, message: `副本清理失败：${failureMessage(error)}` };
+    }
+  }
+
   /** 直接重命名已存储项目（仅适用于未打开的项目；打开中的重命名走编辑器提交）。
    *  写前先迁移/校验（第八轮 #4：未来 schema 拒绝写前变更）；以迁移后的 revision
    *  为 CAS 期望：读-改-写间被其他写入推进时拒绝，防倒退。 */
@@ -263,7 +284,9 @@ export class ProjectStore implements ProjectStorage {
    *  写前先迁移/校验（第八轮 #4）；新 uri 首存走创建语义（null），防与并发创建的碰撞；
    *  保存成功后验证副本可加载，失败清理副本并报错（不留下不可用的半成品复制）。
    *  复制后验证/清理纳入异常安全类型化流程（第九轮 #5）：验证读取抛错、清理
-   *  remove 抛错或删除事务中止都如实返回，绝不遗留「半成品副本」假象。 */
+   *  失败都如实返回，绝不遗留「半成品副本」假象；清理为 CAS（第十四轮严重 4）：
+   *  仅当记录内容指纹与创建时一致才删除 —— 验证挂起期间另一标签页已打开并
+   *  保存副本时，更新后的合法记录保留。 */
   async duplicate(uri: string, name?: string): Promise<DuplicateOutcome> {
     const project = await this.load(uri);
     if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
@@ -277,6 +300,7 @@ export class ProjectStore implements ProjectStorage {
       createdAt: new Date().toISOString(),
       revision: 0,
     };
+    const fingerprint = stableStringify(copy);
     const result = await this.save(copy, null);
     if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
     let loaded: Project | null;
@@ -286,14 +310,14 @@ export class ProjectStore implements ProjectStorage {
       return {
         ok: false,
         code: 'storage-error',
-        message: `复制成功但副本无法加载验证（${failureMessage(error)}），${await this.cleanupCopy(copy.uri)}`,
+        message: `复制成功但副本无法加载验证（${failureMessage(error)}），${await this.cleanupCopy(copy.uri, fingerprint)}`,
       };
     }
     if (!loaded || validateProjectSchema(loaded) || validateProjectStructure(loaded)) {
       return {
         ok: false,
         code: 'storage-error',
-        message: `复制成功但副本无法通过加载校验，${await this.cleanupCopy(copy.uri)}`,
+        message: `复制成功但副本无法通过加载校验，${await this.cleanupCopy(copy.uri, fingerprint)}`,
       };
     }
     return {
@@ -305,18 +329,19 @@ export class ProjectStore implements ProjectStorage {
         revision: 0,
         schemaVersion: copy.schemaVersion,
       },
+      fingerprint,
     };
   }
 
-  /** 清理复制失败留下的副本：仅在 remove 成功（删除事务已提交）后声称「已清理」；
-   *  任何失败如实说明副本保留（可手动删除），绝不掩盖清理失败（第九轮 #5）。 */
-  private async cleanupCopy(uri: string): Promise<string> {
-    try {
-      await this.remove(uri);
-      return '已清理并取消复制';
-    } catch (error) {
-      return `副本清理失败（${failureMessage(error)}），副本记录保留，可手动删除`;
-    }
+  /** 清理复制失败留下的副本（CAS，第十四轮严重 4）：仅当记录内容指纹与创建时
+   *  一致才删除（另一标签页已打开并保存的更新后记录保留）；仅在删除事务提交后
+   *  声称「已清理」，任何失败如实说明副本保留（可手动删除），绝不掩盖清理失败
+   *  （第九轮 #5）。 */
+  private async cleanupCopy(uri: string, expectedFingerprint: string | null): Promise<string> {
+    const outcome = await this.removeIfUnchanged(uri, expectedFingerprint);
+    if (outcome.ok && outcome.removed) return '已清理并取消复制';
+    if (outcome.ok) return '副本记录已变化（可能已被其他会话保存），已保留该记录，可手动删除';
+    return `副本清理失败（${outcome.message}），副本记录保留，可手动删除`;
   }
 
   /** 关闭连接（幂等；应用卸载前调用）。 */

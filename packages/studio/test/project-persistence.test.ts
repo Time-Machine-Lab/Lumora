@@ -529,7 +529,7 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     // 已注册插件（显式 allowlist 放行该键）后编码预检对最终投影视图拒绝（第十三轮）
     const result = await runtime.persistence.exportCurrent({
       includePrivate: true,
-      privateKeysByPlugin: { 'com.example': ['arr'] },
+      publicKeysByPlugin: { 'com.example': ['arr'] },
     });
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -593,6 +593,32 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     }
   });
 
+  it('exportCurrent 文件名回归：get 陷阱抛错的源对象经 descriptor 预检隔离，文件名读取不裸抛（第十四轮一般 6）', async () => {
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, dbName: DB });
+    const target = createSampleProject('lumora://project/gettrap', '代理名称项目');
+    // get 陷阱抛错：任何属性读取都会裸抛；getOwnPropertyDescriptor 正常 →
+    // 构建期 descriptor 预检不触发 get，文件名改从构建产物（manifest 投影视图）
+    // 读取 —— 修复前文件名在 try 外直接读原始 project.name，会裸抛
+    const proxy = new Proxy(target, {
+      get() {
+        throw new Error('unexpected get trap');
+      },
+    });
+    const spy = vi.spyOn(editor, 'getProject').mockReturnValue(proxy);
+    try {
+      const result = persistence.exportCurrent({ includePrivate: true });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.filename).toBe('代理名称项目.lumora');
+      expect(result.text).toContain('代理名称项目');
+    } finally {
+      spy.mockRestore();
+      await persistence.dispose();
+    }
+  });
+
   it('exportCurrent 编码预检：循环引用扩展字段（allowlist 放行键内含）→ 类型化失败', async () => {
     const runtime = await makeRuntime();
     const project = runtime.persistence.createProject('循环项目');
@@ -602,7 +628,7 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     await settle(40);
     const result = await runtime.persistence.exportCurrent({
       includePrivate: true,
-      privateKeysByPlugin: { 'com.example': ['loop'] },
+      publicKeysByPlugin: { 'com.example': ['loop'] },
     });
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -734,11 +760,11 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     expect(runtime.persistence.exportCurrent({ includePrivate: true }).ok).toBe(true);
     // 空 allowlist（已注册但无公开字段）：整段排除 → 导出成功（第十三轮阻断 2 反转）
     expect(
-      runtime.persistence.exportCurrent({ includePrivate: true, privateKeysByPlugin: { 'com.example': [] } }).ok,
+      runtime.persistence.exportCurrent({ includePrivate: true, publicKeysByPlugin: { 'com.example': [] } }).ok,
     ).toBe(true);
     const result = await runtime.persistence.exportCurrent({
       includePrivate: true,
-      privateKeysByPlugin: { 'com.example': ['big'] },
+      publicKeysByPlugin: { 'com.example': ['big'] },
     });
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -779,7 +805,7 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     // （第十三轮阻断 2 反转：已注册但空声明不再整段放行）
     const rawExport = runtime.persistence.exportCurrent({
       includePrivate: true,
-      privateKeysByPlugin: { 'com.example': [] },
+      publicKeysByPlugin: { 'com.example': [] },
     });
     expect(rawExport.ok).toBe(true);
     if (!rawExport.ok) return;
@@ -789,7 +815,7 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     // 显式 allowlist：只有声明的键进包，未声明键（含凭据形态键名之外的组合词）排除
     const exported = runtime.persistence.exportCurrent({
       includePrivate: true,
-      privateKeysByPlugin: { 'com.example': ['apiKey', 'clientSecret'] },
+      publicKeysByPlugin: { 'com.example': ['apiKey', 'clientSecret'] },
     });
     expect(exported.ok).toBe(true);
     if (!exported.ok) return;
@@ -891,19 +917,22 @@ describe('ProjectPersistence：facade 事件桥代际失效（第十轮 #1 阻�
 
 describe('ProjectPersistence：复制路径保存后统一验证与失败清理（第十一轮严重 #3 回归）', () => {
   /** 故障存储探针：save 永远成功（写入成功 ≠ 数据可用），load 返回损坏记录
-   *  （settings.fps 非法 → 校验拒绝），remove 由断言观测。 */
-  function corruptStore(): { store: ProjectStorage; remove: ReturnType<typeof vi.fn> } {
+   *  （settings.fps 非法 → 校验拒绝），removeIfUnchanged 由断言观测。 */
+  function corruptStore(): { store: ProjectStorage; removeIfUnchanged: ReturnType<typeof vi.fn> } {
     const corruptRecord: Project = {
       ...createSampleProject('lumora://project/corrupt', '损坏副本'),
       settings: { fps: 'bad' } as unknown as Project['settings'],
     };
-    const remove = vi.fn(async () => true);
+    const removeIfUnchanged = vi.fn(
+      async (_uri: string, _expectedFingerprint: string | null) => ({ ok: true, removed: true }) as const,
+    );
     const store: ProjectStorage = {
       kind: 'indexeddb',
       list: vi.fn(async () => []),
       load: vi.fn(async () => corruptRecord),
       save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
-      remove,
+      remove: vi.fn(async () => true),
+      removeIfUnchanged,
       rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
       duplicate: vi.fn(
         async (_uri: string, _name?: string) =>
@@ -911,12 +940,12 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
       ),
       close: vi.fn(),
     };
-    return { store, remove };
+    return { store, removeIfUnchanged };
   }
 
   it('saveSnapshotAsNew：保存成功但副本无法通过校验 → 返回错误并清除记录', async () => {
     const editor = new SceneEditor();
-    const { store, remove } = corruptStore();
+    const { store, removeIfUnchanged } = corruptStore();
     const persistence = new ProjectPersistence(editor);
     await persistence.init({ store });
 
@@ -928,15 +957,15 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     expect(result.message).toContain('副本保存失败');
     expect(result.message).toContain('校验');
     expect(store.save).toHaveBeenCalledTimes(1);
-    // 清理探针：副本记录被移除 —— 未通过的副本不得留在最近项目列表
-    expect(remove).toHaveBeenCalledTimes(1);
-    expect(remove).toHaveBeenCalledWith(expect.stringMatching(/^lumora:\/\/project\//));
+    // 清理探针：CAS 清理按创建指纹执行 —— 未通过的副本不得留在最近项目列表
+    expect(removeIfUnchanged).toHaveBeenCalledTimes(1);
+    expect(removeIfUnchanged).toHaveBeenCalledWith(expect.stringMatching(/^lumora:\/\/project\//), expect.any(String));
     await persistence.dispose();
   });
 
   it('duplicateProject（当前项目分支）：保存成功但副本无法通过校验 → 返回 storage-error 并清除记录', async () => {
     const editor = new SceneEditor();
-    const { store, remove } = corruptStore();
+    const { store, removeIfUnchanged } = corruptStore();
     const persistence = new ProjectPersistence(editor);
     // 先接监听再打开：openProject 的 project:changed 需被 facade 捕获（currentUri 分流）
     editor.openProject(createSampleProject('lumora://project/open', '打开中项目'));
@@ -948,13 +977,15 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     expect(result.code).toBe('storage-error');
     expect(result.message).toContain('副本保存失败');
     expect(result.message).toContain('校验');
-    expect(remove).toHaveBeenCalledTimes(1);
+    expect(removeIfUnchanged).toHaveBeenCalledTimes(1);
     await persistence.dispose();
   });
 
   it('验证阶段 loadProject reject（load 抛异常）→ 类型化失败并清除副本（第十二轮严重 #5）', async () => {
     const editor = new SceneEditor();
-    const remove = vi.fn(async () => true);
+    const removeIfUnchanged = vi.fn(
+      async (_uri: string, _expectedFingerprint: string | null) => ({ ok: true, removed: true }) as const,
+    );
     const store: ProjectStorage = {
       kind: 'indexeddb',
       list: vi.fn(async () => []),
@@ -962,7 +993,8 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
         throw new Error('idb transaction aborted');
       }),
       save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
-      remove,
+      remove: vi.fn(async () => true),
+      removeIfUnchanged,
       rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
       duplicate: vi.fn(
         async (_uri: string, _name?: string) =>
@@ -981,27 +1013,29 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     expect(result.message).toContain('副本保存失败');
     expect(result.message).toContain('验证异常');
     // 清理探针：reject 的副本同样被清除 —— 绝不遗留损坏/状态未知的副本
-    expect(remove).toHaveBeenCalledTimes(1);
-    expect(remove).toHaveBeenCalledWith(expect.stringMatching(/^lumora:\/\/project\//));
+    expect(removeIfUnchanged).toHaveBeenCalledTimes(1);
+    expect(removeIfUnchanged).toHaveBeenCalledWith(expect.stringMatching(/^lumora:\/\/project\//), expect.any(String));
     await persistence.dispose();
   });
 
-  it('清理阶段 remove reject → 不掩盖验证失败：明确提示「记录保留、可手动删除」，残留记录仍在存储（第十三轮严重 #5）', async () => {
+  it('清理阶段 removeIfUnchanged 失败 → 不掩盖验证失败：明确提示「记录保留、可手动删除」，残留记录仍在存储（第十三轮严重 #5）', async () => {
     const editor = new SceneEditor();
     const corruptRecord: Project = {
       ...createSampleProject('lumora://project/corrupt', '损坏副本'),
       settings: { fps: 'bad' } as unknown as Project['settings'],
     };
     let copyUri = '';
+    const removeIfUnchanged = vi.fn(async (uri: string, _expectedFingerprint: string | null) => {
+      copyUri = uri;
+      return { ok: false, message: 'idb transaction aborted' } as const;
+    });
     const store: ProjectStorage = {
       kind: 'indexeddb',
       list: vi.fn(async () => []),
       load: vi.fn(async () => corruptRecord),
       save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
-      remove: vi.fn(async (uri: string) => {
-        copyUri = uri;
-        throw new Error('idb transaction aborted');
-      }),
+      remove: vi.fn(async () => true),
+      removeIfUnchanged,
       rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
       duplicate: vi.fn(
         async (_uri: string, _name?: string) =>
@@ -1024,10 +1058,88 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     // 损坏副本静默残留且无任何提示）
     expect(result.message).toContain('记录保留');
     expect(result.message).toContain('可手动删除');
-    // 残留记录断言：remove 被拒 → 损坏副本记录仍在存储中（load 仍可读到）
-    expect(store.remove).toHaveBeenCalledTimes(1);
+    // 残留记录断言：CAS 清理被拒 → 损坏副本记录仍在存储中（load 仍可读到）
+    expect(removeIfUnchanged).toHaveBeenCalledTimes(1);
     expect(copyUri).toMatch(/^lumora:\/\/project\//);
     expect(await store.load(copyUri)).not.toBeNull();
+    await persistence.dispose();
+  });
+
+  it('副本清理 CAS：验证失败时记录已被另一会话更新 → 保留记录并如实提示（第十四轮严重 4）', async () => {
+    const editor = new SceneEditor();
+    const corruptRecord: Project = {
+      ...createSampleProject('lumora://project/corrupt', '损坏副本'),
+      settings: { fps: 'bad' } as unknown as Project['settings'],
+    };
+    const removeIfUnchanged = vi.fn(
+      async (_uri: string, _expectedFingerprint: string | null) => ({ ok: true, removed: false }) as const,
+    );
+    const store: ProjectStorage = {
+      kind: 'indexeddb',
+      list: vi.fn(async () => []),
+      load: vi.fn(async () => corruptRecord),
+      save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
+      remove: vi.fn(async () => true),
+      removeIfUnchanged,
+      rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
+      duplicate: vi.fn(
+        async (_uri: string, _name?: string) =>
+          ({ ok: false, code: 'not-found', message: 'not mocked' }) as const,
+      ),
+      close: vi.fn(),
+    };
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ store });
+
+    const result = await persistence.saveSnapshotAsNew(
+      createSampleProject('lumora://project/src', '源项目'),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    // 验证失败结论不变；清理按 CAS 执行，记录已变化时如实提示保留（修复前
+    // remove 无条件删除，会误删另一标签页已打开并保存的更新后合法记录）
+    expect(result.message).toContain('副本保存失败');
+    expect(result.message).toContain('副本记录已变化');
+    expect(result.message).toContain('已保留');
+    expect(removeIfUnchanged).toHaveBeenCalledTimes(1);
+    expect(removeIfUnchanged).toHaveBeenCalledWith(
+      expect.stringMatching(/^lumora:\/\/project\//),
+      expect.any(String), // 创建时指纹：记录已变化即不删除
+    );
+    await persistence.dispose();
+  });
+
+  it('loadCopyForOpen：load reject → 类型化失败并 CAS 清理副本，不产生未处理 reject（第十四轮严重 5）', async () => {
+    const editor = new SceneEditor();
+    const removeIfUnchanged = vi.fn(
+      async (_uri: string, _expectedFingerprint: string | null) => ({ ok: true, removed: true }) as const,
+    );
+    const store: ProjectStorage = {
+      kind: 'indexeddb',
+      list: vi.fn(async () => []),
+      load: vi.fn(async () => {
+        throw new Error('idb transaction aborted');
+      }),
+      save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
+      remove: vi.fn(async () => true),
+      removeIfUnchanged,
+      rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
+      duplicate: vi.fn(
+        async (_uri: string, _name?: string) =>
+          ({ ok: false, code: 'not-found', message: 'not mocked' }) as const,
+      ),
+      close: vi.fn(),
+    };
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ store });
+
+    const result = await persistence.loadCopyForOpen('lumora://project/copy', 'fingerprint-at-create');
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.message).toContain('无法打开副本');
+    // 副本清理按创建时指纹 CAS 执行；load 的 reject 被归一为类型化失败
+    expect(removeIfUnchanged).toHaveBeenCalledTimes(1);
+    expect(removeIfUnchanged).toHaveBeenCalledWith('lumora://project/copy', 'fingerprint-at-create');
     await persistence.dispose();
   });
 });
@@ -1066,7 +1178,7 @@ describe('ProjectPersistence：exportCurrent 全链路逐层负向回归（第�
 
     const cases = [
       {},
-      { includePrivate: true, privateKeysByPlugin: { 'com.example': [] } },
+      { includePrivate: true, publicKeysByPlugin: { 'com.example': [] } },
     ] as Array<Parameters<ProjectPersistence['exportCurrent']>[0]>;
     for (const options of cases) {
       const result = runtime.persistence.exportCurrent(options);

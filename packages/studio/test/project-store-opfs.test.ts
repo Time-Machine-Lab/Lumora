@@ -957,19 +957,22 @@ describe('复制后验证/清理异常安全（第九轮 #5，OPFS）', () => {
       }
       return realLoad(uri);
     });
-    vi.spyOn(store, 'remove').mockRejectedValue(new Error('删除失败'));
-    const result = await store.duplicate('lumora://project/a');
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('storage-error');
-      expect(result.message).toContain('副本清理失败');
-      expect(result.message).toContain('副本记录保留');
-      expect(result.message).not.toContain('已清理');
+    vi.spyOn(store, 'removeIfUnchanged').mockResolvedValue({ ok: false, message: '删除失败' });
+    try {
+      const result = await store.duplicate('lumora://project/a');
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe('storage-error');
+        expect(result.message).toContain('副本清理失败');
+        expect(result.message).toContain('副本记录保留');
+        expect(result.message).not.toContain('已清理');
+      }
+      expect(copyUri).not.toBeNull();
+      expect(await store.load(copyUri!)).not.toBeNull(); // 清理失败：副本记录确实保留
+    } finally {
+      vi.mocked(store.removeIfUnchanged).mockRestore();
+      vi.mocked(store.load).mockRestore();
+      store.close();
     }
-    vi.mocked(store.remove).mockRestore();
-    vi.mocked(store.load).mockRestore();
-    expect(copyUri).not.toBeNull();
-    expect(await store.load(copyUri!)).not.toBeNull(); // 清理失败：副本记录确实保留
-    store.close();
   });
 });

@@ -173,37 +173,11 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
         showToast(result.message, 'error');
         return;
       }
-      let loaded: Awaited<ReturnType<typeof persistence.loadProject>>;
-      try {
-        loaded = await persistence.loadProject(result.summary.uri);
-      } catch (error) {
-        // 副本加载 reject（故障存储抛错）：尝试清理副本并报告清理状态（第十三轮一般 8）
-        let cleaned = false;
-        try {
-          cleaned = await persistence.deleteProject(result.summary.uri);
-        } catch {
-          cleaned = false;
-        }
-        showToast(
-          `无法打开副本（${error instanceof Error ? error.message : String(error)}）${cleaned ? '' : '；清理失败，损坏副本记录保留，可手动删除'}`,
-          'error',
-        );
-        return;
-      }
+      // 副本二次加载统一边界（第十四轮严重 5）：load 的 reject 与校验失败都归一
+      // 为类型化失败并 CAS 清理副本（清理状态如实报告），绝不产生未处理的 reject
+      const loaded = await persistence.loadCopyForOpen(result.summary.uri, result.fingerprint);
       if (!loaded.ok) {
-        // 副本写入成功但数据无法通过校验（第十二轮一般 #6 + 第十三轮一般 8）：
-        // 显式失败 —— 清理损坏副本（不得把坏记录留在最近列表误导用户）并提示
-        // 错误，绝不报成功；清理失败时如实报告记录保留
-        let cleaned = false;
-        try {
-          cleaned = await persistence.deleteProject(result.summary.uri);
-        } catch {
-          cleaned = false;
-        }
-        showToast(
-          `无法打开副本：${loaded.message}${cleaned ? '' : '；清理失败，损坏副本记录保留，可手动删除'}`,
-          'error',
-        );
+        showToast(loaded.message, 'error');
         return;
       }
       // 复制打开中的项目时内容已以副本落盘：跳过切换排空屏障（flush:false），
@@ -245,24 +219,17 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
   };
 
   const exportCurrent = async () => {
-    // 命名空间 + 键级显式可导出字段 allowlist（第十三轮阻断 2）：core 端只保留
-    // 映射中显式声明的键，未声明键（含凭据形态键名）一律不进包。映射由宿主
-    // 生成并验证：可导出字段 = pluginData 实际 own 键 − manifest.privateSettings
-    // 显式私有声明；插件未声明 privateSettings（无私有信息契约）→ 无可导出字段，
-    // 整个命名空间 fail-closed 排除（「凭据永不导出」不依赖插件自觉声明）
-    const privateKeysByPlugin: Record<string, string[]> = {};
+    // 命名空间 + 路径 schema 显式公开导出契约（第十四轮阻断 1/2）：core 端只
+    // 保留插件显式声明可导出的字段/路径，缺失或空声明一律整段排除（fail-closed）。
+    // 宿主直读 manifest.exportableSettings 原样传入，不做减法过滤 —— 「凭据
+    // 永不导出」不依赖插件自觉声明 privateSettings
+    const publicKeysByPlugin: Record<string, readonly (string | readonly string[])[]> = {};
     for (const info of runtime.host.listPlugins()) {
       const manifest = runtime.host.getPluginManifest(info.instanceId);
-      const declaredPrivate = Array.isArray(manifest?.privateSettings) ? manifest.privateSettings : null;
-      const pluginData = project?.pluginData?.[info.instanceId];
-      const keys =
-        pluginData && typeof pluginData === 'object' && !Array.isArray(pluginData)
-          ? Object.keys(pluginData)
-          : [];
-      privateKeysByPlugin[info.instanceId] =
-        declaredPrivate === null ? [] : keys.filter((key) => !declaredPrivate.includes(key));
+      const declarations = manifest?.exportableSettings;
+      publicKeysByPlugin[info.instanceId] = Array.isArray(declarations) ? declarations : [];
     }
-    const exported = persistence.exportCurrent({ includePrivate, privateKeysByPlugin });
+    const exported = persistence.exportCurrent({ includePrivate, publicKeysByPlugin });
     if (!exported.ok) {
       showToast(exported.message, 'error');
       return;
@@ -364,10 +331,12 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
         showToast(dup.message, 'error');
         return;
       }
-      const loaded = await persistence.loadProject(dup.summary.uri);
+      // 存储复制分支与最近复制同一统一边界（第十四轮严重 5）：load 的 reject
+      // （修复前为未处理的 Promise）与校验失败都归一为类型化失败并 CAS 清理
+      // 副本（清理状态如实报告），ok:false 分支绝不静默报成功
+      const loaded = await persistence.loadCopyForOpen(dup.summary.uri, dup.fingerprint);
       if (!loaded.ok) {
-        // 副本写入成功但数据无法通过校验（故障存储）：不得静默报成功
-        showToast(`副本校验失败：${loaded.message}`, 'error');
+        showToast(loaded.message, 'error');
         return;
       }
       const opened = await runtime.openProject(loaded.project, { flush: false });

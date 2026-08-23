@@ -63,8 +63,18 @@ export type SaveOutcome =
   | { ok: false; code: SaveFailureCode; message: string; storedRevision?: number };
 
 export type DuplicateOutcome =
-  | { ok: true; summary: ProjectSummary }
+  | { ok: true; summary: ProjectSummary; fingerprint: string }
   | { ok: false; code: 'not-found' | 'storage-error'; message: string };
+
+/** 条件删除结果（第十四轮严重 4）：副本验证失败后的清理必须 CAS —— 不得误删
+ *  另一标签页已打开并保存的更新后合法记录。
+ *  - removed: true = 记录存在且内容指纹与期望一致，已删除；
+ *  - removed: false = 记录不存在或内容已变化（指纹不符），保留；
+ *  - ok: false = 存储故障（读/删失败），记录可能残留。 */
+export type RemoveIfOutcome =
+  | { ok: true; removed: true }
+  | { ok: true; removed: false }
+  | { ok: false; message: string };
 
 export type RenameOutcome =
   | { ok: true }
@@ -81,9 +91,15 @@ export interface ProjectStorage {
   save(project: Project, expectedStoredRevision?: number | null): Promise<SaveOutcome>;
   /** 删除项目；返回是否真的存在并删除。 */
   remove(uri: string): Promise<boolean>;
+  /** 条件删除（第十四轮严重 4）：仅当记录内容指纹与期望一致时删除（副本验证
+   *  失败后的清理不得误删另一标签页已打开并保存的更新后合法记录）。
+   *  实现与 save 同一原子边界：IndexedDB 在 readwrite 事务内读-比-删并以事务
+   *  提交为完成边界；OPFS 在互斥锁内执行。 */
+  removeIfUnchanged(uri: string, expectedFingerprint: string | null): Promise<RemoveIfOutcome>;
   /** 直接重命名已存储项目（仅适用于未打开的项目）；失败返回类型化错误。 */
   rename(uri: string, name: string): Promise<RenameOutcome>;
-  /** 复制项目：新 uri + 名称（缺省「原名 副本」）+ 重置 revision/createdAt。 */
+  /** 复制项目：新 uri + 名称（缺省「原名 副本」）+ 重置 revision/createdAt；
+   *  返回副本内容指纹（调用方二次加载失败时的 CAS 清理依据）。 */
   duplicate(uri: string, name?: string): Promise<DuplicateOutcome>;
   /** 关闭连接（幂等；应用卸载前调用）。 */
   close(): void;

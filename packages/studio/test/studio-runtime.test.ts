@@ -118,6 +118,9 @@ describe('StudioRuntime：首存失败的切换屏障（TML-53 第四轮 #2 运�
       async remove() {
         return false;
       },
+      async removeIfUnchanged() {
+        return { ok: true, removed: false };
+      },
       async rename() {
         return { ok: false, code: 'not-found' as const, message: '项目不存在' };
       },
@@ -168,6 +171,9 @@ describe('StudioRuntime：首存失败的切换屏障（TML-53 第四轮 #2 运�
       },
       async remove(uri) {
         return real.remove(uri);
+      },
+      async removeIfUnchanged(uri, expectedFingerprint) {
+        return real.removeIfUnchanged(uri, expectedFingerprint);
       },
       async rename(uri, name) {
         return real.rename(uri, name);

@@ -136,7 +136,7 @@ describe('buildProjectPackage：私有数据默认排除（FR-011 / NFR-008）',
     // （第十三轮阻断 2：空 allowlist = 无公开字段 = 整段排除）
     const privatePkg = buildProjectPackage(rich, {
       includePrivate: true,
-      privateKeysByPlugin: { 'com.example': ['theme'] },
+      publicKeysByPlugin: { 'com.example': ['theme'] },
     });
     const privateJson = JSON.stringify(privatePkg);
     expect(privateJson).toContain('pluginData');
@@ -224,7 +224,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     // includePrivate + 已注册插件空声明（无公开字段）：整段排除 —— 已注册但空/
     // 漏声明一律不整段放行，凭据形态值绝不因 fail-open 进入包（第十三轮阻断 2）
     const emptyJson = JSON.stringify(
-      buildProjectPackage(rich, { includePrivate: true, privateKeysByPlugin: { 'com.example': [] } }),
+      buildProjectPackage(rich, { includePrivate: true, publicKeysByPlugin: { 'com.example': [] } }),
     );
     expect(emptyJson).not.toContain('theme');
     expect(emptyJson).not.toContain('sk-keep-1');
@@ -233,7 +233,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
 
     // includePrivate + 显式 allowlist：只保留声明的键
     const privateJson = JSON.stringify(
-      buildProjectPackage(rich, { includePrivate: true, privateKeysByPlugin: { 'com.example': ['theme'] } }),
+      buildProjectPackage(rich, { includePrivate: true, publicKeysByPlugin: { 'com.example': ['theme'] } }),
     );
     expect(privateJson).toContain('theme');
     expect(privateJson).not.toContain('sk-keep-1');
@@ -258,7 +258,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     const json = JSON.stringify(
       buildProjectPackage(rich, {
         includePrivate: true,
-        privateKeysByPlugin: { 'com.example': ['apiKey', 'clientSecret', 'accessToken', 'auth'] },
+        publicKeysByPlugin: { 'com.example': ['apiKey', 'clientSecret', 'accessToken', 'auth'] },
       }),
     );
     // allowlist 键及其整棵子树完整保留（allowlist 是「可导出字段」而非「剥离列表」）
@@ -280,7 +280,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     // 仅 com.a 注册（allowlist 只含 theme）：apiKey 不导出；com.b 是未知命名空间
     // → 整体排除（隔离 fail-closed，第十二轮阻断 2）
     const json = JSON.stringify(
-      buildProjectPackage(rich, { includePrivate: true, privateKeysByPlugin: { 'com.a': ['theme'] } }),
+      buildProjectPackage(rich, { includePrivate: true, publicKeysByPlugin: { 'com.a': ['theme'] } }),
     );
     expect(json).not.toContain('a-leak-1');
     expect(json).toContain('a-theme');
@@ -289,7 +289,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     const bothJson = JSON.stringify(
       buildProjectPackage(rich, {
         includePrivate: true,
-        privateKeysByPlugin: { 'com.a': ['theme'], 'com.b': [] },
+        publicKeysByPlugin: { 'com.a': ['theme'], 'com.b': [] },
       }),
     );
     expect(bothJson).not.toContain('a-leak-1');
@@ -299,7 +299,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     const explicitJson = JSON.stringify(
       buildProjectPackage(rich, {
         includePrivate: true,
-        privateKeysByPlugin: { 'com.a': ['theme'], 'com.b': ['apiKey'] },
+        publicKeysByPlugin: { 'com.a': ['theme'], 'com.b': ['apiKey'] },
       }),
     );
     expect(explicitJson).toContain('b-keep-1');
@@ -329,7 +329,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     // 空声明（无公开字段）：整段排除，任何键都不进包（第十三轮阻断 2）
     const emptyPkg = buildProjectPackage({ ...project, pluginData }, {
       includePrivate: true,
-      privateKeysByPlugin: { 'com.example': [] },
+      publicKeysByPlugin: { 'com.example': [] },
     });
     const emptyParsed = await parseProjectPackage(serializeProjectPackage(emptyPkg));
     expect(emptyParsed.ok).toBe(true);
@@ -338,7 +338,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     // 显式 allowlist（宿主核验过的全部键）：逐键无损往返，值不被改动
     const pkg = buildProjectPackage({ ...project, pluginData }, {
       includePrivate: true,
-      privateKeysByPlugin: { 'com.example': Object.keys(pluginData['com.example']) },
+      publicKeysByPlugin: { 'com.example': Object.keys(pluginData['com.example']) },
     });
     const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
     expect(parsed.ok).toBe(true);
@@ -374,7 +374,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     } as Project;
     const pkg = buildProjectPackage(rich, {
       includePrivate: true,
-      privateKeysByPlugin: { 'com.example': ['apiKey', 'accessToken', 'clientSecret'] },
+      publicKeysByPlugin: { 'com.example': ['apiKey', 'accessToken', 'clientSecret'] },
     });
     const text = serializeProjectPackage(pkg);
     const parsed = await parseProjectPackage(text);
@@ -484,7 +484,7 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
     const json = JSON.stringify(
       buildProjectPackage({ ...project, pluginData } as unknown as Project, {
         includePrivate: true,
-        privateKeysByPlugin: { 'com.example': ['theme'] },
+        publicKeysByPlugin: { 'com.example': ['theme'] },
       }),
     );
     expect(json).not.toContain('proto-secret-1');
@@ -499,7 +499,7 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
     poisonedValue['__proto__'] = { pollute: 'proto-polluted' };
     const rich = { ...project, pluginData: { 'com.example': poisonedValue } } as Project;
     const strippedJson = JSON.stringify(
-      buildProjectPackage(rich, { includePrivate: true, privateKeysByPlugin: declarations }),
+      buildProjectPackage(rich, { includePrivate: true, publicKeysByPlugin: declarations }),
     );
     expect(strippedJson).toContain('sk-strip-1');
     expect(strippedJson).not.toContain('proto-polluted');
@@ -512,11 +512,94 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
     const json = JSON.stringify(
       buildProjectPackage(rich, {
         includePrivate: true,
-        privateKeysByPlugin: { 'com.example': 'apiKey' as unknown as string[] },
+        publicKeysByPlugin: { 'com.example': 'apiKey' as unknown as string[] },
       }),
     );
     expect(json).not.toContain('sk-nonarray-1');
     expect(json).not.toContain('theme');
+  });
+
+  it('路径 schema：声明路径导出嵌套公开字段，未声明路径与嵌套凭据排除（第十四轮阻断 1）', async () => {
+    const project = await buildFixtureProject();
+    const rich = {
+      ...project,
+      pluginData: {
+        'com.example': {
+          theme: 'dark',
+          apiKey: 'sk-direct-1',
+          profile: {
+            username: 'alice',
+            email: 'alice@example.com',
+            auth: { apiKey: 'sk-nested-2', accessToken: 'tok-nested-3' },
+          },
+        },
+      },
+    } as Project;
+    const json = JSON.stringify(
+      buildProjectPackage(rich, {
+        includePrivate: true,
+        publicKeysByPlugin: {
+          'com.example': ['theme', ['profile', 'username'], ['profile', 'auth', 'apiKey']],
+        },
+      }),
+    );
+    // 顶层键整值导出；路径末端键按路径导出
+    for (const kept of ['dark', 'alice', 'sk-nested-2']) {
+      expect(json, `声明键值 ${kept} 必须进入包`).toContain(kept);
+    }
+    // 未声明键与嵌套凭据排除
+    for (const leaked of ['sk-direct-1', 'alice@example.com', 'tok-nested-3']) {
+      expect(json, `未声明凭据 ${leaked} 不得进入包`).not.toContain(leaked);
+    }
+    // 投影结果只含声明路径：profile 段只有 username 与 auth.apiKey
+    const parsed = await parseProjectPackage(json);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, Record<string, unknown>>)['com.example'];
+    expect(plugin).toEqual({
+      theme: 'dark',
+      profile: { username: 'alice', auth: { apiKey: 'sk-nested-2' } },
+    });
+  });
+
+  it('路径 schema：中途缺失/中间层非普通对象/路径含原型键时整条路径回滚，不残留部分投影（第十四轮阻断 1）', async () => {
+    const project = await buildFixtureProject();
+    const rich = {
+      ...project,
+      pluginData: {
+        'com.example': {
+          theme: 'dark',
+          profile: {
+            username: 'alice',
+            tags: ['a', 'b'],
+            auth: { apiKey: 'sk-rollback-1' },
+          },
+        },
+      },
+    } as Project;
+    const json = JSON.stringify(
+      buildProjectPackage(rich, {
+        includePrivate: true,
+        publicKeysByPlugin: {
+          'com.example': [
+            'theme',
+            ['profile', 'tags', 'x'], // 中间层是数组（非普通对象）→ 整条失败
+            ['profile', 'missing', 'x'], // 中途缺失 → 整条失败
+            ['__proto__', 'x'], // 原型键声明 → 忽略
+            ['profile', '__proto__'], // 路径含原型键 → 整条失败
+          ],
+        },
+      }),
+    );
+    expect(json, '失败路径的值不得进入包').not.toContain('sk-rollback-1');
+    expect(json).not.toContain('"__proto__"');
+    expect(json, '回滚不得残留部分投影').not.toContain('alice');
+    const parsed = await parseProjectPackage(json);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, Record<string, unknown>>)['com.example'];
+    // profile 完全未导出（整条路径回滚），顶层键声明不受失败路径影响
+    expect(plugin).toEqual({ theme: 'dark' });
   });
 
   it('子结构逐层投影：geometry/material/light/camera 与 assets[].parts[] 嵌套契约外字段不进包，契约字段保留（第十三轮阻断 1）', async () => {

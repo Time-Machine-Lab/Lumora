@@ -1263,3 +1263,91 @@ describe('ProjectAutosaver：保存失败错误广播与监听器同步重入（
     autosaver.dispose();
   });
 });
+
+describe('ProjectAutosaver：慢保存失败的延迟错误广播按 {uri, session} 新鲜度校验（第十四轮严重 3）', () => {
+  it('慢失败后切换 B：A 的保存失败不覆盖 B 的真实状态，不广播 error', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(60); // 首存完成（rev0 clean）
+
+    // A 的保存慢速挂起（in-flight）：切换前任务已开始执行
+    editor.addObject(createGroupObject()); // dirty
+    let releaseSave!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    const realSave = store.save.bind(store);
+    const slowSave = vi.spyOn(store, 'save').mockImplementation(async (_incoming, _expected) => {
+      await gate;
+      slowSave.mockImplementation(realSave); // 仅本次失败，后续排空/对账走真实存储
+      return { ok: false, code: 'storage-error', message: '存储不可用' };
+    });
+    const states: string[] = [];
+    autosaver.onState((s) => states.push(s.status));
+    await settle(40); // debounce 到期 → runSave → 任务开始（保存挂起中）
+    expect(slowSave).toHaveBeenCalledTimes(1);
+
+    // 挂起期间切换到 B（resetTo 递增会话代、currentUri 指向 B）
+    autosaver.switchOpen(createSampleProject('lumora://project/b', '项目B'));
+    await settle(10);
+
+    releaseSave(); // A 的慢保存失败
+    await settle(100);
+    // 修复前无条件广播 error，覆盖 B 的真实状态；修复后仅在目标仍 fresh 时
+    // 广播 —— A 已不是当前项目（会话代递增），失败绝不回弹
+    expect(states).not.toContain('error');
+    // switchOpen 丢弃 A 的 pending（排空由调用方 flush 负责）：A 保持首存基线，
+    // 失败不产生假记录；这正是「旧项目慢失败不覆盖任何状态」的落点
+    const storedA = await store.load(A);
+    expect(storedA).not.toBeNull();
+    expect(storedA!.revision).toBe(0);
+    expect(storedA!.objects.length).toBe(base.objects.length);
+    // B 的对账完成：真实状态 clean（不被 A 的失败覆盖）
+    expect(states.at(-1)).toBe('clean');
+    expect(editor.getProject()?.uri).toBe('lumora://project/b');
+    slowSave.mockRestore();
+    autosaver.dispose();
+  });
+
+  it('慢失败后关闭 A：编辑器关闭（会话代递增、currentUri 清空）后不广播 error', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(60); // 首存完成（rev0 clean）
+
+    editor.addObject(createGroupObject()); // dirty
+    let releaseSave!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    const realSave = store.save.bind(store);
+    const slowSave = vi.spyOn(store, 'save').mockImplementation(async (_incoming, _expected) => {
+      await gate;
+      slowSave.mockImplementation(realSave); // 仅本次失败
+      return { ok: false, code: 'storage-error', message: '存储不可用' };
+    });
+    const states: string[] = [];
+    autosaver.onState((s) => states.push(s.status));
+    await settle(40); // 任务开始（保存挂起中）
+    expect(slowSave).toHaveBeenCalledTimes(1);
+
+    // 挂起期间关闭 A（编辑器关闭事件：session 递增、currentUri 清空、广播 idle）
+    autosaver.changed(null);
+    expect(states.at(-1)).toBe('idle');
+
+    releaseSave(); // A 的慢保存失败
+    await settle(100);
+    // 关闭后不得回弹错误状态（修复前无条件广播 error 覆盖 idle）
+    expect(states).not.toContain('error');
+    // 关闭时排空任务以真实存储重试成功：A 的未保存内容最终落盘（不丢）
+    const storedA = await store.load(A);
+    expect(storedA).not.toBeNull();
+    expect(storedA!.revision).toBe(1);
+    expect(storedA!.objects.length).toBe(base.objects.length + 1);
+    slowSave.mockRestore();
+    autosaver.dispose();
+  });
+});

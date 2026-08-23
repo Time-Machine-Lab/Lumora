@@ -14,6 +14,7 @@ import { LumoraStudio } from '../src/components/LumoraStudio';
 import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
 import type { StudioRuntime } from '../src/runtime/studio-runtime';
 import { ProjectStore } from '../src/persistence/project-store';
+import type { ProjectStorage } from '../src/persistence/project-storage';
 
 vi.mock('@react-three/fiber', () => ({
   Canvas: ({ children }: { children?: React.ReactNode }) => (
@@ -210,11 +211,12 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
     }
   });
 
-  it('导出菜单勾选「包含插件私有设置」后 exportCurrent 收到 includePrivate 与宿主生成的键级 allowlist（第十三轮阻断 2）', async () => {
+  it('导出菜单勾选「包含插件私有设置」后 exportCurrent 收到 includePrivate 与 manifest.exportableSettings 原样声明的公开键（第十四轮阻断 1/2）', async () => {
     const handle = renderStudio();
     const runtime = await waitPersistence(handle);
-    // 注册声明 privateSettings 的插件：ProjectMenu 导出时生成可导出字段 allowlist
-    // = pluginData 实际 own 键 − privateSettings 声明（可导出键 = 未声明为私有的键）
+    // 注册声明显式公开导出契约（exportableSettings）的插件：ProjectMenu 导出时
+    // 直读 manifest.exportableSettings 原样传入 publicKeysByPlugin —— 宿主不再做
+    // 减法过滤（privateSettings 不参与导出决策），core 端按声明投影
     await runtime.host.register({
       manifest: {
         schemaVersion: '1',
@@ -223,7 +225,7 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
         version: '1.0.0',
         entry: './dist/index.js',
         contributes: [],
-        privateSettings: ['auth', 'apiKey'],
+        exportableSettings: ['theme'],
       },
       entry: async () => ({ activate: () => undefined }),
     });
@@ -251,23 +253,23 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
     );
     try {
       await openMenu();
-      // 隐私默认：不勾选 → 默认导出（allowlist 照常生成，仅 pluginData 不进包）
+      // 隐私默认：不勾选 → 默认导出（声明照常读取，仅 pluginData 不进包）
       expect(screen.getByTestId('project-export-include-private')).not.toBeChecked();
       screen.getByTestId('project-export').click();
       await waitFor(() =>
         expect(spy).toHaveBeenCalledWith({
           includePrivate: false,
-          privateKeysByPlugin: { 'com.example.aiassistant': ['theme'] },
+          publicKeysByPlugin: { 'com.example.aiassistant': ['theme'] },
         }),
       );
-      // 显式开启：仅放行可导出字段（私有声明键 auth/apiKey 从 allowlist 中剔除）
+      // 显式开启：同一显式公开契约（未声明键 apiKey/auth 即使存在也不导出）
       fireEvent.click(screen.getByTestId('project-export-include-private'));
       expect(screen.getByTestId('project-export-include-private')).toBeChecked();
       screen.getByTestId('project-export').click();
       await waitFor(() =>
         expect(spy).toHaveBeenCalledWith({
           includePrivate: true,
-          privateKeysByPlugin: { 'com.example.aiassistant': ['theme'] },
+          publicKeysByPlugin: { 'com.example.aiassistant': ['theme'] },
         }),
       );
       await new Promise((r) => setTimeout(r, 1100));
@@ -278,7 +280,7 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
     }
   });
 
-  it('includePrivate 导出：manifest.privateSettings 声明的键不进包，未声明键完整保留（NFR-008 + 第十三轮阻断 2）', async () => {
+  it('includePrivate 导出：仅 manifest.exportableSettings 显式声明的键进包，未声明键（直接及嵌套凭据）一律排除（NFR-008 + 第十四轮阻断 1）', async () => {
     const handle = renderStudio();
     const runtime = await waitPersistence(handle);
     await runtime.host.register({
@@ -289,7 +291,7 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
         version: '1.0.0',
         entry: './dist/index.js',
         contributes: [],
-        privateSettings: ['auth'],
+        exportableSettings: ['theme'],
       },
       entry: async () => ({ activate: () => undefined }),
     });
@@ -313,12 +315,12 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
     expect(defaultJson).not.toContain('pluginData');
     expect(defaultJson).not.toContain('sk-lumora-secret-1234');
 
-    // includePrivate：宿主生成的 allowlist = 实际 own 键 − privateSettings 声明
-    // → auth 不进包；未声明键（theme/model/passwd）完整保留（凭据永不导出由
-    // allowlist 结构性保证，不依赖插件自觉声明）
+    // includePrivate：宿主直读 manifest.exportableSettings 原样传入 —— 只有显式
+    // 声明的键（theme）进包；未声明键（model/passwd 直接凭据、auth.apiKey 嵌套
+    // 凭据）一律排除（修复前减法 allowlist 会把这些键连同整棵 auth 一起导出）
     const privateExport = runtime.persistence.exportCurrent({
       includePrivate: true,
-      privateKeysByPlugin: { 'com.example.aiassistant': ['theme', 'model', 'passwd'] },
+      publicKeysByPlugin: { 'com.example.aiassistant': ['theme'] },
     });
     expect(privateExport.ok).toBe(true);
     const privatePkg = JSON.parse(privateExport.ok ? privateExport.text : '') as {
@@ -330,11 +332,13 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
       | Record<string, unknown>
       | undefined;
     expect(plugin?.theme).toBe('dark');
-    expect(plugin?.model).toBe('claude-sonnet-5');
-    expect(plugin?.passwd).toBe('pw-local-5678');
+    expect(plugin?.model).toBeUndefined();
+    expect(plugin?.passwd).toBeUndefined();
     expect(plugin?.auth).toBeUndefined();
     const privateJson = JSON.stringify(privatePkg);
     expect(privateJson).not.toContain('sk-lumora-secret-1234');
+    expect(privateJson).not.toContain('claude-sonnet-5');
+    expect(privateJson).not.toContain('pw-local-5678');
     expect(privateJson).not.toContain('"auth"');
   });
 
@@ -449,7 +453,8 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
     );
 
     // 注入存储复制路径故障：无未保存源（走 duplicate 分支）、duplicate 成功，
-    // 但副本记录无法通过校验（loadProject 失败）—— 修复前此处静默报成功
+    // 但副本记录无法通过校验（loadCopyForOpen 内 loadProject 失败）—— 修复前
+    // 此处静默报成功且 load 的 reject 形成未处理 Promise（第十四轮严重 5）
     const persistence = runtime.persistence;
     const sourceSpy = vi.spyOn(persistence, 'resolveSaveAsCopySource').mockReturnValue(null);
     const dupSpy = vi.spyOn(persistence, 'duplicateProject').mockResolvedValue({
@@ -461,6 +466,7 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
         revision: 0,
         schemaVersion: 3,
       },
+      fingerprint: 'fp-at-create',
     });
     const loadSpy = vi.spyOn(persistence, 'loadProject').mockResolvedValue({
       ok: false,
@@ -469,7 +475,7 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
     try {
       await openMenu();
       screen.getByTestId('save-saveas').click();
-      await waitFor(() => expect(screen.getByText(/副本校验失败/)).toBeInTheDocument());
+      await waitFor(() => expect(screen.getByText(/无法打开副本/)).toBeInTheDocument());
       expect(dupSpy).toHaveBeenCalledTimes(1);
       expect(loadSpy).toHaveBeenCalledTimes(1);
       // 校验失败：菜单不关闭（无成功切换），也不得出现「已另存为」成功提示
@@ -492,7 +498,7 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
 
     // 普通复制分支：duplicate 成功（副本已写入）但副本记录无法通过 loadProject
     // 校验（ok:false）—— 修复前该分支静默报「已复制为」成功；修复后显式失败
-    // 并清理损坏副本（不得留在最近项目列表误导用户）
+    // 并 CAS 清理损坏副本（第十四轮严重 4：按创建时指纹清理，绝不误删更新后记录）
     const persistence = runtime.persistence;
     const dupSpy = vi.spyOn(persistence, 'duplicateProject').mockResolvedValue({
       ok: true,
@@ -503,26 +509,29 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
         revision: 0,
         schemaVersion: 3,
       },
+      fingerprint: 'fp-at-create',
     });
     const loadSpy = vi.spyOn(persistence, 'loadProject').mockResolvedValue({
       ok: false,
       message: '本地项目数据校验失败：settings.fps 非法',
     });
-    const deleteSpy = vi.spyOn(persistence, 'deleteProject').mockResolvedValue(true);
+    const store = (persistence as unknown as { store: ProjectStorage | null }).store;
+    expect(store).not.toBeNull();
+    const cleanupSpy = vi.spyOn(store!, 'removeIfUnchanged');
     try {
       screen.getByTestId('recent-duplicate').click();
       await waitFor(() => expect(screen.getByText(/无法打开副本/)).toBeInTheDocument());
       expect(dupSpy).toHaveBeenCalledTimes(1);
       expect(loadSpy).toHaveBeenCalledTimes(1);
-      // 损坏副本被清理：绝不遗留坏记录
-      expect(deleteSpy).toHaveBeenCalledTimes(1);
-      expect(deleteSpy).toHaveBeenCalledWith('lumora://project/recent-dup-copy');
+      // 损坏副本按创建时指纹 CAS 清理：绝不遗留坏记录，也绝不误删已变化的记录
+      expect(cleanupSpy).toHaveBeenCalledTimes(1);
+      expect(cleanupSpy).toHaveBeenCalledWith('lumora://project/recent-dup-copy', 'fp-at-create');
       // 绝不报成功：无「已复制为」成功提示
       expect(screen.queryByText(/已复制为/)).not.toBeInTheDocument();
     } finally {
       dupSpy.mockRestore();
       loadSpy.mockRestore();
-      deleteSpy.mockRestore();
+      cleanupSpy.mockRestore();
     }
   });
 
@@ -544,24 +553,35 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
         revision: 0,
         schemaVersion: 3,
       },
+      fingerprint: 'fp-at-create-2',
     });
     const loadSpy = vi.spyOn(persistence, 'loadProject').mockRejectedValue(new Error('idb transaction aborted'));
-    const deleteSpy = vi.spyOn(persistence, 'deleteProject').mockRejectedValue(new Error('idb transaction aborted'));
+    const store = (persistence as unknown as { store: ProjectStorage | null }).store;
+    expect(store).not.toBeNull();
+    const cleanupSpy = vi
+      .spyOn(store!, 'removeIfUnchanged')
+      .mockResolvedValue({ ok: false, message: 'idb transaction aborted' });
     try {
       screen.getByTestId('recent-duplicate').click();
-      await waitFor(() => expect(screen.getByText(/无法打开副本/)).toBeInTheDocument());
+      // 完整消息唯一匹配：toast 为模块级全局数组（4 秒过期），前序测试的
+      // 「无法打开副本：…」可能仍在，前缀匹配会命中多条
+      await waitFor(() =>
+        expect(
+          screen.getByText(/无法打开副本（idb transaction aborted）；清理失败，损坏记录保留，可手动删除（idb transaction aborted）/),
+        ).toBeInTheDocument(),
+      );
       expect(dupSpy).toHaveBeenCalledTimes(1);
       expect(loadSpy).toHaveBeenCalledTimes(1);
-      // 清理也失败：如实报告记录保留、可手动删除 —— 修复前两次 await 的
-      // reject 均未捕获，坏副本静默残留且无任何提示
-      expect(deleteSpy).toHaveBeenCalledTimes(1);
-      expect(deleteSpy).toHaveBeenCalledWith('lumora://project/recent-dup-copy-2');
-      expect(screen.getByText(/清理失败，损坏副本记录保留，可手动删除/)).toBeInTheDocument();
+      // 清理也失败：如实报告记录保留、可手动删除 —— 修复前 load 的 reject 未
+      // 捕获（未处理 Promise），坏副本静默残留且无任何提示
+      expect(cleanupSpy).toHaveBeenCalledTimes(1);
+      expect(cleanupSpy).toHaveBeenCalledWith('lumora://project/recent-dup-copy-2', 'fp-at-create-2');
+      expect(screen.getByText(/清理失败，损坏记录保留，可手动删除/)).toBeInTheDocument();
       expect(screen.queryByText(/已复制为/)).not.toBeInTheDocument();
     } finally {
       dupSpy.mockRestore();
       loadSpy.mockRestore();
-      deleteSpy.mockRestore();
+      cleanupSpy.mockRestore();
     }
   });
 });
