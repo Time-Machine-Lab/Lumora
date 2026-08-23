@@ -33,8 +33,9 @@ export const AUTOSAVE_DEBOUNCE_MS = 2000;
 export const MAX_FLUSH_DRAIN_ROUNDS = 32;
 
 /** flush 入队任务的内部结果：done = 任务体已保存（或确认无需保存）；superseded =
- *  排队期间会话失效（关闭/切换），由 superseding drain 承载，flush() 等待链尾后
- *  读取其结果传播（第十九轮严重 3） */
+ *  排队期间或保存 await 期间会话失效（关闭/切换，第十九轮严重 3 + 第二十一轮
+ *  阻断 2），由 superseding drain 承载，flush() 等待链尾后读取该会话代的一次性
+ *  drain 结果传播 */
 type FlushTaskResult = { kind: 'done'; outcome: SaveOutcome } | { kind: 'superseded' };
 
 export type AutosaveState =
@@ -136,11 +137,18 @@ export class ProjectAutosaver {
   private latched: LatchedError | null = null;
   /** 切换/关闭时保存失败被保留的旧项目快照（按 uri），重新打开时明示可恢复 */
   private readonly recovery = new Map<string, Project>();
-  /** 各 uri 最近一次 superseding drain 的结果（第十九轮严重 3）：flush 任务在
-   *  排队期间会话失效（关闭/切换）后，flush() 等待链尾读取此记录并传播 ——
-   *  不把「已排空给 superseding drain」映射为成功。open 同 uri 时清除旧代
-   *  记录（上一代失败的残留不得误导新一代 flush）。 */
-  private readonly drainOutcomeByUri = new Map<string, SaveOutcome>();
+  /** 每代 superseding drain 的一次性结果（第二十一轮阻断 3）：按 drain 服务的
+   *  会话代记录 —— 同 uri 多代 drain 各占独立键，后代成功不再覆盖前代失败
+   *  （第十九轮的按 uri 记录会被后代 drain 覆盖，原 flush 误读后代结果）。
+   *  记录是 drain 任务 promise：绑定同一会话代的 flush 等待链尾后读取并消费
+   *  （读后删除）；open 不做任何清理 —— 尚未结算的旧 drain 记录在对应代键上，
+   *  与新一代无关。从未被消费的记录（无 flush 等待的 drain）受大小上限约束，
+   *  最旧代被淘汰（flush 读不到时回落到恢复快照/已提交基线判定，仍不会误报
+   *  成功）。 */
+  private readonly drainOutcomeByEpoch = new Map<number, Promise<SaveOutcome>>();
+  /** drainOutcomeByEpoch 防御性上限：实际每次 drain 都被其会话代的 flush 消费，
+   *  上限仅为防极端长会话下的内存增长 */
+  private static readonly DRAIN_OUTCOME_KEEP = 16;
 
   constructor(
     private readonly editor: SceneEditor,
@@ -224,6 +232,9 @@ export class ProjectAutosaver {
   private open(project: Project): void {
     const prevUri = this.currentUri;
     const previous = this.pending;
+    // 排空结果按「被排空内容所属的会话代」记录（第二十一轮阻断 3）：递增前捕获，
+    // drain 记录挂在旧代键上，新一代 open/close 不触碰
+    const drainingEpoch = this.session;
     this.cancelTimer();
     this.session += 1;
     this.currentUri = project.uri;
@@ -233,11 +244,8 @@ export class ProjectAutosaver {
     // 新项目尚无「已确认落盘」记录：基线置 null（create-only 语义），数字基线
     // 仅由对账的 load/保存成功建立 —— 首存失败不被吞，后续保存仍按创建语义重试
     this.committedByUri.set(project.uri, null);
-    // 上一代该 uri 的 drain 结果已随会话作废（第十九轮严重 3）：新一代 flush
-    // 不得误读旧代失败/成功记录
-    this.drainOutcomeByUri.delete(project.uri);
     if (prevUri !== null && previous !== null) {
-      this.enqueueDrain(prevUri, previous);
+      this.enqueueDrain(prevUri, previous, drainingEpoch);
     }
     // 对账结果决定新项目的真实状态（首存 saving→clean / 冲突 error / 恢复快照 error / 一致 clean）
     void this.enqueue(() => this.reconcile(project));
@@ -247,6 +255,7 @@ export class ProjectAutosaver {
   private close(): void {
     const prevUri = this.currentUri;
     const previous = this.pending;
+    const drainingEpoch = this.session;
     this.cancelTimer();
     this.session += 1;
     this.currentUri = null;
@@ -254,7 +263,7 @@ export class ProjectAutosaver {
     this.saveQueued = null;
     this.latched = null;
     if (prevUri !== null && previous !== null) {
-      this.enqueueDrain(prevUri, previous);
+      this.enqueueDrain(prevUri, previous, drainingEpoch);
     }
     this.emit({ status: 'idle' });
   }
@@ -373,11 +382,15 @@ export class ProjectAutosaver {
    * 净/脏以 committed baseline 判定（isUnsaved）：首存失败（baseline 仍为 null）
    * 时即使 revision 未变也必须重试保存 —— 失败如实返回，调用方不得放行关闭/切换
    * （内容仍在编辑器与恢复快照中），绝不假报成功。
-   * 排队期间会话失效（关闭/切换，第十九轮严重 3）：任务体捕获 {uri, session}，
-   * 执行时已失效则返回 superseded —— 旧项目未保存内容由 close/open 同步排入的
-   * superseding drain 承载，flush() 等待链尾后读取该 drain 的结果并传播
-   * （失败如实返回，不得映射为成功）；无 drain（内容已由在途保存落盘或已净）时
-   * 按恢复快照是否存在判定，绝不放行「内容仍在恢复区」的假成功。
+   * 排队期间会话失效（关闭/切换，第十九轮严重 3 + 第二十一轮阻断 2/3）：每轮
+   * 任务体捕获 {uri, session}，执行时与每次 await 后都复验 —— 保存挂起期间
+   * 编辑/关闭/切换后，该次保存的成功只代表旧内容落盘，新内容由 close/open
+   * 同步排入的 superseding drain 承载，flush() 等待链尾后读取该会话代的
+   * 一次性 drain 结果并传播（失败如实返回，不得映射为成功；同 uri 多代 drain
+   * 各占独立键，后代成功不覆盖前代失败）。无 drain 记录（绑定内容从未进入
+   * 排空，如新项目打开后从未编辑、reconcile 未完成即重置）时以「已提交基线
+   * 是否覆盖绑定内容」判定，恢复快照存在或基线未覆盖都如实失败 —— 绝不放行
+   * 「内容仍在恢复区或从未落盘」的假成功。
    * 返回类型化结果：保存失败或锁存错误（冲突/恢复待处理）都如实返回。
    */
   async flush(): Promise<SaveOutcome> {
@@ -385,7 +398,6 @@ export class ProjectAutosaver {
     // 仅内存模式：无可持久化内容，排空无意义也不阻塞关闭
     if (!this.store) return { ok: true };
     this.cancelTimer();
-    const session = this.session;
     for (let i = 0; i < MAX_FLUSH_DRAIN_ROUNDS; i += 1) {
       if (this.latched && this.latched.uri === this.currentUri) {
         // 锁存错误下排空无法稳定：返回锁存错误，由调用方阻断关闭/切换并引导显式解决
@@ -394,6 +406,10 @@ export class ProjectAutosaver {
       const project = this.pending ?? this.editor.getProject();
       if (project && project.uri === this.currentUri && this.isUnsaved(project)) {
         const uri = project.uri;
+        // 本轮绑定 {uri, session}（第二十一轮阻断 2）：会话代在入队前捕获，任务
+        // 体执行时与保存 await 后都复验 —— 排队期间/保存挂起期间会话失效都
+        // 返回 superseded，由 superseding drain 的结果定论
+        const session = this.session;
         // 第十八轮严重 3：入队任务执行时重读最新内容，不闭包调用时的旧快照 ——
         // 慢 reconcile/在途保存占队期间 flush 捕获 rev1、等待中继续编辑到 rev2
         // 时，重放 rev1 会以旧 revision 覆写较新记录触发假 revision-conflict
@@ -402,30 +418,59 @@ export class ProjectAutosaver {
         const result = await this.enqueue<FlushTaskResult>(async (): Promise<FlushTaskResult> => {
           if (this.disposed) return { kind: 'done', outcome: { ok: true } };
           if (!this.isFresh(uri, session)) {
-            // 第十九轮严重 3：排队期间会话失效（关闭/切换）——旧项目未保存内容
-            // 已由 close/open 同步排入 superseding drain（drain 排在当前任务之后，
-            // 任务体直接 await 会自锁，故返回 superseded 由 flush() 等待链尾读取）
+            // 排队期间会话失效（关闭/切换）——旧项目未保存内容已由 close/open
+            // 同步排入 superseding drain（drain 排在当前任务之后，任务体直接
+            // await 会自锁，故返回 superseded 由 flush() 等待链尾读取）
             return { kind: 'superseded' };
           }
           const latest = this.pending ?? this.editor.getProject();
           if (!latest || latest.uri !== uri) return { kind: 'done', outcome: { ok: true } };
           if (!this.isUnsaved(latest)) return { kind: 'done', outcome: { ok: true } };
-          return { kind: 'done', outcome: await this.saveSnapshot(latest) };
+          const outcome = await this.saveSnapshot(latest);
+          // 第二十一轮阻断 2：保存 await 期间会话可能已失效（继续编辑后关闭/
+          // 切换）——该次保存的成功只代表旧内容落盘，rev2 由 superseding
+          // drain 承载，其结果才决定本轮成败；不得因 rev1 成功返回 done/ok
+          // （否则外层在「当前项目已净/为空」时误报成功，rev2 未落盘被放行）
+          if (!this.isFresh(uri, session)) return { kind: 'superseded' };
+          return { kind: 'done', outcome };
         });
         if (result.kind === 'done') {
           if (!result.outcome.ok) return result.outcome;
           continue;
         }
-        // superseded：会话失效必然先于任务执行发生，superseding drain 已在链上；
-        // 等待链尾（含 drain）后读取其结果传播 —— 失败如实返回，不得映射为成功
+        // superseded：会话失效（关闭/切换）。等待链尾（含 superseding drain
+        // 执行）后读取该会话代的一次性结果传播 —— 失败如实返回，不得映射为成功
         await this.chainTail;
-        const drained = this.drainOutcomeByUri.get(uri);
-        if (drained) return drained;
+        const drained = this.drainOutcomeByEpoch.get(session);
+        if (drained) {
+          // 一次性结果：消费后清理（第二十一轮阻断 3）
+          this.drainOutcomeByEpoch.delete(session);
+          return await drained;
+        }
+        // 无 drain 记录（绑定内容从未进入排空，如新项目打开后从未编辑、
+        // reconcile 未完成即重置）：以「绑定内容是否已落盘」判定 —— 已提交
+        // 基线覆盖（revision + 内容指纹一致）则成功；恢复快照存在或基线未
+        // 覆盖则如实失败，绝不假报成功
+        const baseline = this.committedByUri.get(uri);
+        const fp = contentFingerprint(project);
+        const persisted =
+          fp !== null &&
+          baseline !== undefined &&
+          baseline !== null &&
+          baseline.revision >= project.revision &&
+          baseline.fingerprint === fp;
         if (this.recovery.has(uri)) {
           return {
             ok: false,
             code: 'storage-error',
             message: '项目未保存内容未能落盘（已保留为恢复快照），请重试',
+          };
+        }
+        if (!persisted) {
+          return {
+            ok: false,
+            code: 'storage-error',
+            message: '项目未保存内容未能落盘且无恢复快照，请重试',
           };
         }
         return { ok: true };
@@ -704,17 +749,16 @@ export class ProjectAutosaver {
   /**
    * 旧项目的排空：执行时以该 uri 的已提交基线做 CAS（在途结果已推进基线，不会冲突）。
    * 成功推进基线并清除该 uri 的恢复快照；失败把快照保留为恢复快照（内容不丢），
-   * 不污染当前项目状态。结果（含失败，第十九轮严重 3）记录到 drainOutcomeByUri，
-   * 供排队期间会话失效的 flush() 读取传播 —— drain 失败不再只写 recovery 静默
-   * 吞掉，正在等待的调用方如实收到失败。
+   * 不污染当前项目状态。结果（含失败）记录为该排空服务会话代的一次性结果
+   * （drainOutcomeByEpoch，第二十一轮阻断 3）：同 uri 多代 drain 各占独立键，
+   * 后代成功不覆盖前代失败；由绑定同一会话代的 flush 读取后消费（删除）。
    */
-  private enqueueDrain(uri: string, snapshot: Project): void {
+  private enqueueDrain(uri: string, snapshot: Project, epoch: number): void {
     if (!this.store) return;
-    void this.enqueue(async () => {
-      if (this.disposed) return;
+    const promise = this.enqueue<SaveOutcome>(async () => {
+      if (this.disposed) return { ok: true };
       const expected = this.committedByUri.get(uri)?.revision ?? null;
       const result = await this.storeSave(snapshot, expected);
-      this.drainOutcomeByUri.set(uri, result);
       if (result.ok) {
         const prev = this.committedByUri.get(uri);
         this.committedByUri.set(uri, {
@@ -725,7 +769,15 @@ export class ProjectAutosaver {
       } else {
         this.recovery.set(uri, snapshot);
       }
+      return result;
     });
+    this.drainOutcomeByEpoch.set(epoch, promise);
+    if (this.drainOutcomeByEpoch.size > ProjectAutosaver.DRAIN_OUTCOME_KEEP) {
+      // 防御性上限：淘汰最旧代记录（flush 读不到时回落到恢复快照/基线判定，
+      // 不会误报成功）
+      const oldest = Math.min(...this.drainOutcomeByEpoch.keys());
+      this.drainOutcomeByEpoch.delete(oldest);
+    }
   }
 
   /** 打开时与存储对账：决定真实状态（首存 / 冲突 / 恢复快照 / 一致），不预设「已保存」。 */

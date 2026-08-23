@@ -1620,3 +1620,142 @@ describe('ProjectAutosaver：flush 排队期间会话失效（第十九轮严重
     autosaver.dispose();
   });
 });
+
+describe('ProjectAutosaver：flush 任务内保存挂起期间会话失效与代际隔离（第二十一轮阻断 2/3）', () => {
+  it('保存 await 期间编辑+关闭：flush 任务保存 rev1 挂起时继续编辑 rev2 并 reset() → 任务复验失败转 superseded，传播本代 drain（rev2 保存失败）而非以 rev1 落盘放行', async () => {
+    const editor = new SceneEditor();
+    const store = await ProjectStore.create(DB);
+    expect(store).not.toBeNull();
+    if (!store) return;
+    openStores.push(store);
+    const realSave = store.save.bind(store);
+    const A_URI = 'lumora://project/a';
+    // 仅 A 的 rev1 保存（flush 任务内、expected=0）挂起 150ms 后真实落盘；
+    // 关闭触发的 rev2 superseding drain（expected=1）失败 —— 修复前 flush 任务
+    // 以 rev1 落盘成功返回 done/ok，外层对「已关闭」假报成功放行
+    store.save = async (p, expected) => {
+      if (p.uri !== A_URI) return realSave(p, expected);
+      if (expected === 0) {
+        await new Promise((r) => setTimeout(r, 150));
+        return realSave(p, expected);
+      }
+      if (expected === 1) return { ok: false, code: 'quota-exceeded', message: '模拟配额不足' };
+      return realSave(p, expected);
+    };
+    const autosaver = new ProjectAutosaver(editor, store, { debounceMs: DEBOUNCE });
+    editor.events.on('project:changed', ({ project }) => autosaver.changed(project));
+
+    editor.openProject(createSampleProject(A_URI));
+    await settle(5); // reconcile 首存（rev0, expected null）完成
+    editor.addObject(createGroupObject()); // rev1 → pending 捕获
+    const flushing = autosaver.flush();
+    await settle(0); // 让 flush 任务开始执行：saveSnapshot(rev1) 挂起在 150ms 保存中
+    editor.addObject(createGroupObject()); // rev2 —— 保存 await 期间继续编辑
+    editor.reset(); // 关闭：close() → 会话递增 + enqueueDrain(A rev2)（本代 drain）
+    const outcome = await flushing;
+
+    // 修复前：rev1 落盘成功 → 任务返回 done/ok → flush 放行假成功；
+    // 修复后：保存后复验失败 → superseded → 传播本代 drain 的失败
+    expect(outcome).toEqual({ ok: false, code: 'quota-exceeded', message: '模拟配额不足' });
+    // rev1 已落盘（flush 任务在途保存），rev2 未落盘且保留为恢复快照 —— 不丢、不假报
+    const storedA = await loadStored(store, A_URI);
+    expect(storedA?.revision).toBe(1);
+    expect(autosaver.getRecovery(A_URI)).not.toBeNull();
+    autosaver.dispose();
+  });
+
+  it('新项目 reconcile 前同步 flush+reset：B 打开后从未编辑（close 无 drain 记录），同步 flush 后被 reset 作废 → 无 drain 记录时以基线判定如实失败（storage-error），不得放行「从未落盘」的假成功', async () => {
+    const editor = new SceneEditor();
+    const store = await ProjectStore.create(DB);
+    expect(store).not.toBeNull();
+    if (!store) return;
+    openStores.push(store);
+    const realLoad = store.load.bind(store);
+    let delayFirstLoad = true;
+    const A_URI = 'lumora://project/a';
+    const B_URI = 'lumora://project/b';
+    // 首轮 reconcile 的 load 延迟 120ms 占住串行链：open(B) 后 reconcile(B)
+    // 尚未执行时 flush 已入队，随后的 reset() 使任务与对账全部过期
+    store.load = async (uri) => {
+      if (delayFirstLoad) {
+        delayFirstLoad = false;
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      return realLoad(uri);
+    };
+    const autosaver = new ProjectAutosaver(editor, store, { debounceMs: DEBOUNCE });
+    editor.events.on('project:changed', ({ project }) => autosaver.changed(project));
+
+    editor.openProject(createSampleProject(A_URI));
+    await settle(5);
+    editor.addObject(createGroupObject()); // A rev1 → pending 捕获
+    editor.openProject(createSampleProject(B_URI)); // 排空 A rev1（本代 drain）+ reconcile(B) 排队
+    const flushing = autosaver.flush(); // 绑定 {B, session}：B 基线 null 视为脏 → 入队
+    editor.reset(); // 关闭：B 从未编辑 → 无 drain 记录；会话递增使任务/对账全部过期
+    const outcome = await flushing;
+
+    // 修复前：任务对 uri 不匹配/无脏快照直接 {ok:true}，假报 B 已落盘；
+    // 修复后：无 drain 记录 → 已提交基线未覆盖 → 如实失败（recovery 也不存在）
+    expect(outcome).toEqual({
+      ok: false,
+      code: 'storage-error',
+      message: '项目未保存内容未能落盘且无恢复快照，请重试',
+    });
+    // A 的排空成功落盘（不丢）；B 从未落盘（对账因会话失效作废，无假成功写入）
+    const storedA = await loadStored(store, A_URI);
+    expect(storedA?.revision).toBe(1);
+    const storedB = await loadStored(store, B_URI);
+    expect(storedB).toBeNull();
+    autosaver.dispose();
+  });
+
+  it('同 URI 前代失败、后代成功：前代 drain（A rev1）失败后同 uri 后代 drain（A rev2）成功 → 等待中的 flush 仍返回前代失败，后代成功不覆盖；恢复快照被后代清除', async () => {
+    const editor = new SceneEditor();
+    const store = await ProjectStore.create(DB);
+    expect(store).not.toBeNull();
+    if (!store) return;
+    openStores.push(store);
+    const realLoad = store.load.bind(store);
+    const realSave = store.save.bind(store);
+    let delayFirstLoad = true;
+    const A_URI = 'lumora://project/a';
+    const B_URI = 'lumora://project/b';
+    const C_URI = 'lumora://project/c';
+    store.load = async (uri) => {
+      if (delayFirstLoad) {
+        delayFirstLoad = false;
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      return realLoad(uri);
+    };
+    // A 的 rev1 保存（前代 drain）失败；rev2 保存（后代 drain）成功 ——
+    // 修复前按 uri 记录 drain 结果：后代成功覆盖前代失败，F1 误读后代结果
+    store.save = async (p, expected) => {
+      if (p.uri !== A_URI) return realSave(p, expected);
+      if (p.revision === 1) return { ok: false, code: 'quota-exceeded', message: '模拟配额不足' };
+      return realSave(p, expected);
+    };
+    const autosaver = new ProjectAutosaver(editor, store, { debounceMs: DEBOUNCE });
+    editor.events.on('project:changed', ({ project }) => autosaver.changed(project));
+
+    editor.openProject(createSampleProject(A_URI));
+    await settle(5);
+    editor.addObject(createGroupObject()); // A rev1 → pending 捕获
+    const flushing = autosaver.flush(); // F1 排队（链被慢 reconcile 占用）
+    editor.openProject(createSampleProject(B_URI)); // 前代 drain（A rev1，epoch 1）→ 失败
+    editor.openProject(createSampleProject(A_URI)); // 回到 A：reconcile 作废
+    editor.addObject(createGroupObject()); // 后代 A 编辑 rev1
+    editor.addObject(createGroupObject()); // 后代 A 编辑 rev2 → pending 捕获
+    editor.openProject(createSampleProject(C_URI)); // 后代 drain（A rev2，epoch 3）→ 成功
+    const outcome = await flushing;
+
+    // F1 绑定第一代会话：读取本代 drain 结果 —— 前代失败如实传播，
+    // 不被同 uri 后代的成功覆盖（修复前按 uri 覆盖后误报成功）
+    expect(outcome).toEqual({ ok: false, code: 'quota-exceeded', message: '模拟配额不足' });
+    // 后代 drain 成功落盘（rev2），恢复快照已被后代清除 —— 但 F1 结果不受翻转
+    const storedA = await loadStored(store, A_URI);
+    expect(storedA?.revision).toBe(2);
+    expect(autosaver.getRecovery(A_URI)).toBeNull();
+    autosaver.dispose();
+  });
+});

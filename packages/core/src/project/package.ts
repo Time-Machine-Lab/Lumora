@@ -313,39 +313,48 @@ function isSafeExportKey(key: string): boolean {
 }
 
 /** 凭据形态判定（第十五轮阻断 1 + 第十七轮阻断 1/严重 2 + 第十八轮重构 +
- *  第十九轮阻断 1 重写）：公开声明路径任意层出现完整凭据形态即整条声明拒绝 ——
- *  「凭据永不导出」不依赖插件自觉声明 privateSettings，显式声明凭据键也不是
- *  放行依据。判定为 NFKC 规范化 + 整段 token 化（第十八轮）+ 任意 token 位置
- *  高置信凭据词（第十九轮）：
- *  1. 任意 token 位置单复数归一后与高置信凭据词比对（password/passwd/apikey/
- *     privatekey/secret/token/credential(s)/auth），命中即拒绝 —— 不再只在
- *     整键单 token 时检查，多 token 键（databasePassword/passwordHash/
- *     password1/bearerToken/sessionToken/oauthToken/jwtSecret/webhookSecret/
- *     secretValue/userCredentials/token1）不再依赖固定相邻词对；
- *  2. 相邻 token 对再与凭据复合序列比对（api+key、pass+word、private+key、
- *     access/refresh+token、client+secret、stored+password、auth+header、
- *     private+setting）—— api_key/pass_word/private_key 等无高置信词但语义
- *     明确的复合键仍拒绝；
- *  3. 非 ASCII 一律拒绝（fail-closed）：密码/访问令牌/密钥等 ASCII 分词器
- *     产生零 token，混拼段非 ASCII 部分也会被静默丢弃 —— 无法完整判定凭据
- *     形态即拒绝。
+ *  第十九轮阻断 1 + 第二十一轮严重 4/5、阻断 1 重写）：公开声明路径任意层出现
+ *  完整凭据形态即整条声明拒绝 —— 「凭据永不导出」不依赖插件自觉声明
+ *  privateSettings，显式声明凭据键也不是放行依据。判定为 NFKC 规范化 + 整段
+ *  token 化 + 分轨（第二十一轮严重 4）：
+ *  1. 高置信凭据词（password/passwd/secret/credential(s)/apikey/privatekey）
+ *     任意 token 位置单复数归一后命中即拒绝 —— 多 token 键
+ *     （databasePassword/passwordHash/secretValue/userCredentials 等）不再
+ *     依赖固定相邻词对；
+ *  2. 歧义词（token/auth）分轨：语义两可（tokenBudget/authMode 为合法公开
+ *     字段），仅 standalone（整键仅该词）、数字后缀（token1/auth0）或处于
+ *     明确敏感组合（相邻复合对）时拒绝；
+ *  3. 相邻 token 对与凭据复合序列比对（api+key、pass+word、private+key、
+ *     access/refresh/bearer/oauth/session+token、client+secret、
+ *     stored+password、auth+header、private+setting）—— 无高置信词但语义
+ *     明确的复合键（api_key/pass_word/authHeader/bearerToken）仍拒绝；
+ *  4. 无边界复合形态（第二十一轮阻断 1）：NFKC+小写+去分隔后的键与派生候选
+ *     （复合对拼接 + 明确敏感限定组合，如 clientsecret/storedpassword/
+ *     accesstoken/jwtsecret/usercredentials）做包含匹配 —— 全小写/全大写/
+ *     全角连写不再因解析成单 token 而绕过；
+ *  5. 显式 CJK 凭据词（第二十一轮严重 5）：非 ASCII 键不再 blanket 拒绝
+ *     （主题/caféMode 等合法键放行），仅 NFKC 后包含密码/口令/令牌/密钥/
+ *     凭据/私钥等敏感词时拒绝 —— 密码/访问令牌/密钥不得因分词为空放行。
  *  任意命中即拒绝。tokenizerConfig/tokenizerModel/authorName/authorizationMode/
  *  apiVersion/MONKEYPATCH/HOTKEYMAP/keyboardLayout 等仅含 tokenizer/author/api
- *  等非凭据词的键放行；tokenBudget/authMode 因含 token/auth 高置信词，自
- *  第十九轮起拒绝。连续大写缩写保留为一个 token（APIKey → api|key、PASSWORD
- *  → password、API_KEY → api|key），不再按单个大写字母拆分导致全大写/缩写键
- *  漏判（第十八轮阻断 1）。 */
-const CREDENTIAL_EXACT_KEYS = new Set([
+ *  等非凭据词的键放行；tokenBudget/authMode 按分轨恢复放行（第二十一轮严重 4）。
+ *  连续大写缩写保留为一个 token（APIKey → api|key、PASSWORD → password、
+ *  API_KEY → api|key），不再按单个大写字母拆分导致全大写/缩写键漏判
+ *  （第十八轮阻断 1）。 */
+/** 高置信凭据词：任意 token 位置命中即拒绝（语义无歧义） */
+const CREDENTIAL_HIGH_CONFIDENCE = new Set([
   'password',
   'passwd',
   'apikey',
   'privatekey',
   'secret',
-  'token',
   'credential',
   'credentials',
-  'auth',
 ]);
+
+/** 歧义词：token/auth 在配置键中语义两可（tokenBudget/authMode 合法），仅
+ *  standalone、数字后缀或处于明确敏感组合（相邻复合对）时拒绝 */
+const CREDENTIAL_AMBIGUOUS = new Set(['token', 'auth']);
 
 const CREDENTIAL_COMPOUND_PAIRS: ReadonlyArray<readonly [string, string]> = [
   ['api', 'key'],
@@ -353,11 +362,64 @@ const CREDENTIAL_COMPOUND_PAIRS: ReadonlyArray<readonly [string, string]> = [
   ['private', 'key'],
   ['access', 'token'],
   ['refresh', 'token'],
+  ['bearer', 'token'],
+  ['oauth', 'token'],
+  ['session', 'token'],
   ['client', 'secret'],
   ['stored', 'password'],
   ['auth', 'header'],
   ['private', 'setting'],
 ];
+
+/** 明确敏感限定组合（限定词 + 高置信词）：用于无边界复合形态候选派生 ——
+ *  databasePassword/jwtSecret/webhookSecret/userCredentials/secretValue 的
+ *  全小写连写（databasepassword/jwtsecret/webhooksecret/usercredentials/
+ *  secretvalue）不得因解析成单 token 而绕过 */
+const CREDENTIAL_SENSITIVE_COMBOS: ReadonlyArray<readonly [string, string]> = [
+  ['jwt', 'secret'],
+  ['webhook', 'secret'],
+  ['user', 'credentials'],
+  ['secret', 'value'],
+];
+
+/** 无边界复合形态候选（第二十一轮阻断 1）：由复合对拼接与敏感限定组合派生，
+ *  长候选在前 —— NFKC+小写+去分隔后的键做包含匹配。候选表显式可审计 */
+const CREDENTIAL_COLLAPSED_FORMS: ReadonlyArray<string> = (() => {
+  const forms = new Set<string>();
+  for (const [a, b] of CREDENTIAL_COMPOUND_PAIRS) forms.add(a + b);
+  for (const [a, b] of CREDENTIAL_SENSITIVE_COMBOS) forms.add(a + b);
+  return [...forms].sort((x, y) => y.length - x.length);
+})();
+
+/** 显式 CJK 凭据词（第二十一轮严重 5）：NFKC 后的键包含即拒绝。ASCII 分词器
+ *  对 CJK 产生零 token，凭据判定只能靠显式敏感词表（fail-closed 仅对敏感词，
+ *  不再 blanket 拒绝全部非 ASCII） */
+const CREDENTIAL_CJK_WORDS = ['密码', '口令', '令牌', '密钥', '凭据', '私钥'];
+
+function containsCredentialCjkWord(key: string): boolean {
+  const nfkc = key.normalize('NFKC');
+  for (const word of CREDENTIAL_CJK_WORDS) {
+    if (nfkc.includes(word)) return true;
+  }
+  return false;
+}
+
+/** 无边界规范化：NFKC + 小写 + 去分隔符 —— 全小写/全大写/全角/分隔符变体
+ *  收敛到同一无边界形态，供派生候选包含匹配 */
+function collapsedCredentialForm(key: string): string {
+  return key
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function hasCollapsedCredentialForm(key: string): boolean {
+  const collapsed = collapsedCredentialForm(key);
+  for (const form of CREDENTIAL_COLLAPSED_FORMS) {
+    if (collapsed.includes(form)) return true;
+  }
+  return false;
+}
 
 /** 完整凭据词匹配（含单复数归一）：token 与基准词相等，或 token 是规则复数
  *  （词尾 -s，长度 > 3）剥尾后与基准词相等（tokens→token、secrets→secret、
@@ -383,18 +445,33 @@ function credentialTokens(key: string): string[] {
 }
 
 /** 对完整 token 列表做凭据形态判定（单键与路径声明共用；路径跨 segment 拼接后
- *  复用同一判定，['api','key'] ≡ 'apikey' ≡ api_key，第十九轮阻断 2）。 */
+ *  复用同一判定，['api','key'] ≡ 'apikey' ≡ api_key，第十九轮阻断 2）。分轨：
+ *  高置信词任意位置拒绝；歧义词（token/auth）仅 standalone/数字后缀/明确敏感
+ *  组合拒绝（第二十一轮严重 4）；无边界复合形态与 CJK 敏感词由派生候选/显式
+ *  词表覆盖（第二十一轮阻断 1、严重 5）。 */
 function isCredentialShapeTokens(joined: string, tokens: string[]): boolean {
-  // 非 ASCII 一律拒绝（fail-closed，第十九轮阻断 1）：密码/访问令牌/密钥等
-  // ASCII 分词器产生零 token，混拼段（['profile','密码']）非 ASCII 部分也会被
-  // 静默丢弃 —— 无法完整判定凭据形态即拒绝（/u 模式 \w 不覆盖 CJK，用
-  // 无控制字符的 U+00A0+ 范围显式检查；全角键 NFKC 后已归为 ASCII，走下方
-  // 正常判定）
-  if (/[^ -~]/.test(joined.normalize('NFKC'))) return true;
+  // 显式 CJK 凭据词（第二十一轮严重 5）：NFKC 后包含即拒绝；主题/caféMode 等
+  // 合法非 ASCII 键不再因 blanket fail-closed 被误删
+  if (containsCredentialCjkWord(joined)) return true;
   for (const token of tokens) {
-    for (const base of CREDENTIAL_EXACT_KEYS) {
+    for (const base of CREDENTIAL_HIGH_CONFIDENCE) {
       if (matchesCredentialWord(token, base)) return true;
     }
+  }
+  // 歧义词分轨：standalone（整键仅该词一个 token）或数字后缀时拒绝；其余情况
+  // （tokenBudget/authMode 等）由下方相邻复合对检查决定
+  const isAmbiguousWord = (t: string): boolean => {
+    for (const base of CREDENTIAL_AMBIGUOUS) {
+      if (matchesCredentialWord(t, base)) return true;
+    }
+    return false;
+  };
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (!isAmbiguousWord(token)) continue;
+    if (tokens.length === 1) return true;
+    const next = tokens[i + 1];
+    if (next !== undefined && /^[0-9]+$/.test(next)) return true;
   }
   for (let i = 0; i < tokens.length - 1; i += 1) {
     const a = tokens[i];
@@ -403,6 +480,9 @@ function isCredentialShapeTokens(joined: string, tokens: string[]): boolean {
       if (matchesCredentialWord(a, x) && matchesCredentialWord(b, y)) return true;
     }
   }
+  // 无边界复合形态（第二十一轮阻断 1）：clientsecret/CLIENTSECRET/全角连写等
+  // 解析成单 token 的复合键，对派生候选做包含匹配
+  if (hasCollapsedCredentialForm(joined)) return true;
   return false;
 }
 
