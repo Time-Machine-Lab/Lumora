@@ -667,18 +667,26 @@ export class ProjectAutosaver {
       if (!current || fpEqual(curFp, snapFp) || fpEqual(curFp, baseFp)) {
         // 编辑器 == 快照、编辑器停留在旧基线（快照是唯一新内容）、或非当前项目：
         // 按原基线保存快照
+        // 第二十九轮阻断 4：执行前复验该代 fork 仍在 —— 排队期间被清除/更新的
+        // 恢复快照不得再落盘（陈旧内容不得以旧 CAS 写回磁盘制造假冲突）
+        if (!this.hasRecoveryGeneration(uri, generation)) {
+          return { ok: false, code: 'revision-conflict', message: '恢复快照已被清除或更新，本次重试已取消' };
+        }
         const result = await this.storeSave(snapshot, expected);
         if (result.ok) {
-          // 保存 await 期间该代恢复记录已被清除或更新：本次重试取消（磁盘已
-          // 推进无害 —— 内容真实落盘；不触碰 latch/恢复区，新 fork 可继续重试）
+          // 磁盘事实先行（第二十九轮阻断 4）：落盘成功即推进基线 —— 无论后续
+          // latch/UI 判定如何，后续保存的 CAS 都不得按旧基线执行
+          advanceBaseline(snapshot, snapFp);
+          // 保存 await 期间该代记录已被清除或更新：本次重试取消（不清除新记录、
+          // 不 latch/不 switchOpen —— 内容已真实落盘，恢复区维持现状，新 fork
+          // 可继续重试）
           if (!this.hasRecoveryGeneration(uri, generation)) {
             return { ok: false, code: 'revision-conflict', message: '恢复快照已被清除或更新，本次重试已取消' };
           }
-          advanceBaseline(snapshot, snapFp);
           if (!verifyNoChange(current)) return latchStale();
           // 落盘的就是该恢复快照本身 → 只清除本代 fork（第二十八轮阻断 2：
           // 同 uri 其他 fork 保留）
-          this.clearRecoveryGeneration(uri, generation);
+          this.deleteRecoveryGeneration(uri, generation);
           if (this.recovery.has(uri)) {
             // 同 uri 其他 fork 仍在恢复区：锁存 recovery-available，不
             // switchOpen —— switchOpen 的 resetTo 会清空整个 uri 的恢复项，
@@ -700,16 +708,23 @@ export class ProjectAutosaver {
       if (fpEqual(snapFp, baseFp)) {
         // 快照未带来新内容：按原基线把编辑器内容向前保存（await 并传播最终结果；
         // revision 反转时保存失败如实返回，快照保留不删除 —— 不假成功）
+        // 第二十九轮阻断 4：执行前复验该代 fork 仍在 —— 排队期间被清除/更新的
+        // 恢复快照不得再落盘（陈旧内容不得以旧 CAS 写回磁盘制造假冲突）
+        if (!this.hasRecoveryGeneration(uri, generation)) {
+          return { ok: false, code: 'revision-conflict', message: '恢复快照已被清除或更新，本次重试已取消' };
+        }
         const result = await this.storeSave(current!, expected);
         if (result.ok) {
-          // 第二十八轮严重 6：保存 await 期间该代恢复记录已被清除/更新 → 取消
+          // 磁盘事实先行（第二十九轮阻断 4）：推进基线后再判定 latch/UI
+          advanceBaseline(current!, contentFingerprint(current!));
+          // 保存 await 期间该代记录已被清除/更新 → 取消（不清除新记录、不 latch
+          // —— 内容已真实落盘，恢复区维持现状）
           if (!this.hasRecoveryGeneration(uri, generation)) {
             return { ok: false, code: 'revision-conflict', message: '恢复快照已被清除或更新，本次重试已取消' };
           }
-          advanceBaseline(current!, contentFingerprint(current!));
           if (!verifyNoChange(current!)) return latchStale();
           // 快照内容 == 已提交基线内容（快照未带来新内容，已落盘）→ 只清除本代
-          this.clearRecoveryGeneration(uri, generation);
+          this.deleteRecoveryGeneration(uri, generation);
           if (this.recovery.has(uri)) {
             // 同 uri 其他 fork 仍在恢复区：锁存 recovery-available，不报 clean
             const message =
@@ -755,12 +770,52 @@ export class ProjectAutosaver {
     return this.recovery.get(uri)?.has(generation) ?? false;
   }
 
-  /** 清除指定代恢复 fork；该 uri 无剩余 fork 时删除外层键。 */
-  private clearRecoveryGeneration(uri: string, generation: number): void {
+  /** 删除指定代恢复 fork（内部原语）；该 uri 无剩余 fork 时删除外层键。 */
+  private deleteRecoveryGeneration(uri: string, generation: number): void {
     const forks = this.recovery.get(uri);
     if (!forks) return;
     forks.delete(generation);
     if (forks.size === 0) this.recovery.delete(uri);
+  }
+
+  /** 恢复源记录（「另存副本」消费决策，第二十九轮阻断 3）：最新代 fork 的快照
+   *  与 {generation, fingerprint} 绑定 —— 消费方只清除这一代，同 uri 其他历史
+   *  fork（更早保存失败的内容）保留在恢复区、仍可恢复。 */
+  getRecoverySource(
+    uri: string,
+  ): { snapshot: Project; generation: number; fingerprint: string | null } | null {
+    const record = this.latestRecoveryRecord(uri);
+    if (!record) return null;
+    return { snapshot: record.snapshot, generation: record.generation, fingerprint: record.fingerprint };
+  }
+
+  /**
+   * 清除指定代恢复 fork（「另存副本」消费的那一代，第二十九轮阻断 3）：
+   * 同 uri 其他历史 fork 保留并继续锁存 recovery-available —— 保全「当代」
+   * 内容绝不沉没更早保存失败的旧内容（旧内容仅存于恢复区，仍可恢复）。
+   * fingerprint 绑定：该代记录已变化（被更新代替换）时不误删。
+   * 无剩余 fork 时与 clearRecovery 一致：解除锁存并按现状重报状态。
+   */
+  clearRecoveryGeneration(uri: string, generation: number, fingerprint: string | null): void {
+    const record = this.recovery.get(uri)?.get(generation);
+    if (!record) return;
+    if (fingerprint !== null && record.fingerprint !== fingerprint) return;
+    this.deleteRecoveryGeneration(uri, generation);
+    if (this.recovery.has(uri)) {
+      // 其他 fork 仍在恢复区：保持锁存 recovery-available（内容仍可恢复），
+      // 编辑动作不得自动解除解决入口
+      const message =
+        '该项目存在未保存的恢复快照（上次保存失败）。可「另存副本」保留未保存内容，或「重试保存」';
+      this.latched = { uri, code: 'recovery-available', message };
+      if (uri === this.currentUri) this.emit({ status: 'error', code: 'recovery-available', message });
+      return;
+    }
+    if (this.latched?.uri === uri && this.latched.code === 'recovery-available') this.latched = null;
+    if (uri === this.currentUri) {
+      const current = this.editor.getProject();
+      if (current && this.isUnsaved(current)) this.emit({ status: 'dirty' });
+      else this.emit(this.store ? { status: 'clean' } : { status: 'memory' });
+    }
   }
 
   /** 入录恢复 fork（第二十八轮阻断 2）：同指纹去重（同内容多次保存失败只保留
@@ -820,6 +875,18 @@ export class ProjectAutosaver {
     // （flush 需在 disposed 置位前读取编辑器项目），再移除监听
     const outcome = await this.flush();
     if (!outcome.ok) return outcome;
+    // 第二十九轮阻断 5：冲刷成功后仍有恢复 fork（任一 uri 的保存失败内容仅存
+    // 于恢复区）→ 拒绝 dispose —— 调用方保留运行时供用户「另存副本」/「重试
+    // 保存」解决，绝不因 teardown 沉没未落盘内容；冲刷已成功（当前内容已保全），
+    // 仅剩余 fork 未解决，锁存 recovery-available 呈现入口
+    if (this.recovery.size > 0) {
+      const message =
+        '存在未保存的恢复快照（上次保存失败），运行时已保留；请先「另存副本」或「重试保存」后再释放';
+      const uri = this.latched?.uri ?? [...this.recovery.keys()][0]!;
+      this.latched = { uri, code: 'recovery-available', message };
+      if (uri === this.currentUri) this.emit({ status: 'error', code: 'recovery-available', message });
+      return { ok: false, code: 'recovery-available', message };
+    }
     this.disposed = true;
     if (typeof window !== 'undefined') {
       window.removeEventListener('pagehide', this.handlePageHide);

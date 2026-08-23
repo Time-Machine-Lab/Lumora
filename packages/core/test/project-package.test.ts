@@ -1183,6 +1183,207 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
   });
 });
 
+describe('工程包构建：全小写复合凭据键字典分词兜底 + manifest 声明校验无条件化（第二十九轮阻断 1/2）', () => {
+  // 阻断 1：camelCase 分词无边界的全小写复合凭据键 —— 无边界形态候选表枚举
+  // 不可闭合（session|id/api|key|value/password|digest 等不在派生候选表），
+  // 字典分词任一分词命中 kind 词/根词/相邻复合对即拒绝
+  const LOWER_COMPOUND_LEAKS = [
+    'sessionid',
+    'sessionkey',
+    'cookieheader',
+    'apikeyvalue',
+    'apikeybackup',
+    'passworddigest',
+    'tokenpayload',
+    'clientsecretbackup',
+    'authheaderbackup',
+  ];
+
+  it('阻断 1：9 个全小写复合凭据键顶层声明一律拒绝，跨插件聚合上报', async () => {
+    const project = await buildFixtureProject();
+    const pluginData: Record<string, Record<string, string>> = {
+      'com.example': Object.fromEntries(LOWER_COMPOUND_LEAKS.map((key) => [key, `leak-${key}`])),
+    };
+    const error = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project, pluginData }, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': LOWER_COMPOUND_LEAKS },
+      }),
+    );
+    expect(error.declarations).toHaveLength(LOWER_COMPOUND_LEAKS.length);
+    for (const key of LOWER_COMPOUND_LEAKS) {
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(key) });
+    }
+    expect(error.message).toContain('凭据永不导出');
+  });
+
+  it('阻断 1：9 键嵌套路径声明（["profile", key]）一律拒绝（逐 segment 独立判定闭合）', async () => {
+    const project = await buildFixtureProject();
+    const pluginData = {
+      'com.example': { profile: Object.fromEntries(LOWER_COMPOUND_LEAKS.map((key) => [key, `n-${key}`])) },
+    };
+    const declarations: Array<readonly string[]> = LOWER_COMPOUND_LEAKS.map((key) => ['profile', key]);
+    const error = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project, pluginData }, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': declarations },
+      }),
+    );
+    expect(error.declarations).toHaveLength(LOWER_COMPOUND_LEAKS.length);
+    for (const key of LOWER_COMPOUND_LEAKS) {
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(['profile', key]) });
+    }
+  });
+
+  it('阻断 1：大小写/数字/环境后缀变体同样拒绝（SESSIONID/全角/SessionId/sessionid2/sessionidv2/sessionidprod），无边界归一收敛到同一判定', async () => {
+    const project = await buildFixtureProject();
+    const variants = [
+      'SESSIONID',
+      'SESSIONKEY',
+      'COOKIEHEADER',
+      'APIKEYVALUE',
+      'APIKEYBACKUP',
+      'PASSWORDDIGEST',
+      'TOKENPAYLOAD',
+      'CLIENTSECRETBACKUP',
+      'AUTHHEADERBACKUP',
+      'SessionId',
+      'ApiKeyValue',
+      'PasswordDigest',
+      'sessionid2',
+      'sessionidv2',
+      'sessionidprod',
+      'apikeyvalue2',
+      'apikeyvaluebeta',
+      'passworddigestv3',
+      'tokenpayload2',
+      'clientsecretbackupprod',
+      'authheaderbackup2',
+      'cookieheaderstage',
+      'ＡＰＩＫＥＹＶＡＬＵＥ', // 全角：NFKC 归一后同一无边界形态
+      'session_id',
+      'api.key.value',
+      'api-key-backup',
+    ];
+    const pluginData = { 'com.example': Object.fromEntries(variants.map((key) => [key, `v-${key}`])) };
+    const error = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project, pluginData }, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': variants },
+      }),
+    );
+    expect(error.declarations).toHaveLength(variants.length);
+    for (const key of variants) {
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(key) });
+    }
+  });
+
+  it('阻断 1：合法键与良性歧义键不受字典分词影响 —— 全量放行键（含 pass/render/passwordless/apiKeyboardLayout/tokenBudget 等）声明与数据无损往返', async () => {
+    const project = await buildFixtureProject();
+    const keepKeys = [
+      'passwordless',
+      'apiKeyboardLayout',
+      'accessTokenizerConfig',
+      'privateKeyboardShortcuts',
+      'compassWordWrap',
+      'tokenizerConfig',
+      'authorName',
+      'authorizationMode',
+      'apiVersion',
+      'apiVersion3',
+      'MONKEYPATCH',
+      'HOTKEYMAP',
+      'keyboardLayout',
+      'shortcutKey',
+      'shortcutKeys',
+      'renderPass',
+      'renderPass2',
+      'passCount',
+      'layout2',
+      'version2',
+      'wordWrap2',
+      'tokenBudget',
+      'authMode',
+      'cookieConsent',
+      'cookieSettings',
+      'sessionMode',
+      'pass',
+      'key',
+      'value',
+      'header',
+      'id',
+      'payload',
+      'digest',
+      'backup',
+      'profile',
+      'username',
+      'theme',
+      'model',
+    ];
+    const pluginData: Record<string, Record<string, string>> = {
+      'com.example': Object.fromEntries(keepKeys.map((key, i) => [key, `r29-keep-${i}`])),
+    };
+    const pkg = buildProjectPackage({ ...project, pluginData }, {
+      includePrivate: true,
+      publicKeysByPlugin: { 'com.example': keepKeys },
+    });
+    const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, Record<string, string>>)['com.example'];
+    for (const [key, value] of Object.entries(pluginData['com.example'])) {
+      expect(plugin[key]).toBe(value);
+    }
+    const json = JSON.stringify(parsed.project);
+    for (let i = 0; i < keepKeys.length; i += 1) {
+      expect(json).toContain(`r29-keep-${i}`);
+    }
+    // 含凭据子串的合法键不因分词误伤：passwordless 内 password|less 中 less 不在
+    // 字典、renderPass 中 pass 单段非凭据形态、apiKeyboardLayout 中 board 不在字典
+    expect(json).toContain('"passwordless"');
+    expect(json).toContain('"renderPass"');
+    expect(json).toContain('"apiKeyboardLayout"');
+    expect(json).toContain('"tokenBudget"');
+  });
+
+  it('阻断 2：pluginData 缺失/undefined/非普通对象时 manifest 声明校验仍无条件执行 —— 凭据键声明一律拒绝，合法声明构建成功且 pluginData 不进包', async () => {
+    const project = await buildFixtureProject();
+    const credentialDeclarations = { 'com.example': ['apiKey', 'tokenBudget'] };
+    // 缺失：project 无 pluginData 字段（声明凭据键 → 仍须失败，修复前静默成功；
+    // tokenBudget 为 BENIGN 白名单键，豁免不受影响）
+    const missingError = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project }, { includePrivate: true, publicKeysByPlugin: credentialDeclarations }),
+    );
+    expect(missingError.declarations).toHaveLength(1);
+    expect(missingError.declarations).toContainEqual({ plugin: 'com.example', path: '"apiKey"' });
+    // undefined：pluginData 显式为 undefined
+    const undefinedError = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project, pluginData: undefined as unknown as Project['pluginData'] }, {
+        includePrivate: true,
+        publicKeysByPlugin: credentialDeclarations,
+      }),
+    );
+    expect(undefinedError.declarations).toHaveLength(1);
+    // 非普通对象：pluginData 为数组（非 record 投影源）
+    const arrayError = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project, pluginData: ['not-a-record'] as unknown as Project['pluginData'] }, {
+        includePrivate: true,
+        publicKeysByPlugin: credentialDeclarations,
+      }),
+    );
+    expect(arrayError.declarations).toHaveLength(1);
+    // 合法声明 + pluginData 缺失：构建成功（无数据即无导出），pluginData 不进包
+    const pkg = buildProjectPackage(
+      { ...project },
+      { includePrivate: true, publicKeysByPlugin: { 'com.example': ['theme'] } },
+    );
+    const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect((parsed.project as { pluginData?: unknown }).pluginData).toBeUndefined();
+  });
+});
+
 describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻断 1 / 一般 8 / 一般 9）', () => {
   it('嵌套凭据不进包：objects/scenes/tracks/资产元数据中的契约外字段默认导出与 includePrivate 一律排除', async () => {
     const project = await buildFixtureProject();

@@ -46,9 +46,11 @@ export interface StudioRuntime {
    */
   closeProject(): Promise<{ ok: boolean; message?: string }>;
   getProject(): Project | null;
-  /** 卸载：冲刷未保存变更后释放全部资源。第二十八轮阻断 4：冲刷失败时返回
-   *  { ok: false, message } 且不 teardown —— 编辑器与存储保留，调用方可重试或
-   *  引导用户保全内容，绝不「假装已卸载」丢弃未落盘内容。 */
+  /** 卸载：冲刷未保存变更后释放全部资源。第二十八轮阻断 4 + 第二十九轮阻断 5：
+   *  冲刷失败或仍有未解决恢复 fork 时返回 { ok: false, message } 且不 teardown
+   *  —— 编辑器与存储保留，调用方（宿主）可重试或引导用户保全内容（另存副本 /
+   *  重试保存），绝不「假装已卸载」丢弃未落盘内容；宿主确需放弃时先显式
+   *  persistence.clearRecovery 丢弃恢复快照后再重试。 */
   dispose(): Promise<{ ok: boolean; message?: string }>;
 }
 

@@ -503,6 +503,69 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
     }
   });
 
+  it('「另存副本」多 fork：只清被消费的当代，历史 fork 保留并继续锁存 recovery-available（第二十九轮阻断 3）', async () => {
+    const handle = renderStudio();
+    const runtime = await waitPersistence(handle);
+    const persistence = runtime.persistence;
+    const store = (persistence as unknown as { store: ProjectStorage | null }).store!;
+    const A = 'lumora://project/multifork';
+    const base = createSampleProject(A, '多fork项目');
+    runtime.openProject(base);
+    await waitFor(() => expect(screen.getByTestId('save-state-badge')).toHaveTextContent('已保存'));
+
+    // A 的保存全部失败：两次「编辑→切换」产生两个内容不同的恢复 fork（base+1 / base+2）
+    const realSave = store.save.bind(store);
+    store.save = async (p, expected) => {
+      if (p.uri === A && p.revision >= 1) {
+        return { ok: false, code: 'storage-error', message: '模拟存储错误' };
+      }
+      return realSave(p, expected);
+    };
+    runtime.editor.addObject(createGroupObject()); // rev1（内容 base+1）
+    runtime.editor.openProject(createSampleProject('lumora://project/multifork-b', 'B'));
+    await waitFor(() => expect(persistence.getRecoverySnapshot(A)).not.toBeNull());
+    expect(persistence.getRecoverySnapshot(A)!.objects.length).toBe(base.objects.length + 1);
+
+    // 重开 A → 锁存 recovery-available（保存失败徽标 + 解决按钮）
+    runtime.editor.openProject(base);
+    await waitFor(() => expect(screen.getByTestId('save-state-badge')).toHaveTextContent('保存失败'));
+    runtime.editor.addObject(createGroupObject());
+    runtime.editor.addObject(createGroupObject()); // rev2（内容 base+2）
+    runtime.editor.openProject(createSampleProject('lumora://project/multifork-c', 'C'));
+    await waitFor(() => {
+      const latest = persistence.getRecoverySnapshot(A);
+      expect(latest).not.toBeNull();
+      expect(latest!.objects.length).toBe(base.objects.length + 2);
+    });
+
+    // 恢复保存；重开 A 呈现最新代 fork 的解决入口
+    store.save = realSave;
+    runtime.editor.openProject(base);
+    await waitFor(() => expect(screen.getByTestId('save-state-badge')).toHaveTextContent('保存失败'));
+
+    // 点击「另存副本」：源 = 最新代 fork（base+2），只清除当代
+    screen.getByTestId('save-saveas').click();
+    await waitFor(() => expect(screen.getByText(/未保存更改已另存为/)).toBeInTheDocument());
+    const copy = runtime.getProject()!;
+    expect(copy.name).toBe('多fork项目 副本');
+    expect(copy.uri).not.toBe(A);
+    expect(copy.objects.length).toBe(base.objects.length + 2);
+    // 历史 fork（base+1）保留 —— 修复前 clearRecovery 清空该 uri 全部 fork，
+    // 更早保存失败的内容从此沉没
+    const remaining = persistence.getRecoverySnapshot(A);
+    expect(remaining).not.toBeNull();
+    expect(remaining!.objects.length).toBe(base.objects.length + 1);
+    await waitFor(
+      () => expect(screen.getByTestId('save-state-badge')).toHaveTextContent('已保存'),
+      { timeout: 4000 },
+    );
+
+    // 重新打开 A：历史 fork 仍锁存 recovery-available，可继续恢复
+    runtime.editor.openProject(base);
+    await waitFor(() => expect(screen.getByTestId('save-state-badge')).toHaveTextContent('保存失败'));
+    expect(persistence.getRecoverySnapshot(A)!.objects.length).toBe(base.objects.length + 1);
+  });
+
   it('「最近项目复制」分支：副本写入成功但 loadProject 返回 ok:false → 清理副本并提示错误，绝不报成功（第十二轮一般 #6）', async () => {
     const handle = renderStudio();
     const runtime = await waitPersistence(handle);

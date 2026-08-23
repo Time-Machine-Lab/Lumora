@@ -421,6 +421,145 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
   }
 });
 
+test('第二十九轮 e2e：真实 manifest → ProjectMenu → includePrivate 下载链路 —— 声明 BENIGN 公开键随包往返，B1/S7/CJK 凭据键与未注册/缺 manifest 命名空间全部剥离', async ({ page }) => {
+  const settingsId = 'com.example.settings';
+  const unregisteredId = 'com.example.ai-assistant';
+  const noManifestId = 'com.example.nomanifest';
+  // 第二十九轮阻断 1 矩阵：无边界全小写复合凭据键
+  const b1 = [
+    'sessionid',
+    'sessionkey',
+    'cookieheader',
+    'apikeyvalue',
+    'apikeybackup',
+    'passworddigest',
+    'tokenpayload',
+    'clientsecretbackup',
+    'authheaderbackup',
+  ];
+  // S7 矩阵：session/cookie 系列（第二十八轮严重 7）
+  const s7 = ['session', 'sessionId', 'sessionKey', 'cookie', 'cookies', 'cookieHeader', 'setCookie', 'pass2'];
+  // CJK：简体敏感词（第二十一轮严重 5）+ 繁体/日文/韩文根词（第二十八轮阻断 1）
+  const cjk = ['密码', '访问令牌', '密钥', '私鑰', '秘密鍵', '認証トークン', '비밀번호'];
+  const benign = ['tokenBudget', 'authMode', 'cookieConsent', 'cookieSettings', 'sessionMode'];
+  const declared = ['theme', 'model', ...benign];
+  const settings: Record<string, string> = { theme: 'dark', model: 'claude-sonnet-5', serverUrl: 'https://settings.example.internal' };
+  for (const [i, key] of [...b1, ...s7, ...cjk].entries()) settings[key] = `sk-e2e-${i.toString().padStart(2, '0')}`;
+  for (const [i, key] of benign.entries()) settings[key] = `ok-e2e-${i}`;
+  const tmpDir = join(HERE, '.tmp');
+  mkdirSync(tmpDir, { recursive: true });
+  const sourcePath = join(tmpDir, 'tml53-round29-source.lumora');
+  const sourceEditor = new SceneEditor();
+  sourceEditor.openProject(createSampleProject());
+  const sourcePkg = buildProjectPackage(
+    { ...sourceEditor.getProject()!, uri: 'lumora://project/round29-source', name: '第二十九轮源项目' },
+    { includePrivate: true },
+  );
+  sourcePkg.project.pluginData = {
+    [settingsId]: settings,
+    [unregisteredId]: { theme: 'dark', apiKey: 'sk-e2e-unregistered' },
+    [noManifestId]: { theme: 'dark', apiKey: 'sk-e2e-nomanifest' },
+  };
+  writeFileSync(sourcePath, serializeProjectPackage(sourcePkg), 'utf8');
+
+  // 浏览器插件注册（真实 manifest）：设置插件激活；缺 manifest 插件注册即失败
+  await page.goto('/');
+  await expect(page.getByTestId('studio-empty-hint')).toBeVisible();
+  await page.getByTestId('open-plugin-manager').click();
+  await expect(page.getByTestId('plugin-state-com.example.settings')).toContainText('运行中');
+  await expect(page.locator('[data-testid^="plugin-reason-"]').first()).toContainText('Manifest 非法');
+  await page.getByTestId('close-plugin-manager').click();
+  await expect(page.getByTestId('plugin-manager')).not.toBeVisible();
+
+  // 导入源项目：插件私有设置（含凭据矩阵）进入编辑器与本地持久化
+  await page.getByTestId('project-menu').click();
+  await page.setInputFiles('[data-testid="project-import-input"]', sourcePath);
+  await expect(page.getByTestId('studio-empty-hint')).not.toBeVisible();
+  await expect(page.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 10_000 });
+
+  // includePrivate 导出：真实 manifest 声明投影，经 ProjectMenu 产生下载
+  await page.getByTestId('project-menu').click();
+  await page.getByTestId('project-export-include-private').check();
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByTestId('project-export').click();
+  const download = await downloadPromise;
+  const exportPath = join(tmpDir, 'tml53-round29-export.lumora');
+  await download.saveAs(exportPath);
+  const text = readFileSync(exportPath, 'utf8');
+  const pkg = JSON.parse(text) as LumoraPackage;
+
+  // 声明的 BENIGN 公开键随包往返，值逐项一致
+  const outSettings = (pkg.project.pluginData as Record<string, Record<string, string>> | undefined)?.[settingsId];
+  expect(outSettings).toBeDefined();
+  for (const key of declared) expect(outSettings![key]).toBe(settings[key]!);
+  // privateSettings 声明（serverUrl）不进包
+  expect(outSettings!['serverUrl']).toBeUndefined();
+  // B1/S7/CJK 凭据键名与全部凭据值：包内不存在
+  for (const key of [...b1, ...s7, ...cjk]) {
+    expect(JSON.stringify(outSettings)).not.toContain(JSON.stringify(key));
+  }
+  for (let i = 0; i < b1.length + s7.length + cjk.length; i++) {
+    expect(text).not.toContain(`sk-e2e-${i.toString().padStart(2, '0')}`);
+  }
+  // 未注册命名空间 + 缺 manifest 命名空间：整段排除（fail-closed），
+  // pluginData 仅剩真实 manifest 声明的命名空间
+  expect(Object.keys(pkg.project.pluginData as Record<string, unknown>)).toEqual([settingsId]);
+  expect(text).not.toContain('sk-e2e-unregistered');
+  expect(text).not.toContain('sk-e2e-nomanifest');
+  expect(text).not.toContain('apiKey');
+  expect(text).not.toContain('"accessToken"');
+
+  // 默认（非 includePrivate）导出：pluginData 整体不进包，凭据随其隔离
+  await page.getByTestId('project-export-include-private').uncheck();
+  const defaultPromise = page.waitForEvent('download');
+  await page.getByTestId('project-export').click();
+  const defaultDownload = await defaultPromise;
+  const defaultPath = join(tmpDir, 'tml53-round29-default.lumora');
+  await defaultDownload.saveAs(defaultPath);
+  const defaultText = readFileSync(defaultPath, 'utf8');
+  expect(defaultText).not.toContain('pluginData');
+  expect(defaultText).not.toContain('sk-e2e');
+});
+
+test('第二十九轮 e2e：真实 manifest 声明凭据键（exportableSettings 含 apiKey）→ includePrivate 导出整包拒绝，不产生下载', async ({ page }) => {
+  const tmpDir = join(HERE, '.tmp');
+  mkdirSync(tmpDir, { recursive: true });
+  const sourcePath = join(tmpDir, 'tml53-round29-leaky-source.lumora');
+  const sourceEditor = new SceneEditor();
+  sourceEditor.openProject(createSampleProject());
+  const sourcePkg = buildProjectPackage(
+    { ...sourceEditor.getProject()!, uri: 'lumora://project/round29-leaky', name: '泄漏声明源项目' },
+    { includePrivate: true },
+  );
+  sourcePkg.project.pluginData = { 'com.example.leaky': { theme: 'dark', apiKey: 'sk-e2e-leaky-1' } };
+  writeFileSync(sourcePath, serializeProjectPackage(sourcePkg), 'utf8');
+
+  // ?plugins=leaky：宿主额外注册 exportableSettings 含 apiKey 的真实 manifest 插件
+  await page.goto('/?plugins=leaky');
+  await expect(page.getByTestId('studio-empty-hint')).toBeVisible();
+  await page.getByTestId('project-menu').click();
+  await page.setInputFiles('[data-testid="project-import-input"]', sourcePath);
+  await expect(page.getByTestId('studio-empty-hint')).not.toBeVisible();
+  await expect(page.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 10_000 });
+
+  await page.getByTestId('project-menu').click();
+  await page.getByTestId('project-export-include-private').check();
+  await expect(page.getByTestId('project-export-include-private')).toBeChecked();
+  // 凭据声明 → 构建校验失败 toast；等待窗口内无任何下载（绝不部分放行）
+  let downloadHappened = false;
+  const noDownload = page
+    .waitForEvent('download', { timeout: 2000 })
+    .then(() => {
+      downloadHappened = true;
+    })
+    .catch(() => undefined);
+  await page.getByTestId('project-export').click();
+  await expect(page.getByTestId('lumora-toasts')).toContainText(/无法导出/, { timeout: 5000 });
+  await expect(page.getByTestId('lumora-toasts')).toContainText(/凭据永不导出/);
+  await noDownload;
+  expect(downloadHappened).toBe(false);
+});
+
 test('AC2 跨标签页冲突：本地计数追平不覆盖较新保存，须显式「加载较新版本」解决', async ({ context }) => {
   // 同一 context 的两个页面共享 IndexedDB：模拟两个标签页编辑同一项目
   const pageA = await context.newPage();

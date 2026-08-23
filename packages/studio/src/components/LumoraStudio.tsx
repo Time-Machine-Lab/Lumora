@@ -109,14 +109,32 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   // StrictMode 重放。因此用「挂载计数 + 延迟确认」：cleanup 先减计数，
   // 重放的下轮 setup 及时加回则取消释放，仅在最终卸载时真正 dispose
   const mountedRef = useRef(0);
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
   useEffect(() => {
     mountedRef.current += 1;
     return () => {
       mountedRef.current -= 1;
       setTimeout(() => {
         if (mountedRef.current === 0) {
-          cache.dispose();
-          void runtime.dispose();
+          // 第二十九轮严重 6：卸载的关闭屏障 —— dispose 结果不得静默丢弃。
+          // 冲刷失败 / 未解决恢复 fork 导致释放失败时如实上报 onError（宿主
+          // 可等待 handle.runtime.dispose() 这一宿主可等待屏障，解决后重试），
+          // 运行时保留未 teardown —— 未落盘内容仍可恢复，绝不「假装已卸载」
+          // 丢弃内容；资源缓存仅随成功释放，宿主重试期间壳层仍完整可用。
+          // 宿主确需放弃内容时先经 persistence.clearRecovery 显式丢弃后重试
+          void runtime.dispose().then(
+            (outcome) => {
+              if (!outcome.ok) {
+                onErrorRef.current?.(new Error(outcome.message ?? '运行时释放失败'));
+                return;
+              }
+              cache.dispose();
+            },
+            (error) => {
+              onErrorRef.current?.(error);
+            },
+          );
         }
       }, 0);
     };

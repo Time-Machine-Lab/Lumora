@@ -1630,12 +1630,21 @@ describe('ProjectAutosaver：flush 任务内保存挂起期间会话失效与代
     openStores.push(store);
     const realSave = store.save.bind(store);
     const A_URI = 'lumora://project/a';
+    // rev1 保存（expected=0）开始执行的显式信号 —— 替代 settle(0) 猜测：确认
+    // flush 任务真正挂起在 150ms 保存上之后才进行 rev2 编辑与 reset，杜绝
+    // 「任务尚未启动」的竞态（改动时序后测试要么照常通过、要么超时失败，
+    // 不会在错误前提下假通过）
+    let markSaveStarted!: () => void;
+    const saveStarted = new Promise<void>((resolve) => {
+      markSaveStarted = resolve;
+    });
     // 仅 A 的 rev1 保存（flush 任务内、expected=0）挂起 150ms 后真实落盘；
     // 关闭触发的 rev2 superseding drain（expected=1）失败 —— 修复前 flush 任务
     // 以 rev1 落盘成功返回 done/ok，外层对「已关闭」假报成功放行
     store.save = async (p, expected) => {
       if (p.uri !== A_URI) return realSave(p, expected);
       if (expected === 0) {
+        markSaveStarted();
         await new Promise((r) => setTimeout(r, 150));
         return realSave(p, expected);
       }
@@ -1649,7 +1658,7 @@ describe('ProjectAutosaver：flush 任务内保存挂起期间会话失效与代
     await settle(5); // reconcile 首存（rev0, expected null）完成
     editor.addObject(createGroupObject()); // rev1 → pending 捕获
     const flushing = autosaver.flush();
-    await settle(0); // 让 flush 任务开始执行：saveSnapshot(rev1) 挂起在 150ms 保存中
+    await saveStarted; // 显式屏障：flush 任务已开始 saveSnapshot(rev1)（挂起中）
     editor.addObject(createGroupObject()); // rev2 —— 保存 await 期间继续编辑
     editor.reset(); // 关闭：close() → 会话递增 + enqueueDrain(A rev2)（本代 drain）
     const outcome = await flushing;
@@ -1888,5 +1897,153 @@ describe('ProjectAutosaver：clean 时 flush 的等待窗口与并发共享（�
     expect(outcome2).toEqual({ ok: false, code: 'quota-exceeded', message: '模拟配额不足' });
     expect(autosaver.getRecovery(A_URI)).not.toBeNull();
     autosaver.dispose();
+  });
+});
+
+describe('ProjectAutosaver：重试恢复代绑定与卸载拒绝（第二十九轮阻断 4/5 回归）', () => {
+  it('阻断4：恢复 fork 在重试执行前被清除 —— 执行前复验失败，不落盘任何内容（修复前先写盘再取消）', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const realSave = store.save.bind(store);
+    // 仅 A rev1 首次保存失败（排空产生恢复 fork）：rev0 与后续 rev1 落盘正常
+    let drainFailed = false;
+    store.save = async (p, expected) => {
+      if (!drainFailed && p.uri === A && p.revision === 1) {
+        drainFailed = true;
+        return { ok: false, code: 'storage-error', message: '模拟存储错误' };
+      }
+      return realSave(p, expected);
+    };
+    editor.openProject(createSampleProject(A));
+    await settle(10); // rev0 落盘 → clean
+    editor.addObject(createGroupObject()); // rev1
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60); // 排空 A rev1 失败 → fork 入录；B 首存成功
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+
+    const saveSpy = vi.spyOn(store, 'save');
+    // 调用时记录仍在（同步通过入口检查），任务执行前该代被显式清除（如用户
+    // 另存副本/放弃恢复）—— 任务执行时的预检必须拦截：不得把已作废的快照
+    // 以旧 CAS 写回磁盘
+    const retrying = autosaver.retryRecovery(A);
+    autosaver.clearRecovery(A);
+    const outcome = await retrying;
+    expect(outcome).toEqual({
+      ok: false,
+      code: 'revision-conflict',
+      message: '恢复快照已被清除或更新，本次重试已取消',
+    });
+    expect(saveSpy).not.toHaveBeenCalled(); // 未发生任何落盘（修复前会先写盘再取消）
+    expect(autosaver.getRecovery(A)).toBeNull();
+    await autosaver.dispose();
+  });
+
+  it('阻断4：恢复 fork 在保存 await 期间被清除 —— 磁盘事实先同步基线，继续编辑不再假冲突（修复前基线不同步，后续 CAS 假 revision-conflict）', async () => {
+    const { editor, store, autosaver } = await wired();
+    const states: string[] = [];
+    autosaver.onState((s) => states.push(s.status));
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A);
+    const realSave = store.save.bind(store);
+    let drainFailed = false;
+    store.save = async (p, expected) => {
+      if (!drainFailed && p.uri === A && p.revision === 1) {
+        drainFailed = true;
+        return { ok: false, code: 'storage-error', message: '模拟存储错误' };
+      }
+      return realSave(p, expected);
+    };
+    editor.openProject(base);
+    await settle(10); // rev0 落盘
+    editor.addObject(createGroupObject()); // rev1
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60); // 排空失败 → fork（内容 base+1）；B 首存成功
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+
+    // 重开 A（内容与已提交基线一致）→ 锁存 recovery-available
+    editor.openProject(base);
+    await settle(60);
+
+    // 重试保存挂起：保存开始后、完成前该代恢复记录被清除（如用户另存副本）
+    let saveStarted = false;
+    let releaseSave!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    vi.spyOn(store, 'save').mockImplementationOnce(async (p, expected) => {
+      saveStarted = true;
+      await gate;
+      return realSave(p, expected);
+    });
+    const retrying = autosaver.retryRecovery(A);
+    await vi.waitFor(() => expect(saveStarted).toBe(true)); // 保存已开始（await 挂起）
+    autosaver.clearRecovery(A); // await 期间该代被清除
+    releaseSave();
+    const outcome = await retrying;
+    expect(outcome).toEqual({
+      ok: false,
+      code: 'revision-conflict',
+      message: '恢复快照已被清除或更新，本次重试已取消',
+    });
+    // 磁盘事实已同步：A 已含恢复快照内容（revision 1），基线随之推进 ——
+    // 修复前取消分支不推进基线，后续保存以旧基线 CAS 触发假冲突
+    const storedAfterRetry = await loadStored(store, A);
+    expect(storedAfterRetry!.revision).toBe(1);
+    expect(storedAfterRetry!.objects.length).toBe(base.objects.length + 1);
+    expect(autosaver.getRecovery(A)).toBeNull();
+
+    // 继续编辑并自动保存：以推进后的基线（rev1）CAS 正常落盘 —— 修复前取消
+    // 分支不推进基线，后续保存按旧基线（rev0）CAS 触发假 revision-conflict
+    // 锁存。连续两次编辑（防抖合并）→ 以 rev2 保存，磁盘已为 rev1 时 CAS 通过
+    states.length = 0;
+    editor.addObject(createGroupObject());
+    editor.addObject(createGroupObject()); // 合并保存 rev2（内容 base+2）
+    await settle(60);
+    const stored = await loadStored(store, A);
+    expect(stored!.revision).toBe(editor.getProject()!.revision);
+    expect(stored!.objects.length).toBe(base.objects.length + 2);
+    expect(states.at(-1)).toBe('clean'); // 落盘成功，无假冲突
+    expect(states).not.toContain('error');
+    await autosaver.dispose();
+  });
+
+  it('阻断5：卸载前任一 uri 仍有恢复 fork —— 冲刷成功后拒绝 dispose（返回 recovery-available），解决后重试成功释放', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const realSave = store.save.bind(store);
+    let drainFailed = false;
+    store.save = async (p, expected) => {
+      if (!drainFailed && p.uri === A && p.revision === 1) {
+        drainFailed = true;
+        return { ok: false, code: 'storage-error', message: '模拟存储错误' };
+      }
+      return realSave(p, expected);
+    };
+    editor.openProject(createSampleProject(A));
+    await settle(10);
+    editor.addObject(createGroupObject()); // rev1
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60); // A rev1 排空失败 → fork；B clean
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+
+    // 当前项目已净，但 A 的恢复 fork 仅存于恢复区 —— 卸载必须拒绝：
+    // 绝不因 teardown 沉没未落盘内容（修复前直接置 disposed 释放）
+    const refused = await autosaver.dispose();
+    expect(refused).toEqual({
+      ok: false,
+      code: 'recovery-available',
+      message: '存在未保存的恢复快照（上次保存失败），运行时已保留；请先「另存副本」或「重试保存」后再释放',
+    });
+    // 未被 dispose：恢复快照仍在、自动保存仍可用（重试可落盘该 fork）
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+    const retried = await autosaver.retryRecovery(A);
+    expect(retried.ok).toBe(true);
+    expect(autosaver.getRecovery(A)).toBeNull();
+    const stored = await loadStored(store, A);
+    expect(stored!.revision).toBe(1);
+    expect(stored!.objects.length).toBe(createSampleProject().objects.length + 1);
+
+    // 解决后重试 dispose：冲刷通过且无剩余 fork → 释放成功
+    expect(await autosaver.dispose()).toEqual({ ok: true });
   });
 });

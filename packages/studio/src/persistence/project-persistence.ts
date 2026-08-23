@@ -183,16 +183,21 @@ export class ProjectPersistence {
   }
 
   /**
-   * 「另存副本」源内容决策（第八轮 #2）：uri 为当前打开项目且有未保存编辑时，
-   * 以编辑器现场为准 —— 慢速保存/重试落盘期间的新编辑不得被旧恢复快照覆盖丢弃；
-   * 否则取该 uri 的恢复快照（切换/关闭时保存失败被保留的内容）；均无返回 null
-   * （调用方走存储复制路径）。
+   * 「另存副本」源内容决策（第八轮 #2 + 第二十九轮阻断 3）：uri 为当前打开项目
+   * 且有未保存编辑时，以编辑器现场为准，generation = null —— 复制当前内容
+   * 不得清除任何历史恢复 fork（旧 fork 内容仅存于恢复区，仍可恢复）；否则取
+   * 该 uri 的最新代恢复 fork 并绑定其 {generation, fingerprint}（消费方只清除
+   * 这一代）；均无返回 null（调用方走存储复制路径）。
    */
-  resolveSaveAsCopySource(uri: string): Project | null {
+  resolveSaveAsCopySource(
+    uri: string,
+  ): { source: Project; generation: number | null; fingerprint: string | null } | null {
     if (this.currentUri === uri && this.autosaver.hasUnsavedContent()) {
-      return this.editor.getProject();
+      return { source: this.editor.getProject()!, generation: null, fingerprint: null };
     }
-    return this.autosaver.getRecovery(uri);
+    const record = this.autosaver.getRecoverySource(uri);
+    if (!record) return null;
+    return { source: record.snapshot, generation: record.generation, fingerprint: record.fingerprint };
   }
 
   /** 显式重试保存恢复快照（成功清除恢复快照与锁存；失败返回错误）。 */
@@ -203,6 +208,13 @@ export class ProjectPersistence {
   /** 清除恢复快照（用户已另存副本等显式决定后调用）。 */
   clearRecovery(uri: string): void {
     this.autosaver.clearRecovery(uri);
+  }
+
+  /** 清除指定代恢复 fork（「另存副本」消费的那一代，第二十九轮阻断 3）：
+   *  同 uri 其他历史 fork 保留并继续锁存 recovery-available（仍可恢复）。
+   *  fingerprint 绑定：该代记录已变化时不误删。 */
+  clearRecoveryGeneration(uri: string, generation: number, fingerprint: string | null): void {
+    this.autosaver.clearRecoveryGeneration(uri, generation, fingerprint);
   }
 
   /** 把恢复快照（或当前编辑器内容）另存为全新项目：以副本保留未保存内容（新 uri，revision 0）。
@@ -503,9 +515,10 @@ export class ProjectPersistence {
   }
 
   /** 卸载：冲刷未保存变更、断开自动保存与存储连接。
-   *  第二十八轮阻断 4：autosaver 冲刷失败时如实返回失败 —— 不得继续 teardown
-   *  （断开监听/关闭存储/清 events），调用方（StudioRuntime）据此保留编辑器与
-   *  存储供重试，绝不「假装已卸载」丢弃未落盘内容。 */
+   *  第二十八轮阻断 4 + 第二十九轮阻断 5：autosaver 冲刷失败、或冲刷成功后仍有
+   *  未解决的恢复 fork 时如实返回失败 —— 不得继续 teardown（断开监听/关闭存储/
+   *  清 events），调用方（StudioRuntime）据此保留编辑器与存储供重试或显式解决，
+   *  绝不「假装已卸载」丢弃未落盘内容。 */
   async dispose(): Promise<SaveOutcome> {
     if (this.disposed) return { ok: true };
     const outcome = await this.autosaver.dispose();

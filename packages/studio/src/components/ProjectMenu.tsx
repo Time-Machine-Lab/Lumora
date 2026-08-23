@@ -328,17 +328,22 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
     if (!project) return;
     setBusy(true);
     try {
-      // 源内容决策（第八轮 #2）：当前项目有未保存编辑时以编辑器现场为准 ——
-      // 慢速保存/重试落盘期间的新编辑不得被旧恢复快照覆盖丢弃；否则取恢复快照
+      // 源内容决策（第八轮 #2 + 第二十九轮阻断 3）：当前项目有未保存编辑时以
+      // 编辑器现场为准（generation = null）—— 慢速保存/重试落盘期间的新编辑
+      // 不得被旧恢复快照覆盖丢弃；否则取该 uri 最新代恢复 fork（绑定代数）
       const source = persistence.resolveSaveAsCopySource(project.uri);
       if (source) {
-        const saved = await persistence.saveSnapshotAsNew(source);
+        const saved = await persistence.saveSnapshotAsNew(source.source);
         if (!saved.ok) {
           showToast(saved.message, 'error');
           return;
         }
-        // 未保存内容已以副本保全：恢复快照与锁存一并清除（显式解决）
-        persistence.clearRecovery(project.uri);
+        // 第二十九轮阻断 3：只清除「被消费的那一代」恢复 fork —— 源为编辑器
+        // 现场（复制当前内容）时不清除任何历史 fork：旧 fork 内容仅存于恢复区，
+        // 保全当前副本绝不沉没旧内容；其余 fork 保留并继续锁存 recovery-available
+        if (source.generation !== null) {
+          persistence.clearRecoveryGeneration(project.uri, source.generation, source.fingerprint);
+        }
         // 未保存内容已保全：跳过切换排空屏障（flush:false）
         const opened = await runtime.openProject(saved.project, { flush: false });
         if (!opened.ok) {

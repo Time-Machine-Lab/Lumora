@@ -759,8 +759,9 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     // 「另存副本」以编辑器现场为准：修复前取旧恢复快照（base+1），新编辑被丢弃
     const source = persistence.resolveSaveAsCopySource(A);
     expect(source).not.toBeNull();
-    expect(source!.objects.length).toBe(base.objects.length + 2);
-    const saved = await persistence.saveSnapshotAsNew(source!);
+    expect(source!.source.objects.length).toBe(base.objects.length + 2);
+    expect(source!.generation).toBeNull(); // 编辑器现场源：不绑定代数
+    const saved = await persistence.saveSnapshotAsNew(source!.source);
     expect(saved.ok).toBe(true);
     if (!saved.ok) return;
     persistence.clearRecovery(A);

@@ -393,7 +393,19 @@ function isSafeExportKey(key: string): boolean {
  *     任何候选集，放行。版本后缀剥尽后余量恰为 'pass'（pass2/passv2/passver2）
  *     同样拒绝（第二十八轮严重 7：pass2 默认拒绝，如产品确认其为渲染语义可加
  *     BENIGN 白名单显式豁免）。旧 [a-z]*[0-9]+$ 贪心剥尾对全小写形态恒产
- *     空串、是死代码，已废弃。
+ *     空串、是死代码，已废弃；
+ *  8. 字典分词兜底（第二十九轮阻断 1）：camelCase 分词无边界时（全小写单 token
+ *     sessionid/apikeyvalue/passworddigest 等），第 5/6 项的无边界形态精确相等
+ *     只覆盖有限派生候选表，枚举不可闭合。对归一化后的无边界形态（数字剥除）
+ *     做记忆化字典分词：任一完整分词命中 kind 词/拉丁根词（任意位置）或相邻
+ *     复合对/敏感限定组合即拒绝。字典 = 既有分类表全部词 + 完成分词所需的最小
+ *     通用词（id/backup/digest/payload，全部有凭据语境，逐项可审计）；
+ *     'pass'/'board'/'less'/'izer'/'author'/'render'/'budget'/'mode' 等过泛词
+ *     不入字典 —— renderpass/passwordless/apiKeyboardLayout/
+ *     accessTokenizerConfig/tokenBudget 等合法键无完整凭据分词，放行（render|pass
+ *     单段 pass 不是 kind/根词、render+pass 不在复合表）。长度上限 80 防病态
+ *     输入撑爆 DP。sessionid → session|id、apikeyvalue → api|key|value、
+ *     clientsecretbackup → client|secret|backup 等全小写复合凭据键在此闭合。
  *  任意命中即拒绝。tokenizerConfig/tokenizerModel/authorName/authorizationMode/
  *  apiVersion/MONKEYPATCH/HOTKEYMAP/keyboardLayout/shortcutKey 等仅含
  *  tokenizer/author/api/key 等非凭据形态的键放行。连续大写缩写保留为一个
@@ -616,10 +628,85 @@ function expandKindSuffixTokens(tokens: string[]): string[] {
   return expanded;
 }
 
+/** 分词字典（第二十九轮阻断 1）：既有分类表全部词 + 完成全小写复合凭据键分词
+ *  所需的最小通用词。'pass' 只在复合对语境（pass+word/pass+key）有意义，作为
+ *  通用词入字典会让 renderpass 等误分词 —— 不入表；'board'/'less'/'izer'/
+ *  'author'/'render'/'budget'/'mode'/'wrap'/'count' 等合法键完成词同理不入表，
+ *  保证 passwordless/apiKeyboardLayout/accessTokenizerConfig/tokenBudget/
+ *  renderPass 等无完整凭据分词。 */
+const CREDENTIAL_SEGMENT_DICT: ReadonlySet<string> = (() => {
+  const words = new Set<string>();
+  for (const kind of CREDENTIAL_KIND_WORDS) words.add(kind);
+  for (const root of CREDENTIAL_LATIN_ROOTS) words.add(root);
+  for (const [a, b] of CREDENTIAL_COMPOUND_PAIRS) {
+    words.add(a);
+    words.add(b);
+  }
+  for (const [a, b] of CREDENTIAL_SENSITIVE_COMBOS) {
+    words.add(a);
+    words.add(b);
+  }
+  for (const general of ['id', 'backup', 'digest', 'payload']) words.add(general);
+  return words;
+})();
+
+/** 分词长度上限：超限保守放行（不拒绝）—— 防御病态长键撑爆 DP 状态 */
+const CREDENTIAL_SEGMENT_MAX_LENGTH = 80;
+
+/** 字典分词凭据形态兜底（第二十九轮阻断 1）：对无边界形态（数字已剥除）做
+ *  记忆化分词，任一完整分词含凭据形态即拒绝 —— kind 词/拉丁根词任意位置命中，
+ *  或相邻两段构成复合对/敏感限定组合。字典不含过泛词，合法键无完整凭据分词
+ *  （passwordless/apiKeyboardLayout/renderPass 等）自然放行；复数段经
+ *  matchesCredentialWord 归一（clientsecrets → client|secrets）。 */
+function hasCredentialSegmentation(collapsed: string): boolean {
+  if (collapsed.length === 0 || collapsed.length > CREDENTIAL_SEGMENT_MAX_LENGTH) return false;
+  const memo = new Map<string, boolean>();
+  const isDictWord = (w: string): boolean =>
+    CREDENTIAL_SEGMENT_DICT.has(w) ||
+    (w.length > 3 && w.endsWith('s') && CREDENTIAL_SEGMENT_DICT.has(w.slice(0, -1)));
+  const isCredentialSegment = (w: string): boolean => {
+    if (isCredentialKindWord(w)) return true;
+    for (const root of CREDENTIAL_LATIN_ROOTS) {
+      if (matchesCredentialWord(w, root)) return true;
+    }
+    return false;
+  };
+  const isCredentialAdjacentPair = (a: string, b: string): boolean => {
+    for (const [x, y] of CREDENTIAL_COMPOUND_PAIRS) {
+      if (matchesCredentialWord(a, x) && matchesCredentialWord(b, y)) return true;
+    }
+    for (const [x, y] of CREDENTIAL_SENSITIVE_COMBOS) {
+      if (matchesCredentialWord(a, x) && matchesCredentialWord(b, y)) return true;
+    }
+    return false;
+  };
+  const find = (pos: number, prev: string | null, credentialSeen: boolean): boolean => {
+    if (pos === collapsed.length) return credentialSeen;
+    const memoKey = `${pos}|${prev ?? ''}|${credentialSeen ? 1 : 0}`;
+    const cached = memo.get(memoKey);
+    if (cached !== undefined) return cached;
+    let result = false;
+    for (let end = pos + 1; end <= collapsed.length; end += 1) {
+      const w = collapsed.slice(pos, end);
+      if (!isDictWord(w)) continue;
+      const shape =
+        credentialSeen || isCredentialSegment(w) || (prev !== null && isCredentialAdjacentPair(prev, w));
+      if (find(end, w, shape)) {
+        result = true;
+        break;
+      }
+    }
+    memo.set(memoKey, result);
+    return result;
+  };
+  return find(0, null, false);
+}
+
 /** 凭据形态核心判定（第二十八轮阻断 1 拆分）：对完整 token 列表做凭据形态判定
  *  （单键与路径声明共用；路径跨 segment 拼接后复用同一判定，['api','key'] ≡
  *  'apikey' ≡ api_key，第十九轮阻断 2）。只含无后缀形态 —— CJK 包含 / kind
- *  词 / 拉丁根词 / 相邻复合对 / 无边界形态精确相等（含数字剥除）。
+ *  词 / 拉丁根词 / 相邻复合对 / 无边界形态精确相等（含数字剥除）/ 字典分词
+ *  兜底（第二十九轮阻断 1）。
  *  第二十三轮范式反转：默认拒绝敏感形态 + 正向豁免（BENIGN_CREDENTIAL_KEYS），
  *  全部规则有边界（详见模块注释）。 */
 function isCredentialShapeCore(joined: string, tokens: string[]): boolean {
@@ -654,7 +741,11 @@ function isCredentialShapeCore(joined: string, tokens: string[]): boolean {
   // 第二十五轮：复合对 + 数字后缀变体 —— 剥掉数字（含词中）后仍命中候选表
   // 即拒绝（apikey2/authkey2/accesstoken2/api2key）
   const digitless = collapsed.replace(/[0-9]+/g, '');
-  return digitless.length > 0 && CREDENTIAL_COLLAPSED_FORMS.has(digitless);
+  if (digitless.length > 0 && CREDENTIAL_COLLAPSED_FORMS.has(digitless)) return true;
+  // 第二十九轮阻断 1：字典分词兜底 —— 有限候选表枚举不可闭合（全小写单 token
+  // sessionid/apikeyvalue/passworddigest/clientsecretbackup 等），任一完整分词
+  // 含凭据形态即拒绝；合法键无完整凭据分词自然放行
+  return hasCredentialSegmentation(digitless);
 }
 
 /** 环境后缀白名单（第二十八轮阻断 1）：凭据键可能带环境限定标签（apikeyprod/
@@ -998,16 +1089,19 @@ export function buildProjectPackage(project: Project, options: PackageBuildOptio
     }
   }
   if (includePrivate) {
+    // 第二十九轮阻断 2：manifest 级声明校验无条件先行 —— 声明即契约，独立于
+    // pluginData 是否有数据/形态（缺失、undefined、非普通对象同样校验）：
+    // 插件作者必须看到非法公开声明被拒，不能因项目尚无该插件数据而绕过
+    // 构建期校验（修复前校验被夹在 isPlainRecord 门内，声明凭据键但 pluginData
+    // 缺失/畸形时可静默构建成功）。数据投影只在 pluginData 为普通对象时进行；
+    // 无数据时无导出（pluginData 键整体不进包）
     const read = readOwnDataField(project, 'pluginData');
-    if (read.present && read.value !== undefined) {
-      // 直接以源为投影输入（不再浅展开 —— 展开会执行命名空间层的 getter，
-      // 第十五轮一般 6）：投影只读源、在新对象上构建，绝不修改源项目对象；
-      // 全部命名空间被排除（无任何已注册插件或声明）时 pluginData 键整体不进包
-      if (isPlainRecord(read.value)) {
-        const projected = projectPublicPluginData(read.value, options.publicKeysByPlugin, options.privateKeysByPlugin);
-        if (projected) stripped.pluginData = projected;
-      }
-    }
+    // 直接以源为投影输入（不再浅展开 —— 展开会执行命名空间层的 getter，
+    // 第十五轮一般 6）：投影只读源、在新对象上构建，绝不修改源项目对象；
+    // 全部命名空间被排除（无任何已注册插件或声明）时 pluginData 键整体不进包
+    const data = read.present && read.value !== undefined && isPlainRecord(read.value) ? read.value : undefined;
+    const projected = projectPublicPluginData(data ?? {}, options.publicKeysByPlugin, options.privateKeysByPlugin);
+    if (projected) stripped.pluginData = projected;
   }
   // settings 契约投影：仅公开契约字段进入包（结构上排除契约外键，含凭据类键名）
   if (isPlainRecord(stripped.settings)) {

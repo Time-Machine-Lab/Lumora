@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { PluginDescriptor } from '@lumora/core';
+import type { Manifest, PluginDescriptor } from '@lumora/core';
 import { LumoraStudio } from '@lumora/studio';
 import type { LumoraStudioHandle } from '@lumora/studio';
 import mockManifest from '@lumora/mock-plugin/lumora.plugin.json';
@@ -61,7 +61,75 @@ const explodingPlugin: PluginDescriptor = {
   }),
 };
 
-const PLUGINS: PluginDescriptor[] = [mockPlugin, brokenManifestPlugin, brokenEnginePlugin, explodingPlugin];
+/** e2e 覆盖：真实 manifest 声明 exportableSettings（含 BENIGN 歧义键）→
+ *  includePrivate 导出经 ProjectMenu 下载链路按声明投影，com.example.settings
+ *  命名空间随包携带声明的公开键，其余字段（含凭据形态键）绝不进包 */
+const settingsPlugin: PluginDescriptor = {
+  manifest: {
+    schemaVersion: '1',
+    id: 'com.example.settings',
+    name: '设置导出插件',
+    version: '0.1.0',
+    entry: './dist/index.js',
+    exportableSettings: [
+      'theme',
+      'model',
+      'tokenBudget',
+      'authMode',
+      'cookieConsent',
+      'cookieSettings',
+      'sessionMode',
+    ],
+    privateSettings: ['serverUrl'],
+  } satisfies Manifest,
+  entry: async () => ({
+    default: {
+      activate: (context) => context.contribute({}),
+    },
+  }),
+};
+
+/** e2e 覆盖：manifest 缺失 → 注册即失败（fail-closed），其 pluginData 命名空间
+ *  无任何声明依据，includePrivate 导出整段排除 */
+const noManifestPlugin: PluginDescriptor = {
+  manifest: undefined as unknown as Manifest,
+  entry: async () => ({
+    default: {
+      activate: (context) => context.contribute({}),
+    },
+  }),
+};
+
+/** e2e 覆盖：真实 manifest 声明凭据形态键（exportableSettings 含 apiKey）→
+ *  构建期整包拒绝，includePrivate 导出不产生下载。仅 ?plugins=leaky 时注册，
+ *  避免污染常规宿主的导出路径 */
+const leakySettingsPlugin: PluginDescriptor = {
+  manifest: {
+    schemaVersion: '1',
+    id: 'com.example.leaky',
+    name: '泄漏声明插件',
+    version: '0.1.0',
+    entry: './dist/index.js',
+    exportableSettings: ['apiKey', 'theme'],
+  } satisfies Manifest,
+  entry: async () => ({
+    default: {
+      activate: (context) => context.contribute({}),
+    },
+  }),
+};
+
+const LEAKY_SETTINGS = new URLSearchParams(window.location.search).get('plugins') === 'leaky';
+
+const PLUGINS: PluginDescriptor[] = [
+  mockPlugin,
+  brokenManifestPlugin,
+  brokenEnginePlugin,
+  explodingPlugin,
+  settingsPlugin,
+  noManifestPlugin,
+  ...(LEAKY_SETTINGS ? [leakySettingsPlugin] : []),
+];
 
 /** 默认只记录事件摘要；?debug=full 时输出完整 payload（大数据量下会产生 GB 级字符串，仅限调试） */
 const DEBUG_FULL = new URLSearchParams(window.location.search).get('debug') === 'full';
