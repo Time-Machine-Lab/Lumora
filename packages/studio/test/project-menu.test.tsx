@@ -537,6 +537,10 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
       expect(latest).not.toBeNull();
       expect(latest!.objects.length).toBe(base.objects.length + 2);
     });
+    // 等 C 首存完成（badge 回「已保存」）再重开 A：若在 C 保存中途切换，
+    // 徽标会出现短暂的「保存中」（C 排空）→ 陈旧「保存失败」先于当代锁存
+    // 送达 —— waitFor 会误判为本次重开已锁存，随后点击落在保存中窗口（竞态）
+    await waitFor(() => expect(screen.getByTestId('save-state-badge')).toHaveTextContent('已保存'));
 
     // 恢复保存；重开 A 呈现最新代 fork 的解决入口
     store.save = realSave;
@@ -544,7 +548,7 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
     await waitFor(() => expect(screen.getByTestId('save-state-badge')).toHaveTextContent('保存失败'));
 
     // 点击「另存副本」：源 = 最新代 fork（base+2），只清除当代
-    screen.getByTestId('save-saveas').click();
+    (await screen.findByTestId('save-saveas')).click();
     await waitFor(() => expect(screen.getByText(/未保存更改已另存为/)).toBeInTheDocument());
     const copy = runtime.getProject()!;
     expect(copy.name).toBe('多fork项目 副本');
