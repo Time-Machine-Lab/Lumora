@@ -300,15 +300,17 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
   }
 
   // 1d. 整对象声明剥离 + 凭据形态键名声明命中（第十五轮阻断 1 + 第二十五轮
-  //     指令 3 回归）：声明 ['users']（整对象/数组）被叶值校验剥离 —— 显式
-  //     登记也无法携带嵌套值；声明 ['apiKey','clientSecret']（凭据形态键名）
-  //     命中 → 构建校验失败（不再静默丢弃），凭据绝无声明通道，即使插件显式
-  //     点名导出
+  //     指令 3 + 第二十六轮回归）：声明 ['users']（整对象/数组）被叶值校验剥离
+  //     —— 显式登记也无法携带嵌套值；声明 ['apiKey','clientSecret','apikeyv2',
+  //     'tokenv2']（凭据形态键名，含无边界复合 + 字母数字版本后缀）命中 →
+  //     构建校验失败（不再静默丢弃），凭据绝无声明通道，即使插件显式点名导出
   const credentialShape: Record<string, unknown> = {
     [pluginId]: {
       theme: 'dark',
       apiKey: secrets.apiKey,
       clientSecret: secrets.accessToken,
+      apikeyv2: secrets.apiKey,
+      tokenv2: secrets.accessToken,
       users: [{ name: 'u1' }, { name: 'u2', password: secrets.password }],
     },
   };
@@ -324,7 +326,7 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
   try {
     buildProjectPackage(
       { ...sourceBase, uri: 'lumora://project/ac4-cred', name: 'AC4 凭据形态键声明', pluginData: credentialShape },
-      { includePrivate: true, publicKeysByPlugin: { [pluginId]: ['apiKey', 'clientSecret', 'theme'] } },
+      { includePrivate: true, publicKeysByPlugin: { [pluginId]: ['apiKey', 'clientSecret', 'apikeyv2', 'tokenv2', 'theme'] } },
     );
   } catch (caught) {
     credentialError = caught;
@@ -332,9 +334,11 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
   expect(credentialError).toBeInstanceOf(PackageBuildError);
   const credentialBuildError = credentialError as PackageBuildError;
   expect(credentialBuildError.code).toBe('credential-declaration-rejected');
-  expect(credentialBuildError.declarations).toHaveLength(2);
+  expect(credentialBuildError.declarations).toHaveLength(4);
   expect(credentialBuildError.declarations).toContainEqual({ plugin: pluginId, path: '"apiKey"' });
   expect(credentialBuildError.declarations).toContainEqual({ plugin: pluginId, path: '"clientSecret"' });
+  expect(credentialBuildError.declarations).toContainEqual({ plugin: pluginId, path: '"apikeyv2"' });
+  expect(credentialBuildError.declarations).toContainEqual({ plugin: pluginId, path: '"tokenv2"' });
   expect(credentialBuildError.message).toContain('凭据永不导出');
 
   // 2. 浏览器导入源项目：插件私有设置（含嵌套凭据）成为编辑器与本地持久化状态

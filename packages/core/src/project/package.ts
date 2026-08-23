@@ -370,9 +370,13 @@ function isSafeExportKey(key: string): boolean {
  *  6. 无边界复合形态（第二十一轮阻断 1 保留，第二十三轮严重 5 改精确相等）：
  *     整键归一化+去分隔后与派生候选（复合对/敏感限定组合拼接表）精确相等
  *     才拒绝 —— authheader/privatesetting/secretvalue 等连写；绝不 includes
- *     （accessTokenizerConfig 不再误中 accesstoken）。数字/版本后缀变体剥除后
- *     命中候选表同样拒绝（apikey2/authkey2/accesstoken2/api2key/apikeyv2，
- *     第二十五轮）；apiVersion3 → apiversion ∉ 候选表，放行。
+ *     （accessTokenizerConfig 不再误中 accesstoken）。数字后缀剥除后命中
+ *     候选表同样拒绝（apikey2/authkey2/api2key，第二十五轮）；尾部版本后缀
+ *     用有界模式 (version|ver|v)?[0-9]+ 剥离后余量命中候选表 / kind 词 /
+ *     拉丁根词任一项即拒绝（apikeyv2/clientsecretv2/secretv2/passwordv2 等
+ *     18 键，第二十六轮）—— 旧 [a-z]*[0-9]+$ 贪心剥尾对全小写形态恒产空串、
+ *     是死代码；apiVersion3 → api、layout2 → layout、renderPass2 → renderpass
+ *     等合法版本键余量不在任何候选集，放行。
  *  任意命中即拒绝。tokenizerConfig/tokenizerModel/authorName/authorizationMode/
  *  apiVersion/MONKEYPATCH/HOTKEYMAP/keyboardLayout/shortcutKey 等仅含
  *  tokenizer/author/api/key 等非凭据形态的键放行。连续大写缩写保留为一个
@@ -596,13 +600,27 @@ function isCredentialShapeTokens(joined: string, tokens: string[]): boolean {
   // 无边界复合形态：整键规范化后精确相等（绝不子串 includes，第二十三轮严重 5）
   const collapsed = collapsedCredentialForm(joined);
   if (CREDENTIAL_COLLAPSED_FORMS.has(collapsed)) return true;
-  // 第二十五轮：复合对 + 数字/版本后缀变体 —— 剥掉数字（含词中）或尾部版本
-  // 后缀后仍命中候选表即拒绝（apikey2/authkey2/accesstoken2/api2key/apikeyv2）；
-  // apiVersion3 → apiversion ∉ 候选表，放行
+  // 第二十五轮：复合对 + 数字后缀变体 —— 剥掉数字（含词中）后仍命中候选表
+  // 即拒绝（apikey2/authkey2/accesstoken2/api2key）
   const digitless = collapsed.replace(/[0-9]+/g, '');
   if (digitless.length > 0 && CREDENTIAL_COLLAPSED_FORMS.has(digitless)) return true;
-  const versionStripped = collapsed.replace(/[a-z]*[0-9]+$/, '');
-  if (versionStripped.length > 0 && versionStripped !== collapsed && CREDENTIAL_COLLAPSED_FORMS.has(versionStripped)) {
+  // 第二十六轮：有界版本后缀剥离（替换旧 [a-z]*[0-9]+$ —— 全小写 collapsed
+  // 无大写边界，[a-z]* 贪心吞掉整个前缀、恒产空串，被 length>0 守卫放过，
+  // 对任何「全小写复合 + 字母数字后缀」都是死代码）。只剥尾部
+  // (version|ver|v)?[0-9]+（v2/ver2/version2/纯数字 2），剥后余量非空且命中
+  // 候选表 / kind 词 / 拉丁根词任一项即拒绝：apikeyv2→apikey、
+  // clientsecretv2→clientsecret（复合表）；secretv2/passwordv2/passphrasev2/
+  // tokenv2 等「根词 + 后缀」形态（standalone 根词不在复合表内）经 kind 词
+  // 与拉丁根词校验闭合。apiVersion3→api、layout2→layout、renderPass2→
+  // renderpass、wordWrap2→wordwrap 余量不在任何候选集，放行
+  const versionStripped = collapsed.replace(/(?:version|ver|v)?[0-9]+$/, '');
+  if (
+    versionStripped.length > 0 &&
+    versionStripped !== collapsed &&
+    (CREDENTIAL_COLLAPSED_FORMS.has(versionStripped) ||
+      isCredentialKindWord(versionStripped) ||
+      [...CREDENTIAL_LATIN_ROOTS].some((root) => matchesCredentialWord(versionStripped, root)))
+  ) {
     return true;
   }
   return false;

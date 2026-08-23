@@ -854,6 +854,121 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     );
   });
 
+  it('第二十六轮：有界版本后缀剥离闭合「无边界复合 + 字母数字后缀」系统性绕过（18 键 + api2key/apikeyv3 拒绝；apiVersion3/layout2/version2/renderPass2/wordWrap2/pass2/session/cookies 放行往返）', async () => {
+    const project = await buildFixtureProject();
+    const pluginData: Record<string, Record<string, string>> = {
+      'com.example': {
+        apikeyv2: 'r26-1',
+        accesstokenv2: 'r26-2',
+        clientsecretv2: 'r26-3',
+        secretv2: 'r26-4',
+        passwordv2: 'r26-5',
+        tokenv2: 'r26-6',
+        authheaderv2: 'r26-7',
+        passphrasev2: 'r26-8',
+        secretkeyv2: 'r26-9',
+        oauthtokenv2: 'r26-10',
+        refreshtokenv2: 'r26-11',
+        bearertokenv2: 'r26-12',
+        sessiontokenv2: 'r26-13',
+        jwtsecretv2: 'r26-14',
+        secretvaluev2: 'r26-15',
+        authkeyv2: 'r26-16',
+        passkeyv2: 'r26-17',
+        privatekeyv2: 'r26-18',
+        api2key: 'r26-19',
+        apikeyv3: 'r26-20',
+        apiVersion3: 'r26-keep-1',
+        layout2: 'r26-keep-2',
+        version2: 'r26-keep-3',
+        renderPass2: 'r26-keep-4',
+        wordWrap2: 'r26-keep-5',
+        pass2: 'r26-keep-6',
+        session: 'r26-keep-7',
+        cookies: 'r26-keep-8',
+      },
+    };
+    const leakKeys = [
+      'apikeyv2',
+      'accesstokenv2',
+      'clientsecretv2',
+      'secretv2',
+      'passwordv2',
+      'tokenv2',
+      'authheaderv2',
+      'passphrasev2',
+      'secretkeyv2',
+      'oauthtokenv2',
+      'refreshtokenv2',
+      'bearertokenv2',
+      'sessiontokenv2',
+      'jwtsecretv2',
+      'secretvaluev2',
+      'authkeyv2',
+      'passkeyv2',
+      'privatekeyv2',
+      'api2key',
+      'apikeyv3',
+    ];
+    const keepKeys = ['apiVersion3', 'layout2', 'version2', 'renderPass2', 'wordWrap2', 'pass2', 'session', 'cookies'];
+    // 整表声明：20 个「无边界复合 + 字母数字后缀」变体逐一命中（含复合表形态与
+    // 「根词 + 后缀」形态 secretv2/passwordv2/tokenv2/passphrasev2 —— standalone
+    // 根词不在复合表内，经 kind 词/拉丁根词校验闭合），错误码/插件名/声明路径
+    // 逐条上报
+    const error = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project, pluginData }, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': Object.keys(pluginData['com.example']) },
+      }),
+    );
+    expect(error.declarations).toHaveLength(leakKeys.length);
+    for (const key of leakKeys) {
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(key) });
+    }
+    expect(error.message).toContain('apikeyv2');
+    // 单键声明同样拒绝
+    for (const key of leakKeys) {
+      expectCredentialDeclarationRejected(() =>
+        buildProjectPackage({ ...project, pluginData }, {
+          includePrivate: true,
+          publicKeysByPlugin: { 'com.example': [key] },
+        }),
+      );
+    }
+    // 合法版本键与可议键：仅声明时正常往返（版本后缀剥离后余量不在任何候选集；
+    // 旧 [a-z]*[0-9]+$ 分支在修复前对这些键同样放行，修复后行为保持）
+    const pkg = buildProjectPackage({ ...project, pluginData }, {
+      includePrivate: true,
+      publicKeysByPlugin: { 'com.example': keepKeys },
+    });
+    const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, Record<string, string>>)['com.example'];
+    for (const key of keepKeys) {
+      expect(plugin[key]).toBe(pluginData['com.example'][key]);
+    }
+    // 嵌套声明同判据：['profile','apikeyv2'] 整条拒绝（逐 segment standalone
+    // 判定命中）；['profile','session']/['profile','layout2'] 放行往返
+    const nestedError = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage(
+        { ...project, pluginData: { 'com.example': { profile: { apikeyv2: 'r26-n-1', session: 'r26-n-ok-1', layout2: 'r26-n-ok-2' } } } },
+        { includePrivate: true, publicKeysByPlugin: { 'com.example': [['profile', 'apikeyv2'], ['profile', 'session'], ['profile', 'layout2']] } },
+      ),
+    );
+    expect(nestedError.declarations).toHaveLength(1);
+    expect(nestedError.declarations).toContainEqual({ plugin: 'com.example', path: '["profile","apikeyv2"]' });
+    const nestedPkg = buildProjectPackage(
+      { ...project, pluginData: { 'com.example': { profile: { session: 'r26-n-ok-1', layout2: 'r26-n-ok-2' } } } },
+      { includePrivate: true, publicKeysByPlugin: { 'com.example': [['profile', 'session'], ['profile', 'layout2']] } },
+    );
+    const nestedParsed = await parseProjectPackage(serializeProjectPackage(nestedPkg));
+    expect(nestedParsed.ok).toBe(true);
+    if (!nestedParsed.ok) return;
+    const nested = (nestedParsed.project.pluginData as Record<string, { profile: Record<string, string> }>)['com.example'];
+    expect(nested).toEqual({ profile: { session: 'r26-n-ok-1', layout2: 'r26-n-ok-2' } });
+  });
+
   it('未知顶层字段不进入工程包（公开字段白名单）；tracks 属公开数据随包携带', async () => {
     const project = await buildFixtureProject();
     const rich = { ...project, runtimeCache: { x: 1 }, internalNote: 'zzz' } as Project & Record<string, unknown>;
