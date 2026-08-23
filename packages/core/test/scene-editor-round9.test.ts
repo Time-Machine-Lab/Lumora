@@ -55,6 +55,7 @@ const PUBLIC_API_LIST = [
   'dispose',
   'duplicateSelection',
   'getHistoryState',
+  'getMutationVersion',
   'getProject',
   'getSelectedObjects',
   'getSelection',

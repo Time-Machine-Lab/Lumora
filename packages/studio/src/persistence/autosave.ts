@@ -229,8 +229,11 @@ export class ProjectAutosaver {
   }
 
   /**
-   * 显式冲突解决「加载较新版本」：以传入项目（存储内容）为基线重开编辑器。
-   * 丢弃未保存变更是用户的显式选择：恢复快照一并作废；随后 changed() 走同 uri 净态路径。
+   * 显式冲突解决「加载较新版本」的状态重置：以传入项目（存储内容）为基线。
+   * 丢弃未保存变更是用户的显式选择：恢复快照一并作废。
+   * 不广播状态（第八轮 #5）：最终状态由调用方（switchOpen / 编辑器重开后的
+   * changed() 链）按新基线判定后统一发出 —— 状态切换与编辑器提交做成不向外
+   * 广播的原子操作，监听器不会看到「基线已换但编辑器未切」的中间态。
    */
   resetTo(project: Project): void {
     this.cancelTimer();
@@ -241,7 +244,49 @@ export class ProjectAutosaver {
     this.latched = null;
     this.committedByUri.set(project.uri, { revision: project.revision, fingerprint: contentFingerprint(project) });
     this.recovery.delete(project.uri);
-    this.emit(this.store ? { status: 'clean' } : { status: 'memory' });
+  }
+
+  /**
+   * 原子切换（第八轮 #5）：autosaver 状态重置与编辑器提交合并为不向外广播的
+   * 原子操作 —— resetTo 不 emit，编辑器 openProject 完成后由 project:changed 链
+   * （persistence 监听 → changed()）按新基线判定净/脏后广播一次；监听器在
+   * save-state 回调中同步提交编辑时走正常 dirty 路径（此时切换已完成，不再有
+   * 「后续 openProject 覆盖新编辑」的窗口）。
+   * 编辑器提交失败时回滚 autosaver 状态并上抛（防御：传入项目已通过存储校验
+   * 与结构化克隆，正常不会抛错）。
+   */
+  switchOpen(project: Project): void {
+    const prevUri = this.currentUri;
+    const prevPending = this.pending;
+    const prevQueued = this.saveQueued;
+    const prevLatched = this.latched;
+    const prevSession = this.session;
+    const prevBaseline = this.committedByUri.get(project.uri);
+    const prevBaselineHas = prevBaseline !== undefined;
+    const prevRecovery = this.recovery.get(project.uri);
+    const prevRecoveryHas = this.recovery.has(project.uri);
+    this.resetTo(project);
+    try {
+      this.editor.openProject(project);
+    } catch (error) {
+      this.currentUri = prevUri;
+      this.pending = prevPending;
+      this.saveQueued = prevQueued;
+      this.latched = prevLatched;
+      this.session = prevSession;
+      if (prevBaselineHas) this.committedByUri.set(project.uri, prevBaseline!);
+      else this.committedByUri.delete(project.uri);
+      if (prevRecoveryHas) this.recovery.set(project.uri, prevRecovery!);
+      else this.recovery.delete(project.uri);
+      throw error;
+    }
+  }
+
+  /** 当前打开项目是否有未保存编辑（「另存副本」源内容决策，第八轮 #2）。 */
+  hasUnsavedContent(): boolean {
+    const project = this.editor.getProject();
+    if (!project) return false;
+    return this.isUnsaved(project);
   }
 
   /**
@@ -304,8 +349,8 @@ export class ProjectAutosaver {
    * 写入成功后的最终切换是会话原子操作（第七轮 #1）：保存前捕获操作代
    * （autosaver 会话 + 编辑器会话令牌 + 编辑器项目引用/指纹），await 落盘成功后
    * 重新读取复验 —— 延迟保存期间用户继续编辑或切换项目时，磁盘写入已完成（基线
-   * 推进，后续保存不因 CAS 错乱），但恢复快照保留、锁存冲突，绝不 resetTo/
-   * openProject 覆盖新编辑、绝不假报 clean，调用方收到冲突结果。
+   * 推进，后续保存不因 CAS 错乱），但恢复快照保留、锁存冲突，绝不 switchOpen
+   * 覆盖新编辑、绝不假报 clean，调用方收到冲突结果。
    * 任一保存失败（含 revision 反转）都如实返回，快照与锁存按结果维护。
    */
   retryRecovery(uri: string): Promise<SaveOutcome> {
@@ -317,6 +362,10 @@ export class ProjectAutosaver {
       if (this.disposed) return { ok: false, code: 'storage-error', message: '自动保存已停用' };
       const session = this.session;
       const editorToken = this.editor.getSessionToken();
+      // 状态变迁代数（第八轮 #6）：复验以「期间无任何编辑」的严格判据为准 ——
+      // 编辑→撤销产生内容相等的新引用，指纹比较会漏判，mutationVersion 每次
+      // 状态写都递增，不会漏
+      const mutationVersion = this.editor.getMutationVersion();
       const baseline = this.committedByUri.get(uri);
       const expected = baseline?.revision ?? null;
       const baseFp = baseline?.fingerprint ?? undefined;
@@ -327,11 +376,11 @@ export class ProjectAutosaver {
         a !== null && a !== undefined && b !== null && b !== undefined && a === b;
 
       /**
-       * await 后复验：决策时捕获的操作代（会话/编辑器令牌）与编辑器内容必须未变。
-       * 切换/关闭（isFresh 或编辑器令牌变化）与继续编辑（项目引用或指纹变化，
-       * 不可编码内容经 fpEqual 保守判变）都会被识别 —— 任何变化都不允许
-       * resetTo/openProject/报 clean，绝不静默覆盖新编辑。
-       * 非当前 uri 的重试不触碰编辑器（无 resetTo/openProject/clean 广播），
+       * await 后复验：决策时捕获的操作代（会话/编辑器令牌/状态变迁代数）与编辑器
+       * 内容必须未变。切换/关闭（isFresh 或编辑器令牌变化）与继续编辑（变迁代数
+       * 或项目引用变化，不可编码内容经 fpEqual 保守判变）都会被识别 —— 任何变化
+       * 都不允许 switchOpen/报 clean，绝不静默覆盖新编辑。
+       * 非当前 uri 的重试不触碰编辑器（无 switchOpen/clean 广播），
        * 落盘成功即完成，无需内容复验。
        */
       const verifyNoChange = (wasCurrent: Project | null): boolean => {
@@ -339,6 +388,7 @@ export class ProjectAutosaver {
         if (wasCurrent === null) return true;
         if (!this.isFresh(uri, session)) return false;
         if (this.editor.getSessionToken() !== editorToken) return false;
+        if (this.editor.getMutationVersion() !== mutationVersion) return false;
         const latest = this.editor.getProject();
         if (!latest || latest.uri !== uri) return false;
         if (latest === wasCurrent) return true;
@@ -369,9 +419,9 @@ export class ProjectAutosaver {
           if (!verifyNoChange(current)) return latchStale();
           this.recovery.delete(uri);
           if (current) {
-            // 复验通过：以恢复快照为准重开编辑器，与已落盘内容对齐（重试期间未编辑或编辑与快照一致）
-            this.resetTo(snapshot);
-            this.editor.openProject(snapshot);
+            // 复验通过：原子切换到恢复快照（autosaver 重置 + 编辑器提交不广播，
+            // 完成后由 changed() 链广播一次），与已落盘内容对齐
+            this.switchOpen(snapshot);
           }
         } else if (result.code === 'revision-conflict') {
           this.latch({ uri, code: 'revision-conflict', message: result.message });

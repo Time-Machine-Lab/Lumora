@@ -921,4 +921,102 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
       autosaver.dispose();
     }
   });
+
+  it('严重6：重试保存挂起期间「编辑→撤销」—— 内容与决策时相等但编辑器已变更，绝不重开编辑器（第八轮 #6）', async () => {
+    const { editor, store, autosaver } = await wired(500); // 长防抖：复验失败后无自动保存干扰断言
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(10); // 基线 rev0
+    vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    editor.addObject(createGroupObject()); // rev1（恢复快照内容 = base+1）
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60);
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+    vi.mocked(store.save).mockRestore();
+
+    const states: AutosaveState[] = [];
+    autosaver.onState((s) => states.push(s));
+    editor.openProject({ ...base, name: '项目A' }); // 编辑器 == 基线 → 分支 1：保存恢复快照
+    await settle(60);
+    expect(states.at(-1)).toMatchObject({ status: 'error', code: 'recovery-available' });
+
+    // 慢速保存挂起期间「编辑→撤销」：内容回到决策时（== 基线，引用全新）。
+    // 修复前复验以内容指纹判「无编辑」→ 误判通过 → switchOpen 用恢复快照覆盖
+    // 编辑、报 clean、清恢复快照；修复后 mutationVersion 代数判变 → 锁存冲突、
+    // 编辑器与撤销栈原样、恢复快照保留
+    const realSave = store.save.bind(store);
+    vi.spyOn(store, 'save').mockImplementationOnce(async (project, expected) => {
+      await new Promise((r) => setTimeout(r, 40));
+      return realSave(project, expected);
+    });
+    const retrying = autosaver.retryRecovery(A);
+    await settle(20); // 保存挂起中
+    editor.addObject(createGroupObject()); // rev1（内容 base+1）
+    editor.undo(); // rev2（内容回到 base，撤销栈已变）
+    const outcome = await retrying;
+
+    expect(outcome).toMatchObject({ ok: false, code: 'revision-conflict' });
+    // 编辑器未被重开/覆盖：当前内容（base，rev2）与撤销栈原样保留
+    const current = editor.getProject()!;
+    expect(current.revision).toBe(2);
+    expect(current.objects.length).toBe(base.objects.length);
+    expect(states.at(-1)).toMatchObject({ status: 'error', code: 'revision-conflict' });
+    // 磁盘已推进到决策时内容（恢复快照 rev1）；恢复快照保留（未清除）
+    const stored = await store.load(A);
+    expect(stored!.revision).toBe(1);
+    expect(stored!.objects.length).toBe(base.objects.length + 1);
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+    autosaver.dispose();
+  });
+
+  it('阻断5：最终切换原子化 —— save-state clean 回调中同步提交编辑，编辑保留且落盘（第八轮 #5）', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(10); // 基线 rev0
+    vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    editor.addObject(createGroupObject()); // rev1（恢复快照内容 = base+1）
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60);
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+    vi.mocked(store.save).mockRestore();
+
+    // 重开 A → recovery-available 锁存（编辑器 == 基线 → 分支 1：保存恢复快照并切换）
+    editor.openProject({ ...base, name: '项目A' });
+    await settle(60);
+
+    // 最终切换是原子操作：编辑器提交 + autosaver 重置完成后才广播。在 clean
+    // 回调中同步提交编辑 —— 修复前 resetTo 先 emit clean（编辑器尚未切换），
+    // 回调编辑落在旧内容上、随后被 openProject 覆盖丢失；修复后编辑落在已切换
+    // 内容上，走正常 dirty 路径落盘（rev2 = base+2）
+    let reentered = false;
+    autosaver.onState((s) => {
+      if (s.status === 'clean' && editor.getProject()?.uri === A && !reentered) {
+        reentered = true;
+        editor.addObject(createGroupObject());
+      }
+    });
+    const outcome = await autosaver.retryRecovery(A);
+    expect(outcome.ok).toBe(true);
+    expect(reentered).toBe(true);
+
+    await settle(60); // 重入编辑经防抖落盘
+    const stored = await store.load(A);
+    expect(stored!.revision).toBe(2);
+    expect(stored!.objects.length).toBe(base.objects.length + 2);
+    expect(autosaver.getRecovery(A)).toBeNull();
+    autosaver.dispose();
+  });
 });

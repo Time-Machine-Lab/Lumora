@@ -34,7 +34,14 @@ import type {
   SaveOutcome,
   StoredProject,
 } from './project-storage';
-import { failureMessage, findJsonEncodingProblem, isMigrationWriteback, isQuotaError, sameProjectContent } from './project-storage';
+import {
+  failureMessage,
+  findJsonEncodingProblem,
+  isMigrationWriteback,
+  isQuotaError,
+  prepareWriteChange,
+  sameProjectContent,
+} from './project-storage';
 
 /** OPFS 根目录名（与 IndexedDB 的 PROJECT_STORE_DB 同名，切换后端不混淆命名空间） */
 export const OPFS_STORE_DIR = 'lumora-studio';
@@ -217,10 +224,24 @@ export class OpfsProjectStore implements ProjectStorage {
    * 提交边界 = writable.close()（落盘）。
    */
   async save(project: Project, expectedStoredRevision?: number | null): Promise<SaveOutcome> {
+    // 首个 await 前同步生成唯一不可变快照（第八轮 #1）：调用方可在保存挂起期间
+    // 任意改写入参 project（如改 uri），后续 URI/预检/CAS/指纹/写入全部只读该
+    // 快照 —— 杜绝「CAS 按 A 查询、写入按 A'」的静默跨项目覆盖。
+    // 结构化克隆抛错（DataCloneError/输入 getter 副作用）归一为类型化失败。
+    let snapshot: Project;
+    try {
+      snapshot = structuredClone(project);
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'storage-error',
+        message: `项目无法本地保存（不可结构化克隆）：${failureMessage(error)}`,
+      };
+    }
     // 写入前 JSON 可编码性预检：与 IndexedDB 后端契约一致（第五轮 #8）——
     // OPFS 以 JSON 文本落盘，循环引用/BigInt 会抛错、undefined/非有限数值会静默
     // 失真；两后端对同一数据必须有一致的接受/拒绝语义
-    const encodingProblem = findJsonEncodingProblem(project);
+    const encodingProblem = findJsonEncodingProblem(snapshot);
     if (encodingProblem) {
       return {
         ok: false,
@@ -229,7 +250,7 @@ export class OpfsProjectStore implements ProjectStorage {
       };
     }
     return this.withLock(async () => {
-      const name = projectFileName(project.uri);
+      const name = projectFileName(snapshot.uri);
       try {
         const record = await this.readRecord(name);
         if (record === null) {
@@ -261,19 +282,19 @@ export class OpfsProjectStore implements ProjectStorage {
           // 同 revision 写入不同内容都会让多标签页的计数收敛失效
           // 拒绝 schema 降级（第六轮 #6）：迁移只向前推进；旧 schema 内容不得
           // 覆盖较新记录（迁移豁免仅限显式的旧版→当前版操作，见 loadProject）
-          if (project.schemaVersion < existing.project.schemaVersion) {
+          if (snapshot.schemaVersion < existing.project.schemaVersion) {
             return {
               ok: false,
               code: 'schema-downgrade',
-              message: `不能以旧 schema 版本（${project.schemaVersion}）覆盖较新记录（${existing.project.schemaVersion}），未写入`,
+              message: `不能以旧 schema 版本（${snapshot.schemaVersion}）覆盖较新记录（${existing.project.schemaVersion}），未写入`,
               storedRevision: existing.project.revision,
             };
           }
-          if (project.revision < existing.project.revision) {
+          if (snapshot.revision < existing.project.revision) {
             return {
               ok: false,
               code: 'revision-conflict',
-              message: `不能以旧 revision（${project.revision}）覆盖较新记录（${existing.project.revision}），未写入`,
+              message: `不能以旧 revision（${snapshot.revision}）覆盖较新记录（${existing.project.revision}），未写入`,
               storedRevision: existing.project.revision,
             };
           }
@@ -282,22 +303,22 @@ export class OpfsProjectStore implements ProjectStorage {
           // migrateProjectSchema(existing) 的确定性结果，facade loadProject 的
           // 迁移写回）。revision CAS 仍生效，并发更新依旧被拦截。
           if (
-            project.revision === existing.project.revision &&
-            !sameProjectContent(project, existing.project) &&
-            !isMigrationWriteback(project, existing.project)
+            snapshot.revision === existing.project.revision &&
+            !sameProjectContent(snapshot, existing.project) &&
+            !isMigrationWriteback(snapshot, existing.project)
           ) {
             return {
               ok: false,
               code: 'revision-conflict',
-              message: `同 revision（${project.revision}）但内容不同的记录已存在（分叉），未覆盖`,
+              message: `同 revision（${snapshot.revision}）但内容不同的记录已存在（分叉），未覆盖`,
               storedRevision: existing.project.revision,
             };
           }
         }
         await this.writeRecord(name, {
-          uri: project.uri,
+          uri: snapshot.uri,
           savedAt: new Date().toISOString(),
-          project: structuredClone(project),
+          project: snapshot,
         });
         return { ok: true };
       } catch (error) {
@@ -320,28 +341,41 @@ export class OpfsProjectStore implements ProjectStorage {
     });
   }
 
-  /** 直接重命名已存储项目（仅适用于未打开的项目）；语义与 ProjectStore 一致。 */
+  /** 直接重命名已存储项目（仅适用于未打开的项目）；语义与 ProjectStore 一致。
+   *  写前先迁移/校验（第八轮 #4：未来 schema 拒绝写前变更）。 */
   async rename(uri: string, name: string): Promise<RenameOutcome> {
     const project = await this.load(uri);
     if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
-    const result = await this.save({ ...project, name, revision: project.revision + 1 }, project.revision);
+    const prepared = prepareWriteChange(project, 'rename');
+    if (!prepared.ok) return prepared;
+    const renamed = { ...prepared.project, name, revision: prepared.project.revision + 1 };
+    const result = await this.save(renamed, prepared.project.revision);
     if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
     return { ok: true };
   }
 
-  /** 复制项目：新 uri + 名称（缺省「原名 副本」）+ 重置 revision/createdAt；语义与 ProjectStore 一致。 */
+  /** 复制项目：新 uri + 名称（缺省「原名 副本」）+ 重置 revision/createdAt；语义与
+   *  ProjectStore 一致（写前迁移/校验 + 复制后加载验证，第八轮 #4）。 */
   async duplicate(uri: string, name?: string): Promise<DuplicateOutcome> {
     const project = await this.load(uri);
     if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
+    const prepared = prepareWriteChange(project, 'duplicate');
+    if (!prepared.ok) return prepared;
+    const source = prepared.project;
     const copy: Project = {
-      ...structuredClone(project),
+      ...structuredClone(source),
       uri: `lumora://project/${genId('p')}`,
-      name: name ?? `${project.name} 副本`,
+      name: name ?? `${source.name} 副本`,
       createdAt: new Date().toISOString(),
       revision: 0,
     };
     const result = await this.save(copy, null);
     if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
+    const loaded = await this.load(copy.uri);
+    if (!loaded || validateProjectSchema(loaded) || validateProjectStructure(loaded)) {
+      await this.remove(copy.uri);
+      return { ok: false, code: 'storage-error', message: '复制成功但副本无法加载，已清理并取消复制' };
+    }
     return {
       ok: true,
       summary: {

@@ -246,6 +246,16 @@ export class SceneEditor {
     return this.sessionToken;
   }
 
+  /**
+   * 状态变迁代数（mutationVersion）：任何状态写（提交/撤销/重做/openProject/
+   * 选择/视图写/dispose）都递增；异步流程（自动保存重试等）以此复验
+   * 「期间无编辑」—— 严格操作代数，不以内容比较替代（编辑→撤销可产生内容
+   * 相等的新引用，指纹比较会漏判，第八轮 #6）。
+   */
+  getMutationVersion(): number {
+    return this.mutationVersion;
+  }
+
   /** token 是否仍为当前会话 */
   isCurrentSession(token: number): boolean {
     return token === this.sessionToken;

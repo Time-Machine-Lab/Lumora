@@ -23,7 +23,15 @@ import type {
   SaveOutcome,
   StoredProject,
 } from './project-storage';
-import { failureMessage, findJsonEncodingProblem, isMigrationWriteback, isQuotaError, sameProjectContent } from './project-storage';
+import {
+  failureMessage,
+  findJsonEncodingProblem,
+  isMigrationWriteback,
+  isQuotaError,
+  prepareWriteChange,
+  sameProjectContent,
+} from './project-storage';
+import { validateProjectSchema, validateProjectStructure } from '@lumora/core';
 
 export const PROJECT_STORE_DB = 'lumora-studio';
 export const PROJECTS_STORE = 'projects';
@@ -121,10 +129,24 @@ export class ProjectStore implements ProjectStorage {
    * 读-比-写与提交在同一 readwrite 事务内，且以事务 complete 为完成边界。
    */
   async save(project: Project, expectedStoredRevision?: number | null): Promise<SaveOutcome> {
+    // 首个 await 前同步生成唯一不可变快照（第八轮 #1）：调用方可在保存挂起期间
+    // 任意改写入参 project（如改 uri），后续 URI/预检/CAS/指纹/写入全部只读该
+    // 快照 —— 杜绝「CAS 按 A 查询、写入按 A'」的静默跨项目覆盖。
+    // 结构化克隆抛错（DataCloneError/输入 getter 副作用）归一为类型化失败。
+    let snapshot: Project;
+    try {
+      snapshot = structuredClone(project);
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'storage-error',
+        message: `项目无法本地保存（不可结构化克隆）：${failureMessage(error)}`,
+      };
+    }
     // 事务前 JSON 可编码性预检：与 OPFS 后端（JSON 文件）契约一致 —— 循环引用/
     // BigInt 会让 JSON 序列化抛错、undefined/非有限数值会静默丢字段或失真，
     // IndexedDB 的 structuredClone 却能原样保存 → 两后端落盘内容不一致（第五轮 #8）
-    const encodingProblem = findJsonEncodingProblem(project);
+    const encodingProblem = findJsonEncodingProblem(snapshot);
     if (encodingProblem) {
       return {
         ok: false,
@@ -135,7 +157,7 @@ export class ProjectStore implements ProjectStorage {
     const transaction = this.db.transaction(PROJECTS_STORE, 'readwrite');
     const store = transaction.objectStore(PROJECTS_STORE);
     try {
-      const existing = await request(store.get(project.uri) as IDBRequest<StoredProject | undefined>);
+      const existing = await request(store.get(snapshot.uri) as IDBRequest<StoredProject | undefined>);
       const storedRevision = existing?.project.revision;
       const mismatch =
         expectedStoredRevision === null
@@ -158,19 +180,19 @@ export class ProjectStore implements ProjectStorage {
         // 同 revision 写入不同内容都会让多标签页的计数收敛失效
         // 拒绝 schema 降级（第六轮 #6）：迁移只向前推进；旧 schema 内容不得
         // 覆盖较新记录（迁移豁免仅限显式的旧版→当前版操作，见 loadProject）
-        if (project.schemaVersion < existing.project.schemaVersion) {
+        if (snapshot.schemaVersion < existing.project.schemaVersion) {
           return {
             ok: false,
             code: 'schema-downgrade',
-            message: `不能以旧 schema 版本（${project.schemaVersion}）覆盖较新记录（${existing.project.schemaVersion}），未写入`,
+            message: `不能以旧 schema 版本（${snapshot.schemaVersion}）覆盖较新记录（${existing.project.schemaVersion}），未写入`,
             storedRevision: existing.project.revision,
           };
         }
-        if (project.revision < existing.project.revision) {
+        if (snapshot.revision < existing.project.revision) {
           return {
             ok: false,
             code: 'revision-conflict',
-            message: `不能以旧 revision（${project.revision}）覆盖较新记录（${existing.project.revision}），未写入`,
+            message: `不能以旧 revision（${snapshot.revision}）覆盖较新记录（${existing.project.revision}），未写入`,
             storedRevision: existing.project.revision,
           };
         }
@@ -180,22 +202,22 @@ export class ProjectStore implements ProjectStorage {
         // 覆盖 v2/rev7 baseline 的场景因此被拒。revision CAS 仍生效，并发更新
         // 依旧被拦截。
         if (
-          project.revision === existing.project.revision &&
-          !sameProjectContent(project, existing.project) &&
-          !isMigrationWriteback(project, existing.project)
+          snapshot.revision === existing.project.revision &&
+          !sameProjectContent(snapshot, existing.project) &&
+          !isMigrationWriteback(snapshot, existing.project)
         ) {
           return {
             ok: false,
             code: 'revision-conflict',
-            message: `同 revision（${project.revision}）但内容不同的记录已存在（分叉），未覆盖`,
+            message: `同 revision（${snapshot.revision}）但内容不同的记录已存在（分叉），未覆盖`,
             storedRevision: existing.project.revision,
           };
         }
       }
       const record: StoredProject = {
-        uri: project.uri,
+        uri: snapshot.uri,
         savedAt: new Date().toISOString(),
-        project: structuredClone(project),
+        project: snapshot,
       };
       await request(store.put(record) as IDBRequest<IDBValidKey>);
       await transactionDone(transaction);
@@ -219,29 +241,42 @@ export class ProjectStore implements ProjectStorage {
   }
 
   /** 直接重命名已存储项目（仅适用于未打开的项目；打开中的重命名走编辑器提交）。
-   *  以加载到的 revision 为 CAS 期望：读-改-写间被其他写入推进时拒绝，防倒退。 */
+   *  写前先迁移/校验（第八轮 #4：未来 schema 拒绝写前变更）；以迁移后的 revision
+   *  为 CAS 期望：读-改-写间被其他写入推进时拒绝，防倒退。 */
   async rename(uri: string, name: string): Promise<RenameOutcome> {
     const project = await this.load(uri);
     if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
-    const result = await this.save({ ...project, name, revision: project.revision + 1 }, project.revision);
+    const prepared = prepareWriteChange(project, 'rename');
+    if (!prepared.ok) return prepared;
+    const renamed = { ...prepared.project, name, revision: prepared.project.revision + 1 };
+    const result = await this.save(renamed, prepared.project.revision);
     if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
     return { ok: true };
   }
 
   /** 复制项目：新 uri + 名称（缺省「原名 副本」）+ 重置 revision/createdAt。
-   *  新 uri 首存走创建语义（null），防与并发创建的碰撞。 */
+   *  写前先迁移/校验（第八轮 #4）；新 uri 首存走创建语义（null），防与并发创建的碰撞；
+   *  保存成功后验证副本可加载，失败清理副本并报错（不留下不可用的半成品复制）。 */
   async duplicate(uri: string, name?: string): Promise<DuplicateOutcome> {
     const project = await this.load(uri);
     if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
+    const prepared = prepareWriteChange(project, 'duplicate');
+    if (!prepared.ok) return prepared;
+    const source = prepared.project;
     const copy: Project = {
-      ...structuredClone(project),
+      ...structuredClone(source),
       uri: `lumora://project/${genId('p')}`,
-      name: name ?? `${project.name} 副本`,
+      name: name ?? `${source.name} 副本`,
       createdAt: new Date().toISOString(),
       revision: 0,
     };
     const result = await this.save(copy, null);
     if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
+    const loaded = await this.load(copy.uri);
+    if (!loaded || validateProjectSchema(loaded) || validateProjectStructure(loaded)) {
+      await this.remove(copy.uri);
+      return { ok: false, code: 'storage-error', message: '复制成功但副本无法加载，已清理并取消复制' };
+    }
     return {
       ok: true,
       summary: {

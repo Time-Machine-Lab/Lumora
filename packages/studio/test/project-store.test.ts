@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildProjectPackage, createBlankProject, migrateProjectSchema } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import { ProjectStore } from '../src/persistence/project-store';
@@ -443,4 +443,131 @@ describe('JSON 编码契约三路共享矩阵（第七轮 #4：IDB / OPFS / 导�
       expect(encodingProblem).toContain(problem);
     });
   }
+});
+
+describe('save 同步不可变快照（第八轮 #1）：保存挂起期间改写入参不改变落盘内容', () => {
+  it('IDB：首个 await 后改写入参 uri —— CAS 与写入都按入口快照（落盘目标不被改写）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const p = project('lumora://project/a', '快照测试', 0);
+    let reads = 0;
+    // 读一次返回 a、之后返回 b：模拟「预检/首读后调用方把 uri 改成另一个项目」——
+    // 修复前 save 在 await 后再次读 project.uri 写入 b（跨项目静默覆盖）；
+    // 修复后入口同步快照固定为 a（结构化克隆只读一次）
+    Object.defineProperty(p, 'uri', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? 'lumora://project/a' : 'lumora://project/b';
+      },
+    });
+    const result = await store.save(p, null);
+    expect(result.ok).toBe(true);
+    expect(await store.load('lumora://project/a')).not.toBeNull();
+    expect(await store.load('lumora://project/b')).toBeNull();
+    store.close();
+  });
+
+  it('IDB：保存挂起期间注入不可编码值 —— 落盘内容与入口一致（不产生两后端失真的记录）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const p = project('lumora://project/a', '注入测试', 0);
+    const realSave = store.save.bind(store);
+    vi.spyOn(store, 'save').mockImplementation(async (incoming, expected) => {
+      // 真实 save 同步执行到首个 await（CAS 查询）后返回 promise；此刻注入
+      // 不可编码值 —— 修复前 record 构造时 structuredClone(project) 会把
+      // undefined 字段原样落盘（IDB 能存、JSON 契约失真）；修复后入口快照
+      // 在注入前已生成，落盘内容不含注入字段
+      const promise = realSave(incoming, expected);
+      (incoming as Project & Record<string, unknown>).extra = undefined;
+      return promise;
+    });
+    const result = await store.save(p, null);
+    expect(result.ok).toBe(true);
+    const loaded = await store.load('lumora://project/a');
+    expect(loaded).not.toBeNull();
+    expect('extra' in loaded!).toBe(false);
+    store.close();
+  });
+});
+
+describe('未打开项目的写前变更管道（第八轮 #4）：未来 schema 拒绝写前变更', () => {
+  it('future schema（v > 当前）：rename/duplicate 拒绝，记录保持原样（仅允许列出/删除）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const future = { ...project('lumora://project/a', '未来版本', 0), schemaVersion: 99 } as unknown as Project;
+    expect((await store.save(future)).ok).toBe(true);
+
+    const renamed = await store.rename('lumora://project/a', '新名');
+    expect(renamed.ok).toBe(false);
+    if (!renamed.ok) {
+      expect(renamed.code).toBe('storage-error');
+      expect(renamed.message).toContain('schema');
+    }
+    const duplicated = await store.duplicate('lumora://project/a');
+    expect(duplicated.ok).toBe(false);
+    if (!duplicated.ok) expect(duplicated.code).toBe('storage-error');
+
+    const loaded = await store.load('lumora://project/a');
+    expect(loaded!.schemaVersion).toBe(99);
+    expect(loaded!.name).toBe('未来版本');
+    expect((await store.list()).map((s) => s.uri)).toEqual(['lumora://project/a']);
+    store.close();
+  });
+
+  it('duplicate：复制后验证副本可加载，加载失败清理副本并报错（不留半成品复制）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    await store.save(project('lumora://project/a', '源项目', 1));
+    const realLoad = store.load.bind(store);
+    let loadCount = 0;
+    // 第一次 load = 源项目读取；第二次 = 副本加载验证 → 注入失败
+    vi.spyOn(store, 'load').mockImplementation(async (uri) => {
+      loadCount += 1;
+      if (loadCount === 2) return null;
+      return realLoad(uri);
+    });
+    const result = await store.duplicate('lumora://project/a');
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe('storage-error');
+      expect(result.message).toContain('清理');
+    }
+    // 副本已被清理：只剩源项目
+    expect((await store.list()).map((s) => s.uri)).toEqual(['lumora://project/a']);
+    store.close();
+  });
+});
+
+describe('findJsonEncodingProblem 反射级检查（第八轮 #7）', () => {
+  it('Symbol 键 / 不可枚举属性 / 访问器属性拒绝；Proxy trap 抛错归一 reflection-error', () => {
+    const symKey: Record<string | symbol, unknown> = { a: 1 };
+    symKey[Symbol('x')] = 2;
+    expect(findJsonEncodingProblem(symKey)).toBe('symbol-key');
+
+    const nonEnum: Record<string, unknown> = { a: 1 };
+    Object.defineProperty(nonEnum, 'hidden', { value: 2, enumerable: false });
+    expect(findJsonEncodingProblem(nonEnum)).toBe('non-enumerable-property');
+
+    const accessor: Record<string, unknown> = { a: 1 };
+    Object.defineProperty(accessor, 'derived', { get: () => 42, enumerable: true });
+    expect(findJsonEncodingProblem(accessor)).toBe('accessor-property');
+
+    const trapOwnKeys = new Proxy({ a: 1 }, { ownKeys: () => { throw new Error('trap'); } });
+    expect(findJsonEncodingProblem(trapOwnKeys)).toBe('reflection-error');
+    const trapDescriptor = new Proxy({ a: 1 }, { getOwnPropertyDescriptor: () => { throw new Error('trap'); } });
+    expect(findJsonEncodingProblem(trapDescriptor)).toBe('reflection-error');
+    const trapProto = new Proxy({ a: 1 }, { getPrototypeOf: () => { throw new Error('trap'); } });
+    expect(findJsonEncodingProblem(trapProto)).toBe('reflection-error');
+
+    // 数组含 Symbol 键 → symbol-key；稀疏空槽（for-of 表现为 undefined）→ undefined-value
+    const arrWithSymbol = [1] as unknown as Record<string | symbol, unknown>;
+    arrWithSymbol[Symbol('i')] = 3;
+    expect(findJsonEncodingProblem(arrWithSymbol)).toBe('symbol-key');
+    // eslint-disable-next-line no-sparse-arrays
+    expect(findJsonEncodingProblem([, 1])).toBe('undefined-value');
+    // 正常对象与 JSON.parse 产物仍可编码
+    expect(findJsonEncodingProblem({ a: 1, nested: { b: [1, 2, 3] } })).toBeNull();
+  });
 });

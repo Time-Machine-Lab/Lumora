@@ -168,6 +168,19 @@ export class ProjectPersistence {
     return this.autosaver.getRecovery(uri);
   }
 
+  /**
+   * 「另存副本」源内容决策（第八轮 #2）：uri 为当前打开项目且有未保存编辑时，
+   * 以编辑器现场为准 —— 慢速保存/重试落盘期间的新编辑不得被旧恢复快照覆盖丢弃；
+   * 否则取该 uri 的恢复快照（切换/关闭时保存失败被保留的内容）；均无返回 null
+   * （调用方走存储复制路径）。
+   */
+  resolveSaveAsCopySource(uri: string): Project | null {
+    if (this.currentUri === uri && this.autosaver.hasUnsavedContent()) {
+      return this.editor.getProject();
+    }
+    return this.autosaver.getRecovery(uri);
+  }
+
   /** 显式重试保存恢复快照（成功清除恢复快照与锁存；失败返回错误）。 */
   retryRecovery(uri: string): Promise<SaveOutcome> {
     return this.autosaver.retryRecovery(uri);
@@ -224,8 +237,13 @@ export class ProjectPersistence {
         message: '重载期间项目已切换或内容已修改，操作已取消；未改变当前编辑',
       };
     }
-    this.autosaver.resetTo(loaded.project);
-    this.editor.openProject(loaded.project);
+    // 原子切换（第八轮 #5）：autosaver 重置 + 编辑器提交不向外广播，完成后由
+    // changed() 链按新基线广播一次净态；编辑器提交失败（防御路径）回滚并报错
+    try {
+      this.autosaver.switchOpen(loaded.project);
+    } catch (error) {
+      return { ok: false, message: `无法应用本地保存内容：${error instanceof Error ? error.message : String(error)}` };
+    }
     return { ok: true, project: loaded.project };
   }
 

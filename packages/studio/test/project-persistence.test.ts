@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createGroupObject } from '@lumora/core';
+import { createGroupObject, createSampleProject, SceneEditor } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import { createStudioRuntime } from '../src/runtime/studio-runtime';
 import type { StudioRuntime } from '../src/runtime/studio-runtime';
 import { ProjectStore } from '../src/persistence/project-store';
+import { ProjectPersistence } from '../src/persistence/project-persistence';
 import { buildProjectPackage, serializeProjectPackage } from '@lumora/core';
 
 const DB = 'lumora-test-persist';
@@ -546,5 +547,63 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     if (result.ok) return;
     expect(result.message).toContain('circular-reference');
     await runtime.dispose();
+  });
+
+  it('阻断2：慢速重试落盘期间继续编辑后「另存副本」保存最新编辑器内容，不丢弃新编辑（第八轮 #2）', async () => {
+    const editor = new SceneEditor();
+    const store = await ProjectStore.create(DB);
+    expect(store).not.toBeNull();
+    openStores.push(store!);
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 500, store: store! }); // 长防抖：慢速窗口内无自动保存干扰
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(10); // 基线 rev0
+    vi.spyOn(store!, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    editor.addObject(createGroupObject()); // rev1（恢复快照内容 = base+1）
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60);
+    expect(persistence.getRecoverySnapshot(A)).not.toBeNull();
+    vi.mocked(store!.save).mockRestore();
+
+    // 重开 A（编辑器 == 基线）→ 慢速重试恢复快照；挂起期间继续编辑两次
+    editor.openProject({ ...base, name: '项目A' });
+    await settle(60);
+    const realSave = store!.save.bind(store!);
+    vi.spyOn(store!, 'save').mockImplementationOnce(async (project, expected) => {
+      await new Promise((r) => setTimeout(r, 40));
+      return realSave(project, expected);
+    });
+    const retrying = persistence.retryRecovery(A);
+    await settle(20); // 保存挂起中
+    editor.addObject(createGroupObject()); // rev1（内容 base+1）
+    editor.addObject(createGroupObject()); // rev2（内容 base+2 —— 最新编辑）
+    const outcome = await retrying;
+    expect(outcome.ok).toBe(false); // 挂起期间编辑 → 锁存冲突（快照保留）
+
+    // 「另存副本」以编辑器现场为准：修复前取旧恢复快照（base+1），新编辑被丢弃
+    const source = persistence.resolveSaveAsCopySource(A);
+    expect(source).not.toBeNull();
+    expect(source!.objects.length).toBe(base.objects.length + 2);
+    const saved = await persistence.saveSnapshotAsNew(source!);
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) return;
+    persistence.clearRecovery(A);
+
+    const copyLoaded = await store!.load(saved.project.uri);
+    expect(copyLoaded).not.toBeNull();
+    expect(copyLoaded!.revision).toBe(0);
+    expect(copyLoaded!.objects.length).toBe(base.objects.length + 2);
+    // 旧恢复快照内容为 base+1（未被误当副本源）；重试保存已把快照落盘到 A
+    const storedA = await store!.load(A);
+    expect(storedA!.objects.length).toBe(base.objects.length + 1);
+    expect(persistence.getRecoverySnapshot(A)).toBeNull();
+    await persistence.dispose();
   });
 });

@@ -768,4 +768,72 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     );
     expect(await OpfsProjectStore.create(DB)).toBeNull();
   });
+
+  it('save 同步不可变快照（第八轮 #1）：首个 await 后改写入参 uri 不改变落盘目标（OPFS）', async () => {
+    const store = await OpfsProjectStore.create(DB);
+    if (!store) return;
+    const p = project('lumora://project/a', '快照测试', 0);
+    let reads = 0;
+    // 修复前 save 在 await 后再次读 project.uri（文件名/锁名），getter 落到 b →
+    // 文件按 b 落盘、a 无记录；修复后入口结构化克隆只读一次 getter，固定为 a
+    Object.defineProperty(p, 'uri', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? 'lumora://project/a' : 'lumora://project/b';
+      },
+    });
+    const result = await store.save(p, null);
+    expect(result.ok).toBe(true);
+    expect(await store.load('lumora://project/a')).not.toBeNull();
+    expect(await store.load('lumora://project/b')).toBeNull();
+    store.close();
+  });
+
+  it('save 同步不可变快照（第八轮 #1）：保存挂起期间注入循环引用 —— 入口快照隔离入参变异（OPFS）', async () => {
+    const store = await OpfsProjectStore.create(DB);
+    if (!store) return;
+    const p = project('lumora://project/a', '注入测试', 0);
+    const realSave = store.save.bind(store);
+    vi.spyOn(store, 'save').mockImplementation(async (incoming, expected) => {
+      // 真实 save 同步执行到首个 await（互斥锁）后返回 promise；此刻注入循环
+      // 引用 —— 修复前写入阶段对入参做 JSON 序列化会抛错（保存失败）；
+      // 修复后入口快照已生成，注入不影响本次保存
+      const promise = realSave(incoming, expected);
+      const cyclic: Record<string, unknown> = { self: null };
+      cyclic.self = cyclic;
+      (incoming as Project & Record<string, unknown>).pluginData = { cyclic };
+      return promise;
+    });
+    const result = await store.save(p, null);
+    expect(result.ok).toBe(true);
+    const loaded = await store.load('lumora://project/a');
+    expect(loaded).not.toBeNull();
+    expect((loaded as Project & Record<string, unknown>).pluginData?.cyclic).toBeUndefined();
+    store.close();
+  });
+
+  it('未打开项目的写前变更管道（第八轮 #4）：未来 schema 拒绝 rename/duplicate，记录保持原样（OPFS）', async () => {
+    const store = await OpfsProjectStore.create(DB);
+    if (!store) return;
+    const future = { ...project('lumora://project/a', '未来版本', 0), schemaVersion: 99 } as unknown as Project;
+    expect((await store.save(future)).ok).toBe(true);
+
+    const renamed = await store.rename('lumora://project/a', '新名');
+    expect(renamed.ok).toBe(false);
+    if (!renamed.ok) {
+      expect(renamed.code).toBe('storage-error');
+      expect(renamed.message).toContain('schema');
+    }
+    const duplicated = await store.duplicate('lumora://project/a');
+    expect(duplicated.ok).toBe(false);
+    if (!duplicated.ok) expect(duplicated.code).toBe('storage-error');
+
+    const loaded = await store.load('lumora://project/a');
+    expect(loaded!.schemaVersion).toBe(99);
+    expect(loaded!.name).toBe('未来版本');
+    expect((await store.list()).map((s) => s.uri)).toEqual(['lumora://project/a']);
+    store.close();
+  });
 });

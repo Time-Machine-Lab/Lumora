@@ -290,17 +290,18 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
     if (!project) return;
     setBusy(true);
     try {
-      // 恢复快照可用时以恢复快照为准（切换/关闭时保存失败被保留的内容）；
-      // 否则以当前编辑器内容为准（冲突/配额失败时的现场）
-      const recovery = persistence.getRecoverySnapshot(project.uri);
-      if (recovery) {
-        const saved = await persistence.saveSnapshotAsNew(recovery);
+      // 源内容决策（第八轮 #2）：当前项目有未保存编辑时以编辑器现场为准 ——
+      // 慢速保存/重试落盘期间的新编辑不得被旧恢复快照覆盖丢弃；否则取恢复快照
+      const source = persistence.resolveSaveAsCopySource(project.uri);
+      if (source) {
+        const saved = await persistence.saveSnapshotAsNew(source);
         if (!saved.ok) {
           showToast(saved.message, 'error');
           return;
         }
+        // 未保存内容已以副本保全：恢复快照与锁存一并清除（显式解决）
         persistence.clearRecovery(project.uri);
-        // 未保存内容已以副本保全：跳过切换排空屏障（flush:false）
+        // 未保存内容已保全：跳过切换排空屏障（flush:false）
         const opened = await runtime.openProject(saved.project, { flush: false });
         if (!opened.ok) {
           showToast(`无法打开副本：${opened.message}`, 'error');

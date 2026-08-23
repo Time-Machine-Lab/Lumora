@@ -18,7 +18,13 @@
  */
 
 import type { Project } from '@lumora/core';
-import { findJsonEncodingProblem, migrateProjectSchema } from '@lumora/core';
+import {
+  CURRENT_PROJECT_SCHEMA_VERSION,
+  findJsonEncodingProblem,
+  migrateProjectSchema,
+  validateProjectSchema,
+  validateProjectStructure,
+} from '@lumora/core';
 import type { JsonEncodingProblem } from '@lumora/core';
 
 // JSON 可编码性判定由 core 唯一负责（第六轮 #5：严格 JSON-value 校验/规范化边界，
@@ -137,6 +143,45 @@ export function isMigrationWriteback(incoming: Project, existing: Project): bool
   const migrated = migrateProjectSchema(existing);
   if (!migrated.ok) return false;
   return sameProjectContent(incoming, migrated.project as Project);
+}
+
+export type WriteChangePrepared =
+  | { ok: true; project: Project }
+  | { ok: false; code: 'not-found' | 'storage-error'; message: string };
+
+/**
+ * 未打开项目的写前变更管道（第八轮 #4，两个适配器共用）：rename/duplicate
+ * 先迁移到当前 schema 再做完整校验，任何失败都拒绝写前变更 ——
+ * - 未来版本（v > CURRENT）：migrateProjectSchema 返回 future-schema-version
+ *   失败，拒绝重命名/复制（未来 schema 只允许列出/删除，与 facade loadProject
+ *   的升级提示一致；不得在写前变更中被静默改写）；
+ * - 旧版本：逐级迁移到当前版本，对迁移结果做完整校验（迁移结果必须合法）；
+ * - 当前版本：完整校验。
+ * 校验失败视为项目不可用（not-found，与损坏记录的处理一致）。
+ * 变更（改名/复制字段）由调用方在返回的迁移后项目上应用再保存。
+ */
+export function prepareWriteChange(project: Project, action: 'rename' | 'duplicate'): WriteChangePrepared {
+  let current: Project = project;
+  if (project.schemaVersion !== CURRENT_PROJECT_SCHEMA_VERSION) {
+    const migrated = migrateProjectSchema(project);
+    if (!migrated.ok) {
+      return {
+        ok: false,
+        code: 'storage-error',
+        message: `项目 schema 版本（${project.schemaVersion}）不支持${action === 'rename' ? '重命名' : '复制'}：${migrated.error.message}`,
+      };
+    }
+    current = migrated.project as Project;
+  }
+  const schemaProblem = validateProjectSchema(current);
+  if (schemaProblem) {
+    return { ok: false, code: 'not-found', message: '项目记录已损坏，不可用' };
+  }
+  const structureProblem = validateProjectStructure(current);
+  if (structureProblem) {
+    return { ok: false, code: 'not-found', message: '项目记录已损坏，不可用' };
+  }
+  return { ok: true, project: current };
 }
 
 export function isQuotaError(error: unknown): boolean {

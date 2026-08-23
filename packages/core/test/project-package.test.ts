@@ -344,6 +344,29 @@ describe('工程包凭据清除（NFR-008：嵌套扩展数据递归清除）', 
       expect(json, `普通键 ${key} 必须保留`).toContain(`safe-${key}`);
     }
   });
+
+  it('紧凑拼接形态：OPENAIAPIKEYVALUE/REFRESHTOKENVALUE 清除（核心词子串覆盖，第八轮 #3）；常见非凭据键保留', async () => {
+    const project = await buildFixtureProject();
+    // 无分隔符连续段拆不出词边界：OPENAIAPIKEYVALUE 是单一词，单词相等/后缀枚举
+    // 都漏 —— 核心词（key/token）词内子串匹配必须兜住
+    const stripped: Record<string, string> = {};
+    for (const key of ['OPENAIAPIKEYVALUE', 'REFRESHTOKENVALUE', 'openaiapikeyvalue', 'refreshtokenvalue']) {
+      stripped[key] = `secret-${key}`;
+    }
+    // 含核心词子串但属常见非凭据配置：规范化名精确命中白名单必须保留
+    const preserved: Record<string, string> = {};
+    for (const key of ['maxOutputTokens', 'tokenBudgetPerScene', 'keyBinding', 'maxTokens', 'tokenizer', 'keyframes']) {
+      preserved[key] = `safe-${key}`;
+    }
+    const rich = { ...project, pluginData: { 'com.example': { ...stripped, ...preserved } } } as Project;
+    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
+    for (const key of Object.keys(stripped)) {
+      expect(json, `凭据键 ${key} 必须被清除`).not.toContain(`secret-${key}`);
+    }
+    for (const key of Object.keys(preserved)) {
+      expect(json, `普通键 ${key} 必须保留`).toContain(`safe-${key}`);
+    }
+  });
 });
 
 describe('parseProjectPackage：导出 → 导入 完整恢复（AC1）', () => {
