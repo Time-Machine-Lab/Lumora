@@ -1474,3 +1474,57 @@ describe('ProjectAutosaver：队列占位期间 A→B→A 的会话代捕获（�
     autosaver.dispose();
   });
 });
+
+describe('ProjectAutosaver：flush 任务执行时重读最新内容（第十八轮严重 3）', () => {
+  it('慢 reconcile 占队 + 已排队 autosave + flush 等待期间继续编辑：不重放旧快照、无假 revision-conflict、关闭/切换不被阻断', async () => {
+    const editor = new SceneEditor();
+    const store = await ProjectStore.create(DB);
+    expect(store).not.toBeNull();
+    if (!store) return;
+    openStores.push(store);
+    const saveSpy = vi.spyOn(store, 'save');
+    const realLoad = store.load.bind(store);
+    let delayFirstLoad = true;
+    const A_URI = 'lumora://project/a';
+    // 首轮 reconcile 的 load 延迟 120ms 占住串行链：rev1 autosave 与 flush 的
+    // 任务都排队等待执行，期间继续编辑产生更新内容（rev2）
+    store.load = async (uri) => {
+      if (delayFirstLoad) {
+        delayFirstLoad = false;
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      return realLoad(uri);
+    };
+    const autosaver = new ProjectAutosaver(editor, store, { debounceMs: DEBOUNCE });
+    editor.events.on('project:changed', ({ project }) => autosaver.changed(project));
+    const states: string[] = [];
+    autosaver.onState((s) => states.push(s.status));
+
+    editor.openProject(createSampleProject(A_URI));
+    await settle(5);
+    editor.addObject(createGroupObject()); // rev1 → 防抖触发 autosave 入队（链被慢 reconcile 占用）
+    // 等足防抖 + 余量：runSave 必须先于 flush 入队（[reconcile, runSave, flush]），
+    // 修复前 flush 重放捕获的 rev1 才会撞上 runSave 已写入的 rev2 触发假冲突
+    await settle(50);
+    const flushing = autosaver.flush(); // 队列占用期间 flush：修复前闭包捕获 rev1 快照
+    editor.addObject(createGroupObject()); // rev2 —— flush 等待期间继续编辑
+    await settle(200); // 慢 reconcile 结束 → runSave 以执行时最新内容落盘 → flush 任务执行
+    const outcome = await flushing;
+
+    // 无旧快照重放：A 恰两次落盘（reconcile 首存 + runSave），全部是 rev2 内容；
+    // 修复前 flush 用捕获的 rev1 快照第三次落盘（旧 revision 撞已写入的 rev2
+    // → 假 revision-conflict 锁存）。逐次检查无 rev1 重放
+    const aSaves = saveSpy.mock.calls.filter(([p]) => p.uri === A_URI);
+    expect(aSaves.length).toBe(2);
+    for (const [p] of aSaves) expect(p.revision).toBe(2);
+    // 无假 revision-conflict：不锁存、不广播 error，flush 放行（关闭/切换不被阻断）
+    expect(states).not.toContain('error');
+    expect(outcome).toEqual({ ok: true });
+    // rev2 内容完整落盘
+    const storedA = await loadStored(store, A_URI);
+    expect(storedA?.revision).toBe(2);
+    expect(storedA?.objects.length).toBe(createSampleProject().objects.length + 2);
+    saveSpy.mockRestore();
+    autosaver.dispose();
+  });
+});

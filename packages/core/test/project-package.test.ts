@@ -389,7 +389,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(parsed.project.pluginData).toEqual({ 'com.example': expected });
   });
 
-  it('凭据形态判定为完整词匹配：分隔符/camelCase 组合词顶层与嵌套路径一律拒绝，含 token/auth 子串的合法键放行（第十七轮阻断 1/严重 2 回归）', async () => {
+  it('凭据形态判定为完整序列匹配：分隔符/camelCase/全大写/全角/复数组合词顶层与嵌套路径一律拒绝，仅含 token/auth/pass/api 子串的合法键放行（第十七轮 + 第十八轮回归）', async () => {
     const project = await buildFixtureProject();
     const pluginData = {
       'com.example': {
@@ -402,15 +402,28 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         apiKey: 'leak-6',
         password: 'leak-7',
         passwd: 'leak-8',
-        api: 'leak-9',
         credentials: 'leak-10',
         accessToken: 'leak-11',
         clientSecret: 'leak-12',
         authHeader: 'leak-13',
         auth: 'leak-14',
-        // privateSettings 显式拒绝语义保留（'private' 分词命中）
+        // privateSettings/privateKeys 显式拒绝语义保留（private+setting/private+key 序列）
         privateSettings: 'leak-15',
-        // 放行组：完整词包含 token/auth 的合法键（旧子串匹配误剥）
+        privateKeys: 'leak-25',
+        // 第十八轮阻断 1：全大写/缩写形态（连续大写缩写保留为一个 token）、
+        // 复数复合词、全角（NFKC 规范化）一律拒绝
+        API_KEY: 'leak-16',
+        APIKey: 'leak-17',
+        PASSWORD: 'leak-18',
+        ACCESS_TOKEN: 'leak-19',
+        PRIVATE_KEY: 'leak-20',
+        'ＡＰＩ＿ＫＥＹ': 'leak-21',
+        accessTokens: 'leak-22',
+        clientSecrets: 'leak-23',
+        storedPasswords: 'leak-24',
+        // 放行组：完整词包含 token/auth 的合法键（旧子串匹配误剥）；
+        // 第十八轮严重 2：仅含 pass/token/api/auth 子串的复合词不在任何完整
+        // 凭据序列中，放行
         tokenizerConfig: 'keep-1',
         tokenizerModel: 'keep-2',
         authorName: 'keep-3',
@@ -419,6 +432,12 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         keyboardLayout: 'keep-6',
         MONKEYPATCH: 'keep-7',
         HOTKEYMAP: 'keep-8',
+        api: 'keep-9',
+        apiVersion: 'keep-10',
+        tokenBudget: 'keep-11',
+        renderPass: 'keep-12',
+        passCount: 'keep-13',
+        authMode: 'keep-14',
       },
     };
     const pkg = buildProjectPackage({ ...project, pluginData }, {
@@ -437,10 +456,19 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(plugin.keyboardLayout).toBe('keep-6');
     expect(plugin.MONKEYPATCH).toBe('keep-7');
     expect(plugin.HOTKEYMAP).toBe('keep-8');
+    expect(plugin.api).toBe('keep-9');
+    expect(plugin.apiVersion).toBe('keep-10');
+    expect(plugin.tokenBudget).toBe('keep-11');
+    expect(plugin.renderPass).toBe('keep-12');
+    expect(plugin.passCount).toBe('keep-13');
+    expect(plugin.authMode).toBe('keep-14');
     const json = JSON.stringify(parsed.project);
-    for (let i = 1; i <= 15; i += 1) expect(json).not.toContain(`leak-${i}`);
-    for (let i = 1; i <= 8; i += 1) expect(json).toContain(`keep-${i}`);
-    // 嵌套路径声明同判据：路径任意层命中凭据词整条声明拒绝；合法组合词路径放行
+    for (let i = 1; i <= 25; i += 1) {
+      if (i === 9) continue; // 裸 api 不再拒绝（第十八轮严重 2 修正）
+      expect(json).not.toContain(`leak-${i}`);
+    }
+    for (let i = 1; i <= 14; i += 1) expect(json).toContain(`keep-${i}`);
+    // 嵌套路径声明同判据：路径任意层命中完整凭据序列整条声明拒绝；合法组合词路径放行
     const nestedPkg = buildProjectPackage(
       {
         ...project,
@@ -454,9 +482,24 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
               'pass-word': 'n-4',
               private_key: 'n-5',
               apiKey: 'n-6',
+              API_KEY: 'n-7',
+              APIKey: 'n-8',
+              PASSWORD: 'n-9',
+              ACCESS_TOKEN: 'n-10',
+              PRIVATE_KEY: 'n-11',
+              'ＡＰＩ＿ＫＥＹ': 'n-12',
+              accessTokens: 'n-13',
+              clientSecrets: 'n-14',
+              storedPasswords: 'n-15',
+              privateKeys: 'n-16',
               tokenizerConfig: 'n-ok-1',
               authorName: 'n-ok-2',
               authorizationMode: 'n-ok-3',
+              apiVersion: 'n-ok-4',
+              tokenBudget: 'n-ok-5',
+              renderPass: 'n-ok-6',
+              passCount: 'n-ok-7',
+              authMode: 'n-ok-8',
             },
           },
         },
@@ -472,9 +515,24 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
             ['profile', 'pass-word'],
             ['profile', 'private_key'],
             ['profile', 'apiKey'],
+            ['profile', 'API_KEY'],
+            ['profile', 'APIKey'],
+            ['profile', 'PASSWORD'],
+            ['profile', 'ACCESS_TOKEN'],
+            ['profile', 'PRIVATE_KEY'],
+            ['profile', 'ＡＰＩ＿ＫＥＹ'],
+            ['profile', 'accessTokens'],
+            ['profile', 'clientSecrets'],
+            ['profile', 'storedPasswords'],
+            ['profile', 'privateKeys'],
             ['profile', 'tokenizerConfig'],
             ['profile', 'authorName'],
             ['profile', 'authorizationMode'],
+            ['profile', 'apiVersion'],
+            ['profile', 'tokenBudget'],
+            ['profile', 'renderPass'],
+            ['profile', 'passCount'],
+            ['profile', 'authMode'],
           ],
         },
       },
@@ -489,6 +547,11 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         tokenizerConfig: 'n-ok-1',
         authorName: 'n-ok-2',
         authorizationMode: 'n-ok-3',
+        apiVersion: 'n-ok-4',
+        tokenBudget: 'n-ok-5',
+        renderPass: 'n-ok-6',
+        passCount: 'n-ok-7',
+        authMode: 'n-ok-8',
       },
     });
   });

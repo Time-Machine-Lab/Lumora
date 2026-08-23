@@ -374,7 +374,19 @@ export class ProjectAutosaver {
       }
       const project = this.pending ?? this.editor.getProject();
       if (project && project.uri === this.currentUri && this.isUnsaved(project)) {
-        const outcome = await this.enqueue(() => this.saveSnapshot(project));
+        const uri = project.uri;
+        // 第十八轮严重 3：入队任务执行时重读最新内容，不闭包调用时的旧快照 ——
+        // 慢 reconcile/在途保存占队期间 flush 捕获 rev1、等待中继续编辑到 rev2
+        // 时，重放 rev1 会以旧 revision 覆写较新记录触发假 revision-conflict
+        // （锁存后关闭/切换被错误阻断）；与 runSave 任务体一致地按绑定 uri
+        // 取 pending/编辑器最新快照保存，已净（runSave 已落盘最新内容）则直接成功
+        const outcome = await this.enqueue<SaveOutcome>(async (): Promise<SaveOutcome> => {
+          if (this.disposed) return { ok: true };
+          const latest = this.pending ?? this.editor.getProject();
+          if (!latest || latest.uri !== uri) return { ok: true };
+          if (!this.isUnsaved(latest)) return { ok: true };
+          return this.saveSnapshot(latest);
+        });
         if (!outcome.ok) return outcome;
         continue;
       }

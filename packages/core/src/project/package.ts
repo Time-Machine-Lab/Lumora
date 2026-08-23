@@ -312,40 +312,85 @@ function isSafeExportKey(key: string): boolean {
   return key !== '__proto__' && key !== 'constructor' && key !== 'prototype';
 }
 
-/** 凭据形态词（第十五轮阻断 1 + 第十七轮阻断 1/严重 2）：公开声明路径任意层
- *  出现凭据形态词即整条声明拒绝 —— 「凭据永不导出」不依赖插件自觉声明
- *  privateSettings，显式声明凭据键也不是放行依据。形态判定为 NFKC 规范化 +
- *  分隔符/camelCase 分词后的完整词匹配（第十七轮阻断 1）：旧实现按子串匹配
- *  （lowered.includes(pattern)），api_key/pass_word/private_key/api.key/pass-word
- *  等组合词绕过检测进包，tokenizerConfig/tokenizerModel/authorName/
- *  authorizationMode 等合法键反而因含 token/auth 子串被误剥。分词规则：
- *  非字母数字分隔符（-_. 空格等）切分后，每段再按大写边界切分
- *  （apiKey → api|Key），全部小写后与完整词集合比对 —— 仅完整词/组合词
- *  组成部分命中才拒绝。 */
-const CREDENTIAL_SHAPE_WORDS = new Set([
-  'api',
-  'apikey',
-  'auth',
-  'credential',
-  'credentials',
-  'pass',
+/** 凭据形态判定（第十五轮阻断 1 + 第十七轮阻断 1/严重 2 + 第十八轮重构）：
+ *  公开声明路径任意层出现完整凭据形态即整条声明拒绝 —— 「凭据永不导出」
+ *  不依赖插件自觉声明 privateSettings，显式声明凭据键也不是放行依据。
+ *  判定为 NFKC 规范化 + 整段 token 化后的完整凭据序列匹配（第十八轮），
+ *  分两路：
+ *  1. 整键单个 token：单复数归一后与精确凭据键比对（password/passwd/apikey/
+ *     privatekey/secret/token/credential(s)/auth）；
+ *  2. 整键多个 token：相邻 token 对单复数归一后与凭据复合序列比对
+ *     （api+key、pass+word、private+key、access/refresh+token、client+secret、
+ *     stored+password、auth+header、private+setting）。
+ *  任意命中即拒绝。tokenizerConfig/authorName/apiVersion/tokenBudget/
+ *  renderPass/passCount/authMode 等仅含 token/auth/pass/api 子串的合法键
+ *  不在任何完整序列中，放行（第十七轮严重 2 回归）。连续大写缩写保留为
+ *  一个 token（APIKey → api|key、PASSWORD → password、API_KEY → api|key），
+ *  不再按单个大写字母拆分导致全大写/缩写键漏判（第十八轮阻断 1）。 */
+const CREDENTIAL_EXACT_KEYS = new Set([
   'password',
   'passwd',
-  'private',
+  'apikey',
   'privatekey',
   'secret',
   'token',
+  'credential',
+  'credentials',
+  'auth',
 ]);
 
-function isCredentialShapeKey(key: string): boolean {
-  const words = key
+const CREDENTIAL_COMPOUND_PAIRS: ReadonlyArray<readonly [string, string]> = [
+  ['api', 'key'],
+  ['pass', 'word'],
+  ['private', 'key'],
+  ['access', 'token'],
+  ['refresh', 'token'],
+  ['client', 'secret'],
+  ['stored', 'password'],
+  ['auth', 'header'],
+  ['private', 'setting'],
+];
+
+/** 完整凭据词匹配（含单复数归一）：token 与基准词相等，或 token 是规则复数
+ *  （词尾 -s，长度 > 3）剥尾后与基准词相等（tokens→token、secrets→secret、
+ *  passwords→password、credentials→credential）。直接相等优先：pass/access
+ *  等以 -s 结尾的基词本身若先做剥尾（pass→pas、access→acces）会错过
+ *  pass+word、access+token 等复合序列（第十八轮修复）。 */
+function matchesCredentialWord(token: string, base: string): boolean {
+  if (token === base) return true;
+  return token.length > 3 && token.endsWith('s') && token.slice(0, -1) === base;
+}
+
+/** camelCase/缩写分词：非字母数字分隔符切段后，每段按大写边界切分
+ *  （连续大写缩写整体保留：APIKey → API|Key、PASSWORD → PASSWORD）。 */
+function credentialTokens(key: string): string[] {
+  return key
     .normalize('NFKC')
     .replace(/[^a-zA-Z0-9]+/g, ' ')
     .trim()
     .split(/\s+/)
     .filter(Boolean)
-    .flatMap((word) => word.split(/(?=[A-Z])/));
-  return words.some((word) => CREDENTIAL_SHAPE_WORDS.has(word.toLowerCase()));
+    .flatMap((segment) => segment.match(/[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[0-9]+|[A-Z]+/g) ?? [])
+    .map((word) => word.toLowerCase());
+}
+
+function isCredentialShapeKey(key: string): boolean {
+  const tokens = credentialTokens(key);
+  if (tokens.length === 0) return false;
+  if (tokens.length === 1) {
+    for (const base of CREDENTIAL_EXACT_KEYS) {
+      if (matchesCredentialWord(tokens[0], base)) return true;
+    }
+    return false;
+  }
+  for (let i = 0; i < tokens.length - 1; i += 1) {
+    const a = tokens[i];
+    const b = tokens[i + 1];
+    for (const [x, y] of CREDENTIAL_COMPOUND_PAIRS) {
+      if (matchesCredentialWord(a, x) && matchesCredentialWord(b, y)) return true;
+    }
+  }
+  return false;
 }
 
 /** 整值导出仅允许 JSON primitive 叶值（第十五轮阻断 1）：对象/数组整值导出会
