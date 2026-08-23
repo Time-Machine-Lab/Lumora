@@ -12,8 +12,9 @@
  * 一律拒绝导入，绝不把损坏资产判为导入成功。
  */
 
-import type { Project } from '../scene/types';
+import type { AssetPartData, Project } from '../scene/types';
 import { compositeContentHash, hashBytes } from '../scene/assets';
+import { isArrayIndexKey } from '../scene/json-encoding';
 import { validateProjectSchema, validateProjectStructure } from '../scene/validate';
 import { migrateProjectSchema } from './migrate';
 import { PACKAGE_FORMAT_VERSION, PROJECT_PACKAGE_FORMAT, CURRENT_PROJECT_SCHEMA_VERSION } from './schema';
@@ -22,11 +23,14 @@ import type { ProjectAssetPayload, ProjectPackage } from './schema';
 export interface PackageBuildOptions {
   /** 是否包含插件私有设置（pluginData）。默认不含：pluginData 结构性排除（NFR-008）。 */
   includePrivate?: boolean;
-  /** includePrivate 时的命名空间 allowlist + 剥离声明（第十二轮阻断 2）：键为
-   *  插件 instanceId，值为该插件 manifest.privateSettings 声明的私有键。仅映射
-   *  中存在的命名空间（已注册插件）保留 —— 未知命名空间（未注册插件）默认排除，
-   *  隔离绝不 fail-open；已注册插件按声明剥离顶层键（空声明 = 整段保留，未声明
-   *  键随包完整往返 —— 凭据隔离是结构化契约而非键名词表猜测）。 */
+  /** includePrivate 时的命名空间 + 键级显式可导出字段 allowlist（第十三轮阻断 2）：
+   *  键为插件 instanceId，值为该命名空间允许随包导出的顶层键列表。仅映射中
+   *  存在的命名空间（已注册插件）可进入包 —— 未知命名空间（未注册插件）默认
+   *  排除，隔离绝不 fail-open；键级同样 fail-closed：只保留显式声明的键，未
+   *  声明键（含凭据形态键名）一律不进包，空/漏声明 = 无公开字段 = 整段排除。
+   *  映射由宿主生成并验证（宿主按 manifest.privateSettings 与实际 pluginData
+   *  键计算可导出键，见 ProjectMenu.exportCurrent），core 端不再把「未声明键」
+   *  默认为可导出。 */
   privateKeysByPlugin?: Record<string, string[]>;
   appName?: string;
   appVersion?: string;
@@ -162,6 +166,19 @@ export const PUBLIC_OBJECT_FIELDS = [
   'assetId',
 ] as const;
 export const PUBLIC_TRANSFORM_FIELDS = ['position', 'rotation', 'scale'] as const;
+export const PUBLIC_GEOMETRY_FIELDS = ['kind'] as const;
+export const PUBLIC_MATERIAL_FIELDS = ['color'] as const;
+export const PUBLIC_LIGHT_FIELDS = ['kind', 'color', 'intensity', 'distance', 'angle'] as const;
+export const PUBLIC_CAMERA_FIELDS = [
+  'projection',
+  'focalLength',
+  'fov',
+  'sensorWidth',
+  'sensorHeight',
+  'near',
+  'far',
+  'aspect',
+] as const;
 export const PUBLIC_TRACK_FIELDS = ['id', 'name', 'objectId', 'targetPath', 'keyframes'] as const;
 export const PUBLIC_KEYFRAME_FIELDS = ['time', 'value', 'interpolation'] as const;
 export const PUBLIC_ASSET_FIELDS = [
@@ -178,6 +195,10 @@ export const PUBLIC_ASSET_FIELDS = [
   'parts',
   'createdAt',
 ] as const;
+/** 外部分件（AssetPartData）契约字段：{ path, mime, payload } */
+export const PUBLIC_ASSET_PART_FIELDS = ['path', 'mime', 'payload'] as const;
+/** manifest.project 必需字段：缺失（own 数据字段不存在）即拒绝导出（第十三轮一般 6） */
+const REQUIRED_PROJECT_FIELDS = ['uri', 'name', 'schemaVersion', 'revision'] as const;
 
 function failure(code: PackageImportErrorCode, message: string, detail?: string): PackageParseResult {
   return { ok: false, error: { code, message, detail } };
@@ -224,13 +245,21 @@ function projectDto(value: unknown, fields: readonly string[]): unknown {
   return out;
 }
 
-/** 场景对象投影：transform 子结构同样按契约投影 */
+/** 场景对象投影：transform/geometry/material/light/camera 子结构同样按契约投影
+ *  （第十三轮阻断 1：子结构整对象进包会使 camera.apiKey 等嵌套凭据进入默认包） */
 function projectObjectDto(value: unknown): unknown {
   const out = projectDto(value, PUBLIC_OBJECT_FIELDS);
-  if (isPlainRecord(out)) {
-    const transform = projectDto(out.transform, PUBLIC_TRANSFORM_FIELDS);
-    if (isPlainRecord(transform)) out.transform = transform;
-  }
+  if (!isPlainRecord(out)) return out;
+  const transform = projectDto(out.transform, PUBLIC_TRANSFORM_FIELDS);
+  if (isPlainRecord(transform)) out.transform = transform;
+  const geometry = projectDto(out.geometry, PUBLIC_GEOMETRY_FIELDS);
+  if (isPlainRecord(geometry)) out.geometry = geometry;
+  const material = projectDto(out.material, PUBLIC_MATERIAL_FIELDS);
+  if (isPlainRecord(material)) out.material = material;
+  const light = projectDto(out.light, PUBLIC_LIGHT_FIELDS);
+  if (isPlainRecord(light)) out.light = light;
+  const camera = projectDto(out.camera, PUBLIC_CAMERA_FIELDS);
+  if (isPlainRecord(camera)) out.camera = camera;
   return out;
 }
 
@@ -254,16 +283,33 @@ function projectAssetMeta(value: unknown): Record<string, unknown> {
   return out;
 }
 
+/** 外部分件数组投影（第十三轮阻断 1 + 严重 3）：逐元素按 AssetPartData 契约投影
+ *  （元素嵌套未知字段不得进包）；数组自身的非索引 own 键（如 parts.extra）在
+ *  JSON 序列化时必然静默丢弃 —— 显式拒绝导出，绝不静默丢字段却返回成功。 */
+function projectAssetPartArray(value: unknown): AssetPartData[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  for (const key of Reflect.ownKeys(value)) {
+    if (key === 'length') continue;
+    const keyStr = typeof key === 'symbol' ? null : String(key);
+    if (keyStr === null || !isArrayIndexKey(keyStr)) {
+      throw new Error(`资产分件数组含非索引属性 ${String(key)}，无法安全导出（JSON 会静默丢弃）`);
+    }
+  }
+  return value.map((part) => projectDto(part, PUBLIC_ASSET_PART_FIELDS)) as AssetPartData[];
+}
+
 /**
- * 声明制剥离 + 命名空间隔离（第十二轮阻断 2 / 一般 9）：privateKeysByPlugin 兼作
- * 命名空间 allowlist —— 仅映射中存在的 instanceId（已注册插件）保留，未知命名空间
- * （未注册插件）整体排除（fail-closed，与 UI「凭据永不导出」一致）；已注册插件按
- * manifest.privateSettings 显式声明删除 pluginData[instanceId] 的顶层键（空声明 =
- * 整段保留 —— 未声明键随包完整往返，凭据隔离是结构化契约而非键名猜测）。
- * 声明查询以 Object.hasOwn 判定（防 pluginData/声明表自身的 __proto__ own 键命中
- * 原型链）+ Array.isArray（防声明为非数组形态导致遍历崩溃）。调用方传入克隆后的
- * pluginData 顶层与逐命名空间副本：剥离在克隆上原地执行，绝不修改源项目对象
- * （多次构建/深冻结项目不得互相污染）。
+ * 命名空间 + 键级显式可导出字段 allowlist（第十三轮阻断 2 / 一般 7）：映射值 =
+ * 该命名空间允许随包导出的顶层键列表，只保留显式声明的键 —— 未声明键（含凭据
+ * 形态键名）一律不进包（键级 fail-closed）；空/漏声明（[] / 非数组 / 映射缺失）
+ * = 无公开字段 = 整段排除，已注册但空/漏声明绝不整段放行。隔离绝不 fail-open：
+ * - instanceId 不在映射（未注册插件）→ 整体排除；
+ * - 畸形声明（值非数组）→ 整段排除（拒绝把畸形声明当作放行依据）；
+ * - pluginData 与声明表同拥 own '__proto__' 时不得把 '__proto__' 当合法
+ *   allowlist 项放行（原型污染矢量）：instanceId 与声明键为 '__proto__' 一律排除。
+ * 声明查询以 Object.hasOwn 判定 + Array.isArray 防护。调用方传入克隆后的
+ * pluginData 顶层：剥离/重建在克隆上原地执行，绝不修改源项目对象（多次构建/
+ * 深冻结项目不得互相污染）。
  */
 function stripDeclaredPrivateKeys(
   pluginData: unknown,
@@ -277,48 +323,66 @@ function stripDeclaredPrivateKeys(
     return;
   }
   for (const instanceId of Object.keys(pluginData)) {
-    if (!Object.hasOwn(privateKeysByPlugin, instanceId)) {
-      // 未知命名空间（未注册插件）：默认排除 —— 没有 manifest 声明的数据没有
-      // 进入包的依据，凭据隔离不得 fail-open
+    if (!Object.hasOwn(privateKeysByPlugin, instanceId) || instanceId === '__proto__') {
+      // 未知命名空间（未注册插件）与原型污染矢量：默认排除 —— 没有 manifest
+      // 声明的数据没有进入包的依据，凭据隔离不得 fail-open
       delete pluginData[instanceId];
       continue;
     }
-    const declared = privateKeysByPlugin[instanceId];
+    const allowlist = privateKeysByPlugin[instanceId];
     const value = pluginData[instanceId];
-    if (!Array.isArray(declared) || !isPlainRecord(value)) continue;
-    // 逐命名空间浅克隆后删除声明键：不得在源项目对象上原地删除
-    const clone = { ...value };
-    for (const key of declared) {
-      if (typeof key === 'string') delete clone[key];
+    if (!Array.isArray(allowlist) || !isPlainRecord(value)) {
+      // 畸形声明（非数组）：拒绝放行 —— 整段排除
+      delete pluginData[instanceId];
+      continue;
     }
-    pluginData[instanceId] = clone;
+    // 逐命名空间按 allowlist 重建（显式可导出字段）：不在列表中的键不进包；
+    // 不得在源项目对象上原地删除
+    const clone: Record<string, unknown> = {};
+    for (const key of allowlist) {
+      if (typeof key !== 'string' || key === '__proto__') continue;
+      if (Object.hasOwn(value, key)) clone[key] = value[key];
+    }
+    // 空 allowlist / 未命中任何键 = 无公开字段 → 整段排除（不保留空对象占位）
+    if (Object.keys(clone).length === 0) delete pluginData[instanceId];
+    else pluginData[instanceId] = clone;
   }
 }
 
 /**
  * 构建工程包：
- * - 逐层白名单构建 project 段（第十二轮阻断 1）：根级仅公开字段进入包；settings
- *   按契约字段投影（PUBLIC_SETTINGS_FIELDS，契约外键结构性排除）；scenes/
- *   objects/tracks/资产元数据按各自公开 DTO 契约逐层投影（transform/keyframes
- *   子结构同契约）—— 嵌套未知字段（含凭据形态键名）任何情况下不得进入包；
- *   pluginData 默认排除（includePrivate 时按命名空间 allowlist + 插件显式声明
- *   剥离私有键后保留，未知命名空间 fail-closed 排除 —— 不再递归猜测键名，
- *   NFR-008）；
+ * - 逐层白名单构建 project 段（第十二轮阻断 1 + 第十三轮阻断 1）：根级仅公开
+ *   字段进入包；settings 按契约字段投影（PUBLIC_SETTINGS_FIELDS，契约外键结构性
+ *   排除）；scenes/objects/tracks/资产元数据按各自公开 DTO 契约逐层投影
+ *   （transform/geometry/material/light/camera/keyframes 子结构与 assets[].parts[]
+ *   分件元素同契约）—— 嵌套未知字段（含凭据形态键名）任何情况下不得进入包；
+ *   pluginData 默认排除（includePrivate 时按命名空间 + 键级显式可导出字段
+ *   allowlist 保留，未知命名空间/空漏声明/未声明键 fail-closed 排除 —— 不再
+ *   递归猜测键名，NFR-008）；
  * - 投影基于 property descriptor（第十二轮一般 #8）：以 getOwnPropertyDescriptor
  *   读取 own 数据字段，访问器/反射异常在读取时拒绝 —— descriptor 预检与后续
- *   structuredClone 基于同一投影视图，克隆不物化预检未看到的字段；
- * - 资产字节从 project.json 摘出，按 assetId 挂入 assets 段；
+ *   structuredClone 基于同一投影视图，克隆不物化预检未看到的字段；manifest 与
+ *   project 段同从投影视图读取，必需字段缺失即拒绝导出（第十三轮一般 6）；
+ * - 资产字节从 project.json 摘出，按 assetId 挂入 assets 段（分件数组的非索引
+ *   属性 JSON 序列化必丢 —— 显式拒绝，绝不静默丢字段，第十三轮严重 3）；
  * - storageRef 为运行期缓存引用（object URL），跨环境不可重建，导出恒置空。
  */
 export function buildProjectPackage(project: Project, options: PackageBuildOptions = {}): ProjectPackage {
   const includePrivate = options.includePrivate ?? false;
   const exportedAt = options.exportedAt ?? new Date().toISOString();
 
-  // 根级字段投影：直接以原 project 为源（引用原值），投影视图随后统一克隆
+  // 根级字段投影：直接以原 project 为源（引用原值），投影视图随后统一克隆。
+  // manifest 必需字段（uri/name/schemaVersion/revision）缺失 own 数据字段即拒绝
+  // 导出（第十三轮一般 6）：manifest 与 project 段同从投影视图读取，继承 getter
+  // 不会产生「manifest 有、project 段无」的不一致包
   const stripped: Record<string, unknown> = {};
   for (const field of PUBLIC_PROJECT_FIELDS) {
     const read = readOwnDataField(project, field);
-    if (read.present && read.value !== undefined) stripped[field] = read.value;
+    if (read.present && read.value !== undefined) {
+      stripped[field] = read.value;
+    } else if ((REQUIRED_PROJECT_FIELDS as readonly string[]).includes(field)) {
+      throw new Error(`项目缺少必需字段 ${field}（own 数据字段不存在），导出被拒绝`);
+    }
   }
   if (includePrivate) {
     const read = readOwnDataField(project, 'pluginData');
@@ -354,7 +418,7 @@ export function buildProjectPackage(project: Project, options: PackageBuildOptio
     ? (stripped.assets as unknown[]).map((asset) => {
         const meta = projectAssetMeta(asset);
         const payload = typeof meta.payload === 'string' ? meta.payload : undefined;
-        const parts = Array.isArray(meta.parts) ? meta.parts : undefined;
+        const parts = projectAssetPartArray(meta.parts);
         // 主载荷是资产的必要内容（glTF/GLB）：没有主载荷绝不生成 parts-only bundle，
         // 分件仅随主载荷一并进入包内 assets 段
         if (payload !== undefined) {
@@ -380,10 +444,10 @@ export function buildProjectPackage(project: Project, options: PackageBuildOptio
       exportedAt,
       app: { name: options.appName ?? 'Lumora Studio', version: options.appVersion ?? '0.1.0' },
       project: {
-        uri: project.uri,
-        name: project.name,
-        schemaVersion: project.schemaVersion,
-        revision: project.revision,
+        uri: String(stripped.uri),
+        name: String(stripped.name),
+        schemaVersion: stripped.schemaVersion as number,
+        revision: stripped.revision as number,
       },
       assetCount,
       includePrivate,

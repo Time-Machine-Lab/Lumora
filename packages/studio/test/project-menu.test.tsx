@@ -210,10 +210,11 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
     }
   });
 
-  it('导出菜单勾选「包含插件私有设置」后 exportCurrent 收到 includePrivate 与插件 privateSettings 声明（第十一轮）', async () => {
+  it('导出菜单勾选「包含插件私有设置」后 exportCurrent 收到 includePrivate 与宿主生成的键级 allowlist（第十三轮阻断 2）', async () => {
     const handle = renderStudio();
     const runtime = await waitPersistence(handle);
-    // 注册声明 privateSettings 的插件：ProjectMenu 导出时从 host 收集声明
+    // 注册声明 privateSettings 的插件：ProjectMenu 导出时生成可导出字段 allowlist
+    // = pluginData 实际 own 键 − privateSettings 声明（可导出键 = 未声明为私有的键）
     await runtime.host.register({
       manifest: {
         schemaVersion: '1',
@@ -226,7 +227,12 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
       },
       entry: async () => ({ activate: () => undefined }),
     });
-    runtime.openProject(createSampleProject('lumora://project/export', '导出样例'));
+    runtime.openProject({
+      ...createSampleProject('lumora://project/export', '导出样例'),
+      pluginData: {
+        'com.example.aiassistant': { theme: 'dark', apiKey: 'sk-x', auth: { token: 't' } },
+      },
+    } as Project);
     const spy = vi.spyOn(runtime.persistence, 'exportCurrent').mockReturnValue({
       ok: true,
       text: '{}',
@@ -245,23 +251,23 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
     );
     try {
       await openMenu();
-      // 隐私默认：不勾选 → 默认导出（声明照常收集，仅 pluginData 不进包）
+      // 隐私默认：不勾选 → 默认导出（allowlist 照常生成，仅 pluginData 不进包）
       expect(screen.getByTestId('project-export-include-private')).not.toBeChecked();
       screen.getByTestId('project-export').click();
       await waitFor(() =>
         expect(spy).toHaveBeenCalledWith({
           includePrivate: false,
-          privateKeysByPlugin: { 'com.example.aiassistant': ['auth', 'apiKey'] },
+          privateKeysByPlugin: { 'com.example.aiassistant': ['theme'] },
         }),
       );
-      // 显式开启：仅放行插件私有设置
+      // 显式开启：仅放行可导出字段（私有声明键 auth/apiKey 从 allowlist 中剔除）
       fireEvent.click(screen.getByTestId('project-export-include-private'));
       expect(screen.getByTestId('project-export-include-private')).toBeChecked();
       screen.getByTestId('project-export').click();
       await waitFor(() =>
         expect(spy).toHaveBeenCalledWith({
           includePrivate: true,
-          privateKeysByPlugin: { 'com.example.aiassistant': ['auth', 'apiKey'] },
+          privateKeysByPlugin: { 'com.example.aiassistant': ['theme'] },
         }),
       );
       await new Promise((r) => setTimeout(r, 1100));
@@ -272,7 +278,7 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
     }
   });
 
-  it('includePrivate 导出：manifest.privateSettings 声明的键被剥离，未声明键完整保留（NFR-008）', async () => {
+  it('includePrivate 导出：manifest.privateSettings 声明的键不进包，未声明键完整保留（NFR-008 + 第十三轮阻断 2）', async () => {
     const handle = renderStudio();
     const runtime = await waitPersistence(handle);
     await runtime.host.register({
@@ -307,11 +313,12 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
     expect(defaultJson).not.toContain('pluginData');
     expect(defaultJson).not.toContain('sk-lumora-secret-1234');
 
-    // includePrivate：声明的 auth 整棵子树被剥离；未声明键（theme/model/passwd）
-    // 完整保留 —— 契约不猜测键名（passwd 形态键名不声明即保留）
+    // includePrivate：宿主生成的 allowlist = 实际 own 键 − privateSettings 声明
+    // → auth 不进包；未声明键（theme/model/passwd）完整保留（凭据永不导出由
+    // allowlist 结构性保证，不依赖插件自觉声明）
     const privateExport = runtime.persistence.exportCurrent({
       includePrivate: true,
-      privateKeysByPlugin: { 'com.example.aiassistant': ['auth'] },
+      privateKeysByPlugin: { 'com.example.aiassistant': ['theme', 'model', 'passwd'] },
     });
     expect(privateExport.ok).toBe(true);
     const privatePkg = JSON.parse(privateExport.ok ? privateExport.text : '') as {
@@ -511,6 +518,45 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
       expect(deleteSpy).toHaveBeenCalledTimes(1);
       expect(deleteSpy).toHaveBeenCalledWith('lumora://project/recent-dup-copy');
       // 绝不报成功：无「已复制为」成功提示
+      expect(screen.queryByText(/已复制为/)).not.toBeInTheDocument();
+    } finally {
+      dupSpy.mockRestore();
+      loadSpy.mockRestore();
+      deleteSpy.mockRestore();
+    }
+  });
+
+  it('「最近项目复制」分支：副本加载 reject 且清理也 reject → 提示「清理失败，损坏副本记录保留，可手动删除」（第十三轮一般 8）', async () => {
+    const handle = renderStudio();
+    const runtime = await waitPersistence(handle);
+    runtime.openProject(createSampleProject('lumora://project/recent-dup2', '最近复制项目二'));
+    await waitFor(() => expect(screen.getByTestId('save-state-badge')).toHaveTextContent('已保存'));
+    await openMenu();
+    await screen.findByTestId('recent-project');
+
+    const persistence = runtime.persistence;
+    const dupSpy = vi.spyOn(persistence, 'duplicateProject').mockResolvedValue({
+      ok: true,
+      summary: {
+        uri: 'lumora://project/recent-dup-copy-2',
+        name: '最近复制项目二 副本',
+        savedAt: new Date().toISOString(),
+        revision: 0,
+        schemaVersion: 3,
+      },
+    });
+    const loadSpy = vi.spyOn(persistence, 'loadProject').mockRejectedValue(new Error('idb transaction aborted'));
+    const deleteSpy = vi.spyOn(persistence, 'deleteProject').mockRejectedValue(new Error('idb transaction aborted'));
+    try {
+      screen.getByTestId('recent-duplicate').click();
+      await waitFor(() => expect(screen.getByText(/无法打开副本/)).toBeInTheDocument());
+      expect(dupSpy).toHaveBeenCalledTimes(1);
+      expect(loadSpy).toHaveBeenCalledTimes(1);
+      // 清理也失败：如实报告记录保留、可手动删除 —— 修复前两次 await 的
+      // reject 均未捕获，坏副本静默残留且无任何提示
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+      expect(deleteSpy).toHaveBeenCalledWith('lumora://project/recent-dup-copy-2');
+      expect(screen.getByText(/清理失败，损坏副本记录保留，可手动删除/)).toBeInTheDocument();
       expect(screen.queryByText(/已复制为/)).not.toBeInTheDocument();
     } finally {
       dupSpy.mockRestore();

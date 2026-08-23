@@ -581,18 +581,28 @@ export class ProjectAutosaver {
       this.saveQueued = false;
       if (this.disposed) return;
       this.saveInFlight = true;
+      let outcome: SaveOutcome | null = null;
       try {
         // 执行时若已有更新的快照（同 uri），保存最新内容
         const target = this.pending && this.pending.uri === project.uri ? this.pending : project;
-        await this.saveSnapshot(target);
+        outcome = await this.saveSnapshot(target, true);
       } finally {
         this.saveInFlight = false;
+      }
+      // error 广播推迟到 saveInFlight 清零之后（第十三轮严重 #4）：错误监听器
+      // 同步执行失败 switchOpen 时回滚捕获的 prevInFlight 已是 false —— 旧项目
+      // 未落盘且无任何调度时回滚分支才会重新调度，自动保存不会因清零时序停止
+      if (outcome && !outcome.ok && outcome.code !== 'revision-conflict') {
+        this.emit({ status: 'error', code: outcome.code, message: outcome.message });
       }
     });
   }
 
-  /** 当前会话保存：捕获会话代与执行时基线（已提交基线，非打开时快照）。 */
-  private async saveSnapshot(project: Project): Promise<SaveOutcome> {
+  /** 当前会话保存：捕获会话代与执行时基线（已提交基线，非打开时快照）。
+   *  deferErrorBroadcast（runSave 专用，第十三轮严重 #4）：保存失败时错误广播
+   *  由调用方推迟到 saveInFlight 清零之后 —— 避免错误监听器同步执行失败
+   *  switchOpen 时回滚误判在途而停止自动保存。 */
+  private async saveSnapshot(project: Project, deferErrorBroadcast = false): Promise<SaveOutcome> {
     if (!this.store || this.disposed) {
       // 仅内存模式：无可持久化内容，视为可继续（关闭不被阻塞）
       return { ok: true };
@@ -601,7 +611,7 @@ export class ProjectAutosaver {
     const expected = this.committedByUri.get(project.uri)?.revision ?? null;
     if (this.isFresh(project.uri, session)) this.emit({ status: 'saving' });
     const result = await this.storeSave(project, expected);
-    this.applySaveResult(project, session, result);
+    this.applySaveResult(project, session, result, deferErrorBroadcast);
     return result;
   }
 
@@ -713,8 +723,10 @@ export class ProjectAutosaver {
    * 保存结果回写：任何成功都推进该 uri 的已提交基线并清除其恢复快照（含旧会话：
    * 在途保存→继续编辑→切换 的落盘结果必须推进旧 uri 基线，后续排空才不会冲突）；
    * 状态广播仅当结果属于当前会话（{ uri, session } 绑定），过期结果不污染新状态。
+   * suppressErrorEmit（runSave 延迟广播专用，第十三轮严重 #4）：配额/存储错误
+   * 的广播由 runSave 在 saveInFlight 清零之后发出。
    */
-  private applySaveResult(project: Project, session: number, result: SaveOutcome): void {
+  private applySaveResult(project: Project, session: number, result: SaveOutcome, suppressErrorEmit = false): void {
     if (result.ok) {
       const prev = this.committedByUri.get(project.uri);
       this.committedByUri.set(project.uri, {
@@ -735,6 +747,7 @@ export class ProjectAutosaver {
       this.latch({ uri: project.uri, code: 'revision-conflict', message: result.message });
       return;
     }
+    if (suppressErrorEmit) return;
     // 配额 / 存储错误：保持脏状态与快照，绝不覆盖较新内容（不锁存，后续编辑转 dirty 重试）
     this.emit({ status: 'error', code: result.code, message: result.message });
   }

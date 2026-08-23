@@ -1217,3 +1217,49 @@ describe('ProjectAutosaver：switchOpen 失败回滚恢复防抖保存（第十�
     autosaver.dispose();
   });
 });
+
+describe('ProjectAutosaver：保存失败错误广播与监听器同步重入（第十三轮严重 #4）', () => {
+  it('保存失败监听器同步失败 switchOpen：错误广播在 saveInFlight 清零之后，回滚重新调度不停止自动保存', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(60);
+
+    // 保存失败（存储错误）：错误监听器在广播中同步执行失败的 switchOpen。
+    // 修复前广播发生在 applySaveResult 内（saveInFlight 仍为 true）→ 回滚捕获
+    // prevInFlight=true 不重调度，随后 finally 清零 —— 自动保存永久停止；
+    // 修复后广播移到 saveInFlight 清零之后 → 回滚看到 prevInFlight=false，
+    // 旧项目未落盘且无调度 → 重新调度
+    const failingSave = vi
+      .spyOn(store, 'save')
+      .mockImplementationOnce(async () => ({ ok: false, code: 'storage-error', message: '存储不可用' } as const));
+    const broken = createSampleProject('lumora://project/b', '项目B');
+    (broken as { activeSceneId: string }).activeSceneId = '不存在的场景';
+    autosaver.onState((s) => {
+      if (s.status === 'error') {
+        try {
+          autosaver.switchOpen(broken);
+        } catch {
+          // 失败 switchOpen：回滚 autosaver 状态并上抛（正常防御路径）
+        }
+      }
+    });
+    editor.addObject(createGroupObject()); // dirty
+    await settle(40); // debounce 到期 → 保存失败 → error 广播（含监听器同步重入）
+    expect(failingSave).toHaveBeenCalledTimes(1);
+    expect((await store.load(A))!.revision).toBe(0); // 旧内容未落盘
+    failingSave.mockRestore();
+
+    // 不再编辑：回滚分支重新调度后自动重试落盘（修复前停止在 rev0）
+    const saveSpy = vi.spyOn(store, 'save');
+    await settle(100);
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    const stored = await store.load(A);
+    expect(stored).not.toBeNull();
+    expect(stored!.revision).toBe(1);
+    expect(stored!.objects.length).toBe(base.objects.length + 1);
+    saveSpy.mockRestore();
+    autosaver.dispose();
+  });
+});

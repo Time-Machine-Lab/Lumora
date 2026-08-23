@@ -396,15 +396,15 @@ describe('schema 升级写回豁免 isMigrationWriteback（第七轮 #5，两个
 });
 
 describe('JSON 编码契约三路共享矩阵（第七轮 #4：IDB / OPFS / 导出 对同一数据一致拒绝）', () => {
-  const cases: Array<[string, () => unknown, string]> = [
-    ['Date', () => ({ d: new Date('2026-01-01T00:00:00Z') }), 'non-plain-object'],
-    ['Map', () => ({ m: new Map([['a', 1]]) }), 'non-plain-object'],
-    ['Set', () => ({ s: new Set([1]) }), 'non-plain-object'],
-    ['RegExp', () => ({ r: /x+/ }), 'non-plain-object'],
-    ['typed array', () => ({ t: new Uint8Array([1, 2]) }), 'non-plain-object'],
-    ['-0', () => ({ z: -0 }), 'negative-zero'],
+  const cases: Array<[string, () => unknown, string, string]> = [
+    ['Date', () => ({ d: new Date('2026-01-01T00:00:00Z') }), 'non-plain-object', 'd'],
+    ['Map', () => ({ m: new Map([['a', 1]]) }), 'non-plain-object', 'm'],
+    ['Set', () => ({ s: new Set([1]) }), 'non-plain-object', 's'],
+    ['RegExp', () => ({ r: /x+/ }), 'non-plain-object', 'r'],
+    ['typed array', () => ({ t: new Uint8Array([1, 2]) }), 'non-plain-object', 't'],
+    ['-0', () => ({ z: -0 }), 'negative-zero', 'z'],
   ];
-  for (const [label, corrupt, problem] of cases) {
+  for (const [label, corrupt, problem, allowKey] of cases) {
     it(`${label}：IDB 保存 / OPFS 保存 / 导出 三路一致拒绝（${problem}）`, async () => {
       // 1) IndexedDB 后端
       const idb = await ProjectStore.create(DB);
@@ -430,18 +430,19 @@ describe('JSON 编码契约三路共享矩阵（第七轮 #4：IDB / OPFS / 导�
       expect(await opfs.load(`lumora://project/opfs-${label}`)).toBeNull();
       opfs.close();
 
-      // 3) 工程包导出（includePrivate + 命名空间 allowlist 放行时 pluginData 进包）：
+      // 3) 工程包导出（includePrivate + 命名空间显式 allowlist 放行损坏键时
+      // pluginData 进包）：
       // 编辑器 openProject 的 assertJsonPlainDeep/deepFreeze 已先行拒绝这些值
       // （损坏数据无法经编辑器持有），因此直接验证 exportCurrent 的检查链
       // （buildProjectPackage → findJsonEncodingProblem），导出表面共享同一编码契约
-      // （第十二轮：无 allowlist 时命名空间 fail-closed 排除，编码问题随数据一并
-      // 不进包 —— 预检只对进入最终投影视图的数据生效）
+      // （第十三轮：键级 allowlist 语义，只显式声明的键进包 —— 空 allowlist 整段
+      // 排除，编码问题随数据一并不进包；预检只对进入最终投影视图的数据生效）
       const exportProject = project(`lumora://project/export-${label}`, '导出坏数据', 1) as Project &
         Record<string, unknown>;
       exportProject.pluginData = { 'com.example': corrupt() };
       const pkg = buildProjectPackage(exportProject as Project, {
         includePrivate: true,
-        privateKeysByPlugin: { 'com.example': [] },
+        privateKeysByPlugin: { 'com.example': [allowKey] },
       });
       const encodingProblem = findJsonEncodingProblem(pkg);
       expect(encodingProblem).not.toBeNull();

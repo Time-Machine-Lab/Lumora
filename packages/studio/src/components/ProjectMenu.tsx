@@ -173,12 +173,37 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
         showToast(result.message, 'error');
         return;
       }
-      const loaded = await persistence.loadProject(result.summary.uri);
+      let loaded: Awaited<ReturnType<typeof persistence.loadProject>>;
+      try {
+        loaded = await persistence.loadProject(result.summary.uri);
+      } catch (error) {
+        // 副本加载 reject（故障存储抛错）：尝试清理副本并报告清理状态（第十三轮一般 8）
+        let cleaned = false;
+        try {
+          cleaned = await persistence.deleteProject(result.summary.uri);
+        } catch {
+          cleaned = false;
+        }
+        showToast(
+          `无法打开副本（${error instanceof Error ? error.message : String(error)}）${cleaned ? '' : '；清理失败，损坏副本记录保留，可手动删除'}`,
+          'error',
+        );
+        return;
+      }
       if (!loaded.ok) {
-        // 副本写入成功但数据无法通过校验（第十二轮一般 #6）：显式失败 ——
-        // 清理损坏副本（不得把坏记录留在最近列表误导用户）并提示错误，绝不报成功
-        await persistence.deleteProject(result.summary.uri);
-        showToast(`无法打开副本：${loaded.message}`, 'error');
+        // 副本写入成功但数据无法通过校验（第十二轮一般 #6 + 第十三轮一般 8）：
+        // 显式失败 —— 清理损坏副本（不得把坏记录留在最近列表误导用户）并提示
+        // 错误，绝不报成功；清理失败时如实报告记录保留
+        let cleaned = false;
+        try {
+          cleaned = await persistence.deleteProject(result.summary.uri);
+        } catch {
+          cleaned = false;
+        }
+        showToast(
+          `无法打开副本：${loaded.message}${cleaned ? '' : '；清理失败，损坏副本记录保留，可手动删除'}`,
+          'error',
+        );
         return;
       }
       // 复制打开中的项目时内容已以副本落盘：跳过切换排空屏障（flush:false），
@@ -220,14 +245,22 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
   };
 
   const exportCurrent = async () => {
-    // 私有设置剥离声明（第十一轮）+ 命名空间隔离（第十二轮阻断 2）：
-    // privateKeysByPlugin 兼作命名空间 allowlist —— 收集全部注册插件（未声明
-    // privateSettings 者登记空数组），core 端据此排除未注册命名空间：没有
-    // manifest 声明的数据（凭据形态键名亦然）任何情况下不进包（「凭据永不导出」）
+    // 命名空间 + 键级显式可导出字段 allowlist（第十三轮阻断 2）：core 端只保留
+    // 映射中显式声明的键，未声明键（含凭据形态键名）一律不进包。映射由宿主
+    // 生成并验证：可导出字段 = pluginData 实际 own 键 − manifest.privateSettings
+    // 显式私有声明；插件未声明 privateSettings（无私有信息契约）→ 无可导出字段，
+    // 整个命名空间 fail-closed 排除（「凭据永不导出」不依赖插件自觉声明）
     const privateKeysByPlugin: Record<string, string[]> = {};
     for (const info of runtime.host.listPlugins()) {
       const manifest = runtime.host.getPluginManifest(info.instanceId);
-      privateKeysByPlugin[info.instanceId] = manifest?.privateSettings ?? [];
+      const declaredPrivate = Array.isArray(manifest?.privateSettings) ? manifest.privateSettings : null;
+      const pluginData = project?.pluginData?.[info.instanceId];
+      const keys =
+        pluginData && typeof pluginData === 'object' && !Array.isArray(pluginData)
+          ? Object.keys(pluginData)
+          : [];
+      privateKeysByPlugin[info.instanceId] =
+        declaredPrivate === null ? [] : keys.filter((key) => !declaredPrivate.includes(key));
     }
     const exported = persistence.exportCurrent({ includePrivate, privateKeysByPlugin });
     if (!exported.ok) {

@@ -132,10 +132,11 @@ describe('buildProjectPackage：私有数据默认排除（FR-011 / NFR-008）',
     expect(noMappingJson).not.toContain('pluginData');
     expect(noMappingJson).not.toContain('theme');
 
-    // includePrivate + 已注册插件声明（空声明 = 整段保留，契约不猜测键名）
+    // includePrivate + 已注册插件键级 allowlist：只有显式声明的键进包
+    // （第十三轮阻断 2：空 allowlist = 无公开字段 = 整段排除）
     const privatePkg = buildProjectPackage(rich, {
       includePrivate: true,
-      privateKeysByPlugin: { 'com.example': [] },
+      privateKeysByPlugin: { 'com.example': ['theme'] },
     });
     const privateJson = JSON.stringify(privatePkg);
     expect(privateJson).toContain('pluginData');
@@ -196,7 +197,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     }
   });
 
-  it('pluginData 默认整体排除；includePrivate 无声明映射时 fail-closed 排除，已注册未声明键无损保留（契约不猜测键名）', async () => {
+  it('pluginData 默认整体排除；includePrivate 无声明映射或空声明时一律 fail-closed 整段排除（第十三轮阻断 2）', async () => {
     const project = await buildFixtureProject();
     const rich = {
       ...project,
@@ -220,17 +221,27 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(noMappingJson).not.toContain('sk-keep-1');
     expect(noMappingJson).not.toContain('Bearer keep-2');
 
-    // includePrivate + 已注册插件空声明：凭据形态键无损保留（契约不猜测键名）
-    const privateJson = JSON.stringify(
+    // includePrivate + 已注册插件空声明（无公开字段）：整段排除 —— 已注册但空/
+    // 漏声明一律不整段放行，凭据形态值绝不因 fail-open 进入包（第十三轮阻断 2）
+    const emptyJson = JSON.stringify(
       buildProjectPackage(rich, { includePrivate: true, privateKeysByPlugin: { 'com.example': [] } }),
     );
+    expect(emptyJson).not.toContain('theme');
+    expect(emptyJson).not.toContain('sk-keep-1');
+    expect(emptyJson).not.toContain('Bearer keep-2');
+    expect(emptyJson).not.toContain('pw-keep-3');
+
+    // includePrivate + 显式 allowlist：只保留声明的键
+    const privateJson = JSON.stringify(
+      buildProjectPackage(rich, { includePrivate: true, privateKeysByPlugin: { 'com.example': ['theme'] } }),
+    );
     expect(privateJson).toContain('theme');
-    expect(privateJson).toContain('sk-keep-1');
-    expect(privateJson).toContain('Bearer keep-2');
-    expect(privateJson).toContain('pw-keep-3');
+    expect(privateJson).not.toContain('sk-keep-1');
+    expect(privateJson).not.toContain('Bearer keep-2');
+    expect(privateJson).not.toContain('pw-keep-3');
   });
 
-  it('includePrivate + 声明剥离：manifest.privateSettings 声明的顶层键（含整棵子树）被剥除，未声明键保留', async () => {
+  it('includePrivate + 键级 allowlist：显式声明的顶层键（含整棵子树）进包，未声明键（theme）排除（第十三轮阻断 2）', async () => {
     const project = await buildFixtureProject();
     const rich = {
       ...project,
@@ -250,42 +261,53 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         privateKeysByPlugin: { 'com.example': ['apiKey', 'clientSecret', 'accessToken', 'auth'] },
       }),
     );
-    for (const leaked of ['sk-declared-1', 'cs-declared-2', 'at-declared-3', 'nested-4', 'nested-5']) {
-      expect(json, `声明键值 ${leaked} 不得进入包`).not.toContain(leaked);
+    // allowlist 键及其整棵子树完整保留（allowlist 是「可导出字段」而非「剥离列表」）
+    for (const kept of ['sk-declared-1', 'cs-declared-2', 'at-declared-3', 'nested-4', 'nested-5']) {
+      expect(json, `allowlist 键值 ${kept} 必须进入包`).toContain(kept);
     }
-    for (const key of ['"apiKey"', '"clientSecret"', '"accessToken"', '"auth"']) {
-      expect(json, `声明键名 ${key} 不得进入包`).not.toContain(key);
-    }
-    expect(json).toContain('theme');
+    expect(json, '未声明的 theme 不得进入包').not.toContain('theme');
   });
 
-  it('声明只作用于声明的插件实例：未知命名空间（未注册插件）默认排除，已注册未声明实例键保留', async () => {
+  it('声明只作用于声明的插件实例：未知命名空间与空声明实例一律排除（第十三轮阻断 2）', async () => {
     const project = await buildFixtureProject();
     const rich = {
       ...project,
       pluginData: {
-        'com.a': { apiKey: 'a-leak-1' },
-        'com.b': { apiKey: 'b-keep-1' },
+        'com.a': { apiKey: 'a-leak-1', theme: 'a-theme' },
+        'com.b': { apiKey: 'b-keep-1', theme: 'b-theme' },
       },
     } as Project;
-    // 仅 com.a 注册：com.b 是未知命名空间 → 整体排除（隔离 fail-closed，第十二轮阻断 2）
+    // 仅 com.a 注册（allowlist 只含 theme）：apiKey 不导出；com.b 是未知命名空间
+    // → 整体排除（隔离 fail-closed，第十二轮阻断 2）
     const json = JSON.stringify(
-      buildProjectPackage(rich, { includePrivate: true, privateKeysByPlugin: { 'com.a': ['apiKey'] } }),
+      buildProjectPackage(rich, { includePrivate: true, privateKeysByPlugin: { 'com.a': ['theme'] } }),
     );
     expect(json).not.toContain('a-leak-1');
+    expect(json).toContain('a-theme');
     expect(json).not.toContain('b-keep-1');
-    // com.b 已注册但未声明私有键：整段保留（声明只剥离已注册插件的显式声明键）
+    // com.b 已注册但空声明（无公开字段）：整段排除 —— 已注册不构成放行依据
     const bothJson = JSON.stringify(
       buildProjectPackage(rich, {
         includePrivate: true,
-        privateKeysByPlugin: { 'com.a': ['apiKey'], 'com.b': [] },
+        privateKeysByPlugin: { 'com.a': ['theme'], 'com.b': [] },
       }),
     );
     expect(bothJson).not.toContain('a-leak-1');
-    expect(bothJson).toContain('b-keep-1');
+    expect(bothJson).not.toContain('b-keep-1');
+    expect(bothJson).not.toContain('b-theme');
+    // com.b 显式声明为可导出：该实例键进包
+    const explicitJson = JSON.stringify(
+      buildProjectPackage(rich, {
+        includePrivate: true,
+        privateKeysByPlugin: { 'com.a': ['theme'], 'com.b': ['apiKey'] },
+      }),
+    );
+    expect(explicitJson).toContain('b-keep-1');
+    expect(explicitJson).not.toContain('b-theme');
+    expect(explicitJson).not.toContain('a-leak-1');
   });
 
-  it('无损往返性质：pass_word/passwd/authHeader 与 benign 组合词及后缀变体未声明时导出→导入逐键一致（第十一轮严重 #2）', async () => {
+  it('无损往返性质：pass_word/passwd/authHeader 与 benign 组合词显式 allowlist 放行时导出→导入逐键一致（第十一轮严重 #2 + 第十三轮）', async () => {
     const project = await buildFixtureProject();
     const pluginData = {
       'com.example': {
@@ -304,10 +326,19 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         tokenizerModel: 'cl100k',
       },
     };
-    // 已注册插件空声明：命名空间放行、未声明键逐键往返（第十二轮阻断 2 后 allowlist 语义）
-    const pkg = buildProjectPackage({ ...project, pluginData }, {
+    // 空声明（无公开字段）：整段排除，任何键都不进包（第十三轮阻断 2）
+    const emptyPkg = buildProjectPackage({ ...project, pluginData }, {
       includePrivate: true,
       privateKeysByPlugin: { 'com.example': [] },
+    });
+    const emptyParsed = await parseProjectPackage(serializeProjectPackage(emptyPkg));
+    expect(emptyParsed.ok).toBe(true);
+    if (!emptyParsed.ok) return;
+    expect(emptyParsed.project.pluginData).toBeUndefined();
+    // 显式 allowlist（宿主核验过的全部键）：逐键无损往返，值不被改动
+    const pkg = buildProjectPackage({ ...project, pluginData }, {
+      includePrivate: true,
+      privateKeysByPlugin: { 'com.example': Object.keys(pluginData['com.example']) },
     });
     const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
     expect(parsed.ok).toBe(true);
@@ -324,7 +355,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(JSON.parse(json)).toMatchObject({ project: { tracks: project.tracks } });
   });
 
-  it('导出导入往返 + 声明剥离：benign 组合词随包往返保留，声明键不进入包（第九轮 #4 契约化）', async () => {
+  it('导出导入往返 + 键级 allowlist：显式声明的键随包往返保留，未声明键（benign 组合词）不进入包（第九轮 #4 契约化 + 第十三轮阻断 2）', async () => {
     const project = await buildFixtureProject();
     const rich = {
       ...project,
@@ -350,18 +381,20 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     const plugin = (parsed.project.pluginData as Record<string, Record<string, string>>)['com.example'];
-    expect(plugin.keyboardLayout).toBe('kb-intl');
-    expect(plugin.tokenizerConfig).toBe('cl100k-base');
-    expect(plugin.monkeyPatch).toBe('off');
-    expect(plugin.hotkeyMap).toBe('default');
-    expect(plugin.shortcutKey).toBe('Ctrl+K');
-    expect(plugin.apiKey).toBeUndefined();
-    expect(plugin.accessToken).toBeUndefined();
-    expect(plugin.clientSecret).toBeUndefined();
+    // allowlist 键随包往返保留；未声明键（benign 组合词同样如此）一律排除
+    expect(plugin.keyboardLayout).toBeUndefined();
+    expect(plugin.tokenizerConfig).toBeUndefined();
+    expect(plugin.monkeyPatch).toBeUndefined();
+    expect(plugin.hotkeyMap).toBeUndefined();
+    expect(plugin.shortcutKey).toBeUndefined();
+    expect(plugin.apiKey).toBe('sk-leak-1');
+    expect(plugin.accessToken).toBe('tok-leak-2');
+    expect(plugin.clientSecret).toBe('client-secret-3');
     const json = JSON.stringify(parsed.project);
-    expect(json).not.toContain('sk-leak-1');
-    expect(json).not.toContain('tok-leak-2');
-    expect(json).not.toContain('client-secret-3');
+    expect(json).toContain('sk-leak-1');
+    expect(json).toContain('tok-leak-2');
+    expect(json).toContain('client-secret-3');
+    expect(json).not.toContain('kb-intl');
   });
 });
 
@@ -442,7 +475,7 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
     expect(json).toContain('非枚举名称');
   });
 
-  it('__proto__ 命名空间与原型链注入不进入包（第十二轮一般 #9）', async () => {
+  it('__proto__ 命名空间、allowlist 键与原型链注入不进入包（第十二轮一般 #9 + 第十三轮一般 #7）', async () => {
     const project = await buildFixtureProject();
     // 无原型字典携带 __proto__ own 键：Object.hasOwn 判定防原型链命中，未知命名空间排除
     const pluginData = Object.create(null) as Record<string, unknown>;
@@ -451,24 +484,29 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
     const json = JSON.stringify(
       buildProjectPackage({ ...project, pluginData } as unknown as Project, {
         includePrivate: true,
-        privateKeysByPlugin: { 'com.example': [] },
+        privateKeysByPlugin: { 'com.example': ['theme'] },
       }),
     );
     expect(json).not.toContain('proto-secret-1');
     expect(json).toContain('theme');
-    // 声明表以 __proto__ own 键注入：不得命中原型链、不得误删正常声明
+    // 声明表以 __proto__ own 键注入 + pluginData 值同拥 own __proto__：
+    // '__proto__' 不得被当作合法 allowlist 项放行（原型污染矢量），正常声明不受影响
     const declarations = Object.create(null) as Record<string, string[]>;
     declarations['__proto__'] = ['apiKey'];
-    declarations['com.example'] = ['apiKey'];
-    const rich = { ...project, pluginData: { 'com.example': { apiKey: 'sk-strip-1', theme: 'dark' } } } as Project;
+    declarations['com.example'] = ['apiKey', '__proto__'];
+    const poisonedValue = Object.create(null) as Record<string, unknown>;
+    poisonedValue['apiKey'] = 'sk-strip-1';
+    poisonedValue['__proto__'] = { pollute: 'proto-polluted' };
+    const rich = { ...project, pluginData: { 'com.example': poisonedValue } } as Project;
     const strippedJson = JSON.stringify(
       buildProjectPackage(rich, { includePrivate: true, privateKeysByPlugin: declarations }),
     );
-    expect(strippedJson).not.toContain('sk-strip-1');
-    expect(strippedJson).toContain('theme');
+    expect(strippedJson).toContain('sk-strip-1');
+    expect(strippedJson).not.toContain('proto-polluted');
+    expect(strippedJson).not.toContain('"__proto__"');
   });
 
-  it('非数组声明不崩溃：视为无声明，该命名空间整段保留（第十二轮一般 #9）', async () => {
+  it('非数组声明不崩溃：视为无公开字段，该命名空间整段排除（fail-closed，第十三轮一般 #7）', async () => {
     const project = await buildFixtureProject();
     const rich = { ...project, pluginData: { 'com.example': { apiKey: 'sk-nonarray-1', theme: 'dark' } } } as Project;
     const json = JSON.stringify(
@@ -477,8 +515,120 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
         privateKeysByPlugin: { 'com.example': 'apiKey' as unknown as string[] },
       }),
     );
-    expect(json).toContain('sk-nonarray-1');
-    expect(json).toContain('theme');
+    expect(json).not.toContain('sk-nonarray-1');
+    expect(json).not.toContain('theme');
+  });
+
+  it('子结构逐层投影：geometry/material/light/camera 与 assets[].parts[] 嵌套契约外字段不进包，契约字段保留（第十三轮阻断 1）', async () => {
+    const project = await buildFixtureProject();
+    const object = project.objects[0]!;
+    const asset = project.assets[0]!;
+    const rich = {
+      ...project,
+      objects: project.objects.map((o) =>
+        o.id === object.id
+          ? {
+              ...o,
+              geometry: { kind: 'box', apiKey: 'geo-secret', extra: 1 },
+              material: { color: '#ff0000', apiKey: 'mat-secret', shader: 'custom' },
+              light: { kind: 'point', color: '#ffffff', intensity: 2, apiKey: 'light-secret' },
+              camera: {
+                projection: 'perspective',
+                focalLength: 50,
+                fov: 45,
+                sensorWidth: 36,
+                sensorHeight: 24,
+                near: 0.1,
+                far: 1000,
+                aspect: 16 / 9,
+                apiKey: 'cam-secret',
+                credentials: 'cam-cred',
+              },
+            }
+          : o,
+      ),
+      assets: project.assets.map((a) =>
+        a.id === asset.id
+          ? {
+              ...a,
+              parts: [
+                { path: 'mesh.bin', mime: 'application/octet-stream', payload: 'AAA=', apiKey: 'part-secret' },
+                { path: 'tex.png', mime: 'image/png', payload: 'BBB=', credentials: 'part-cred' },
+              ],
+            }
+          : a,
+      ),
+    } as unknown as Project;
+    for (const includePrivate of [false, true]) {
+      const packed = buildProjectPackage(rich, { includePrivate });
+      const json = JSON.stringify(packed);
+      for (const leaked of ['geo-secret', 'mat-secret', 'light-secret', 'cam-secret', 'cam-cred', 'part-secret', 'part-cred']) {
+        expect(json, `${leaked}（includePrivate=${includePrivate}）不得进入包`).not.toContain(leaked);
+      }
+      // 契约字段完整保留：子结构投影不丢公开数据
+      const raw = JSON.parse(json) as {
+        project: { objects: Array<Record<string, unknown>>; assets: Array<Record<string, unknown>> };
+        assets: Record<string, { parts?: Array<Record<string, string>> }>;
+      };
+      const packedObject = raw.project.objects.find((o) => o.id === object.id)!;
+      expect(packedObject.geometry).toEqual({ kind: 'box' });
+      expect(packedObject.material).toEqual({ color: '#ff0000' });
+      expect(packedObject.light).toEqual({ kind: 'point', color: '#ffffff', intensity: 2 });
+      expect(packedObject.camera).toEqual({
+        projection: 'perspective',
+        focalLength: 50,
+        fov: 45,
+        sensorWidth: 36,
+        sensorHeight: 24,
+        near: 0.1,
+        far: 1000,
+        aspect: 16 / 9,
+      });
+      const partsPayload = raw.assets[String(asset.id)] as { parts?: Array<Record<string, string>> };
+      expect(partsPayload.parts).toEqual([
+        { path: 'mesh.bin', mime: 'application/octet-stream', payload: 'AAA=' },
+        { path: 'tex.png', mime: 'image/png', payload: 'BBB=' },
+      ]);
+      // 资产元数据投影不含 parts（字节在 assets 段）与嵌套未知字段
+      const packedAsset = raw.project.assets.find((a) => a.id === asset.id)!;
+      expect(packedAsset.parts).toBeUndefined();
+      expect(packedAsset.storageRef).toBe('');
+    }
+  });
+
+  it('资产分件数组非索引 own 键：拒绝导出（JSON 序列化必然静默丢弃，绝不静默丢字段，第十三轮严重 3）', async () => {
+    const project = await buildFixtureProject();
+    const asset = project.assets[0]!;
+    const parts = [
+      { path: 'mesh.bin', mime: 'application/octet-stream', payload: 'AAA=' },
+    ] as unknown as AssetPartData[];
+    (parts as unknown as Record<string, unknown>).extra = '非索引键';
+    const rich = {
+      ...project,
+      assets: project.assets.map((a) => (a.id === asset.id ? { ...a, parts } : a)),
+    } as Project;
+    expect(() => buildProjectPackage(rich)).toThrow(/非索引属性 extra/);
+    expect(() => buildProjectPackage(rich, { includePrivate: true })).toThrow(/非索引属性 extra/);
+  });
+
+  it('manifest 与 project 段同图：必需字段缺失 own 数据字段（含继承 getter）→ 拒绝导出，不产生不一致包（第十三轮一般 6）', async () => {
+    const project = await buildFixtureProject();
+    // uri 挂在原型上的 getter：旧实现 manifest 直接读 project.uri 会触发 getter
+    // （manifest 有值、project 段缺该字段的不一致包）；现在必需字段按 own 数据
+    // 字段判定 → 视为缺失 → 拒绝导出，getter 副作用不发生
+    let getterCalled = 0;
+    const withInheritedUri = Object.create({ get uri() { getterCalled += 1; return 'inherited-uri'; } });
+    for (const key of Object.keys(project)) {
+      if (key !== 'uri') (withInheritedUri as Record<string, unknown>)[key] = project[key as keyof Project];
+    }
+    expect(() => buildProjectPackage(withInheritedUri as Project)).toThrow(/缺少必需字段 uri/);
+    expect(getterCalled).toBe(0);
+    // 缺失任意必需字段均拒绝
+    for (const field of ['name', 'schemaVersion', 'revision'] as const) {
+      const missing = { ...project } as Project & Record<string, unknown>;
+      delete missing[field];
+      expect(() => buildProjectPackage(missing as Project)).toThrow(new RegExp(`缺少必需字段 ${field}`));
+    }
   });
 });
 

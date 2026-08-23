@@ -518,18 +518,18 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     await runtime.dispose();
   });
 
-  it('exportCurrent 编码预检：数组非索引键（pluginData.arr.extra）→ 类型化失败，不产出丢字段的包', async () => {
+  it('exportCurrent 编码预检：数组非索引键（allowlist 放行键内含 pluginData.arr.extra）→ 类型化失败，不产出丢字段的包', async () => {
     const runtime = await makeRuntime();
     const project = runtime.persistence.createProject('不可导出');
-    // pluginData.arr 数组带非索引自有键（JSON.stringify 会静默丢键）
+    // allowlist 放行的值内含带非索引自有键的数组（JSON.stringify 会静默丢键）
     const arr = [1, 2] as unknown as Record<string, unknown>;
     arr.extra = 3;
-    runtime.openProject({ ...project, pluginData: { arr: arr as unknown as unknown[] } } as Project);
+    runtime.openProject({ ...project, pluginData: { 'com.example': { arr: arr as unknown as unknown[] } } } as Project);
     await settle(40);
-    // 已注册插件（allowlist 放行）后编码预检对最终投影视图拒绝（第十二轮一般 #10）
+    // 已注册插件（显式 allowlist 放行该键）后编码预检对最终投影视图拒绝（第十三轮）
     const result = await runtime.persistence.exportCurrent({
       includePrivate: true,
-      privateKeysByPlugin: { arr: [] },
+      privateKeysByPlugin: { 'com.example': ['arr'] },
     });
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -593,16 +593,16 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     }
   });
 
-  it('exportCurrent 编码预检：循环引用扩展字段（allowlist 放行命名空间内）→ 类型化失败', async () => {
+  it('exportCurrent 编码预检：循环引用扩展字段（allowlist 放行键内含）→ 类型化失败', async () => {
     const runtime = await makeRuntime();
     const project = runtime.persistence.createProject('循环项目');
     const loop: Record<string, unknown> = {};
     loop.self = loop;
-    runtime.openProject({ ...project, pluginData: { loop } } as Project);
+    runtime.openProject({ ...project, pluginData: { 'com.example': { loop } } } as Project);
     await settle(40);
     const result = await runtime.persistence.exportCurrent({
       includePrivate: true,
-      privateKeysByPlugin: { loop: [] },
+      privateKeysByPlugin: { 'com.example': ['loop'] },
     });
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -712,7 +712,7 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     await runtime.dispose();
   });
 
-  it('exportCurrent 真实入口：非纯对象（Date）在开时被编辑器拒绝；BigInt 由编码预检在投影后归一为类型化失败（第九轮 #2 + 第十二轮一般 #10）', async () => {
+  it('exportCurrent 真实入口：非纯对象（Date）在开时被编辑器拒绝；BigInt 由编码预检在投影后归一为类型化失败（第九轮 #2 + 第十三轮：显式 allowlist 放行时拒绝）', async () => {
     const runtime = await makeRuntime();
     const project = runtime.persistence.createProject('不可导出');
     // 非纯对象（Date）：编辑器开时 JSON 纯结构校验直接拒绝 —— 这类值根本到不了
@@ -732,9 +732,13 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     expect(opened.ok).toBe(true);
     // 未注册插件（无声明映射）：命名空间排除 → 导出成功
     expect(runtime.persistence.exportCurrent({ includePrivate: true }).ok).toBe(true);
+    // 空 allowlist（已注册但无公开字段）：整段排除 → 导出成功（第十三轮阻断 2 反转）
+    expect(
+      runtime.persistence.exportCurrent({ includePrivate: true, privateKeysByPlugin: { 'com.example': [] } }).ok,
+    ).toBe(true);
     const result = await runtime.persistence.exportCurrent({
       includePrivate: true,
-      privateKeysByPlugin: { 'com.example': [] },
+      privateKeysByPlugin: { 'com.example': ['big'] },
     });
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -745,7 +749,7 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     await runtime.dispose();
   });
 
-  it('导出导入往返 + 声明制剥离（第十一轮）：声明键不进入包，benign 组合词随包保留', async () => {
+  it('导出导入往返 + 键级 allowlist（第十三轮阻断 2）：显式声明的键进包，未声明键（含凭据形态键名）排除', async () => {
     const runtime = await makeRuntime();
     const project = runtime.persistence.createProject('往返回归');
     runtime.openProject({
@@ -771,36 +775,38 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     expect(excludedExport.text).not.toContain('sk-leak-1');
     expect(excludedExport.text).not.toContain('client-secret-2');
 
-    // 已注册插件（空声明）：未声明的键（含凭据形态键名）随包完整往返 —— 契约不猜测键名
+    // 已注册插件（空声明）：无公开字段 —— 整段排除，凭据形态键名同样绝不进包
+    // （第十三轮阻断 2 反转：已注册但空声明不再整段放行）
     const rawExport = runtime.persistence.exportCurrent({
       includePrivate: true,
       privateKeysByPlugin: { 'com.example': [] },
     });
     expect(rawExport.ok).toBe(true);
     if (!rawExport.ok) return;
-    expect(rawExport.text).toContain('sk-leak-1');
-    expect(rawExport.text).toContain('client-secret-2');
+    expect(rawExport.text).not.toContain('sk-leak-1');
+    expect(rawExport.text).not.toContain('client-secret-2');
 
-    // 显式声明剥离：声明的顶层键不进入包
+    // 显式 allowlist：只有声明的键进包，未声明键（含凭据形态键名之外的组合词）排除
     const exported = runtime.persistence.exportCurrent({
       includePrivate: true,
       privateKeysByPlugin: { 'com.example': ['apiKey', 'clientSecret'] },
     });
     expect(exported.ok).toBe(true);
     if (!exported.ok) return;
-    expect(exported.text).not.toContain('sk-leak-1');
-    expect(exported.text).not.toContain('client-secret-2');
+    expect(exported.text).toContain('sk-leak-1');
+    expect(exported.text).toContain('client-secret-2');
+    expect(exported.text).not.toContain('kb-intl');
 
     const imported = await runtime.persistence.importPackage(exported.text);
     expect(imported.ok).toBe(true);
     if (!imported.ok) return;
     const plugin = (imported.project.pluginData as Record<string, Record<string, string>>)['com.example'];
-    expect(plugin.keyboardLayout).toBe('kb-intl');
-    expect(plugin.tokenizerConfig).toBe('cl100k-base');
-    expect(plugin.monkeyPatch).toBe('off');
-    expect(plugin.hotkeyMap).toBe('default');
-    expect(plugin.apiKey).toBeUndefined();
-    expect(plugin.clientSecret).toBeUndefined();
+    expect(plugin.keyboardLayout).toBeUndefined();
+    expect(plugin.tokenizerConfig).toBeUndefined();
+    expect(plugin.monkeyPatch).toBeUndefined();
+    expect(plugin.hotkeyMap).toBeUndefined();
+    expect(plugin.apiKey).toBe('sk-leak-1');
+    expect(plugin.clientSecret).toBe('client-secret-2');
 
     // 导入结果可正常打开（往返内容与编辑器不变量兼容）
     runtime.openProject(imported.project);
@@ -980,18 +986,20 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     await persistence.dispose();
   });
 
-  it('清理阶段 remove reject → 不掩盖验证失败：仍返回类型化失败（第十二轮严重 #5）', async () => {
+  it('清理阶段 remove reject → 不掩盖验证失败：明确提示「记录保留、可手动删除」，残留记录仍在存储（第十三轮严重 #5）', async () => {
     const editor = new SceneEditor();
     const corruptRecord: Project = {
       ...createSampleProject('lumora://project/corrupt', '损坏副本'),
       settings: { fps: 'bad' } as unknown as Project['settings'],
     };
+    let copyUri = '';
     const store: ProjectStorage = {
       kind: 'indexeddb',
       list: vi.fn(async () => []),
       load: vi.fn(async () => corruptRecord),
       save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
-      remove: vi.fn(async () => {
+      remove: vi.fn(async (uri: string) => {
+        copyUri = uri;
         throw new Error('idb transaction aborted');
       }),
       rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
@@ -1012,6 +1020,106 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     // 清理失败不掩盖验证失败：调用方仍拿到明确失败，绝不报告成功
     expect(result.message).toContain('副本保存失败');
     expect(result.message).toContain('校验');
+    // 清理失败如实提示记录保留、可手动删除（修复前 remove 的 reject 被吞掉，
+    // 损坏副本静默残留且无任何提示）
+    expect(result.message).toContain('记录保留');
+    expect(result.message).toContain('可手动删除');
+    // 残留记录断言：remove 被拒 → 损坏副本记录仍在存储中（load 仍可读到）
+    expect(store.remove).toHaveBeenCalledTimes(1);
+    expect(copyUri).toMatch(/^lumora:\/\/project\//);
+    expect(await store.load(copyUri)).not.toBeNull();
     await persistence.dispose();
+  });
+});
+
+describe('ProjectPersistence：exportCurrent 全链路逐层负向回归（第十三轮阻断 1 / 严重 3）', () => {
+  it('对象子结构（camera/material）嵌套契约外字段默认导出与 includePrivate 一律不进包，契约字段保留', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('逐层投影');
+    const object = project.objects[0]!;
+    const rich = {
+      ...project,
+      objects: project.objects.map((o) =>
+        o.id === object.id
+          ? {
+              ...o,
+              camera: {
+                projection: 'perspective',
+                focalLength: 50,
+                fov: 45,
+                sensorWidth: 36,
+                sensorHeight: 24,
+                near: 0.1,
+                far: 200,
+                aspect: null,
+                apiKey: 'cam-secret',
+                credentials: 'cam-cred',
+              },
+              material: { color: '#ffffff', apiKey: 'mat-secret' },
+            }
+          : o,
+      ),
+    } as unknown as Project;
+    const opened = await runtime.openProject(rich);
+    expect(opened.ok).toBe(true);
+    await settle(40);
+
+    const cases = [
+      {},
+      { includePrivate: true, privateKeysByPlugin: { 'com.example': [] } },
+    ] as Array<Parameters<ProjectPersistence['exportCurrent']>[0]>;
+    for (const options of cases) {
+      const result = runtime.persistence.exportCurrent(options);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      for (const leaked of ['cam-secret', 'cam-cred', 'mat-secret']) {
+        expect(result.text, `${leaked}（${JSON.stringify(options)}）不得进入包`).not.toContain(leaked);
+      }
+      // 契约字段完整保留：子结构投影不丢公开数据
+      expect(result.text).toContain('"focalLength": 50');
+      expect(result.text).toContain('"sensorWidth": 36');
+      expect(result.text).toContain('"color": "#ffffff"');
+    }
+    await runtime.dispose();
+  });
+
+  it('资产分件数组非索引 own 键 → 类型化失败，不产出丢字段的包', async () => {
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, dbName: DB });
+    const parts = [
+      { path: 'mesh.bin', mime: 'application/octet-stream', payload: 'AAA=' },
+    ] as unknown as Array<Record<string, unknown>>;
+    (parts as unknown as Record<string, unknown>).extra = '非索引键';
+    const withParts = {
+      ...createSampleProject('lumora://project/parts', '分件项目'),
+      assets: [
+        {
+          id: 'asset-parts-1',
+          kind: 'gltf',
+          name: '测试模型.gltf',
+          format: 'gltf',
+          mime: 'model/gltf+json',
+          hash: 'deadbeef',
+          size: 4,
+          source: 'file',
+          storageRef: 'blob:runtime-only',
+          payload: 'eyJ4Ijo1fQ==',
+          parts,
+          createdAt: new Date().toISOString(),
+        },
+      ],
+    } as unknown as Project;
+    const spy = vi.spyOn(editor, 'getProject').mockReturnValue(withParts);
+    try {
+      const result = persistence.exportCurrent();
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.message).toContain('无法导出');
+      expect(result.message).toContain('非索引属性 extra');
+    } finally {
+      spy.mockRestore();
+      await persistence.dispose();
+    }
   });
 });

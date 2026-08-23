@@ -36,9 +36,10 @@ export type JsonEncodingProblem =
   | 'reflection-error';
 
 /** 规范数组索引：'0' | '1' …（无前导零，2^32-2 封顶，与数组索引语义一致） */
-const MAX_ARRAY_INDEX = 4294967294;
+export const MAX_ARRAY_INDEX = 4294967294;
 
-function isArrayIndexKey(key: string): boolean {
+/** 规范数组索引判定（工程包构建复用：数组非索引键 JSON 序列化必丢） */
+export function isArrayIndexKey(key: string): boolean {
   if (!/^(0|[1-9]\d*)$/.test(key)) return false;
   return Number(key) <= MAX_ARRAY_INDEX;
 }

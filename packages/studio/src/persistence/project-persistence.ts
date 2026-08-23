@@ -304,10 +304,11 @@ export class ProjectPersistence {
     return this.store ? this.store.remove(uri) : false;
   }
 
-  /** 副本验证与清理的异常安全封装（第十二轮严重 #5）：存储写入成功 ≠ 数据可用
-   *  （故障存储可写入损坏记录），统一以「load → 迁移 → 校验」管道验证副本可
-   *  打开；loadProject / store.remove 的 reject（故障存储抛错）归一为类型化
-   *  失败 —— 绝不遗留损坏副本、绝不把未捕获异常上抛给调用方。 */
+  /** 副本验证与清理的异常安全封装（第十二轮严重 #5 + 第十三轮严重 5）：存储写入
+   *  成功 ≠ 数据可用（故障存储可写入损坏记录），统一以「load → 迁移 → 校验」
+   *  管道验证副本可打开；loadProject / store.remove 的 reject（故障存储抛错）
+   *  归一为类型化失败 —— 绝不遗留损坏副本、绝不把未捕获异常上抛给调用方；
+   *  清理本身失败时如实报告「记录保留、可手动删除」，不假装已清理。 */
   private async verifyCopy(
     uri: string,
   ): Promise<{ ok: true; project: Project } | { ok: false; message: string }> {
@@ -315,23 +316,31 @@ export class ProjectPersistence {
     try {
       verified = await this.loadProject(uri);
     } catch (error) {
-      await this.removeCopy(uri);
-      return { ok: false, message: `副本保存失败（验证异常）：${failureMessage(error)}` };
+      const removed = await this.removeCopy(uri);
+      return {
+        ok: false,
+        message: `副本保存失败（验证异常）：${failureMessage(error)}${removed ? '' : '；清理失败，损坏记录保留，可手动删除'}`,
+      };
     }
     if (!verified.ok) {
-      await this.removeCopy(uri);
-      return { ok: false, message: `副本保存失败（数据无法通过校验）：${verified.message}` };
+      const removed = await this.removeCopy(uri);
+      return {
+        ok: false,
+        message: `副本保存失败（数据无法通过校验）：${verified.message}${removed ? '' : '；清理失败，损坏记录保留，可手动删除'}`,
+      };
     }
     return { ok: true, project: verified.project };
   }
 
-  /** 副本清理（验证失败时移除损坏记录）：remove 的 reject 不掩盖验证失败结论 */
-  private async removeCopy(uri: string): Promise<void> {
-    if (!this.store) return;
+  /** 副本清理（验证失败时移除损坏记录）：返回清理状态 —— remove 的 reject
+   *  不掩盖验证失败结论，但调用方必须知道记录是否残留。 */
+  private async removeCopy(uri: string): Promise<boolean> {
+    if (!this.store) return true;
     try {
       await this.store.remove(uri);
+      return true;
     } catch {
-      // 清理失败不掩盖验证失败
+      return false;
     }
   }
 
@@ -375,7 +384,10 @@ export class ProjectPersistence {
     } catch (error) {
       return { ok: false, message: `项目无法导出（构建失败）：${failureMessage(error)}` };
     }
-    const problem = findJsonEncodingProblem(pkg.project);
+    // 编码预检作用于最终整个包（manifest/project/assets 全部分支，第十三轮严重 3）：
+    // 构建已完成全部投影与剥离，预检与序列化看到同一张图；assets 段（含分件
+    // 数组）与 manifest 的编码问题同样如实拒绝，不被排除的数据不静默丢失
+    const problem = findJsonEncodingProblem(pkg);
     if (problem) {
       return { ok: false, message: `项目包含无法导出的数据（${problem}），导出被拒绝` };
     }
