@@ -199,13 +199,31 @@ export class ProjectPersistence {
   /**
    * 冲突解决「加载较新版本」：复用统一边界 loadProject（load → 迁移 → 校验）
    * 以存储内容为基线重开当前项目（第五轮 #5）。显式丢弃未保存变更是用户确认
-   * 的选择；失败返回可操作错误且不改变编辑器状态 —— 只有全部成功后才原子切换
-   * （重置自动保存基线 + 重开编辑器）。
+   * 的选择；失败返回可操作错误且不改变编辑器状态。
+   * 最终切换是会话原子操作（第七轮 #2）：await 挂起期间（存储读取/迁移/写回）
+   * 用户可能继续编辑或切换项目 —— 提交前重新验证 uri 未变、编辑器会话令牌未变、
+   * 编辑器项目引用未变（内容可能不可编码而无法比较，引用身份是可靠判据）；
+   * 任一变化都返回已取消，自动保存与编辑器（含锁存的冲突状态）均不动。
    */
   async reloadOpenProject(): Promise<{ ok: true; project: Project } | { ok: false; message: string }> {
     if (!this.currentUri) return { ok: false, message: '本地持久化不可用' };
-    const loaded = await this.loadProject(this.currentUri);
+    const uri = this.currentUri;
+    const editorToken = this.editor.getSessionToken();
+    const before = this.editor.getProject();
+    const loaded = await this.loadProject(uri);
     if (!loaded.ok) return loaded;
+    if (
+      this.currentUri !== uri ||
+      this.editor.getSessionToken() !== editorToken ||
+      this.editor.getProject() !== before
+    ) {
+      // 重载挂起期间用户已编辑或切换项目：此刻切换会覆盖新内容 —— 取消，
+      // 恢复快照/锁存原样保留，由用户重新决定
+      return {
+        ok: false,
+        message: '重载期间项目已切换或内容已修改，操作已取消；未改变当前编辑',
+      };
+    }
     this.autosaver.resetTo(loaded.project);
     this.editor.openProject(loaded.project);
     return { ok: true, project: loaded.project };

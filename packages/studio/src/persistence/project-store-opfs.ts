@@ -25,7 +25,7 @@
  */
 
 import type { Project } from '@lumora/core';
-import { genId, migrateProjectSchema, validateProjectSchema, validateProjectStructure } from '@lumora/core';
+import { CURRENT_PROJECT_SCHEMA_VERSION, genId, migrateProjectSchema, validateProjectSchema, validateProjectStructure } from '@lumora/core';
 import type {
   DuplicateOutcome,
   ProjectStorage,
@@ -34,7 +34,7 @@ import type {
   SaveOutcome,
   StoredProject,
 } from './project-storage';
-import { failureMessage, findJsonEncodingProblem, isQuotaError, sameProjectContent } from './project-storage';
+import { failureMessage, findJsonEncodingProblem, isMigrationWriteback, isQuotaError, sameProjectContent } from './project-storage';
 
 /** OPFS 根目录名（与 IndexedDB 的 PROJECT_STORE_DB 同名，切换后端不混淆命名空间） */
 export const OPFS_STORE_DIR = 'lumora-studio';
@@ -200,11 +200,13 @@ export class OpfsProjectStore implements ProjectStorage {
     });
   }
 
-  /** 加载项目（返回调用方可自由修改的副本；损坏记录视为缺失）。 */
+  /** 加载项目（返回调用方可自由修改的副本；损坏记录视为缺失）。
+   *  显式比对请求 uri 与记录 uri（哈希文件名错位时视为缺失，第七轮 #8）。 */
   async load(uri: string): Promise<Project | null> {
     return this.withLock(async () => {
       const record = await this.readRecord(projectFileName(uri));
       if (!record) return null;
+      if (record.uri !== uri) return null;
       return record.project ? structuredClone(record.project) : null;
     });
   }
@@ -275,12 +277,14 @@ export class OpfsProjectStore implements ProjectStorage {
               storedRevision: existing.project.revision,
             };
           }
-          // 分叉保护豁免 schema 升级写回（loadProject 迁移：同 revision 内容随
-          // schema 版本合法变化）；revision CAS 仍生效，并发更新依旧被拦截
+          // 分叉保护（第七轮 #5，与 IndexedDB 一致）：同 revision 内容不同一律
+          // 拒绝 —— 唯一豁免是 isMigrationWriteback（incoming 精确等于
+          // migrateProjectSchema(existing) 的确定性结果，facade loadProject 的
+          // 迁移写回）。revision CAS 仍生效，并发更新依旧被拦截。
           if (
             project.revision === existing.project.revision &&
-            existing.project.schemaVersion === project.schemaVersion &&
-            !sameProjectContent(project, existing.project)
+            !sameProjectContent(project, existing.project) &&
+            !isMigrationWriteback(project, existing.project)
           ) {
             return {
               ok: false,
@@ -364,10 +368,18 @@ export class OpfsProjectStore implements ProjectStorage {
   }
 
   /**
-   * 读取记录：文件缺失返回 undefined；损坏返回 null；合法记录返回 StoredProject。
-   * 损坏判定为深度校验（第六轮一般项）：记录形状通过后，版本感知迁移到当前
-   * schema（未来版本/缺版本/迁移链缺失 → 损坏），再做完整 schema + 图结构校验
-   * —— 缺 settings/scenes/objects/tracks/assets 或图关系损坏的记录不得被
+   * 读取记录：文件缺失返回 undefined；损坏返回 null；合法记录原样返回
+   * StoredProject（raw/source schema 保留，不提前迁移 —— 迁移由统一 facade
+   * （loadProject）完成 migrate → validate → CAS 写回，第七轮 #6）。
+   * 损坏判定为版本感知深度校验（第六轮一般项 + 第七轮 #8）：
+   * - 记录形状通过后，校验文件名与记录 uri 严格绑定（name === projectFileName(uri)，
+   *   错位文件名记录视为损坏，不得进入最近列表或 load 结果）；
+   * - 当前版本记录做完整 schema + 图结构校验；
+   * - 旧版本记录先迁移到当前版本，对迁移结果做完整校验（可迁移 + 迁移结果合法），
+   *   raw 本身原样返回；
+   * - 未来版本（schemaVersion > 当前）不做猜测校验、不折叠成 null —— 原样返回，
+   *   facade 的迁移失败自然产生与 IndexedDB 一致的升级提示。
+   * 缺 settings/scenes/objects/tracks/assets 或图关系损坏的记录不得被
    * list/load/rename/duplicate 使用（各自经 null 路径隔离，remove 可删除作为修复路径）。
    */
   private async readRecord(name: string): Promise<StoredProject | undefined | null> {
@@ -383,12 +395,19 @@ export class OpfsProjectStore implements ProjectStorage {
     try {
       const parsed: unknown = JSON.parse(text);
       if (!isStoredProjectRecord(parsed)) return null;
-      const migrated = migrateProjectSchema(parsed.project);
-      if (!migrated.ok) return null;
-      const project = migrated.project as Project;
-      if (validateProjectSchema(project)) return null;
-      if (validateProjectStructure(project)) return null;
-      return { ...parsed, project };
+      if (name !== projectFileName(parsed.uri)) return null;
+      const project = parsed.project;
+      if (project.schemaVersion < CURRENT_PROJECT_SCHEMA_VERSION) {
+        const migrated = migrateProjectSchema(project);
+        if (!migrated.ok) return null;
+        const migratedProject = migrated.project as Project;
+        if (validateProjectSchema(migratedProject)) return null;
+        if (validateProjectStructure(migratedProject)) return null;
+      } else if (project.schemaVersion === CURRENT_PROJECT_SCHEMA_VERSION) {
+        if (validateProjectSchema(project)) return null;
+        if (validateProjectStructure(project)) return null;
+      }
+      return parsed;
     } catch {
       return null;
     }
@@ -406,12 +425,8 @@ export class OpfsProjectStore implements ProjectStorage {
     const tmpName = `.${name}.tmp`;
     const tmp = await this.projectsDir.getFileHandle(tmpName, { create: true });
     if (typeof tmp.move !== 'function') {
-      // 非原子降级路径：不创建临时文件（上一行已创建，先清理），直接写目标
-      try {
-        await this.projectsDir.removeEntry(tmpName);
-      } catch {
-        // 清理失败不掩盖写入
-      }
+      // 非原子降级路径：清理刚创建的临时文件后直接写目标
+      await this.cleanupTmp(tmpName);
       await this.directWrite(name, text);
       return;
     }
@@ -426,25 +441,26 @@ export class OpfsProjectStore implements ProjectStorage {
       } catch {
         // 写入本身已失败，close 可能再次拒绝；忽略
       }
-      try {
-        await this.projectsDir.removeEntry(tmpName);
-      } catch {
-        // 清理失败不掩盖原始错误
-      }
+      await this.cleanupTmp(tmpName);
       throw error;
     }
     try {
       await tmp.move(this.projectsDir, name);
     } catch (error) {
-      // 方法存在但后端不支持：清理 .tmp 后降级直接写（仅明确能力错误降级，
-      // 其余错误如实上抛，不留半写临时文件）
+      // 所有 move 失败路径都先尽力清理 .tmp（第七轮 #7，不留半写临时文件）；
+      // 仅明确的能力错误（NotSupportedError）降级直接写，其余错误如实上抛
+      await this.cleanupTmp(tmpName);
       if (!isNotSupportedError(error)) throw error;
-      try {
-        await this.projectsDir.removeEntry(tmpName);
-      } catch {
-        // 清理失败不掩盖降级
-      }
       await this.directWrite(name, text);
+    }
+  }
+
+  /** 尽力清理临时文件（move 缺失/失败路径；清理失败不掩盖原始错误） */
+  private async cleanupTmp(tmpName: string): Promise<void> {
+    try {
+      await this.projectsDir.removeEntry(tmpName);
+    } catch {
+      // 清理失败不掩盖原始错误
     }
   }
 

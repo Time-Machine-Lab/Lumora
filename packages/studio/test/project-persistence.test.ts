@@ -303,6 +303,76 @@ describe('ProjectPersistence：运行时集成（自动保存链路）', () => {
     expect(stored!.name).toBe('较新内容');
     await runtime.dispose();
   });
+
+  it('阻断2：重载挂起期间继续编辑：操作取消（cancelled），编辑器与自动保存未被触碰（第七轮 #2）', async () => {
+    const runtime = createStudioRuntime();
+    openRuntimes.push(runtime);
+    const store = await openStandaloneStore();
+    await runtime.init({ debounceMs: 10, dbName: DB, store });
+    const project = runtime.persistence.createProject('重载项目');
+    runtime.openProject(project);
+    runtime.editor.addObject(createGroupObject());
+    await settle(60); // rev1 已存
+
+    // 慢速 load：reloadOpenProject 的 await 挂起
+    const realLoad = store.load.bind(store);
+    vi.spyOn(store, 'load').mockImplementationOnce(async () => {
+      await new Promise((r) => setTimeout(r, 40));
+      return realLoad(project.uri);
+    });
+    const reloading = runtime.persistence.reloadOpenProject();
+    await settle(20); // load 挂起中
+    runtime.editor.addObject(createGroupObject()); // 继续编辑（rev2）
+    const outcome = await reloading;
+    vi.mocked(store.load).mockRestore();
+
+    // 重载取消：不把存储内容切换进编辑器，绝不覆盖挂起期间的新编辑
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.message).toContain('已取消');
+    expect(runtime.editor.getProject()!.revision).toBe(2);
+    expect(runtime.editor.getProject()!.objects.length).toBe(project.objects.length + 2);
+    // 自动保存未被触碰（无锁存冲突）：新编辑随后正常落盘
+    await settle(60);
+    const stored = await store.load(project.uri);
+    expect(stored!.revision).toBe(2);
+    expect(stored!.objects.length).toBe(project.objects.length + 2);
+    await runtime.dispose();
+  });
+
+  it('阻断2：重载挂起期间切换项目：操作取消，新项目未被重载结果覆盖（第七轮 #2）', async () => {
+    const runtime = createStudioRuntime();
+    openRuntimes.push(runtime);
+    const store = await openStandaloneStore();
+    await runtime.init({ debounceMs: 10, dbName: DB, store });
+    const project = runtime.persistence.createProject('重载项目');
+    runtime.openProject(project);
+    runtime.editor.addObject(createGroupObject());
+    await settle(60); // rev1 已存
+
+    const realLoad = store.load.bind(store);
+    vi.spyOn(store, 'load').mockImplementationOnce(async () => {
+      await new Promise((r) => setTimeout(r, 40));
+      return realLoad(project.uri);
+    });
+    const reloading = runtime.persistence.reloadOpenProject();
+    await settle(20); // load 挂起中
+    const other = runtime.persistence.createProject('另一项目');
+    runtime.openProject(other); // 切换项目
+    const outcome = await reloading;
+    vi.mocked(store.load).mockRestore();
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.message).toContain('已取消');
+    // 新项目原样：未被重载结果覆盖，自动保存基线未被重置
+    expect(runtime.editor.getProject()!.uri).toBe(other.uri);
+    expect(runtime.editor.getProject()!.name).toBe('另一项目');
+    await settle(60);
+    const otherStored = await store.load(other.uri);
+    expect(otherStored).not.toBeNull(); // 新项目自身照常落盘
+    await runtime.dispose();
+  });
 });
 
 describe('ProjectPersistence：本地加载边界 schema 迁移（TML-53 第四轮 #6）', () => {

@@ -301,6 +301,11 @@ export class ProjectAutosaver {
    *   失败、恢复快照保留）；
    * - 三方各不相同（或当前内容不可编码无法比较）：真分叉 —— 不写入磁盘，快照保留
    *   在恢复区可重试，锁存冲突供显式解决（另存副本 / 加载较新版本）。
+   * 写入成功后的最终切换是会话原子操作（第七轮 #1）：保存前捕获操作代
+   * （autosaver 会话 + 编辑器会话令牌 + 编辑器项目引用/指纹），await 落盘成功后
+   * 重新读取复验 —— 延迟保存期间用户继续编辑或切换项目时，磁盘写入已完成（基线
+   * 推进，后续保存不因 CAS 错乱），但恢复快照保留、锁存冲突，绝不 resetTo/
+   * openProject 覆盖新编辑、绝不假报 clean，调用方收到冲突结果。
    * 任一保存失败（含 revision 反转）都如实返回，快照与锁存按结果维护。
    */
   retryRecovery(uri: string): Promise<SaveOutcome> {
@@ -310,6 +315,8 @@ export class ProjectAutosaver {
     }
     return this.enqueue(async () => {
       if (this.disposed) return { ok: false, code: 'storage-error', message: '自动保存已停用' };
+      const session = this.session;
+      const editorToken = this.editor.getSessionToken();
       const baseline = this.committedByUri.get(uri);
       const expected = baseline?.revision ?? null;
       const baseFp = baseline?.fingerprint ?? undefined;
@@ -319,9 +326,37 @@ export class ProjectAutosaver {
       const fpEqual = (a: string | null | undefined, b: string | null | undefined): boolean =>
         a !== null && a !== undefined && b !== null && b !== undefined && a === b;
 
-      const commit = (saved: Project, fp: string | null): void => {
+      /**
+       * await 后复验：决策时捕获的操作代（会话/编辑器令牌）与编辑器内容必须未变。
+       * 切换/关闭（isFresh 或编辑器令牌变化）与继续编辑（项目引用或指纹变化，
+       * 不可编码内容经 fpEqual 保守判变）都会被识别 —— 任何变化都不允许
+       * resetTo/openProject/报 clean，绝不静默覆盖新编辑。
+       * 非当前 uri 的重试不触碰编辑器（无 resetTo/openProject/clean 广播），
+       * 落盘成功即完成，无需内容复验。
+       */
+      const verifyNoChange = (wasCurrent: Project | null): boolean => {
+        if (this.disposed) return false;
+        if (wasCurrent === null) return true;
+        if (!this.isFresh(uri, session)) return false;
+        if (this.editor.getSessionToken() !== editorToken) return false;
+        const latest = this.editor.getProject();
+        if (!latest || latest.uri !== uri) return false;
+        if (latest === wasCurrent) return true;
+        return fpEqual(contentFingerprint(latest), curFp);
+      };
+
+      /** 复验失败：磁盘已推进，但快照保留 + 锁存冲突，编辑器与状态广播不动 */
+      const latchStale = (): SaveOutcome => {
+        const message =
+          '重试保存期间项目内容已变化，恢复快照保留；请「另存副本」保留当前编辑，或重新选择「加载较新版本」';
+        this.latched = { uri, code: 'revision-conflict', message };
+        if (uri === this.currentUri) this.emit({ status: 'error', code: 'revision-conflict', message });
+        return { ok: false, code: 'revision-conflict', message };
+      };
+
+      /** 推进已提交基线（磁盘事实已变，无论会话是否仍新鲜），清除锁存标记 */
+      const advanceBaseline = (saved: Project, fp: string | null): void => {
         this.committedByUri.set(uri, { revision: saved.revision, fingerprint: fp });
-        this.recovery.delete(uri);
         if (this.latched?.uri === uri) this.latched = null;
       };
 
@@ -330,9 +365,11 @@ export class ProjectAutosaver {
         // 按原基线保存快照
         const result = await this.storeSave(snapshot, expected);
         if (result.ok) {
-          commit(snapshot, snapFp);
+          advanceBaseline(snapshot, snapFp);
+          if (!verifyNoChange(current)) return latchStale();
+          this.recovery.delete(uri);
           if (current) {
-            // 以恢复快照为准重开编辑器，与已落盘内容对齐（重试期间未编辑或编辑与快照一致）
+            // 复验通过：以恢复快照为准重开编辑器，与已落盘内容对齐（重试期间未编辑或编辑与快照一致）
             this.resetTo(snapshot);
             this.editor.openProject(snapshot);
           }
@@ -346,7 +383,9 @@ export class ProjectAutosaver {
         // revision 反转时保存失败如实返回，快照保留不删除 —— 不假成功）
         const result = await this.storeSave(current!, expected);
         if (result.ok) {
-          commit(current!, contentFingerprint(current!));
+          advanceBaseline(current!, contentFingerprint(current!));
+          if (!verifyNoChange(current!)) return latchStale();
+          this.recovery.delete(uri);
           if (uri === this.currentUri) {
             this.emit(this.store ? { status: 'clean' } : { status: 'memory' });
           }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createBlankProject } from '@lumora/core';
+import { createBlankProject, migrateProjectSchema } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import { OpfsProjectStore, projectFileName } from '../src/persistence/project-store-opfs';
 import { MemDirectoryHandle, MemFileHandle } from './opfs-fs-shim';
@@ -445,7 +445,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     store.close();
   });
 
-  it('深度损坏记录（缺 settings/scenes/objects/tracks/assets 或图关系损坏或未来版本）：load 视为缺失、list 跳过、rename/duplicate 不传播、save 拒绝（第六轮一般项）', async () => {
+  it('深度损坏记录（缺 settings/scenes/objects/tracks/assets 或图关系损坏）：load 视为缺失、list 跳过、rename/duplicate 不传播、save 拒绝（第六轮一般项）', async () => {
     const store = await OpfsProjectStore.create(DB);
     if (!store) return;
     const root = (await navigator.storage.getDirectory()) as unknown as MemDirectoryHandle;
@@ -472,12 +472,9 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
       objects: [{ ...good.objects[0]!, parentId: 'nonexistent' }],
     };
     await writeFile('lumora://project/orphan', orphan);
-    // 未来 schema 版本（无法迁移验证）：视为损坏
-    await writeFile('lumora://project/future', { ...good, uri: 'lumora://project/future', schemaVersion: 4 });
 
     expect(await store.load('lumora://project/missing-sections')).toBeNull();
     expect(await store.load('lumora://project/orphan')).toBeNull();
-    expect(await store.load('lumora://project/future')).toBeNull();
     // 最近列表不出现损坏记录
     expect((await store.list()).map((s) => s.uri)).toEqual([]);
     // rename/duplicate 不得传播损坏内容
@@ -494,7 +491,31 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     store.close();
   });
 
-  it('版本感知迁移（第六轮一般项）：v2 记录（无 tracks）迁移后合法可加载；迁移后仍损坏的记录视为损坏', async () => {
+  it('未来 schema 记录（v>CURRENT）：raw 原样返回不折叠为 null（第七轮 #6），迁移提示由 facade 统一给出', async () => {
+    const store = await OpfsProjectStore.create(DB);
+    if (!store) return;
+    const root = (await navigator.storage.getDirectory()) as unknown as MemDirectoryHandle;
+    const rootDir = await root.getDirectoryHandle(DB);
+    const projectsDir = await rootDir.getDirectoryHandle('projects');
+    const good = project('lumora://project/future', '合法项目', 3);
+    const future = { ...good, uri: 'lumora://project/future', schemaVersion: 99 };
+    const handle = await projectsDir.getFileHandle(projectFileName('lumora://project/future'), { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(JSON.stringify({ uri: 'lumora://project/future', savedAt: 'x', project: future }));
+    await writable.close();
+
+    // 不做猜测校验、不折叠：raw 原样返回（facade 的 migrate 失败自然给出升级提示）
+    const loaded = await store.load('lumora://project/future');
+    expect(loaded).not.toBeNull();
+    expect(loaded!.schemaVersion).toBe(99);
+    expect(loaded!.name).toBe('合法项目');
+    expect(loaded!.revision).toBe(3);
+    // 最近列表同样呈现（list 不因版本折叠未来记录）
+    expect((await store.list()).map((s) => s.uri)).toEqual(['lumora://project/future']);
+    store.close();
+  });
+
+  it('版本感知读取（第七轮 #6）：v2 记录 raw 原样返回（不提前迁移，迁移写回由 facade 统一完成）；迁移结果仍损坏的记录视为损坏', async () => {
     const store = await OpfsProjectStore.create(DB);
     if (!store) return;
     const root = (await navigator.storage.getDirectory()) as unknown as MemDirectoryHandle;
@@ -512,8 +533,9 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     await writeFile('lumora://project/v2', v2);
     const loaded = await store.load('lumora://project/v2');
     expect(loaded).not.toBeNull();
-    expect(loaded!.schemaVersion).toBe(3);
-    expect(loaded!.tracks).toEqual([]);
+    // raw/source schema 保留：适配器层不提前迁移（否则迁移写回与 migratedFrom 丢失）
+    expect(loaded!.schemaVersion).toBe(2);
+    expect((loaded as unknown as Record<string, unknown>).tracks).toBeUndefined();
     expect(loaded!.revision).toBe(2);
     expect(loaded!.name).toBe('旧版本');
     // 迁移后仍缺 settings：深度校验拒绝，不把旧版本半写数据当合法记录
@@ -524,6 +546,144 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
       revision: 0,
     });
     expect(await store.load('lumora://project/v2bad')).toBeNull();
+    store.close();
+  });
+
+  it('schema 升级写回豁免（第七轮 #5）：v2/rev7 baseline 仅接受精确迁移结果的同 revision 覆盖，任意分叉拒绝', async () => {
+    const store = await OpfsProjectStore.create(DB);
+    if (!store) return;
+    const root = (await navigator.storage.getDirectory()) as unknown as MemDirectoryHandle;
+    const rootDir = await root.getDirectoryHandle(DB);
+    const projectsDir = await rootDir.getDirectoryHandle('projects');
+    const writeFile = async (uri: string, project: unknown) => {
+      const handle = await projectsDir.getFileHandle(projectFileName(uri), { create: true });
+      const writable = await handle.createWritable();
+      await writable.write(JSON.stringify({ uri, savedAt: 'x', project }));
+      await writable.close();
+    };
+    const v3 = project('lumora://project/a', '旧版', 7);
+    const { tracks: _tracks, ...v2 } = v3;
+    const baseline = { ...v2, schemaVersion: 2 } as unknown as Project;
+    await writeFile('lumora://project/a', baseline);
+
+    // 任意 v3/rev7 分叉（仅升级 schemaVersion + 场景内容被改写）：不得借「升级」覆盖
+    const divergent = {
+      ...v3,
+      schemaVersion: 3,
+      scenes: [{ ...v3.scenes[0]!, name: '被篡改的场景' }],
+    } as unknown as Project;
+    const forked = await store.save(divergent, 7);
+    expect(forked.ok).toBe(false);
+    if (forked.ok || forked.code !== 'revision-conflict') return;
+    expect((await store.load('lumora://project/a'))!.schemaVersion).toBe(2);
+
+    // 精确迁移结果（migrateProjectSchema(baseline)）：放行（facade loadProject 的迁移写回）
+    const migrated = migrateProjectSchema(baseline);
+    expect(migrated.ok).toBe(true);
+    if (!migrated.ok) return;
+    expect((await store.save(migrated.project as Project, 7)).ok).toBe(true);
+    const stored = await store.load('lumora://project/a');
+    expect(stored!.schemaVersion).toBe(3);
+    expect(stored!.revision).toBe(7);
+    store.close();
+  });
+
+  it('文件名与记录 uri 严格绑定（第七轮 #8）：错位文件名的合法记录视为缺失，load/list/save 隔离', async () => {
+    const store = await OpfsProjectStore.create(DB);
+    if (!store) return;
+    const root = (await navigator.storage.getDirectory()) as unknown as MemDirectoryHandle;
+    const rootDir = await root.getDirectoryHandle(DB);
+    const projectsDir = await rootDir.getDirectoryHandle('projects');
+    // 内容完全合法的记录，但文件名与 uri 哈希错位（外部复制/重命名产生）
+    const good = project('lumora://project/real', '真实项目', 3);
+    const handle = await projectsDir.getFileHandle(projectFileName('lumora://project/other'), { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(JSON.stringify({ uri: 'lumora://project/real', savedAt: 'x', project: good }));
+    await writable.close();
+
+    // 显式比对请求 uri 与记录 uri：错误文件不得返回错误记录
+    expect(await store.load('lumora://project/real')).toBeNull();
+    // list 跳过错位记录（不把错误文件当最近项目）
+    expect((await store.list()).map((s) => s.uri)).toEqual([]);
+    // save 到正确文件名不受错位文件影响（创建语义）
+    expect((await store.save(good, null)).ok).toBe(true);
+    expect((await store.load('lumora://project/real'))).toEqual(good);
+    store.close();
+  });
+
+  it('move 抛非 NotSupported 的通用错误：保存如实失败、.tmp 清理、旧记录保持原样（第七轮 #7）', async () => {
+    // 代理链与 NotSupportedError 测试相同，但 move 抛普通错误（不得降级直接写）
+    const throwingMoveFile = (handle: MemFileHandle) =>
+      new Proxy(handle, {
+        get(h, hp, hr) {
+          if (hp === 'move') {
+            return async () => {
+              throw new Error('文件系统 move 失败');
+            };
+          }
+          return Reflect.get(h, hp, hr);
+        },
+      });
+    const throwingMoveDir = (dir: MemDirectoryHandle) =>
+      new Proxy(dir, {
+        get(t, p, r) {
+          if (p === 'getFileHandle') {
+            return async (name: string, options?: { create?: boolean }) => {
+              const handle = await (t as MemDirectoryHandle).getFileHandle(name, options);
+              return throwingMoveFile(handle as MemFileHandle);
+            };
+          }
+          const value = Reflect.get(t, p, r);
+          return typeof value === 'function' ? value.bind(t) : value;
+        },
+      });
+    const root = new MemDirectoryHandle('root');
+    const rootProxy = new Proxy(root, {
+      get(t, p, r) {
+        if (p === 'getDirectoryHandle') {
+          return async (name: string, options?: { create?: boolean }) => {
+            const dir = await (t as MemDirectoryHandle).getDirectoryHandle(name, options);
+            if (name === DB) {
+              return new Proxy(dir as MemDirectoryHandle, {
+                get(d, dp, dr) {
+                  if (dp === 'getDirectoryHandle') {
+                    return async (subName: string, subOpts?: { create?: boolean }) => {
+                      const sub = await (d as MemDirectoryHandle).getDirectoryHandle(subName, subOpts);
+                      return subName === 'projects' ? throwingMoveDir(sub as MemDirectoryHandle) : sub;
+                    };
+                  }
+                  const value = Reflect.get(d, dp, dr);
+                  return typeof value === 'function' ? value.bind(d) : value;
+                },
+              });
+            }
+            return dir;
+          };
+        }
+        const value = Reflect.get(t, p, r);
+        return typeof value === 'function' ? value.bind(t) : value;
+      },
+    });
+    const store = await OpfsProjectStore.create(DB, rootProxy);
+    if (!store) return;
+    // 预置已落盘记录（绕过 move 路径直接写入）
+    const saved = project('lumora://project/a', '已落盘内容', 3);
+    const rootDir = await root.getDirectoryHandle(DB);
+    const projectsDir = await rootDir.getDirectoryHandle('projects');
+    const handle = await projectsDir.getFileHandle(projectFileName('lumora://project/a'), { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(JSON.stringify({ uri: 'lumora://project/a', savedAt: 'x', project: saved }));
+    await writable.close();
+
+    // 覆盖保存（CAS 通过）→ move 通用错误 → 如实失败，不降级直接写
+    const result = await store.save(project('lumora://project/a', '更新内容', 4), 3);
+    expect(result.ok).toBe(false);
+    if (result.ok || result.code !== 'storage-error') return;
+    // 旧记录保持原样；.tmp 被尽力清理
+    expect((await store.load('lumora://project/a'))).toEqual(saved);
+    const names: string[] = [];
+    for await (const [name] of projectsDir.entries()) names.push(name);
+    expect(names.filter((n) => n.endsWith('.tmp'))).toEqual([]);
     store.close();
   });
 

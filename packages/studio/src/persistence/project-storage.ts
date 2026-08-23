@@ -18,7 +18,7 @@
  */
 
 import type { Project } from '@lumora/core';
-import { findJsonEncodingProblem } from '@lumora/core';
+import { findJsonEncodingProblem, migrateProjectSchema } from '@lumora/core';
 import type { JsonEncodingProblem } from '@lumora/core';
 
 // JSON 可编码性判定由 core 唯一负责（第六轮 #5：严格 JSON-value 校验/规范化边界，
@@ -123,6 +123,20 @@ export function stableStringify(value: unknown): string {
 export function sameProjectContent(a: Project, b: Project): boolean {
   if (findJsonEncodingProblem(a) || findJsonEncodingProblem(b)) return false;
   return stableStringify(a) === stableStringify(b);
+}
+
+/**
+ * schema 升级写回豁免判定（第七轮 #5，两个适配器共用）：incoming 必须精确等于
+ * migrateProjectSchema(existing) 的确定性结果才允许以同 revision 覆盖 —— 仅
+ * schema 版本更高不足以免责，任意同 revision 分叉内容不得借「升级」覆盖旧记录
+ * （v2/rev7 baseline 不得被任意 v3/rev7 divergent 覆盖）。facade 的 loadProject
+ * 迁移写回（incoming 正是迁移结果本身）通过；其余内容一律按分叉拒绝。
+ */
+export function isMigrationWriteback(incoming: Project, existing: Project): boolean {
+  if (incoming.schemaVersion <= existing.schemaVersion) return false;
+  const migrated = migrateProjectSchema(existing);
+  if (!migrated.ok) return false;
+  return sameProjectContent(incoming, migrated.project as Project);
 }
 
 export function isQuotaError(error: unknown): boolean {

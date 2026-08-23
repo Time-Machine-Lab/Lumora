@@ -23,7 +23,7 @@ import type {
   SaveOutcome,
   StoredProject,
 } from './project-storage';
-import { failureMessage, findJsonEncodingProblem, isQuotaError, sameProjectContent } from './project-storage';
+import { failureMessage, findJsonEncodingProblem, isMigrationWriteback, isQuotaError, sameProjectContent } from './project-storage';
 
 export const PROJECT_STORE_DB = 'lumora-studio';
 export const PROJECTS_STORE = 'projects';
@@ -174,12 +174,15 @@ export class ProjectStore implements ProjectStorage {
             storedRevision: existing.project.revision,
           };
         }
-        // 分叉保护豁免 schema 升级写回（loadProject 迁移：同 revision 内容随
-        // schema 版本合法变化）；revision CAS 仍生效，并发更新依旧被拦截
+        // 分叉保护（第七轮 #5）：同 revision 内容不同一律拒绝 —— 唯一豁免是
+        // isMigrationWriteback（incoming 精确等于 migrateProjectSchema(existing)
+        // 的确定性结果，facade loadProject 的迁移写回）；任意 v3/rev7 divergent
+        // 覆盖 v2/rev7 baseline 的场景因此被拒。revision CAS 仍生效，并发更新
+        // 依旧被拦截。
         if (
           project.revision === existing.project.revision &&
-          existing.project.schemaVersion === project.schemaVersion &&
-          !sameProjectContent(project, existing.project)
+          !sameProjectContent(project, existing.project) &&
+          !isMigrationWriteback(project, existing.project)
         ) {
           return {
             ok: false,

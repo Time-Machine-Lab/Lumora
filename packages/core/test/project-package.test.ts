@@ -287,6 +287,38 @@ describe('工程包凭据清除（NFR-008：嵌套扩展数据递归清除）', 
     }
   });
 
+  it('provider/token 组合矩阵（第七轮 #3）：任意 provider 限定的 token 族键默认敏感清除，不依赖有限前缀枚举；白名单普通配置保留', async () => {
+    const project = await buildFixtureProject();
+    const stripped: Record<string, string> = {};
+    // provider/协议限定词 + token 的组合不可枚举（refreshToken/githubToken/
+    // bearerToken/jwtToken/idToken/refresh_token 等）：核心词任意位置出现即默认敏感
+    for (const key of [
+      'refreshToken', 'refresh_token', 'refresh-token', 'RefreshToken', 'REFRESH_TOKEN',
+      'githubToken', 'gitHubToken', 'GITHUB_TOKEN',
+      'bearerToken', 'bearer_token', 'BEARER_TOKEN',
+      'jwtToken', 'jwt_token', 'JWT_TOKEN',
+      'idToken', 'id_token', 'ID_TOKEN',
+      'anthropicApiKey', 'openaiApiKey', 'claudeToken', 'geminiToken', 'groqToken', 'xaiToken',
+      'awsAccessKey', 'firebaseToken', 'stripeToken', 'slackToken', 'discordToken', 'oauthToken',
+      'sessionToken', 'SESSION_TOKEN',
+    ]) {
+      stripped[key] = `secret-${key}`;
+    }
+    // 白名单窄例外：经确认的普通配置（快捷键/计数/关键帧）不受「核心词默认敏感」误杀
+    const preserved: Record<string, string> = {};
+    for (const key of ['shortcutKey', 'keyboardKey', 'primaryKey', 'cacheKey', 'maxToken', 'maxTokens', 'tokenBudget', 'tokenizer', 'keyframes']) {
+      preserved[key] = `safe-${key}`;
+    }
+    const rich = { ...project, pluginData: { 'com.example': { ...stripped, ...preserved } } } as Project;
+    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
+    for (const key of Object.keys(stripped)) {
+      expect(json, `凭据键 ${key} 必须被清除`).not.toContain(`secret-${key}`);
+    }
+    for (const key of Object.keys(preserved)) {
+      expect(json, `普通键 ${key} 必须保留`).toContain(`safe-${key}`);
+    }
+  });
+
   it('组合式规则（第六轮 #3）：provider 前缀 + value/pem 后缀的凭据键清除；普通 key/token 词保留', async () => {
     const project = await buildFixtureProject();
     const stripped: Record<string, string> = {};

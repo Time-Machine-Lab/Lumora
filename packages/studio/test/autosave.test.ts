@@ -785,6 +785,107 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     autosaver.dispose();
   });
 
+  it('阻断1：重试保存挂起期间继续编辑：不重开编辑器、不报 clean、锁存冲突，恢复快照保留（第七轮 #1）', async () => {
+    const { editor, store, autosaver } = await wired(500); // 长防抖：复验失败后无自动保存干扰断言
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(10); // 基线 rev0
+    vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    editor.addObject(createGroupObject()); // rev1
+    editor.undo(); // rev2，内容与基线一致 → 恢复快照 == 已提交基线
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60);
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+    vi.mocked(store.save).mockRestore();
+
+    // 重开 A：基线 rev0 + 恢复快照（内容 == 基线）→ recovery-available 锁存
+    const states: AutosaveState[] = [];
+    autosaver.onState((s) => states.push(s));
+    editor.openProject({ ...base, name: '项目A' });
+    await settle(60);
+    expect(states.at(-1)).toMatchObject({ status: 'error', code: 'recovery-available' });
+
+    // 编辑出新内容（rev1 X1）→ 决策走「快照 == 基线 → 向前保存当前内容」分支；
+    // 慢速保存：真实写入但延迟返回；挂起期间继续编辑（rev2 X2）
+    editor.addObject(createGroupObject()); // rev1
+    const realSave = store.save.bind(store);
+    vi.spyOn(store, 'save').mockImplementationOnce(async (project, expected) => {
+      await new Promise((r) => setTimeout(r, 40));
+      return realSave(project, expected);
+    });
+    const retrying = autosaver.retryRecovery(A);
+    await settle(20); // 保存挂起中
+    editor.addObject(createGroupObject()); // rev2：延迟保存期间继续编辑
+    const outcome = await retrying;
+
+    expect(outcome).toMatchObject({ ok: false, code: 'revision-conflict' });
+    // 编辑器未被重开/重置：当前编辑内容原样保留（不静默覆盖新编辑）
+    const current = editor.getProject()!;
+    expect(current.revision).toBe(2);
+    expect(current.objects.length).toBe(base.objects.length + 2);
+    // 锁存冲突且不报 clean
+    expect(states.at(-1)).toMatchObject({ status: 'error', code: 'revision-conflict' });
+    // 磁盘已推进到决策时内容（rev1），恢复快照保留（未清除）
+    const stored = await store.load(A);
+    expect(stored!.revision).toBe(1);
+    expect(stored!.objects.length).toBe(base.objects.length + 1);
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+    autosaver.dispose();
+  });
+
+  it('阻断1：重试保存挂起期间切换项目：不触碰新项目、锁存冲突、恢复快照保留（第七轮 #1）', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(10); // 基线 rev0
+    vi.spyOn(store, 'save').mockImplementation(async () => ({
+      ok: false,
+      code: 'storage-error' as const,
+      message: '保存失败',
+    }));
+    editor.addObject(createGroupObject()); // rev1（恢复快照内容）
+    await settle(60);
+    editor.openProject(createSampleProject('lumora://project/b'));
+    await settle(60);
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+    vi.mocked(store.save).mockRestore();
+
+    const states: AutosaveState[] = [];
+    autosaver.onState((s) => states.push(s));
+    editor.openProject({ ...base, name: '项目A' });
+    await settle(60);
+    expect(states.at(-1)).toMatchObject({ status: 'error', code: 'recovery-available' });
+
+    // 决策：编辑器 == 已提交基线 → 保存恢复快照（分支 1）；慢速保存挂起期间切换
+    const realSave = store.save.bind(store);
+    vi.spyOn(store, 'save').mockImplementationOnce(async (project, expected) => {
+      await new Promise((r) => setTimeout(r, 40));
+      return realSave(project, expected);
+    });
+    const retrying = autosaver.retryRecovery(A);
+    await settle(20); // 保存挂起中
+    editor.openProject(createSampleProject('lumora://project/c', '项目C')); // 切换项目
+    const outcome = await retrying;
+
+    expect(outcome).toMatchObject({ ok: false, code: 'revision-conflict' });
+    // 编辑器是切换后的项目（恢复快照未被重开覆盖到新项目上）
+    expect(editor.getProject()!.uri).toBe('lumora://project/c');
+    expect(editor.getProject()!.name).toBe('项目C');
+    // 恢复快照保留；磁盘已推进（恢复快照落盘 rev1）
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+    const stored = await store.load(A);
+    expect(stored!.revision).toBe(1);
+    expect(stored!.objects.length).toBe(base.objects.length + 1);
+    autosaver.dispose();
+  });
+
   it('阻断1：不可编码内容（undefined/NaN/BigInt/循环引用/数组非索引键）恒判未保存，保存返回类型化错误且不崩溃', async () => {
     const cases: Array<[string, () => object]> = [
       ['undefined 字段', () => ({ extra: undefined })],

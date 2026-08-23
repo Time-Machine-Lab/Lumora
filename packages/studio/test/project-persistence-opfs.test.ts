@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createGroupObject } from '@lumora/core';
+import type { Project } from '@lumora/core';
 import { createStudioRuntime } from '../src/runtime/studio-runtime';
 import type { StudioRuntime } from '../src/runtime/studio-runtime';
 import { ProjectStore } from '../src/persistence/project-store';
@@ -157,6 +158,32 @@ describe('ProjectPersistence：OPFS 后端（可配置切换，行为与 Indexed
     const final = await store.load(project.uri);
     expect(final!.revision).toBe(6);
     expect(final!.name).toBe('较新内容');
+    store.close();
+  });
+
+  it('v2 记录经 OPFS 后端重开：适配器层 raw 保留，facade 统一完成 迁移 → 校验 → CAS 写回（第七轮 #6）', async () => {
+    const runtime = await makeRuntime('opfs');
+    const store = await OpfsProjectStore.create(DB);
+    expect(store).not.toBeNull();
+    if (!store) return;
+    const v3 = runtime.persistence.createProject('OPFS 旧版项目');
+    const { tracks: _tracks, ...v2 } = v3;
+    expect((await store.save({ ...v2, schemaVersion: 2 } as unknown as Project)).ok).toBe(true);
+
+    // 适配器层不提前迁移：raw/source schema 原样返回
+    const raw = await store.load(v3.uri);
+    expect(raw!.schemaVersion).toBe(2);
+    // facade loadProject：迁移 → 校验 → 以已存 revision CAS 写回（migratedFrom 如实报告）
+    const loaded = await runtime.persistence.loadProject(v3.uri);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.migratedFrom).toBe(2);
+    expect(loaded.project.schemaVersion).toBe(3);
+    expect(loaded.project.tracks).toEqual([]);
+    // 写回后的存储记录已是 v3（下次加载不再迁移）
+    const after = await store.load(v3.uri);
+    expect(after!.schemaVersion).toBe(3);
+    expect(after!.revision).toBe(0);
     store.close();
   });
 

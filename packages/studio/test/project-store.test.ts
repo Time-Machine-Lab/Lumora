@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createBlankProject } from '@lumora/core';
+import { buildProjectPackage, createBlankProject, migrateProjectSchema } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import { ProjectStore } from '../src/persistence/project-store';
+import { OpfsProjectStore } from '../src/persistence/project-store-opfs';
+import { MemDirectoryHandle } from './opfs-fs-shim';
 import { findJsonEncodingProblem, sameProjectContent, stableStringify } from '../src/persistence/project-storage';
 
 const DB = 'lumora-test-store';
@@ -331,4 +333,114 @@ describe('project-storage 共享工具（第五轮 #6 / #8）', () => {
     expect(findJsonEncodingProblem({ s: Symbol('x') })).toBe('symbol-value');
     expect(findJsonEncodingProblem({ ok: [1, 'a', null, { deep: true }] })).toBeNull();
   });
+
+  it('findJsonEncodingProblem（第七轮 #4）：品牌对象（Date/Map/Set/RegExp/typed array）与 -0 拒绝，JSON.parse 产物接受', () => {
+    expect(findJsonEncodingProblem({ d: new Date('2026-01-01T00:00:00Z') })).toBe('non-plain-object');
+    expect(findJsonEncodingProblem({ m: new Map([['a', 1]]) })).toBe('non-plain-object');
+    expect(findJsonEncodingProblem({ s: new Set([1]) })).toBe('non-plain-object');
+    expect(findJsonEncodingProblem({ r: /x+/ })).toBe('non-plain-object');
+    expect(findJsonEncodingProblem({ t: new Uint8Array([1, 2]) })).toBe('non-plain-object');
+    expect(findJsonEncodingProblem({ e: new Error('x') })).toBe('non-plain-object');
+    expect(findJsonEncodingProblem({ z: -0 })).toBe('negative-zero');
+    expect(findJsonEncodingProblem(-0)).toBe('negative-zero');
+    expect(findJsonEncodingProblem({ z: 0 })).toBeNull();
+    // 普通对象与 null 原型 record（JSON.parse 产物）可编码
+    const nullProto = JSON.parse('{"n":1}');
+    expect(findJsonEncodingProblem({ p: nullProto })).toBeNull();
+  });
+});
+
+describe('schema 升级写回豁免 isMigrationWriteback（第七轮 #5，两个适配器共享判定）', () => {
+  it('迁移写回（incoming 精确等于 migrateProjectSchema(existing) 的确定性结果）：同 revision 覆盖被放行', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const v3 = project('lumora://project/a', '旧版', 7);
+    const { tracks: _tracks, ...v2 } = v3;
+    const baseline = { ...v2, schemaVersion: 2 } as unknown as Project;
+    expect((await store.save(baseline)).ok).toBe(true);
+
+    const migrated = migrateProjectSchema(baseline);
+    expect(migrated.ok).toBe(true);
+    if (!migrated.ok) return;
+    const result = await store.save(migrated.project as Project, 7);
+    expect(result.ok).toBe(true);
+    const stored = await store.load('lumora://project/a');
+    expect(stored!.schemaVersion).toBe(3);
+    expect(stored!.revision).toBe(7);
+    store.close();
+  });
+
+  it('v2/rev7 baseline 被任意 v3/rev7 divergent 覆盖：按分叉拒绝（第七轮 #5 回归，不得借「升级」覆盖）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    const v3 = project('lumora://project/a', '旧版', 7);
+    const { tracks: _tracks, ...v2 } = v3;
+    const baseline = { ...v2, schemaVersion: 2 } as unknown as Project;
+    expect((await store.save(baseline)).ok).toBe(true);
+
+    // 仅升级 schemaVersion、场景内容被改写的任意 v3/rev7 分叉：不是迁移结果 → 拒绝
+    const divergent = {
+      ...v3,
+      schemaVersion: 3,
+      scenes: [{ ...v3.scenes[0]!, name: '被篡改的场景' }],
+    } as unknown as Project;
+    const result = await store.save(divergent, 7);
+    expect(result.ok).toBe(false);
+    if (result.ok || result.code !== 'revision-conflict') return;
+    expect(result.storedRevision).toBe(7);
+    const stored = await store.load('lumora://project/a');
+    expect(stored!.schemaVersion).toBe(2);
+    expect(stored!.name).toBe('旧版');
+    store.close();
+  });
+});
+
+describe('JSON 编码契约三路共享矩阵（第七轮 #4：IDB / OPFS / 导出 对同一数据一致拒绝）', () => {
+  const cases: Array<[string, () => unknown, string]> = [
+    ['Date', () => ({ d: new Date('2026-01-01T00:00:00Z') }), 'non-plain-object'],
+    ['Map', () => ({ m: new Map([['a', 1]]) }), 'non-plain-object'],
+    ['Set', () => ({ s: new Set([1]) }), 'non-plain-object'],
+    ['RegExp', () => ({ r: /x+/ }), 'non-plain-object'],
+    ['typed array', () => ({ t: new Uint8Array([1, 2]) }), 'non-plain-object'],
+    ['-0', () => ({ z: -0 }), 'negative-zero'],
+  ];
+  for (const [label, corrupt, problem] of cases) {
+    it(`${label}：IDB 保存 / OPFS 保存 / 导出 三路一致拒绝（${problem}）`, async () => {
+      // 1) IndexedDB 后端
+      const idb = await ProjectStore.create(DB);
+      expect(idb).not.toBeNull();
+      if (!idb) return;
+      const badIdb = project(`lumora://project/idb-${label}`, '坏数据', 1) as Project & Record<string, unknown>;
+      badIdb.extra = corrupt();
+      const r1 = await idb.save(badIdb as Project, null);
+      expect(r1).toMatchObject({ ok: false, code: 'storage-error' });
+      if (!r1.ok) expect(r1.message).toContain(problem);
+      expect(await idb.load(`lumora://project/idb-${label}`)).toBeNull();
+      idb.close();
+
+      // 2) OPFS 后端
+      const opfs = await OpfsProjectStore.create(DB, new MemDirectoryHandle('root'));
+      expect(opfs).not.toBeNull();
+      if (!opfs) return;
+      const badOpfs = project(`lumora://project/opfs-${label}`, '坏数据', 1) as Project & Record<string, unknown>;
+      badOpfs.extra = corrupt();
+      const r2 = await opfs.save(badOpfs as Project, null);
+      expect(r2).toMatchObject({ ok: false, code: 'storage-error' });
+      if (!r2.ok) expect(r2.message).toContain(problem);
+      expect(await opfs.load(`lumora://project/opfs-${label}`)).toBeNull();
+      opfs.close();
+
+      // 3) 工程包导出（includePrivate 时 pluginData 进包）：编辑器 openProject 的
+      // assertJsonPlainDeep/deepFreeze 已先行拒绝这些值（损坏数据无法经编辑器持有），
+      // 因此直接验证 exportCurrent 的检查链（buildProjectPackage → findJsonEncodingProblem，
+      // project-persistence.ts:296-303），导出表面共享同一编码契约
+      const exportProject = project(`lumora://project/export-${label}`, '导出坏数据', 1) as Project &
+        Record<string, unknown>;
+      exportProject.pluginData = { 'com.example': corrupt() };
+      const pkg = buildProjectPackage(exportProject as Project, { includePrivate: true });
+      const encodingProblem = findJsonEncodingProblem(pkg);
+      expect(encodingProblem).not.toBeNull();
+      expect(encodingProblem).toContain(problem);
+    });
+  }
 });

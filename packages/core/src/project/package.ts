@@ -118,20 +118,18 @@ export function preDecodePayloadFailure(
  * 凭据族敏感词（导出时递归清除；插件扩展数据可携带任意嵌套键）。
  * 凭据隔离是两层设计：顶层凭据结构（credentials/apiKeys/…）由公开字段白名单
  * 结构性排除（见 PRIVATE_PROJECT_FIELDS），此处仅兜底嵌套任意键名。
- * 匹配规则为显式分词后精确匹配（camelCase/连字符/下划线/点分拆分）：
+ * 匹配规则（第七轮 #3 重构）为「组合敏感默认 + 白名单窄例外」：
  * - 任意位置命中：secret/secrets/password/credential/credentials/authorization；
- * - 末词核心词（key/keys/token/tokens/cookie）按组合规则（第六轮 #3）：
- *   cookie 末词即敏感；key/token 仅当它是唯一词、或前一词是敏感限定词
- *   （api/access/auth/oauth/private/client/provider/session）时敏感 ——
- *   普通设置 shortcutKey/keyboardKey/primaryKey/cacheKey/maxToken 因此保留，
- *   而 apiKey/accessToken/sessionToken/apiKeyValue/sshPrivateKeyPem 清除；
+ * - 核心词（key/keys/token/tokens/cookie）在任意位置出现即默认敏感 —— 不再依赖
+ *   有限的「敏感限定词」前缀枚举证明安全（refreshToken/githubToken/bearerToken/
+ *   jwtToken/idToken/refresh_token 等 provider 限定词不可枚举，前缀法必然漏）；
+ * - 白名单窄例外：规范化键名（小写词 join('_')）精确匹配的普通配置（shortcutKey/
+ *   keyboardKey/primaryKey/cacheKey/maxToken/tokenBudget/keyframes 等）放行；
  * - 紧凑别名：无分隔符拼接的凭据词（API_KEY→apikey、ACCESS_TOKEN→accesstoken），
  *   全小写/全大写形态拆不出单词边界（APIKEY、accesstoken 是单一连续段），
  *   显式枚举；另有 provider 前缀 + 紧凑核心后缀形态（OPENAIAPIKEY→openaiapikey，
  *   provider 名不可枚举，按核心后缀匹配）。
- * 不含 token 的非末词形态（tokenizer/tokenBudget/maxTokens 等 token* 配置是
- * 常见插件设置，不是凭据；末词 token 才是访问令牌模式），也不含 keyframes
- * 这类以 key 开头但语义非凭据的词（组合规则天然排除）。
+ * 无核心词的键（tokenizer/keyframes/apiUrl/endpoint 等）天然保留。
  */
 const SENSITIVE_ANY_WORD = new Set([
   'secret',
@@ -141,10 +139,24 @@ const SENSITIVE_ANY_WORD = new Set([
   'credentials',
   'authorization',
 ]);
-/** 末词核心词：需限定词组合（cookie 除外，cookie 末词本身就是凭据语义） */
-const SENSITIVE_CORE_LAST = new Set(['key', 'keys', 'token', 'tokens', 'cookie']);
-/** 敏感限定词：与末词核心词相邻（前一词）时构成凭据模式 */
-const SENSITIVE_QUALIFIER = new Set(['api', 'access', 'auth', 'oauth', 'private', 'client', 'provider', 'session']);
+/** 组合敏感核心词：任意位置出现即默认敏感（凭据语义；cookie 无例外） */
+const SENSITIVE_CORE_WORDS = new Set(['key', 'keys', 'token', 'tokens', 'cookie']);
+/** 白名单窄例外：规范化键名（小写词 join('_')）精确匹配。仅放行经确认的普通配置 */
+const ALLOWED_CONFIG_KEYS = new Set([
+  'shortcut_key',
+  'keyboard_key',
+  'primary_key',
+  'cache_key',
+  'max_token',
+  'max_tokens',
+  'maxtokens',
+  'token_budget',
+  'token_count',
+  'tokens_per_sec',
+  'token_limit',
+  'keyframes',
+  'keyframe_rate',
+]);
 
 /** 紧凑别名：无分隔符拼接的凭据词（API_KEY→apikey、ACCESS_TOKEN→accesstoken）。
  *  全小写/全大写形态拆不出单词边界（APIKEY、accesstoken 是单一连续段），须显式枚举 */
@@ -198,19 +210,9 @@ function isSensitiveKey(key: string): boolean {
   if (words.some((word) => COMPACT_SENSITIVE.has(word) || COMPACT_SENSITIVE_SUFFIXES.some((core) => word.endsWith(core)))) {
     return true;
   }
-  // 核心词任意位置组合规则：cookie 末词即敏感（凭据语义强）；key/token 唯一词、
-  // 或前一词为敏感限定词时敏感 —— 普通设置（shortcutKey/maxToken/…）保留
-  for (let i = 0; i < words.length; i += 1) {
-    const word = words[i]!;
-    if (!SENSITIVE_CORE_LAST.has(word)) continue;
-    if (word === 'cookie') {
-      if (i === words.length - 1) return true;
-      continue;
-    }
-    if (i === 0 && words.length === 1) return true;
-    if (i > 0 && SENSITIVE_QUALIFIER.has(words[i - 1]!)) return true;
-  }
-  return false;
+  // 核心词任意位置出现即默认敏感；仅规范化键名精确命中白名单的普通配置放行
+  if (!words.some((word) => SENSITIVE_CORE_WORDS.has(word))) return false;
+  return !ALLOWED_CONFIG_KEYS.has(words.join('_'));
 }
 
 /** 工程包仅携带的公开项目字段（白名单：未知顶层字段一律不进包） */
