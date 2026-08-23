@@ -474,4 +474,48 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
       loadSpy.mockRestore();
     }
   });
+
+  it('「最近项目复制」分支：副本写入成功但 loadProject 返回 ok:false → 清理副本并提示错误，绝不报成功（第十二轮一般 #6）', async () => {
+    const handle = renderStudio();
+    const runtime = await waitPersistence(handle);
+    runtime.openProject(createSampleProject('lumora://project/recent-dup', '最近复制项目'));
+    await waitFor(() => expect(screen.getByTestId('save-state-badge')).toHaveTextContent('已保存'));
+    await openMenu();
+    await screen.findByTestId('recent-project');
+
+    // 普通复制分支：duplicate 成功（副本已写入）但副本记录无法通过 loadProject
+    // 校验（ok:false）—— 修复前该分支静默报「已复制为」成功；修复后显式失败
+    // 并清理损坏副本（不得留在最近项目列表误导用户）
+    const persistence = runtime.persistence;
+    const dupSpy = vi.spyOn(persistence, 'duplicateProject').mockResolvedValue({
+      ok: true,
+      summary: {
+        uri: 'lumora://project/recent-dup-copy',
+        name: '最近复制项目 副本',
+        savedAt: new Date().toISOString(),
+        revision: 0,
+        schemaVersion: 3,
+      },
+    });
+    const loadSpy = vi.spyOn(persistence, 'loadProject').mockResolvedValue({
+      ok: false,
+      message: '本地项目数据校验失败：settings.fps 非法',
+    });
+    const deleteSpy = vi.spyOn(persistence, 'deleteProject').mockResolvedValue(true);
+    try {
+      screen.getByTestId('recent-duplicate').click();
+      await waitFor(() => expect(screen.getByText(/无法打开副本/)).toBeInTheDocument());
+      expect(dupSpy).toHaveBeenCalledTimes(1);
+      expect(loadSpy).toHaveBeenCalledTimes(1);
+      // 损坏副本被清理：绝不遗留坏记录
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+      expect(deleteSpy).toHaveBeenCalledWith('lumora://project/recent-dup-copy');
+      // 绝不报成功：无「已复制为」成功提示
+      expect(screen.queryByText(/已复制为/)).not.toBeInTheDocument();
+    } finally {
+      dupSpy.mockRestore();
+      loadSpy.mockRestore();
+      deleteSpy.mockRestore();
+    }
+  });
 });

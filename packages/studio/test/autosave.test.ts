@@ -1110,12 +1110,14 @@ describe('ProjectAutosaver：切换广播守卫与代际失效（第九轮 #1 �
 });
 
 describe('ProjectAutosaver：switchOpen 失败回滚恢复防抖保存（第十轮 #1 严重回归）', () => {
-  it('dirty → 切换失败 → 不再编辑 → 自动落盘仍发生（存储 revision 推进）', async () => {
+  it('dirty → 切换失败 → 不再编辑 → 自动落盘仍发生（存储 revision 推进，保存恰一次）', async () => {
     const { editor, store, autosaver } = await wired();
     const A = 'lumora://project/a';
     const base = createSampleProject(A, '项目A');
     editor.openProject(base);
     await settle(60); // 基线落盘（rev0）
+    const saveSpy = vi.spyOn(store, 'save');
+    saveSpy.mockClear();
 
     editor.addObject(createGroupObject()); // dirty（防抖 20ms 窗口内）
     await settle(5);
@@ -1127,24 +1129,28 @@ describe('ProjectAutosaver：switchOpen 失败回滚恢复防抖保存（第十�
     expect(() => autosaver.switchOpen(broken)).toThrow();
     expect(editor.getProject()?.uri).toBe(A);
 
-    // 不再编辑：修复后回滚会重新 scheduleSave，防抖窗口过后旧内容自动落盘
+    // 不再编辑：修复后回滚重建真实存在的待执行 timer，防抖窗口过后旧内容
+    // 自动落盘（第十二轮一般 #7：仅恢复 reset 前真实存在的 timer，保存恰好一次）
     await settle(100);
+    expect(saveSpy).toHaveBeenCalledTimes(1);
     const stored = await store.load(A);
     expect(stored).not.toBeNull();
     expect(stored!.revision).toBe(1);
     expect(stored!.objects.length).toBe(base.objects.length + 1);
+    saveSpy.mockRestore();
     autosaver.dispose();
   });
 
-  it('dirty 且在途保存（saveQueued）时回滚不重复调度，在途保存完成落盘', async () => {
+  it('dirty 且在途保存（in-flight）时回滚不重复调度：释放阻塞后保存调用恰一次，落盘完成', async () => {
     const { editor, store, autosaver } = await wired();
     const A = 'lumora://project/a';
     const base = createSampleProject(A, '项目A');
     editor.openProject(base);
     await settle(60);
 
-    // 在途保存：慢速保存挂起期间切换失败 —— 回滚后不重复 scheduleSave，
-    // 在途保存任务完成旧内容落盘（CAS 不冲突，基线未变）
+    // 在途保存：慢速保存挂起期间切换失败 —— 回滚后不得重复 scheduleSave
+    // （第十二轮一般 #7：in-flight 单独跟踪，链中任务继续推进基线），
+    // 释放阻塞后断言调用次数仍为 1
     editor.addObject(createGroupObject());
     let releaseSave!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -1157,7 +1163,7 @@ describe('ProjectAutosaver：switchOpen 失败回滚恢复防抖保存（第十�
         await gate;
         return realSave(incoming, expected);
       });
-    await settle(40); // debounce 到期 → runSave → saveQueued = true 且保存挂起
+    await settle(40); // debounce 到期 → runSave → 任务开始（saveQueued 清位，in-flight）
     expect(slowSave).toHaveBeenCalledTimes(1);
 
     const broken = createSampleProject('lumora://project/b', '项目B');
@@ -1166,10 +1172,48 @@ describe('ProjectAutosaver：switchOpen 失败回滚恢复防抖保存（第十�
 
     releaseSave();
     await settle(80);
+    // 释放阻塞后调用次数不翻倍：在途任务是唯一一次保存
+    expect(slowSave).toHaveBeenCalledTimes(1);
     const stored = await store.load(A);
     expect(stored).not.toBeNull();
     expect(stored!.revision).toBe(1);
     slowSave.mockRestore();
+    autosaver.dispose();
+  });
+
+  it('保存失败后未再编辑（timer/queued/in-flight 皆无）→ 切换失败回滚重新调度，自动重试落盘', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(60);
+
+    // 保存失败（配额错误）：runSave 执行完失败路径 —— timer 已清、queued/in-flight
+    // 皆无，内容仍未落盘（第十轮 #1 严重场景：保存失败后未再编辑）
+    const failingSave = vi
+      .spyOn(store, 'save')
+      .mockImplementationOnce(async () => ({ ok: false, code: 'quota-exceeded', message: '配额不足' } as const));
+    editor.addObject(createGroupObject()); // dirty
+    await settle(40); // debounce 到期 → 保存失败 → error 状态
+    expect(failingSave).toHaveBeenCalledTimes(1);
+    expect((await store.load(A))!.revision).toBe(0); // 旧内容未落盘
+    failingSave.mockRestore();
+
+    // 切换失败 → 回滚：三个调度态皆无但内容未保存 → 重新调度（第十二轮一般 #7）
+    const broken = createSampleProject('lumora://project/b', '项目B');
+    (broken as { activeSceneId: string }).activeSceneId = '不存在的场景';
+    const saveSpy = vi.spyOn(store, 'save');
+    expect(() => autosaver.switchOpen(broken)).toThrow();
+    expect(editor.getProject()?.uri).toBe(A);
+
+    // 不再编辑：防抖窗口过后保存自动重试成功（修复前停留在 rev0）
+    await settle(100);
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    const stored = await store.load(A);
+    expect(stored).not.toBeNull();
+    expect(stored!.revision).toBe(1);
+    expect(stored!.objects.length).toBe(base.objects.length + 1);
+    saveSpy.mockRestore();
     autosaver.dispose();
   });
 });

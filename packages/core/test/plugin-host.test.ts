@@ -80,6 +80,57 @@ describe('PluginHost', () => {
     expect(host.commands.has('example.hello')).toBe(true);
   });
 
+  it('宿主持有的 manifest 深冻结：插件清空 privateSettings 被拒绝，已声明凭据的剥离依据不丢失（第十二轮严重 #4）', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const attempts: string[] = [];
+    const definition = definitionOf({
+      activate: (context) => {
+        // context.manifest 直接引用宿主持有的 manifest（非副本）：任何改写尝试
+        // 都被深冻结拒绝 —— 插件不得抹掉自己已声明的凭据剥离依据
+        const held = context.manifest as unknown as Record<string, unknown> & { privateSettings?: string[] };
+        try {
+          held.privateSettings = [];
+          attempts.push('assign-succeeded');
+        } catch {
+          attempts.push('assign-rejected');
+        }
+        const declared = held.privateSettings;
+        try {
+          declared!.push('extra');
+          attempts.push('push-succeeded');
+        } catch {
+          attempts.push('push-rejected');
+        }
+        return context.contribute({ panels: [] });
+      },
+    });
+    await host.register(
+      descriptor({ ...VALID_MANIFEST, privateSettings: ['apiKey', 'accessToken'] }, async () => ({ default: definition })),
+    );
+    expect(attempts).toEqual(['assign-rejected', 'push-rejected']);
+    // 宿主仍完整持有声明：导出收集的剥离依据未被插件抹掉
+    expect(host.getPluginManifest('com.example.plugin')!.privateSettings).toEqual(['apiKey', 'accessToken']);
+  });
+
+  it('getPluginManifest 返回防御性只读副本：调用方修改副本不影响宿主与后续查询（第十二轮严重 #4）', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    await host.register(
+      descriptor({ ...VALID_MANIFEST, privateSettings: ['apiKey'] }, async () => ({ default: definitionOf() })),
+    );
+    const copy = host.getPluginManifest('com.example.plugin')!;
+    expect(copy).toBeDefined();
+    copy.privateSettings = [];
+    copy.name = '被篡改';
+    copy.contributes = [];
+    // 副本修改不侧漏：宿主状态不受影响
+    const again = host.getPluginManifest('com.example.plugin')!;
+    expect(again.privateSettings).toEqual(['apiKey']);
+    expect(again.name).toBe('示例插件');
+    expect(again.contributes).toEqual(VALID_MANIFEST.contributes);
+    // 未知插件返回 undefined
+    expect(host.getPluginManifest('com.nonexistent')).toBeUndefined();
+  });
+
   it('Manifest 非法时进入 failed 且不加载入口模块', async () => {
     const host = new PluginHost();
     const entry = vi.fn(async () => ({ default: definitionOf() }));

@@ -6,6 +6,7 @@ import type { EventMap } from '../events/event-map';
 import { checkEngineCompatibility } from '../manifest/engine';
 import { validateManifest } from '../manifest/validate';
 import type { Manifest } from '../manifest/validate';
+import { deepFreeze } from '../scene/immutable';
 import { createPluginServices, type PluginServices } from '../services';
 import type { Project } from '../scene/types';
 import type {
@@ -254,10 +255,14 @@ export class PluginHost {
     return this.plugins.get(instanceId)?.info();
   }
 
-  /** 按 instanceId 返回插件 Manifest（导出时收集 privateSettings 剥离声明用；
-   *  未知插件返回 undefined）。 */
+  /** 按 instanceId 返回插件 Manifest 的防御性只读副本（第十二轮严重 #4）：宿主
+   *  持有的 manifest 已深冻结（插件经 context.manifest 清空 privateSettings 会
+   *  被拒绝，已声明凭据的剥离依据不会被抹掉），此处返回结构克隆副本 —— 调用方
+   *  （导出收集剥离声明）修改副本不影响宿主状态；未知插件返回 undefined。 */
   getPluginManifest(instanceId: string): Manifest | undefined {
-    return this.plugins.get(instanceId)?.manifest;
+    const record = this.plugins.get(instanceId);
+    if (!record) return undefined;
+    return structuredClone(record.manifest);
   }
 
   /**
@@ -578,15 +583,20 @@ export class PluginHost {
     }
 
     // 校验失败时使用安全占位 Manifest（仅含可安全提取的展示字段），
-    // info()/事件等后续环节只接触占位对象，不再触碰原始输入
-    const safeManifest: Manifest = manifest ?? {
-      schemaVersion: '1',
-      id: safeId,
-      name: safeName,
-      version: safeVersion,
-      entry: typeof raw?.entry === 'string' ? raw.entry : './dist/index.js',
-      contributes: [],
-    };
+    // info()/事件等后续环节只接触占位对象，不再触碰原始输入。
+    // 宿主持有的 manifest 一律深冻结（第十二轮严重 #4）：插件经 context.manifest
+    // 清空 privateSettings 等声明字段会被严格模式拒绝 —— 已声明凭据的剥离依据
+    // 不被抹掉，导出隔离不依赖插件的善意
+    const safeManifest: Manifest = deepFreeze(
+      manifest ?? {
+        schemaVersion: '1',
+        id: safeId,
+        name: safeName,
+        version: safeVersion,
+        entry: typeof raw?.entry === 'string' ? raw.entry : './dist/index.js',
+        contributes: [],
+      },
+    );
 
     const record: PluginRecord = {
       key,

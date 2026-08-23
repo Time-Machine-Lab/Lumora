@@ -18,7 +18,6 @@ import { TypedEventEmitter, createBlankProject, genId } from '@lumora/core';
 import type { Project, SceneEditor } from '@lumora/core';
 import {
   CURRENT_PROJECT_SCHEMA_VERSION,
-  PUBLIC_PROJECT_FIELDS,
   buildProjectPackage,
   estimatePackageBytes,
   findJsonEncodingProblem,
@@ -58,27 +57,6 @@ function safeFilename(name: string): string {
   return cleaned.length > 0 ? cleaned : '未命名项目';
 }
 
-/** 根级导出字段的反射读取（第十一轮一般 #6）：以 property descriptor 判定字段
- *  存在与可导出性 —— 不执行属性读取（getter/Proxy trap 不得在预检前产生副作用）；
- *  访问器字段直接拒绝（JSON.stringify/structuredClone 都会调用 getter，结果不可
- *  预测，与 findJsonEncodingProblem 的 accessor-property 语义一致）；反射抛错
- *  （getOwnPropertyDescriptor trap）归一为类型化失败。 */
-function reflectProjectField(
-  project: Project,
-  field: string,
-): { ok: true; value?: unknown } | { ok: false; message: string } {
-  let descriptor: PropertyDescriptor | undefined;
-  try {
-    descriptor = Reflect.getOwnPropertyDescriptor(project, field);
-  } catch {
-    return { ok: false, message: `项目字段 ${field} 无法反射（代理陷阱抛错），导出被拒绝` };
-  }
-  if (!descriptor) return { ok: true };
-  if ('get' in descriptor || 'set' in descriptor) {
-    return { ok: false, message: `项目字段 ${field} 是访问器属性，无法安全导出` };
-  }
-  return { ok: true, value: descriptor.value };
-}
 
 export class ProjectPersistence {
   private store: ProjectStorage | null = null;
@@ -93,7 +71,11 @@ export class ProjectPersistence {
     // 冷启动在 IndexedDB 打开前的项目变更不会丢失，init 完成后重新对账
     this.autosaver = new ProjectAutosaver(editor, null);
     this.autosaver.onState((state) => {
-      if (!this.disposed) this.events.emit('save-state', { state });
+      // latest-wins（第十二轮严重 #3）：save-state 是状态类事件 —— 监听器回调内
+      // 同步提交编辑会嵌套触发新的 save-state，外层陈旧状态不得在更新状态之后
+      // 送达其余监听器（广播代际失效仅适用于 latest-wins 状态事件，发生型事件
+      // 不做代际截断）
+      if (!this.disposed) this.events.emit('save-state', { state }, { latestWins: true });
     });
     this.unsubscribeEditor = editor.events.on('project:changed', ({ project }) => {
       if (!this.disposed) {
@@ -216,8 +198,8 @@ export class ProjectPersistence {
 
   /** 把恢复快照（或当前编辑器内容）另存为全新项目：以副本保留未保存内容（新 uri，revision 0）。
    *  保存成功后复用统一加载管道（load → 迁移 → 校验）验证副本可打开：存储写入成功
-   *  ≠ 数据可用（故障存储可写入损坏记录），验证失败即清除该记录并返回可操作错误 ——
-   *  副本未产生，调用方不得报成功。 */
+   *  ≠ 数据可用（故障存储可写入损坏记录），验证/清理经异常安全封装（verifyCopy）——
+   *  验证失败或 reject 均清除记录并返回可操作错误，副本未产生，调用方不得报成功。 */
   async saveSnapshotAsNew(
     project: Project,
     name?: string,
@@ -232,12 +214,7 @@ export class ProjectPersistence {
     };
     const result = await this.store.save(copy, null);
     if (!result.ok) return { ok: false, message: result.message };
-    const verified = await this.loadProject(copy.uri);
-    if (!verified.ok) {
-      await this.store.remove(copy.uri);
-      return { ok: false, message: `副本保存失败（数据无法通过校验）：${verified.message}` };
-    }
-    return { ok: true, project: verified.project };
+    return this.verifyCopy(copy.uri);
   }
 
   /**
@@ -301,16 +278,12 @@ export class ProjectPersistence {
       };
       const result = await this.store.save(copy, null);
       if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
-      // 与 saveSnapshotAsNew 同一验证管道（第十一轮严重 #3）：存储写入成功 ≠ 可打开，
-      // 失败即清除记录 —— 副本未产生，调用方不得报成功
-      const verified = await this.loadProject(copy.uri);
+      // 与 saveSnapshotAsNew 同一验证管道（第十一轮严重 #3 + 第十二轮严重 #5）：
+      // 存储写入成功 ≠ 可打开，验证/清理经异常安全封装（verifyCopy）—— 失败
+      // 或 reject 均清除记录，副本未产生，调用方不得报成功
+      const verified = await this.verifyCopy(copy.uri);
       if (!verified.ok) {
-        await this.store.remove(copy.uri);
-        return {
-          ok: false,
-          code: 'storage-error',
-          message: `副本保存失败（数据无法通过校验）：${verified.message}`,
-        };
+        return { ok: false, code: 'storage-error', message: verified.message };
       }
       return {
         ok: true,
@@ -331,6 +304,37 @@ export class ProjectPersistence {
     return this.store ? this.store.remove(uri) : false;
   }
 
+  /** 副本验证与清理的异常安全封装（第十二轮严重 #5）：存储写入成功 ≠ 数据可用
+   *  （故障存储可写入损坏记录），统一以「load → 迁移 → 校验」管道验证副本可
+   *  打开；loadProject / store.remove 的 reject（故障存储抛错）归一为类型化
+   *  失败 —— 绝不遗留损坏副本、绝不把未捕获异常上抛给调用方。 */
+  private async verifyCopy(
+    uri: string,
+  ): Promise<{ ok: true; project: Project } | { ok: false; message: string }> {
+    let verified: Awaited<ReturnType<ProjectPersistence['loadProject']>>;
+    try {
+      verified = await this.loadProject(uri);
+    } catch (error) {
+      await this.removeCopy(uri);
+      return { ok: false, message: `副本保存失败（验证异常）：${failureMessage(error)}` };
+    }
+    if (!verified.ok) {
+      await this.removeCopy(uri);
+      return { ok: false, message: `副本保存失败（数据无法通过校验）：${verified.message}` };
+    }
+    return { ok: true, project: verified.project };
+  }
+
+  /** 副本清理（验证失败时移除损坏记录）：remove 的 reject 不掩盖验证失败结论 */
+  private async removeCopy(uri: string): Promise<void> {
+    if (!this.store) return;
+    try {
+      await this.store.remove(uri);
+    } catch {
+      // 清理失败不掩盖验证失败
+    }
+  }
+
   /** 重命名：打开中的项目走编辑器提交（一步历史 + revision 递增 + 自动保存落盘）。 */
   renameProject(uri: string, name: string): Promise<RenameResult> {
     const trimmed = name.trim();
@@ -348,43 +352,32 @@ export class ProjectPersistence {
   /**
    * 导出当前项目为 `.lumora` 工程包（同步纯构建，绝不抛异常）。
    * includePrivate 显式开启时允许包含插件私有设置（pluginData）；凭据隔离是
-   * 结构化契约（第十一轮）：settings 按契约字段投影、pluginData 仅按插件
-   * manifest.privateSettings 显式声明剥离（privateKeysByPlugin），默认导出时
-   * pluginData 整体不进包 —— 不再依赖键名词表猜测（NFR-008）。
-   * 编码预检（第九轮 #2）作用于「将被导出字段的原始值」而非构建后的克隆包：
-   * buildProjectPackage 先 structuredClone 再投影 —— Symbol 键/不可枚举属性/
-   * 访问器已在克隆中被删除或物化，克隆后再检查看不到原输入问题，会静默产出
-   * 丢字段的包。此处先按同一白名单（PUBLIC_PROJECT_FIELDS + 可选 pluginData）
-   * 从原项目投影导出字段（引用原值，反射检查看到的就是原图），预检通过后才
-   * 构建；构建/序列化抛错（DataCloneError/getter 副作用）归一为类型化失败。
-   * 根级投影基于 property descriptor（第十一轮一般 #6）：字段存在/可导出性以
-   * getOwnPropertyDescriptor 判定，不执行属性读取 —— getter 副作用不得发生在
-   * 预检之前；访问器字段与反射异常（Proxy trap）在读取前被拒绝为类型化失败。
+   * 结构化契约（第十一轮 + 第十二轮阻断 1/2）：settings 按契约字段投影、
+   * scenes/objects/tracks/资产元数据逐层公开 DTO 契约投影、pluginData 仅按命名
+   * 空间 allowlist + manifest.privateSettings 显式声明剥离，默认导出时 pluginData
+   * 整体不进包 —— 不再依赖键名词表猜测（NFR-008）。
+   * 编码预检在最终投影视图之后（第十二轮一般 #10）：buildProjectPackage 先完成
+   * 全部白名单投影与剥离（settings 契约外键 / 未声明 pluginData 命名空间 / 每层
+   * DTO 契约外字段 / 访问器与反射异常都在构建期处理），再对构建产物检查 ——
+   * 预检与序列化看到同一张图；位于被剥离/排除字段中的不可编码数据（私有
+   * BigInt / 循环引用）不阻断导出，被保留字段中的不可编码数据仍如实拒绝。
+   * 构建/序列化抛错（DataCloneError/getter 副作用）归一为类型化失败。
    */
   exportCurrent(options: { includePrivate?: boolean; privateKeysByPlugin?: Record<string, string[]> } = {}): ExportResult {
     const project = this.editor.getProject();
     if (!project) return { ok: false, message: '当前没有打开的项目' };
-    const includePrivate = options.includePrivate ?? false;
-    const projected: Record<string, unknown> = {};
-    for (const field of PUBLIC_PROJECT_FIELDS) {
-      const reflected = reflectProjectField(project, field);
-      if (!reflected.ok) return reflected;
-      if (reflected.value !== undefined) projected[field] = reflected.value;
-    }
-    if (includePrivate) {
-      const reflected = reflectProjectField(project, 'pluginData');
-      if (!reflected.ok) return reflected;
-      if (reflected.value !== undefined) projected.pluginData = reflected.value;
-    }
-    const problem = findJsonEncodingProblem(projected);
-    if (problem) {
-      return { ok: false, message: `项目包含无法导出的数据（${problem}），导出被拒绝` };
-    }
     let pkg: ProjectPackage;
     try {
-      pkg = buildProjectPackage(project, { includePrivate, privateKeysByPlugin: options.privateKeysByPlugin });
+      pkg = buildProjectPackage(project, {
+        includePrivate: options.includePrivate ?? false,
+        privateKeysByPlugin: options.privateKeysByPlugin,
+      });
     } catch (error) {
       return { ok: false, message: `项目无法导出（构建失败）：${failureMessage(error)}` };
+    }
+    const problem = findJsonEncodingProblem(pkg.project);
+    if (problem) {
+      return { ok: false, message: `项目包含无法导出的数据（${problem}），导出被拒绝` };
     }
     let text: string;
     try {

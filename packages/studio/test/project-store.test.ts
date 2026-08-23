@@ -430,14 +430,19 @@ describe('JSON 编码契约三路共享矩阵（第七轮 #4：IDB / OPFS / 导�
       expect(await opfs.load(`lumora://project/opfs-${label}`)).toBeNull();
       opfs.close();
 
-      // 3) 工程包导出（includePrivate 时 pluginData 进包）：编辑器 openProject 的
-      // assertJsonPlainDeep/deepFreeze 已先行拒绝这些值（损坏数据无法经编辑器持有），
-      // 因此直接验证 exportCurrent 的检查链（buildProjectPackage → findJsonEncodingProblem，
-      // project-persistence.ts:296-303），导出表面共享同一编码契约
+      // 3) 工程包导出（includePrivate + 命名空间 allowlist 放行时 pluginData 进包）：
+      // 编辑器 openProject 的 assertJsonPlainDeep/deepFreeze 已先行拒绝这些值
+      // （损坏数据无法经编辑器持有），因此直接验证 exportCurrent 的检查链
+      // （buildProjectPackage → findJsonEncodingProblem），导出表面共享同一编码契约
+      // （第十二轮：无 allowlist 时命名空间 fail-closed 排除，编码问题随数据一并
+      // 不进包 —— 预检只对进入最终投影视图的数据生效）
       const exportProject = project(`lumora://project/export-${label}`, '导出坏数据', 1) as Project &
         Record<string, unknown>;
       exportProject.pluginData = { 'com.example': corrupt() };
-      const pkg = buildProjectPackage(exportProject as Project, { includePrivate: true });
+      const pkg = buildProjectPackage(exportProject as Project, {
+        includePrivate: true,
+        privateKeysByPlugin: { 'com.example': [] },
+      });
       const encodingProblem = findJsonEncodingProblem(pkg);
       expect(encodingProblem).not.toBeNull();
       expect(encodingProblem).toContain(problem);

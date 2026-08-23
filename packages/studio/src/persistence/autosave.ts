@@ -102,6 +102,9 @@ export class ProjectAutosaver {
   private pending: Project | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private saveQueued = false;
+  /** 保存是否在途（第十二轮一般 #7）：runSave 的任务已开始执行但尚未完成 ——
+   *  saveQueued 在任务开始时即清位，在途阶段只能由该标志识别 */
+  private saveInFlight = false;
   /** 串行任务链尾：所有保存/排空/对账按序执行，互不交错 */
   private chainTail: Promise<void> = Promise.resolve();
   private debounceMs: number;
@@ -271,6 +274,8 @@ export class ProjectAutosaver {
     const prevUri = this.currentUri;
     const prevPending = this.pending;
     const prevQueued = this.saveQueued;
+    const prevInFlight = this.saveInFlight;
+    const prevTimer = this.timer;
     const prevLatched = this.latched;
     const prevSession = this.session;
     const prevBaseline = this.committedByUri.get(project.uri);
@@ -286,17 +291,36 @@ export class ProjectAutosaver {
       this.currentUri = prevUri;
       this.pending = prevPending;
       this.saveQueued = prevQueued;
+      this.saveInFlight = prevInFlight;
       this.latched = prevLatched;
       this.session = prevSession;
       if (prevBaselineHas) this.committedByUri.set(project.uri, prevBaseline!);
       else this.committedByUri.delete(project.uri);
       if (prevRecoveryHas) this.recovery.set(project.uri, prevRecovery!);
       else this.recovery.delete(project.uri);
-      // 回滚时恢复待执行保存（第十轮 #1 严重）：resetTo 已取消防抖定时器且未恢复
-      // —— 旧项目仍有未落盘内容（isUnsaved）且无在途保存时，不重新 scheduleSave
-      // 则切换失败后自动落盘永远不触发（用户不再编辑，存储停留在旧 revision）
+      // 回滚时恢复保存意图（第十二轮一般 #7）：resetTo 已取消防抖定时器且未恢复。
+      // 分状态跟踪 timer/queued/in-flight，仅恢复 reset 前真实存在的待执行 timer，
+      // 不臆造调度 ——
+      // - timer（待执行）：reset 前存在真实待执行 timer（编辑后防抖等待中）→
+      //   重建同长 timer（旧句柄已被 clearTimeout，必须新建）；
+      // - queued/in-flight：reset 前保存已排队或任务已在途 → 链中任务继续推进
+      //   基线，不重复调度（重复调度使保存调用翻倍，释放阻塞后断言调用次数）；
+      // - 三者皆无但旧项目仍有未落盘内容（第十轮 #1 严重：保存失败后未再编辑）
+      //   → 重新调度，切换失败后自动落盘仍会触发（用户不再编辑，存储停留在
+      //   旧 revision）
       const rolledBack = this.editor.getProject();
-      if (rolledBack && rolledBack.uri === this.currentUri && this.isUnsaved(rolledBack) && !this.saveQueued) {
+      if (prevTimer !== null) {
+        this.timer = setTimeout(() => {
+          this.timer = null;
+          this.runSave();
+        }, this.debounceMs);
+      } else if (
+        !prevQueued &&
+        !prevInFlight &&
+        rolledBack &&
+        rolledBack.uri === this.currentUri &&
+        this.isUnsaved(rolledBack)
+      ) {
         this.scheduleSave();
       }
       throw error;
@@ -556,9 +580,14 @@ export class ProjectAutosaver {
     void this.enqueue(async () => {
       this.saveQueued = false;
       if (this.disposed) return;
-      // 执行时若已有更新的快照（同 uri），保存最新内容
-      const target = this.pending && this.pending.uri === project.uri ? this.pending : project;
-      await this.saveSnapshot(target);
+      this.saveInFlight = true;
+      try {
+        // 执行时若已有更新的快照（同 uri），保存最新内容
+        const target = this.pending && this.pending.uri === project.uri ? this.pending : project;
+        await this.saveSnapshot(target);
+      } finally {
+        this.saveInFlight = false;
+      }
     });
   }
 

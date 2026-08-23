@@ -174,16 +174,21 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
         return;
       }
       const loaded = await persistence.loadProject(result.summary.uri);
-      if (loaded.ok) {
-        // 复制打开中的项目时内容已以副本落盘：跳过切换排空屏障（flush:false），
-        // 旧项目的未保存快照随后由排空任务尽力保存或转为恢复快照
-        const opened = await runtime.openProject(loaded.project, {
-          flush: uri === project?.uri ? false : undefined,
-        });
-        if (!opened.ok) {
-          showToast(`无法打开副本：${opened.message}`, 'error');
-          return;
-        }
+      if (!loaded.ok) {
+        // 副本写入成功但数据无法通过校验（第十二轮一般 #6）：显式失败 ——
+        // 清理损坏副本（不得把坏记录留在最近列表误导用户）并提示错误，绝不报成功
+        await persistence.deleteProject(result.summary.uri);
+        showToast(`无法打开副本：${loaded.message}`, 'error');
+        return;
+      }
+      // 复制打开中的项目时内容已以副本落盘：跳过切换排空屏障（flush:false），
+      // 旧项目的未保存快照随后由排空任务尽力保存或转为恢复快照
+      const opened = await runtime.openProject(loaded.project, {
+        flush: uri === project?.uri ? false : undefined,
+      });
+      if (!opened.ok) {
+        showToast(`无法打开副本：${opened.message}`, 'error');
+        return;
       }
       showToast(`已复制为「${result.summary.name}」`, 'success');
       void refreshRecent();
@@ -215,14 +220,14 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
   };
 
   const exportCurrent = async () => {
-    // 私有设置剥离声明（第十一轮）：各插件 manifest.privateSettings 显式声明的
-    // pluginData 顶层键不随包导出；未注册插件的键（凭据形态键名亦然）随包完整往返
+    // 私有设置剥离声明（第十一轮）+ 命名空间隔离（第十二轮阻断 2）：
+    // privateKeysByPlugin 兼作命名空间 allowlist —— 收集全部注册插件（未声明
+    // privateSettings 者登记空数组），core 端据此排除未注册命名空间：没有
+    // manifest 声明的数据（凭据形态键名亦然）任何情况下不进包（「凭据永不导出」）
     const privateKeysByPlugin: Record<string, string[]> = {};
     for (const info of runtime.host.listPlugins()) {
       const manifest = runtime.host.getPluginManifest(info.instanceId);
-      if (manifest?.privateSettings && manifest.privateSettings.length > 0) {
-        privateKeysByPlugin[info.instanceId] = manifest.privateSettings;
-      }
+      privateKeysByPlugin[info.instanceId] = manifest?.privateSettings ?? [];
     }
     const exported = persistence.exportCurrent({ includePrivate, privateKeysByPlugin });
     if (!exported.ok) {

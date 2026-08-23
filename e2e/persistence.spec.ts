@@ -218,10 +218,12 @@ test('AC1b 真实 GLB 模型资产：导入渲染 + 载荷引用往返（TML-53 
   }
 });
 
-test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，includePrivate 按插件声明剥离（第十一轮契约制）', async ({ page }) => {
-  // 1. Node 端构造「含 AI 凭据与插件私有设置」的源工程包。契约制下 buildProjectPackage
-  //    仅按插件显式声明（privateKeysByPlugin）剥离 —— 此处不声明，包内完整携带
-  //    pluginData（含嵌套凭据），模拟插件把私有设置（含凭据）存入项目本地状态的真实形态
+test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，includePrivate 按插件声明剥离（第十二轮契约制）', async ({ page }) => {
+  // 1. Node 端构造「含 AI 凭据与插件私有设置」的源工程包。契约制（第十二轮阻断 2）
+  //    buildProjectPackage 的 privateKeysByPlugin 兼作命名空间 allowlist：显式登记
+  //    该插件（空声明 = 不剥离任何键）后包内完整携带 pluginData（含嵌套凭据），
+  //    模拟插件把私有设置（含凭据）存入项目本地状态的真实形态 —— 未登记命名空间
+  //    fail-closed 整体排除，无从构造含凭据的源包
   const pluginId = 'com.example.ai-assistant';
   const secrets = {
     apiKey: 'sk-lumora-ac4-1f7a9c3d',
@@ -252,7 +254,7 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
       name: 'AC4 源项目',
       pluginData: sourcePluginData,
     },
-    { includePrivate: true },
+    { includePrivate: true, privateKeysByPlugin: { [pluginId]: [] } },
   );
   writeFileSync(sourcePath, serializeProjectPackage(sourcePkg), 'utf8');
 
@@ -313,9 +315,10 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
     expect(defaultText).not.toContain(key);
   }
 
-  // 5. includePrivate 显式开启：插件私有设置随包导出。浏览器未注册任何插件 ——
-  //    无 manifest.privateSettings 声明即不剥离（契约不猜测键名，凭据形态键与
-  //    嵌套值原样保留）；剥离由插件显式声明驱动
+  // 5. includePrivate 显式开启：浏览器未注册任何插件 —— includePrivate 无插件
+  //    声明映射时命名空间 fail-closed 排除（第十二轮阻断 2）：pluginData 不进包、
+  //    凭据不出现，与 UI「凭据永不导出」一致 —— 没有 manifest 声明的来源数据
+  //    没有进入包的依据，隔离绝不 fail-open
   await page.getByTestId('project-export-include-private').check();
   await expect(page.getByTestId('project-export-include-private')).toBeChecked();
   const downloadPrivate = page.waitForEvent('download');
@@ -326,13 +329,13 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
   const privateText = readFileSync(privatePath, 'utf8');
   const privatePkg = JSON.parse(privateText) as LumoraPackage;
   expect(privatePkg.manifest.includePrivate).toBe(true);
-  const plugin = (privatePkg.project.pluginData as
-    | Record<string, Record<string, unknown>>
-    | undefined)?.[pluginId];
-  expect(plugin?.theme).toBe('dark');
-  expect(plugin?.model).toBe('claude-sonnet-5');
-  expect(plugin?.auth).toEqual({ apiKey: secrets.apiKey, accessToken: secrets.accessToken });
-  for (const secret of Object.values(secrets)) expect(privateText).toContain(secret);
+  // 未知命名空间（未注册插件）被整体排除：pluginData 不存在、凭据不出现
+  expect(privatePkg.project.pluginData).toBeUndefined();
+  expect(privateText).not.toContain('pluginData');
+  for (const secret of Object.values(secrets)) expect(privateText).not.toContain(secret);
+  for (const key of ['apiKey', 'accessToken', 'authorization', 'password', 'credentials']) {
+    expect(privateText).not.toContain(key);
+  }
 });
 
 test('AC2 跨标签页冲突：本地计数追平不覆盖较新保存，须显式「加载较新版本」解决', async ({ context }) => {

@@ -518,7 +518,7 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     await runtime.dispose();
   });
 
-  it('exportCurrent 编码预检：数组非索引键（pluginData.arr.extra）与循环引用 → 类型化失败，不产出丢字段的包', async () => {
+  it('exportCurrent 编码预检：数组非索引键（pluginData.arr.extra）→ 类型化失败，不产出丢字段的包', async () => {
     const runtime = await makeRuntime();
     const project = runtime.persistence.createProject('不可导出');
     // pluginData.arr 数组带非索引自有键（JSON.stringify 会静默丢键）
@@ -526,7 +526,11 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     arr.extra = 3;
     runtime.openProject({ ...project, pluginData: { arr: arr as unknown as unknown[] } } as Project);
     await settle(40);
-    const result = await runtime.persistence.exportCurrent({ includePrivate: true });
+    // 已注册插件（allowlist 放行）后编码预检对最终投影视图拒绝（第十二轮一般 #10）
+    const result = await runtime.persistence.exportCurrent({
+      includePrivate: true,
+      privateKeysByPlugin: { arr: [] },
+    });
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.message).toContain('无法导出');
@@ -589,17 +593,44 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     }
   });
 
-  it('exportCurrent 编码预检：循环引用扩展字段 → 类型化失败', async () => {
+  it('exportCurrent 编码预检：循环引用扩展字段（allowlist 放行命名空间内）→ 类型化失败', async () => {
     const runtime = await makeRuntime();
     const project = runtime.persistence.createProject('循环项目');
     const loop: Record<string, unknown> = {};
     loop.self = loop;
     runtime.openProject({ ...project, pluginData: { loop } } as Project);
     await settle(40);
-    const result = await runtime.persistence.exportCurrent({ includePrivate: true });
+    const result = await runtime.persistence.exportCurrent({
+      includePrivate: true,
+      privateKeysByPlugin: { loop: [] },
+    });
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.message).toContain('circular-reference');
+    await runtime.dispose();
+  });
+
+  it('exportCurrent 编码预检：BigInt/循环引用位于契约外字段（投影剥离）→ 不阻断导出（第十二轮一般 #10）', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('可导出');
+    const object = project.objects[0]!;
+    const loop: Record<string, unknown> = {};
+    loop.self = loop;
+    // settings 契约外 BigInt + 对象契约外 BigInt/循环引用：逐层投影把这些字段
+    // 从最终投影视图剥离 —— 预检在投影之后执行，不得阻断合法导出
+    runtime.openProject({
+      ...project,
+      settings: { ...project.settings, apiKey: 9007199254740993n } as unknown as Project['settings'],
+      objects: [
+        { ...object, apiKey: 9007199254740993n, loop },
+        ...project.objects.slice(1),
+      ],
+    } as Project);
+    await settle(40);
+    const result = await runtime.persistence.exportCurrent();
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.text).not.toContain('apiKey');
     await runtime.dispose();
   });
 
@@ -681,7 +712,7 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     await runtime.dispose();
   });
 
-  it('exportCurrent 真实入口：非纯对象（Date）在开时被编辑器拒绝；BigInt 由导出预检先于构建归一为类型化失败（第九轮 #2）', async () => {
+  it('exportCurrent 真实入口：非纯对象（Date）在开时被编辑器拒绝；BigInt 由编码预检在投影后归一为类型化失败（第九轮 #2 + 第十二轮一般 #10）', async () => {
     const runtime = await makeRuntime();
     const project = runtime.persistence.createProject('不可导出');
     // 非纯对象（Date）：编辑器开时 JSON 纯结构校验直接拒绝 —— 这类值根本到不了
@@ -692,13 +723,19 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
 
     // BigInt 是原始值：通过编辑器开时校验进入项目，但 JSON.stringify 会抛
     // TypeError —— 修复前 exportCurrent 在序列化阶段裸抛异常（调用方拿到崩溃而
-    // 非类型化失败）；修复后反射预检先于构建在原始导出字段上拒绝
+    // 非类型化失败）；修复后编码预检在最终投影视图上拒绝（投影剥离的契约外
+    // BigInt 不阻断导出，见上一测试）
     const opened = await runtime.openProject({
       ...project,
       pluginData: { 'com.example': { big: 9007199254740993n } },
     } as Project);
     expect(opened.ok).toBe(true);
-    const result = await runtime.persistence.exportCurrent({ includePrivate: true });
+    // 未注册插件（无声明映射）：命名空间排除 → 导出成功
+    expect(runtime.persistence.exportCurrent({ includePrivate: true }).ok).toBe(true);
+    const result = await runtime.persistence.exportCurrent({
+      includePrivate: true,
+      privateKeysByPlugin: { 'com.example': [] },
+    });
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.message).toContain('无法导出');
@@ -726,8 +763,19 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     } as Project);
     await settle(40);
 
-    // 无声明：未声明的键（含凭据形态键名）随包完整往返 —— 契约不猜测键名
-    const rawExport = runtime.persistence.exportCurrent({ includePrivate: true });
+    // 无声明映射（未注册插件）：命名空间 fail-closed 排除 —— 凭据形态值绝不进包
+    // （第十二轮阻断 2）
+    const excludedExport = runtime.persistence.exportCurrent({ includePrivate: true });
+    expect(excludedExport.ok).toBe(true);
+    if (!excludedExport.ok) return;
+    expect(excludedExport.text).not.toContain('sk-leak-1');
+    expect(excludedExport.text).not.toContain('client-secret-2');
+
+    // 已注册插件（空声明）：未声明的键（含凭据形态键名）随包完整往返 —— 契约不猜测键名
+    const rawExport = runtime.persistence.exportCurrent({
+      includePrivate: true,
+      privateKeysByPlugin: { 'com.example': [] },
+    });
     expect(rawExport.ok).toBe(true);
     if (!rawExport.ok) return;
     expect(rawExport.text).toContain('sk-leak-1');
@@ -895,6 +943,75 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     expect(result.message).toContain('副本保存失败');
     expect(result.message).toContain('校验');
     expect(remove).toHaveBeenCalledTimes(1);
+    await persistence.dispose();
+  });
+
+  it('验证阶段 loadProject reject（load 抛异常）→ 类型化失败并清除副本（第十二轮严重 #5）', async () => {
+    const editor = new SceneEditor();
+    const remove = vi.fn(async () => true);
+    const store: ProjectStorage = {
+      kind: 'indexeddb',
+      list: vi.fn(async () => []),
+      load: vi.fn(async () => {
+        throw new Error('idb transaction aborted');
+      }),
+      save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
+      remove,
+      rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
+      duplicate: vi.fn(
+        async (_uri: string, _name?: string) =>
+          ({ ok: false, code: 'not-found', message: 'not mocked' }) as const,
+      ),
+      close: vi.fn(),
+    };
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ store });
+
+    const result = await persistence.saveSnapshotAsNew(
+      createSampleProject('lumora://project/src', '源项目'),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.message).toContain('副本保存失败');
+    expect(result.message).toContain('验证异常');
+    // 清理探针：reject 的副本同样被清除 —— 绝不遗留损坏/状态未知的副本
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith(expect.stringMatching(/^lumora:\/\/project\//));
+    await persistence.dispose();
+  });
+
+  it('清理阶段 remove reject → 不掩盖验证失败：仍返回类型化失败（第十二轮严重 #5）', async () => {
+    const editor = new SceneEditor();
+    const corruptRecord: Project = {
+      ...createSampleProject('lumora://project/corrupt', '损坏副本'),
+      settings: { fps: 'bad' } as unknown as Project['settings'],
+    };
+    const store: ProjectStorage = {
+      kind: 'indexeddb',
+      list: vi.fn(async () => []),
+      load: vi.fn(async () => corruptRecord),
+      save: vi.fn(async (_project: Project, _expected?: number | null) => ({ ok: true } as const)),
+      remove: vi.fn(async () => {
+        throw new Error('idb transaction aborted');
+      }),
+      rename: vi.fn(async (_uri: string, _name: string) => ({ ok: true } as const)),
+      duplicate: vi.fn(
+        async (_uri: string, _name?: string) =>
+          ({ ok: false, code: 'not-found', message: 'not mocked' }) as const,
+      ),
+      close: vi.fn(),
+    };
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ store });
+
+    const result = await persistence.saveSnapshotAsNew(
+      createSampleProject('lumora://project/src', '源项目'),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    // 清理失败不掩盖验证失败：调用方仍拿到明确失败，绝不报告成功
+    expect(result.message).toContain('副本保存失败');
+    expect(result.message).toContain('校验');
     await persistence.dispose();
   });
 });
