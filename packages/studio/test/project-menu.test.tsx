@@ -211,12 +211,13 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
     }
   });
 
-  it('导出菜单勾选「包含插件私有设置」后 exportCurrent 收到 includePrivate 与 manifest.exportableSettings 原样声明的公开键（第十四轮阻断 1/2）', async () => {
+  it('导出菜单勾选「包含插件私有设置」后 exportCurrent 收到 includePrivate 与 manifest 原样声明的公开/私有键（第十四轮阻断 1/2 + 第十五轮阻断 1）', async () => {
     const handle = renderStudio();
     const runtime = await waitPersistence(handle);
     // 注册声明显式公开导出契约（exportableSettings）的插件：ProjectMenu 导出时
-    // 直读 manifest.exportableSettings 原样传入 publicKeysByPlugin —— 宿主不再做
-    // 减法过滤（privateSettings 不参与导出决策），core 端按声明投影
+    // 直读 manifest.exportableSettings 与 manifest.privateSettings 原样传入
+    // publicKeysByPlugin / privateKeysByPlugin —— 宿主不再做减法过滤，重叠与
+    // 凭据形态键由 core 端逐条拒绝
     await runtime.host.register({
       manifest: {
         schemaVersion: '1',
@@ -260,9 +261,11 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
         expect(spy).toHaveBeenCalledWith({
           includePrivate: false,
           publicKeysByPlugin: { 'com.example.aiassistant': ['theme'] },
+          privateKeysByPlugin: { 'com.example.aiassistant': [] },
         }),
       );
-      // 显式开启：同一显式公开契约（未声明键 apiKey/auth 即使存在也不导出）
+      // 显式开启：同一显式公开契约（未声明键 apiKey/auth 即使存在也不导出；
+      // manifest 未声明 privateSettings → 私有键映射为空数组）
       fireEvent.click(screen.getByTestId('project-export-include-private'));
       expect(screen.getByTestId('project-export-include-private')).toBeChecked();
       screen.getByTestId('project-export').click();
@@ -270,6 +273,7 @@ describe('ProjectMenu：工程包导出 / 导入（FR-011 / AC1 / AC3）', () =>
         expect(spy).toHaveBeenCalledWith({
           includePrivate: true,
           publicKeysByPlugin: { 'com.example.aiassistant': ['theme'] },
+          privateKeysByPlugin: { 'com.example.aiassistant': [] },
         }),
       );
       await new Promise((r) => setTimeout(r, 1100));
@@ -577,6 +581,52 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
       expect(cleanupSpy).toHaveBeenCalledTimes(1);
       expect(cleanupSpy).toHaveBeenCalledWith('lumora://project/recent-dup-copy-2', 'fp-at-create-2');
       expect(screen.getByText(/清理失败，损坏记录保留，可手动删除/)).toBeInTheDocument();
+      expect(screen.queryByText(/已复制为/)).not.toBeInTheDocument();
+    } finally {
+      dupSpy.mockRestore();
+      loadSpy.mockRestore();
+      cleanupSpy.mockRestore();
+    }
+  });
+
+  it('「最近项目复制」分支：清理按 CAS 判定记录已变化（另一会话已保存）→ 提示「已保留」，绝不误删（第十五轮一般 7 四态 UI）', async () => {
+    const handle = renderStudio();
+    const runtime = await waitPersistence(handle);
+    runtime.openProject(createSampleProject('lumora://project/recent-dup3', '最近复制项目三'));
+    await waitFor(() => expect(screen.getByTestId('save-state-badge')).toHaveTextContent('已保存'));
+    await openMenu();
+    await screen.findByTestId('recent-project');
+
+    const persistence = runtime.persistence;
+    const dupSpy = vi.spyOn(persistence, 'duplicateProject').mockResolvedValue({
+      ok: true,
+      summary: {
+        uri: 'lumora://project/recent-dup-copy-3',
+        name: '最近复制项目三 副本',
+        savedAt: new Date().toISOString(),
+        revision: 0,
+        schemaVersion: 3,
+      },
+      fingerprint: 'fp-at-create-3',
+    });
+    const loadSpy = vi.spyOn(persistence, 'loadProject').mockRejectedValue(new Error('idb transaction aborted'));
+    const store = (persistence as unknown as { store: ProjectStorage | null }).store;
+    expect(store).not.toBeNull();
+    // 清理按创建时指纹 CAS 判定记录已被另一会话更新（outcome 'changed'）：
+    // 绝不无条件删除 —— 更新后的合法记录保留并在提示中如实说明
+    const cleanupSpy = vi.spyOn(store!, 'removeIfUnchanged').mockResolvedValue({ ok: true, outcome: 'changed' });
+    try {
+      screen.getByTestId('recent-duplicate').click();
+      await waitFor(() =>
+        expect(
+          screen.getByText(/无法打开副本（idb transaction aborted）；副本记录已变化（可能已被其他会话保存），已保留该记录，可手动删除/),
+        ).toBeInTheDocument(),
+      );
+      expect(dupSpy).toHaveBeenCalledTimes(1);
+      expect(loadSpy).toHaveBeenCalledTimes(1);
+      expect(cleanupSpy).toHaveBeenCalledTimes(1);
+      expect(cleanupSpy).toHaveBeenCalledWith('lumora://project/recent-dup-copy-3', 'fp-at-create-3');
+      expect(screen.getByText(/已保留该记录/)).toBeInTheDocument();
       expect(screen.queryByText(/已复制为/)).not.toBeInTheDocument();
     } finally {
       dupSpy.mockRestore();

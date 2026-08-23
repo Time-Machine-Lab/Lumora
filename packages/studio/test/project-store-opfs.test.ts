@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createBlankProject, migrateProjectSchema } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import { OpfsProjectStore, projectFileName } from '../src/persistence/project-store-opfs';
-import { MemDirectoryHandle, MemFileHandle } from './opfs-fs-shim';
+import { MemDirectoryHandle, MemFileHandle, stubOpfsNavigator } from './opfs-fs-shim';
 
 const DB = 'lumora-test-opfs';
 
@@ -10,21 +10,8 @@ function project(uri: string, name: string, revision: number) {
   return { ...createBlankProject(uri, name), revision };
 }
 
-/** 把内存根目录挂到 navigator.storage.getDirectory（生产代码的注入点） */
-function stubNavigatorWithRoot(root: MemDirectoryHandle): void {
-  vi.stubGlobal(
-    'navigator',
-    Object.create(navigator, {
-      storage: {
-        value: { getDirectory: async () => root },
-        configurable: true,
-      },
-    }),
-  );
-}
-
 beforeEach(async () => {
-  stubNavigatorWithRoot(new MemDirectoryHandle('root'));
+  stubOpfsNavigator(new MemDirectoryHandle('root'));
   await OpfsProjectStore.drop(DB);
 });
 
@@ -767,6 +754,88 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
       }),
     );
     expect(await OpfsProjectStore.create(DB)).toBeNull();
+  });
+
+  it('无 Web Locks 禁用 OPFS（第十五轮待确认风险固化）：生产路径无跨标签页互斥保障即降级，测试注入 fs 跳过该检查', async () => {
+    // 先还原 jsdom 原生 navigator（无 locks）再仅挂 storage（Object.create
+    // 会继承 beforeEach 的 locks stub）：Web Locks 是 OPFS 跨标签页互斥的
+    // 唯一保障，缺失时进程内退化锁只保证同标签页串行（清理竞态窗口仍在）→
+    // 禁用 OPFS
+    vi.unstubAllGlobals();
+    const root = new MemDirectoryHandle('root');
+    vi.stubGlobal(
+      'navigator',
+      Object.create(navigator, {
+        storage: { value: { getDirectory: async () => root }, configurable: true },
+      }),
+    );
+    expect(await OpfsProjectStore.create(DB)).toBeNull();
+    // 测试注入 fs 时信任测试环境（互斥由测试桩保证），不执行该检查
+    const injected = await OpfsProjectStore.create(DB, new MemDirectoryHandle('root2'));
+    expect(injected).not.toBeNull();
+    injected?.close();
+  });
+
+  it('退化锁（无 Web Locks + fs 注入）：锁内任务 reject 后队列不被毒化，后续任务照常执行（第十五轮严重 4）', async () => {
+    // 先还原 jsdom 原生 navigator（无 locks）再仅挂 storage；注入 fs 绕过
+    // Web Locks 启用检查 → 锁退化到进程内 promise 链（withFallbackLock），
+    // 验证锁内异常后队列仍前进
+    vi.unstubAllGlobals();
+    const root = new MemDirectoryHandle('root');
+    vi.stubGlobal(
+      'navigator',
+      Object.create(navigator, {
+        storage: { value: { getDirectory: async () => root }, configurable: true },
+      }),
+    );
+    const store = await OpfsProjectStore.create(DB, root);
+    expect(store).not.toBeNull();
+    if (!store) return;
+    expect((await store.save(project('lumora://project/chain', '队列项目', 1))).ok).toBe(true);
+
+    // 第一个任务在锁内 reject：list 的目录 entries 抛错（list 无内部归一 → 异常向外传播）
+    const rootDir = await root.getDirectoryHandle(DB);
+    const projectsDir = await rootDir.getDirectoryHandle('projects');
+    const originalEntries = projectsDir.entries;
+    projectsDir.entries = (() => ({
+      [Symbol.asyncIterator]() {
+        return {
+          next: async () => {
+            throw new Error('entries boom');
+          },
+        };
+      },
+    })) as unknown as typeof projectsDir.entries;
+    await expect(store.list()).rejects.toThrow('entries boom');
+    projectsDir.entries = originalEntries;
+
+    // 修复前：前序任务 reject 使退化锁链上的 gate 无人 release，后续任务永久挂起；
+    // 修复后：队列前进，后续保存照常执行
+    expect((await store.save(project('lumora://project/chain', '队列项目', 2), 1)).ok).toBe(true);
+    expect((await store.load('lumora://project/chain'))!.revision).toBe(2);
+    store.close();
+  });
+
+  it('Web Locks 获取失败（锁管理器 reject）：removeIfUnchanged 返回类型化结果，不向调用方二次抛出（第十五轮严重 4）', async () => {
+    const store = await OpfsProjectStore.create(DB);
+    expect(store).not.toBeNull();
+    if (!store) return;
+    const locks = (navigator as unknown as { locks: { request: (...args: unknown[]) => Promise<unknown> } }).locks;
+    const realRequest = locks.request.bind(locks);
+    locks.request = async () => {
+      throw new Error('locks unavailable');
+    };
+    try {
+      const result = await store.removeIfUnchanged('lumora://project/a', 'fp');
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.message).toContain('副本清理失败');
+      const dup = await store.duplicate('lumora://project/a');
+      expect(dup.ok).toBe(false);
+      if (!dup.ok) expect(dup.message).toContain('复制失败');
+    } finally {
+      locks.request = realRequest;
+      store.close();
+    }
   });
 
   it('save 同步不可变快照（第八轮 #1）：保存挂起期间改写入参 uri 不改变落盘目标（OPFS）', async () => {

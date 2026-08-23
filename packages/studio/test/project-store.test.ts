@@ -405,19 +405,19 @@ describe('removeIfUnchanged：条件删除 CAS（第十四轮严重 4）', () =>
     // 指纹不一致（验证挂起期间另一标签页已打开并保存更新后的记录）→ 保留
     expect(await store.removeIfUnchanged('lumora://project/cas', 'stale-fingerprint')).toEqual({
       ok: true,
-      removed: false,
+      outcome: 'changed',
     });
     expect((await store.load('lumora://project/cas'))!.name).toBe('CAS 项目');
 
     // 指纹一致（记录仍是创建时的内容）→ 删除
     expect(await store.removeIfUnchanged('lumora://project/cas', stableStringify(record))).toEqual({
       ok: true,
-      removed: true,
+      outcome: 'removed',
     });
     expect(await store.load('lumora://project/cas')).toBeNull();
 
-    // 记录不存在 → removed:false（幂等，不报错）
-    expect(await store.removeIfUnchanged('lumora://project/cas', null)).toEqual({ ok: true, removed: false });
+    // 记录不存在 → outcome:'missing'（幂等，清理后置条件已满足，不报错）
+    expect(await store.removeIfUnchanged('lumora://project/cas', null)).toEqual({ ok: true, outcome: 'missing' });
     store.close();
   });
 
@@ -431,14 +431,14 @@ describe('removeIfUnchanged：条件删除 CAS（第十四轮严重 4）', () =>
     // 指纹不一致 → 保留
     expect(await opfs.removeIfUnchanged('lumora://project/opfs-cas', 'stale')).toEqual({
       ok: true,
-      removed: false,
+      outcome: 'changed',
     });
     expect((await opfs.load('lumora://project/opfs-cas'))!.name).toBe('CAS 项目');
 
     // 指纹一致 → 删除
     expect(await opfs.removeIfUnchanged('lumora://project/opfs-cas', stableStringify(record))).toEqual({
       ok: true,
-      removed: true,
+      outcome: 'removed',
     });
     expect(await opfs.load('lumora://project/opfs-cas')).toBeNull();
 
@@ -448,7 +448,7 @@ describe('removeIfUnchanged：条件删除 CAS（第十四轮严重 4）', () =>
     await projectsDir.getFileHandle(projectFileName('lumora://project/opfs-broken'), { create: true });
     expect(await opfs.removeIfUnchanged('lumora://project/opfs-broken', 'whatever')).toEqual({
       ok: true,
-      removed: false,
+      outcome: 'changed',
     });
     expect(await opfs.load('lumora://project/opfs-broken')).toBeNull();
     opfs.close();
@@ -490,23 +490,36 @@ describe('JSON 编码契约三路共享矩阵（第七轮 #4：IDB / OPFS / 导�
       expect(await opfs.load(`lumora://project/opfs-${label}`)).toBeNull();
       opfs.close();
 
-      // 3) 工程包导出（includePrivate + 命名空间显式 allowlist 放行损坏键时
-      // pluginData 进包）：
-      // 编辑器 openProject 的 assertJsonPlainDeep/deepFreeze 已先行拒绝这些值
-      // （损坏数据无法经编辑器持有），因此直接验证 exportCurrent 的检查链
-      // （buildProjectPackage → findJsonEncodingProblem），导出表面共享同一编码契约
-      // （第十三轮：键级 allowlist 语义，只显式声明的键进包 —— 空 allowlist 整段
-      // 排除，编码问题随数据一并不进包；预检只对进入最终投影视图的数据生效）
+      // 3) 工程包导出：编辑器 openProject 的 assertJsonPlainDeep/deepFreeze 已
+      // 先行拒绝这些值（损坏数据无法经编辑器持有），因此直接验证
+      // exportCurrent 的检查链（buildProjectPackage → findJsonEncodingProblem），
+      // 导出表面共享同一编码契约。损坏值经 settings 契约字段（契约投影不做值
+      // 类型校验）进入包 → 预检照常拒绝（第十三轮：预检只对进入最终投影视图的
+      // 数据生效）
       const exportProject = project(`lumora://project/export-${label}`, '导出坏数据', 1) as Project &
         Record<string, unknown>;
-      exportProject.pluginData = { 'com.example': corrupt() };
-      const pkg = buildProjectPackage(exportProject as Project, {
-        includePrivate: true,
-        publicKeysByPlugin: { 'com.example': [allowKey] },
-      });
+      exportProject.settings = { fps: corrupt() as never } as unknown as Project['settings'];
+      const pkg = buildProjectPackage(exportProject as Project, { includePrivate: true });
       const encodingProblem = findJsonEncodingProblem(pkg);
       expect(encodingProblem).not.toBeNull();
       expect(encodingProblem).toContain(problem);
+
+      // 4) 同一损坏值经 pluginData 字符串声明（includePrivate）：非 primitive
+      // 叶值被叶值校验剥离（第十五轮阻断 1 —— 整对象声明不得绕过递归投影进包）
+      const cleanProject = project(`lumora://project/clean-${label}`, '干净数据', 1) as Project &
+        Record<string, unknown>;
+      cleanProject.pluginData = { 'com.example': corrupt() };
+      const pkg2 = buildProjectPackage(cleanProject as Project, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': [allowKey] },
+      });
+      if (problem === 'negative-zero') {
+        // -0 是合法 primitive 叶值：经声明导出，预检仍如实拒绝（叶值不豁免编码检查）
+        expect(findJsonEncodingProblem(pkg2)).toContain(problem);
+      } else {
+        expect(findJsonEncodingProblem(pkg2)).toBeNull();
+        expect('pluginData' in pkg2.project).toBe(false);
+      }
     });
   }
 });

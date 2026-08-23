@@ -36,6 +36,10 @@ export interface PackageBuildOptions {
    *  声明由宿主直接读取 manifest.exportableSettings 原样传入（宿主不再做减法
    *  过滤），core 端负责路径投影与克隆。 */
   publicKeysByPlugin?: Record<string, readonly (string | readonly string[])[]>;
+  /** 插件的私有键声明（宿主直读 manifest.privateSettings 原样传入，第十五轮
+   *  阻断 1）：公开声明路径任意层与私有键重叠即整条声明拒绝 —— 私有键不因
+   *  显式公开声明而可导出，凭据永不导出不依赖插件自觉声明。 */
+  privateKeysByPlugin?: Record<string, readonly string[]>;
   appName?: string;
   appVersion?: string;
   /** 可注入导出时刻（测试确定性）；缺省取当前时间 */
@@ -308,67 +312,125 @@ function isSafeExportKey(key: string): boolean {
   return key !== '__proto__' && key !== 'constructor' && key !== 'prototype';
 }
 
-/** 单个命名空间的路径 schema 显式公开投影（第十四轮阻断 1）：
- *  - 顶层键字符串（'theme'）：该键整值导出（插件的显式公开契约，值可以是任意
- *    JSON 可编码类型）；
- *  - 路径数组（['profile', 'username']）：逐层递归投影 —— 中间层必须是普通
- *    对象，只导出路径末端键；路径中途缺失/非对象/含原型键时整条路径失败，
- *    已写入的部分投影一并回滚（fail-closed，绝不产出半投影）。
- *  返回 undefined = 无可导出内容（调用方整段排除）。
- *  字段读取统一走 readOwnDataField（descriptor 语义：访问器/反射异常拒绝）。 */
-function applyPublicPluginData(
-  value: unknown,
+/** 凭据形态键名（第十五轮阻断 1）：公开声明路径任意层出现这些键名（不区分
+ *  大小写、子串匹配）即整条声明拒绝 —— 「凭据永不导出」不依赖插件自觉声明
+ *  privateSettings，显式声明凭据键也不是放行依据。 */
+const CREDENTIAL_SHAPE_PATTERNS = [
+  'apikey',
+  'password',
+  'passwd',
+  'token',
+  'secret',
+  'credential',
+  'privatekey',
+  'auth',
+] as const;
+
+function isCredentialShapeKey(key: string): boolean {
+  const lowered = key.toLowerCase();
+  return CREDENTIAL_SHAPE_PATTERNS.some((pattern) => lowered.includes(pattern));
+}
+
+/** 整值导出仅允许 JSON primitive 叶值（第十五轮阻断 1）：对象/数组整值导出会
+ *  绕过递归投影（嵌套凭据随整对象/整数组进包），一律拒绝 —— 对象内容只能经
+ *  显式路径声明逐叶导出；数组无逐元素投影机制，整数组不导出。 */
+function isExportableLeaf(value: unknown): boolean {
+  return value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
+}
+
+/** 投影 trie：键 → 子节点；'leaf' = 顶层字符串声明（整值导出意图，覆盖该键下
+ *  的任何冗余路径声明，第十五轮严重 2 —— 祖先声明覆盖冗余后代，结果与声明
+ *  顺序无关）。 */
+type ExportTrie = Map<string, ExportTrie | 'leaf'>;
+
+/** 声明列表规范化为 trie（纯数据，无合并/原地改写）：顶层字符串声明置 leaf
+ *  （祖先覆盖：其下路径声明忽略）；路径数组逐层建分支。任一路径键含原型键、
+ *  privateSettings 重叠或凭据形态键时整条声明拒绝（fail-closed）。 */
+function buildExportTrie(
   declarations: readonly (string | readonly string[])[],
-): Record<string, unknown> | undefined {
-  if (!isPlainRecord(value)) return undefined;
-  const out: Record<string, unknown> = {};
-  const merge = (base: Record<string, unknown>, patch: Record<string, unknown>): void => {
-    for (const key of Object.keys(patch)) {
-      if (isPlainRecord(base[key]) && isPlainRecord(patch[key])) {
-        merge(base[key] as Record<string, unknown>, patch[key] as Record<string, unknown>);
-      } else {
-        base[key] = patch[key];
-      }
-    }
-  };
+  privateKeys: readonly string[],
+): ExportTrie | null {
+  const root: ExportTrie = new Map();
   for (const declaration of declarations) {
     if (typeof declaration === 'string') {
-      if (!isSafeExportKey(declaration)) continue;
-      const read = readOwnDataField(value, declaration);
-      if (read.present && read.value !== undefined) out[declaration] = read.value;
+      if (!isSafeExportKey(declaration) || privateKeys.includes(declaration) || isCredentialShapeKey(declaration)) {
+        continue;
+      }
+      root.set(declaration, 'leaf');
       continue;
     }
     if (!Array.isArray(declaration) || declaration.length === 0) continue; // 畸形/空路径：忽略
-    // 多元素路径在独立对象上构建，整条路径成功后才合并 —— 中途失败不残留部分投影
-    const nested: Record<string, unknown> = {};
-    let cursor: unknown = value;
-    let target = nested;
-    let failed = false;
+    let node = root;
+    let rejected = false;
     for (let i = 0; i < declaration.length; i += 1) {
       const key = declaration[i];
-      if (typeof key !== 'string' || !isSafeExportKey(key)) {
-        failed = true;
+      if (typeof key !== 'string' || !isSafeExportKey(key) || privateKeys.includes(key) || isCredentialShapeKey(key)) {
+        rejected = true;
         break;
       }
-      const read = readOwnDataField(cursor, key);
-      if (!read.present || read.value === undefined) {
-        failed = true;
-        break;
-      }
+      const existing = node.get(key);
+      if (existing === 'leaf') break; // 祖先声明覆盖冗余后代：路径声明忽略
       if (i === declaration.length - 1) {
-        target[key] = read.value;
+        node.set(key, 'leaf');
+        break;
+      }
+      if (existing === undefined) {
+        const child: ExportTrie = new Map();
+        node.set(key, child);
+        node = child;
       } else {
-        if (!isPlainRecord(read.value)) {
-          failed = true;
-          break;
-        }
-        const next: Record<string, unknown> = {};
-        target[key] = next;
-        cursor = read.value;
-        target = next;
+        node = existing;
       }
     }
-    if (!failed) merge(out, nested);
+    void rejected; // 拒绝 = 该声明不进入 trie（fail-closed 与忽略同效）
+  }
+  if (root.size === 0) return null;
+  return root;
+}
+
+/** 按 trie 递归投影单个键（纯函数：只读源、在新对象上构建、叶值仅 primitive）：
+ *  - leaf：整值导出 —— 值必须是 JSON primitive 叶值；缺失/undefined/对象/数组
+ *    一律不导出（对象内容只能经显式路径声明逐叶导出）；
+ *  - branch：中间层必须是普通对象，逐子键递归投影（子键访问器/反射异常由
+ *    readOwnDataField 拒绝）—— 全程不执行 getter、不修改源对象、不依赖声明
+ *    顺序（trie 已规范化，祖先覆盖冗余后代）。
+ *  返回 undefined = 该键无可导出内容。 */
+function projectExportTrie(source: unknown, node: ExportTrie | 'leaf', field: string): unknown {
+  const read = readOwnDataField(source, field);
+  if (!read.present || read.value === undefined) return undefined;
+  if (node === 'leaf') {
+    return isExportableLeaf(read.value) ? read.value : undefined;
+  }
+  if (!isPlainRecord(read.value)) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [childKey, childNode] of node) {
+    const child = projectExportTrie(read.value, childNode, childKey);
+    if (child !== undefined) out[childKey] = child;
+  }
+  if (Object.keys(out).length === 0) return undefined;
+  return out;
+}
+
+/** 单个命名空间的路径 schema 显式公开投影（第十四轮阻断 1 + 第十五轮严重 2）：
+ *  声明先规范化为 trie（纯函数、顺序无关），再逐层递归投影 —— 中间层必须是
+ *  普通对象，只导出显式声明的叶路径；整值声明仅允许 primitive 叶值，对象/数组
+ *  整值一律拒绝（强制递归投影，嵌套凭据无整对象出口）；声明路径任意层与
+ *  privateSettings 重叠或为凭据形态键时整条声明拒绝（阻断 1，fail-closed）。
+ *  返回 undefined = 无可导出内容（调用方整段排除）。
+ *  字段读取统一走 readOwnDataField（descriptor 语义：访问器/反射异常拒绝，
+ *  全程不执行 getter）。 */
+function applyPublicPluginData(
+  value: unknown,
+  declarations: readonly (string | readonly string[])[],
+  privateKeys: readonly string[],
+): Record<string, unknown> | undefined {
+  if (!isPlainRecord(value)) return undefined;
+  const trie = buildExportTrie(declarations, privateKeys);
+  if (!trie) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [key, node] of trie) {
+    const projected = projectExportTrie(value, node, key);
+    if (projected !== undefined) out[key] = projected;
   }
   if (Object.keys(out).length === 0) return undefined;
   return out;
@@ -376,19 +438,25 @@ function applyPublicPluginData(
 
 /**
  * 命名空间 + 路径 schema 显式公开导出投影（第十四轮阻断 1/2，破坏式改名自
- * 第十三轮 privateKeysByPlugin）：映射值 = 该命名空间允许随包导出的字段路径
- * 列表（顶层键字符串或 [父键, 子键, …] 路径数组，逐层递归投影）。隔离绝不
- * fail-open：
+ * 第十三轮 privateKeysByPlugin；第十五轮阻断 1 + 严重 2 加固）：映射值 = 该
+ * 命名空间允许随包导出的字段路径列表（顶层键字符串或 [父键, 子键, …] 路径
+ * 数组，逐层递归投影）。隔离绝不 fail-open：
  * - instanceId 不在映射（未注册插件）或映射整体缺失 → 全部命名空间排除，
  *   没有 manifest 公开声明的来源数据没有进入包的依据；
  * - 空/畸形声明（[] / 非数组）→ 整段排除（拒绝把畸形声明当作放行依据）；
- * - instanceId 或路径键为 '__proto__' 等原型键 → 排除（原型污染矢量）。
- * 声明查询以 Object.hasOwn 判定 + Array.isArray 防护。投影在调用方传入的
- * 克隆上执行，绝不修改源项目对象（多次构建/深冻结项目不得互相污染）。
+ * - instanceId 或路径键为 '__proto__' 等原型键 → 排除（原型污染矢量）；
+ * - 声明与 manifest.privateSettings（privateKeysByPlugin 原样传入）重叠、
+ *   或声明路径含凭据形态键（apiKey/password/token/secret/…）→ 整条声明
+ *   拒绝 —— 「凭据永不导出」不依赖插件自觉声明；
+ * - 整值声明仅允许 primitive 叶值：对象/数组整值导出被强制递归投影拒绝。
+ * 声明查询以 Object.hasOwn 判定 + Array.isArray 防护；命名空间值经
+ * readOwnDataField 读取（descriptor 语义，不执行 getter）。投影只读源、
+ * 在新对象上构建，绝不修改源项目对象（多次构建/深冻结项目不得互相污染）。
  */
 function projectPublicPluginData(
   pluginData: Record<string, unknown>,
   publicKeysByPlugin?: Record<string, readonly (string | readonly string[])[]>,
+  privateKeysByPlugin?: Record<string, readonly string[]>,
 ): Record<string, unknown> | undefined {
   if (!publicKeysByPlugin) return undefined;
   const out: Record<string, unknown> = {};
@@ -396,7 +464,11 @@ function projectPublicPluginData(
     if (instanceId === '__proto__' || !Object.hasOwn(publicKeysByPlugin, instanceId)) continue;
     const declarations = publicKeysByPlugin[instanceId];
     if (!Array.isArray(declarations) || declarations.length === 0) continue;
-    const projected = applyPublicPluginData(pluginData[instanceId], declarations);
+    const privateKeys =
+      privateKeysByPlugin && Array.isArray(privateKeysByPlugin[instanceId]) ? privateKeysByPlugin[instanceId] : [];
+    const read = readOwnDataField(pluginData, instanceId);
+    if (!read.present) continue;
+    const projected = applyPublicPluginData(read.value, declarations, privateKeys);
     if (projected) out[instanceId] = projected;
   }
   if (Object.keys(out).length === 0) return undefined;
@@ -442,11 +514,11 @@ export function buildProjectPackage(project: Project, options: PackageBuildOptio
   if (includePrivate) {
     const read = readOwnDataField(project, 'pluginData');
     if (read.present && read.value !== undefined) {
-      // 顶层浅克隆后投影：删除/重建一律发生在克隆上，绝不修改源项目对象；
+      // 直接以源为投影输入（不再浅展开 —— 展开会执行命名空间层的 getter，
+      // 第十五轮一般 6）：投影只读源、在新对象上构建，绝不修改源项目对象；
       // 全部命名空间被排除（无任何已注册插件或声明）时 pluginData 键整体不进包
-      const pluginData = isPlainRecord(read.value) ? { ...read.value } : read.value;
-      if (isPlainRecord(pluginData)) {
-        const projected = projectPublicPluginData(pluginData, options.publicKeysByPlugin);
+      if (isPlainRecord(read.value)) {
+        const projected = projectPublicPluginData(read.value, options.publicKeysByPlugin, options.privateKeysByPlugin);
         if (projected) stripped.pluginData = projected;
       }
     }

@@ -191,6 +191,10 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
       }
       showToast(`已复制为「${result.summary.name}」`, 'success');
       void refreshRecent();
+    } catch (error) {
+      // 兜底 catch（第十五轮严重 5）：facade/loadCopyForOpen 均已归一为类型化
+      // 失败，此处仅防御未覆盖的意外 reject（UI 不产生未处理的 Promise）
+      showToast(`复制失败：${error instanceof Error ? error.message : String(error)}`, 'error');
     } finally {
       setBusy(false);
     }
@@ -219,17 +223,21 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
   };
 
   const exportCurrent = async () => {
-    // 命名空间 + 路径 schema 显式公开导出契约（第十四轮阻断 1/2）：core 端只
-    // 保留插件显式声明可导出的字段/路径，缺失或空声明一律整段排除（fail-closed）。
-    // 宿主直读 manifest.exportableSettings 原样传入，不做减法过滤 —— 「凭据
-    // 永不导出」不依赖插件自觉声明 privateSettings
+    // 命名空间 + 路径 schema 显式公开导出契约（第十四轮阻断 1/2 + 第十五轮阻断
+    // 1 加固）：core 端只保留插件显式声明可导出的字段/路径，缺失或空声明一律
+    // 整段排除（fail-closed）；宿主直读 manifest.exportableSettings 与
+    // manifest.privateSettings 原样传入 —— 声明与 privateSettings/凭据形态键
+    // 重叠（含整对象声明）由 core 逐条拒绝，不依赖插件自觉声明 privateSettings
     const publicKeysByPlugin: Record<string, readonly (string | readonly string[])[]> = {};
+    const privateKeysByPlugin: Record<string, readonly string[]> = {};
     for (const info of runtime.host.listPlugins()) {
       const manifest = runtime.host.getPluginManifest(info.instanceId);
       const declarations = manifest?.exportableSettings;
       publicKeysByPlugin[info.instanceId] = Array.isArray(declarations) ? declarations : [];
+      const privateSettings = manifest?.privateSettings;
+      privateKeysByPlugin[info.instanceId] = Array.isArray(privateSettings) ? privateSettings : [];
     }
-    const exported = persistence.exportCurrent({ includePrivate, publicKeysByPlugin });
+    const exported = persistence.exportCurrent({ includePrivate, publicKeysByPlugin, privateKeysByPlugin });
     if (!exported.ok) {
       showToast(exported.message, 'error');
       return;
@@ -347,6 +355,10 @@ export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
       setOpen(false);
       showToast(`未保存更改已另存为「${dup.summary.name}」`, 'success');
       void refreshRecent();
+    } catch (error) {
+      // 兜底 catch（第十五轮严重 5）：saveSnapshotAsNew/duplicateProject 均已
+      // 归一为类型化失败，此处仅防御未覆盖的意外 reject（UI 不产生未处理 Promise）
+      showToast(`另存副本失败：${error instanceof Error ? error.message : String(error)}`, 'error');
     } finally {
       setBusy(false);
     }

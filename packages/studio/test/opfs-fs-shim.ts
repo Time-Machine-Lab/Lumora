@@ -6,6 +6,7 @@
  * failNextWrite 钩子用于注入配额不足等写入失败，验证原子写保护。
  */
 
+import { vi } from 'vitest';
 import type { OpfsDirectoryHandle, OpfsFileHandle } from '../src/persistence/project-store-opfs';
 
 class NotFoundError extends Error {
@@ -122,4 +123,63 @@ export function memDirWithFiles(name: string, files: Record<string, string>): Me
     dir.children.set(fileName, handle);
   }
   return dir;
+}
+
+export interface LockStub {
+  request<T>(name: string, callback: () => Promise<T>): Promise<T>;
+}
+
+/**
+ * 互斥 Web Locks 模拟（jsdom 无 navigator.locks）：按锁名串行化，语义与生产
+ * withFallbackLock 一致 —— 前序任务 reject（锁内异常）不毒化队列，任务自身
+ * 的异常传播给调用方但仍在 finally 释放互斥位。挂到 navigator.locks 后生产
+ * 路径走 Web Locks 分支，同一 navigator 内的多实例（模拟多标签页）共享互斥。
+ */
+export function makeLockStub(): LockStub {
+  const chains = new Map<string, Promise<void>>();
+  return {
+    request<T>(name: string, callback: () => Promise<T>): Promise<T> {
+      const previous = chains.get(name) ?? Promise.resolve();
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      chains.set(
+        name,
+        previous
+          .catch(() => {})
+          .then(() => gate),
+      );
+      return previous
+        .catch(() => {})
+        .then(async () => {
+          try {
+            return await callback();
+          } finally {
+            release();
+          }
+        });
+    },
+  };
+}
+
+/**
+ * 把内存根目录 + 互斥 Web Locks 模拟挂到 navigator（生产代码的两个注入点：
+ * navigator.storage.getDirectory 与 navigator.locks）。无 locks 时生产路径会
+ * 因 Web Locks 固化检查（无 Web Locks 即禁用 OPFS）返回 null。
+ */
+export function stubOpfsNavigator(root: MemDirectoryHandle): void {
+  vi.stubGlobal(
+    'navigator',
+    Object.create(navigator, {
+      storage: {
+        value: { getDirectory: async () => root },
+        configurable: true,
+      },
+      locks: {
+        value: makeLockStub(),
+        configurable: true,
+      },
+    }),
+  );
 }

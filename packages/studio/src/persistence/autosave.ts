@@ -576,19 +576,25 @@ export class ProjectAutosaver {
     if (this.saveQueued) return;
     const project = this.pending ?? this.editor.getProject();
     if (!project || project.uri !== this.currentUri) return;
+    // 第十五轮严重 3：目标会话代在入队前捕获 —— 队列被慢 reconcile/其他任务
+    // 占用时（A→B→A0 后旧 A1 任务才执行），任务体内读取 this.session 已是新
+    // 会话代，A1 会被 isFresh 误判为当前代而写回已丢弃快照；以入队时的会话代
+    // 复验，旧代任务直接作废（未落盘内容由切换时的排空/恢复快照承载，已落盘
+    // 内容不受影响）
+    const capturedSession = this.session;
     this.saveQueued = true;
     void this.enqueue(async () => {
       this.saveQueued = false;
       if (this.disposed) return;
+      // 复验：切换/关闭（会话代递增）后旧代任务作废，绝不写回已丢弃快照
+      if (!this.isFresh(project.uri, capturedSession)) return;
       this.saveInFlight = true;
       let outcome: SaveOutcome | null = null;
-      // 保存目标与目标会话代在任务执行时捕获：广播的新鲜度校验依据
       const targetUri = project.uri;
-      const session = this.session;
       try {
         // 执行时若已有更新的快照（同 uri），保存最新内容
         const target = this.pending && this.pending.uri === project.uri ? this.pending : project;
-        outcome = await this.saveSnapshot(target, true);
+        outcome = await this.saveSnapshot(target, true, capturedSession);
       } finally {
         this.saveInFlight = false;
       }
@@ -598,22 +604,25 @@ export class ProjectAutosaver {
       // 且仅在目标仍 fresh 时广播（第十四轮严重 3）：慢保存失败期间切换/关闭
       // （会话代递增）后，旧项目的失败不得覆盖新项目的真实状态 —— 旧 uri 的
       // 失败已由排空/恢复快照机制承载，关闭后也不得回弹错误状态
-      if (outcome && !outcome.ok && outcome.code !== 'revision-conflict' && this.isFresh(targetUri, session)) {
+      if (outcome && !outcome.ok && outcome.code !== 'revision-conflict' && this.isFresh(targetUri, capturedSession)) {
         this.emit({ status: 'error', code: outcome.code, message: outcome.message });
       }
     });
   }
 
   /** 当前会话保存：捕获会话代与执行时基线（已提交基线，非打开时快照）。
+   *  sessionOverride（runSave 专用，第十五轮严重 3）：使用入队前捕获的会话代
+   *  —— 队列被慢任务占用时执行期的 this.session 可能已是新代，会把已丢弃
+   *  快照误判为 fresh 写回；该代贯穿 saving 广播与 applySaveResult。
    *  deferErrorBroadcast（runSave 专用，第十三轮严重 #4）：保存失败时错误广播
    *  由调用方推迟到 saveInFlight 清零之后 —— 避免错误监听器同步执行失败
    *  switchOpen 时回滚误判在途而停止自动保存。 */
-  private async saveSnapshot(project: Project, deferErrorBroadcast = false): Promise<SaveOutcome> {
+  private async saveSnapshot(project: Project, deferErrorBroadcast = false, sessionOverride?: number): Promise<SaveOutcome> {
     if (!this.store || this.disposed) {
       // 仅内存模式：无可持久化内容，视为可继续（关闭不被阻塞）
       return { ok: true };
     }
-    const session = this.session;
+    const session = sessionOverride ?? this.session;
     const expected = this.committedByUri.get(project.uri)?.revision ?? null;
     if (this.isFresh(project.uri, session)) this.emit({ status: 'saving' });
     const result = await this.storeSave(project, expected);

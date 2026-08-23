@@ -218,13 +218,16 @@ test('AC1b 真实 GLB 模型资产：导入渲染 + 载荷引用往返（TML-53 
   }
 });
 
-test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，includePrivate 显式公开契约制（第十二轮阻断 2 + 第十三轮反转 + 第十四轮阻断 1/2）', async ({ page }) => {
+test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，includePrivate 显式公开契约制（第十二轮阻断 2 + 第十三轮反转 + 第十四轮阻断 1/2 + 第十五轮阻断 1）', async ({ page }) => {
   // 1. Node 端构造「含 AI 凭据与插件私有设置」的源工程包。显式公开契约制
-  //    （第十四轮阻断 1/2）：publicKeysByPlugin 是「显式可导出字段声明」——
-  //    显式登记全部键（顶层键字符串 = 整值导出）后包内完整携带 pluginData
-  //    （含嵌套凭据），模拟插件把私有设置（含凭据）存入项目本地状态的真实
-  //    形态；空/漏声明 = 无公开字段 = 整段排除（已注册但空/漏声明绝不整段
-  //    放行，凭据无从经声明缺口进入包）
+  //    （第十四轮阻断 1/2）：publicKeysByPlugin 是「显式可导出字段声明」，
+  //    第十五轮阻断 1 加固后声明只放行叶值（null/字符串/数字/布尔），整对象
+  //    声明一律剥离、凭据形态键名（apikey/password/token/secret/…）一律拒绝
+  //    —— 嵌套凭据结构没有任何声明通道。因此源包在 Node 侧直接注入完整
+  //    pluginData（含嵌套凭据），模拟插件把私有设置（含凭据）写入项目本地
+  //    状态的真实形态：本地存储完整、导出剥离由浏览器链路验证；空/漏声明 =
+  //    无公开字段 = 整段排除（已注册但空/漏声明绝不整段放行，凭据无从经
+  //    声明缺口进入包）
   const pluginId = 'com.example.ai-assistant';
   const secrets = {
     apiKey: 'sk-lumora-ac4-1f7a9c3d',
@@ -253,10 +256,10 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
       ...sourceEditor.getProject()!,
       uri: 'lumora://project/ac4-source',
       name: 'AC4 源项目',
-      pluginData: sourcePluginData,
     },
-    { includePrivate: true, publicKeysByPlugin: { [pluginId]: Object.keys(sourcePluginData[pluginId]!) } },
+    { includePrivate: true },
   );
+  sourcePkg.project.pluginData = sourcePluginData;
   writeFileSync(sourcePath, serializeProjectPackage(sourcePkg), 'utf8');
 
   // 1b. 已注册但空/漏声明（第十三轮阻断 2 反转）：同一源数据以空声明或
@@ -294,6 +297,36 @@ test('AC4 源项目含 pluginData 与凭据：默认导出结构性隔离，incl
   for (const key of ['auth', 'credentials', 'users', 'api']) {
     expect(declaredJson).not.toContain(`"${key}"`);
   }
+
+  // 1d. 整对象声明剥离 + 凭据形态键名拒绝（第十五轮阻断 1 回归）：声明
+  //     ['users']（整对象/数组）被叶值校验剥离 —— 显式登记也无法携带嵌套
+  //     值；声明 ['apiKey','clientSecret']（凭据形态键名）一律拒绝 ——
+  //     凭据绝无声明通道，即使插件显式点名导出
+  const credentialShape: Record<string, unknown> = {
+    [pluginId]: {
+      theme: 'dark',
+      apiKey: secrets.apiKey,
+      clientSecret: secrets.accessToken,
+      users: [{ name: 'u1' }, { name: 'u2', password: secrets.password }],
+    },
+  };
+  const wholeObjectDecl = buildProjectPackage(
+    { ...sourceBase, uri: 'lumora://project/ac4-whole', name: 'AC4 整对象声明', pluginData: credentialShape },
+    { includePrivate: true, publicKeysByPlugin: { [pluginId]: ['users', 'theme'] } },
+  );
+  const wholeJson = JSON.stringify(wholeObjectDecl);
+  expect(wholeJson).toContain('"theme":"dark"');
+  expect(wholeJson).not.toContain('"users"');
+  for (const secret of Object.values(secrets)) expect(wholeJson).not.toContain(secret);
+  const credentialKeyDecl = buildProjectPackage(
+    { ...sourceBase, uri: 'lumora://project/ac4-cred', name: 'AC4 凭据形态键声明', pluginData: credentialShape },
+    { includePrivate: true, publicKeysByPlugin: { [pluginId]: ['apiKey', 'clientSecret', 'theme'] } },
+  );
+  const credentialJson = JSON.stringify(credentialKeyDecl);
+  expect(credentialJson).toContain('"theme":"dark"');
+  expect(credentialJson).not.toContain('"apiKey"');
+  expect(credentialJson).not.toContain('"clientSecret"');
+  for (const secret of Object.values(secrets)) expect(credentialJson).not.toContain(secret);
 
   // 2. 浏览器导入源项目：插件私有设置（含嵌套凭据）成为编辑器与本地持久化状态
   await page.goto('/');

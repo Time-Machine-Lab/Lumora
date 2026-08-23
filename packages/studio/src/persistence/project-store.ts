@@ -247,20 +247,21 @@ export class ProjectStore implements ProjectStorage {
     return true;
   }
 
-  /** 条件删除（第十四轮严重 4）：读-比-删与提交在同一 readwrite 事务内 ——
-   *  副本验证失败后的清理不得误删另一标签页已打开并保存的更新后合法记录；
-   *  内容指纹一致才删除，已变化/不存在时保留（removed:false），存储故障返回
-   *  类型化失败（记录可能残留）。 */
+  /** 条件删除（第十四轮严重 4 CAS + 第十五轮严重 4/一般 7）：读-比-删与提交在
+   *  同一 readwrite 事务内 —— 副本验证失败后的清理不得误删另一标签页已打开并
+   *  保存的更新后合法记录；内容指纹一致才删除，不存在（missing）/已变化
+   *  （changed）按态区分，存储故障（含事务创建失败 —— 连接已关闭等）返回
+   *  类型化失败（记录可能残留），绝不二次抛出。 */
   async removeIfUnchanged(uri: string, expectedFingerprint: string | null): Promise<RemoveIfOutcome> {
-    const transaction = this.db.transaction(PROJECTS_STORE, 'readwrite');
-    const store = transaction.objectStore(PROJECTS_STORE);
     try {
+      const transaction = this.db.transaction(PROJECTS_STORE, 'readwrite');
+      const store = transaction.objectStore(PROJECTS_STORE);
       const existing = await request(store.get(uri) as IDBRequest<StoredProject | undefined>);
-      if (!existing) return { ok: true, removed: false };
-      if (stableStringify(existing.project) !== expectedFingerprint) return { ok: true, removed: false };
+      if (!existing) return { ok: true, outcome: 'missing' };
+      if (stableStringify(existing.project) !== expectedFingerprint) return { ok: true, outcome: 'changed' };
       await request(store.delete(uri) as IDBRequest<undefined>);
       await transactionDone(transaction);
-      return { ok: true, removed: true };
+      return { ok: true, outcome: 'removed' };
     } catch (error) {
       return { ok: false, message: `副本清理失败：${failureMessage(error)}` };
     }
@@ -288,58 +289,67 @@ export class ProjectStore implements ProjectStorage {
    *  仅当记录内容指纹与创建时一致才删除 —— 验证挂起期间另一标签页已打开并
    *  保存副本时，更新后的合法记录保留。 */
   async duplicate(uri: string, name?: string): Promise<DuplicateOutcome> {
-    const project = await this.load(uri);
-    if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
-    const prepared = prepareWriteChange(project, 'duplicate');
-    if (!prepared.ok) return prepared;
-    const source = prepared.project;
-    const copy: Project = {
-      ...structuredClone(source),
-      uri: `lumora://project/${genId('p')}`,
-      name: name ?? `${source.name} 副本`,
-      createdAt: new Date().toISOString(),
-      revision: 0,
-    };
-    const fingerprint = stableStringify(copy);
-    const result = await this.save(copy, null);
-    if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
-    let loaded: Project | null;
+    // 入口级异常归一（第十五轮严重 5）：源加载/克隆/指纹/save 的意外 reject
+    // 一律返回类型化 storage-error —— adapter 契约不向上抛异常，UI 无需兜底
     try {
-      loaded = await this.load(copy.uri);
-    } catch (error) {
-      return {
-        ok: false,
-        code: 'storage-error',
-        message: `复制成功但副本无法加载验证（${failureMessage(error)}），${await this.cleanupCopy(copy.uri, fingerprint)}`,
-      };
-    }
-    if (!loaded || validateProjectSchema(loaded) || validateProjectStructure(loaded)) {
-      return {
-        ok: false,
-        code: 'storage-error',
-        message: `复制成功但副本无法通过加载校验，${await this.cleanupCopy(copy.uri, fingerprint)}`,
-      };
-    }
-    return {
-      ok: true,
-      summary: {
-        uri: copy.uri,
-        name: copy.name,
-        savedAt: new Date().toISOString(),
+      const project = await this.load(uri);
+      if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
+      const prepared = prepareWriteChange(project, 'duplicate');
+      if (!prepared.ok) return prepared;
+      const source = prepared.project;
+      const copy: Project = {
+        ...structuredClone(source),
+        uri: `lumora://project/${genId('p')}`,
+        name: name ?? `${source.name} 副本`,
+        createdAt: new Date().toISOString(),
         revision: 0,
-        schemaVersion: copy.schemaVersion,
-      },
-      fingerprint,
-    };
+      };
+      const fingerprint = stableStringify(copy);
+      const result = await this.save(copy, null);
+      if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
+      let loaded: Project | null;
+      try {
+        loaded = await this.load(copy.uri);
+      } catch (error) {
+        return {
+          ok: false,
+          code: 'storage-error',
+          message: `复制成功但副本无法加载验证（${failureMessage(error)}），${await this.cleanupCopy(copy.uri, fingerprint)}`,
+        };
+      }
+      if (!loaded || validateProjectSchema(loaded) || validateProjectStructure(loaded)) {
+        return {
+          ok: false,
+          code: 'storage-error',
+          message: `复制成功但副本无法通过加载校验，${await this.cleanupCopy(copy.uri, fingerprint)}`,
+        };
+      }
+      return {
+        ok: true,
+        summary: {
+          uri: copy.uri,
+          name: copy.name,
+          savedAt: new Date().toISOString(),
+          revision: 0,
+          schemaVersion: copy.schemaVersion,
+        },
+        fingerprint,
+      };
+    } catch (error) {
+      // 克隆/指纹/清理等意外 reject：如实返回类型化失败（副本残留时如实呈现，
+      // 不声称已清理）
+      return { ok: false, code: 'storage-error', message: `复制失败：${failureMessage(error)}` };
+    }
   }
 
-  /** 清理复制失败留下的副本（CAS，第十四轮严重 4）：仅当记录内容指纹与创建时
-   *  一致才删除（另一标签页已打开并保存的更新后记录保留）；仅在删除事务提交后
-   *  声称「已清理」，任何失败如实说明副本保留（可手动删除），绝不掩盖清理失败
-   *  （第九轮 #5）。 */
+  /** 清理复制失败留下的副本（CAS，第十四轮严重 4 + 第十五轮一般 7）：仅当记录
+   *  内容指纹与创建时一致才删除（另一标签页已打开并保存的更新后记录保留）；仅
+   *  在删除事务提交后声称「已清理」，任何失败如实说明副本保留（可手动删除），
+   *  绝不掩盖清理失败（第九轮 #5）；记录已不存在（missing）时清理后置条件已
+   *  满足，不声称「已保留」。 */
   private async cleanupCopy(uri: string, expectedFingerprint: string | null): Promise<string> {
     const outcome = await this.removeIfUnchanged(uri, expectedFingerprint);
-    if (outcome.ok && outcome.removed) return '已清理并取消复制';
+    if (outcome.ok && outcome.outcome !== 'changed') return '已清理并取消复制';
     if (outcome.ok) return '副本记录已变化（可能已被其他会话保存），已保留该记录，可手动删除';
     return `副本清理失败（${outcome.message}），副本记录保留，可手动删除`;
   }

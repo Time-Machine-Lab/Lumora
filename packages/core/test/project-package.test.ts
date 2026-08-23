@@ -241,13 +241,14 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(privateJson).not.toContain('pw-keep-3');
   });
 
-  it('includePrivate + 键级 allowlist：显式声明的顶层键（含整棵子树）进包，未声明键（theme）排除（第十三轮阻断 2）', async () => {
+  it('includePrivate + 键级 allowlist：路径声明导出嵌套公开字段；整对象声明与凭据形态键声明拒绝（第十五轮阻断 1）', async () => {
     const project = await buildFixtureProject();
     const rich = {
       ...project,
       pluginData: {
         'com.example': {
           theme: 'dark',
+          layout: { panel: 'left', density: 'compact' },
           apiKey: 'sk-declared-1',
           clientSecret: 'cs-declared-2',
           accessToken: 'at-declared-3',
@@ -255,17 +256,42 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         },
       },
     } as Project;
+    // 路径声明是导出嵌套对象字段的唯一合法形态（字符串声明仅接受 primitive 叶值）
     const json = JSON.stringify(
       buildProjectPackage(rich, {
         includePrivate: true,
-        publicKeysByPlugin: { 'com.example': ['apiKey', 'clientSecret', 'accessToken', 'auth'] },
+        publicKeysByPlugin: { 'com.example': [['layout', 'panel'], ['layout', 'density']] },
       }),
     );
-    // allowlist 键及其整棵子树完整保留（allowlist 是「可导出字段」而非「剥离列表」）
-    for (const kept of ['sk-declared-1', 'cs-declared-2', 'at-declared-3', 'nested-4', 'nested-5']) {
-      expect(json, `allowlist 键值 ${kept} 必须进入包`).toContain(kept);
+    for (const kept of ['left', 'compact']) {
+      expect(json, `路径声明值 ${kept} 必须进入包`).toContain(kept);
     }
     expect(json, '未声明的 theme 不得进入包').not.toContain('theme');
+
+    // 整对象声明（layout 值为对象，非 primitive 叶值）→ 剥离，绝不绕过递归投影
+    const objectJson = JSON.stringify(
+      buildProjectPackage(rich, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': ['layout'] },
+      }),
+    );
+    expect(objectJson, '整对象声明不得导出子树').not.toContain('panel');
+    expect(objectJson, '整对象声明不得导出子树').not.toContain('density');
+
+    // 凭据形态键声明（顶层键或路径任意段含 apikey/password/token/secret/auth
+    // 等形态子串）→ 整条声明拒绝：即使显式 allowlist 声明，值也不得进包
+    const credentialJson = JSON.stringify(
+      buildProjectPackage(rich, {
+        includePrivate: true,
+        publicKeysByPlugin: {
+          'com.example': ['apiKey', 'clientSecret', 'accessToken', 'auth', ['auth', 'apiKey']],
+        },
+      }),
+    );
+    for (const leaked of ['sk-declared-1', 'cs-declared-2', 'at-declared-3', 'nested-4', 'nested-5']) {
+      expect(credentialJson, `凭据形态键值 ${leaked} 不得进入包`).not.toContain(leaked);
+    }
+    expect(credentialJson, '凭据声明拒绝后整段不残留').not.toContain('apiKey');
   });
 
   it('声明只作用于声明的插件实例：未知命名空间与空声明实例一律排除（第十三轮阻断 2）', async () => {
@@ -295,19 +321,28 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(bothJson).not.toContain('a-leak-1');
     expect(bothJson).not.toContain('b-keep-1');
     expect(bothJson).not.toContain('b-theme');
-    // com.b 显式声明为可导出：该实例键进包
+    // com.b 显式声明非凭据键为可导出：该实例键进包
     const explicitJson = JSON.stringify(
+      buildProjectPackage(rich, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.a': ['theme'], 'com.b': ['theme'] },
+      }),
+    );
+    expect(explicitJson).toContain('b-theme');
+    expect(explicitJson).not.toContain('b-keep-1');
+    expect(explicitJson).not.toContain('a-leak-1');
+    // com.b 显式声明凭据形态键（apiKey）：声明被拒，值不得进包（第十五轮阻断 1）
+    const credentialJson = JSON.stringify(
       buildProjectPackage(rich, {
         includePrivate: true,
         publicKeysByPlugin: { 'com.a': ['theme'], 'com.b': ['apiKey'] },
       }),
     );
-    expect(explicitJson).toContain('b-keep-1');
-    expect(explicitJson).not.toContain('b-theme');
-    expect(explicitJson).not.toContain('a-leak-1');
+    expect(credentialJson, '凭据形态键声明拒绝').not.toContain('b-keep-1');
+    expect(credentialJson, '其他实例声明不受影响').toContain('a-theme');
   });
 
-  it('无损往返性质：pass_word/passwd/authHeader 与 benign 组合词显式 allowlist 放行时导出→导入逐键一致（第十一轮严重 #2 + 第十三轮）', async () => {
+  it('无损往返性质：非凭据键显式 allowlist 放行时导出→导入逐键一致；凭据形态键声明拒绝（第十一轮严重 #2 + 第十三轮 + 第十五轮阻断 1）', async () => {
     const project = await buildFixtureProject();
     const pluginData = {
       'com.example': {
@@ -335,7 +370,10 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(emptyParsed.ok).toBe(true);
     if (!emptyParsed.ok) return;
     expect(emptyParsed.project.pluginData).toBeUndefined();
-    // 显式 allowlist（宿主核验过的全部键）：逐键无损往返，值不被改动
+    // 显式 allowlist（宿主核验过的全部键）：非凭据键逐键无损往返，值不被改动；
+    // 凭据形态键（passwd/authHeader/TOKENIZERCONFIG/tokenizerConfigModel/
+    // tokenizerModel 含 passwd/auth/token 形态子串）声明逐条拒绝 —— allowlist
+    // 放行不豁免凭据形态（第十五轮阻断 1）
     const pkg = buildProjectPackage({ ...project, pluginData }, {
       includePrivate: true,
       publicKeysByPlugin: { 'com.example': Object.keys(pluginData['com.example']) },
@@ -343,7 +381,11 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
-    expect(parsed.project.pluginData).toEqual(pluginData);
+    const expected = { ...pluginData['com.example'] };
+    for (const credentialKey of ['passwd', 'authHeader', 'TOKENIZERCONFIG', 'tokenizerConfigModel', 'tokenizerModel']) {
+      delete expected[credentialKey];
+    }
+    expect(parsed.project.pluginData).toEqual({ 'com.example': expected });
   });
 
   it('未知顶层字段不进入工程包（公开字段白名单）；tracks 属公开数据随包携带', async () => {
@@ -355,7 +397,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(JSON.parse(json)).toMatchObject({ project: { tracks: project.tracks } });
   });
 
-  it('导出导入往返 + 键级 allowlist：显式声明的键随包往返保留，未声明键（benign 组合词）不进入包（第九轮 #4 契约化 + 第十三轮阻断 2）', async () => {
+  it('导出导入往返 + 键级 allowlist：显式声明的键随包往返保留，未声明键（benign 组合词）与凭据形态键声明不进入包（第九轮 #4 契约化 + 第十三轮阻断 2 + 第十五轮阻断 1）', async () => {
     const project = await buildFixtureProject();
     const rich = {
       ...project,
@@ -374,27 +416,32 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     } as Project;
     const pkg = buildProjectPackage(rich, {
       includePrivate: true,
-      publicKeysByPlugin: { 'com.example': ['apiKey', 'accessToken', 'clientSecret'] },
+      publicKeysByPlugin: {
+        'com.example': ['keyboardLayout', 'monkeyPatch', 'apiKey', 'accessToken', 'clientSecret'],
+      },
     });
     const text = serializeProjectPackage(pkg);
     const parsed = await parseProjectPackage(text);
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     const plugin = (parsed.project.pluginData as Record<string, Record<string, string>>)['com.example'];
-    // allowlist 键随包往返保留；未声明键（benign 组合词同样如此）一律排除
-    expect(plugin.keyboardLayout).toBeUndefined();
-    expect(plugin.tokenizerConfig).toBeUndefined();
-    expect(plugin.monkeyPatch).toBeUndefined();
+    // 声明的非凭据键随包往返保留；未声明键（benign 组合词）一律排除
+    expect(plugin.keyboardLayout).toBe('kb-intl');
+    expect(plugin.monkeyPatch).toBe('off');
     expect(plugin.hotkeyMap).toBeUndefined();
     expect(plugin.shortcutKey).toBeUndefined();
-    expect(plugin.apiKey).toBe('sk-leak-1');
-    expect(plugin.accessToken).toBe('tok-leak-2');
-    expect(plugin.clientSecret).toBe('client-secret-3');
+    // 凭据形态键声明（apiKey/accessToken/clientSecret 含 apikey/token/secret、
+    // tokenizerConfig 含 token 形态子串）逐条拒绝，值绝不进包（第十五轮阻断 1）
+    expect(plugin.tokenizerConfig).toBeUndefined();
+    expect(plugin.apiKey).toBeUndefined();
+    expect(plugin.accessToken).toBeUndefined();
+    expect(plugin.clientSecret).toBeUndefined();
     const json = JSON.stringify(parsed.project);
-    expect(json).toContain('sk-leak-1');
-    expect(json).toContain('tok-leak-2');
-    expect(json).toContain('client-secret-3');
-    expect(json).not.toContain('kb-intl');
+    expect(json).not.toContain('sk-leak-1');
+    expect(json).not.toContain('tok-leak-2');
+    expect(json).not.toContain('client-secret-3');
+    expect(json).not.toContain('cl100k-base');
+    expect(json).toContain('kb-intl');
   });
 });
 
@@ -490,18 +537,21 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
     expect(json).not.toContain('proto-secret-1');
     expect(json).toContain('theme');
     // 声明表以 __proto__ own 键注入 + pluginData 值同拥 own __proto__：
-    // '__proto__' 不得被当作合法 allowlist 项放行（原型污染矢量），正常声明不受影响
+    // '__proto__' 不得被当作合法 allowlist 项放行（原型污染矢量），正常声明不受影响；
+    // apiKey 凭据形态声明一并拒绝（第十五轮阻断 1）
     const declarations = Object.create(null) as Record<string, string[]>;
     declarations['__proto__'] = ['apiKey'];
-    declarations['com.example'] = ['apiKey', '__proto__'];
+    declarations['com.example'] = ['apiKey', '__proto__', 'theme'];
     const poisonedValue = Object.create(null) as Record<string, unknown>;
     poisonedValue['apiKey'] = 'sk-strip-1';
+    poisonedValue['theme'] = 'dark';
     poisonedValue['__proto__'] = { pollute: 'proto-polluted' };
     const rich = { ...project, pluginData: { 'com.example': poisonedValue } } as Project;
     const strippedJson = JSON.stringify(
       buildProjectPackage(rich, { includePrivate: true, publicKeysByPlugin: declarations }),
     );
-    expect(strippedJson).toContain('sk-strip-1');
+    expect(strippedJson).toContain('dark');
+    expect(strippedJson, '凭据形态键声明拒绝（第十五轮阻断 1）').not.toContain('sk-strip-1');
     expect(strippedJson).not.toContain('proto-polluted');
     expect(strippedJson).not.toContain('"__proto__"');
   });
@@ -519,7 +569,7 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
     expect(json).not.toContain('theme');
   });
 
-  it('路径 schema：声明路径导出嵌套公开字段，未声明路径与嵌套凭据排除（第十四轮阻断 1）', async () => {
+  it('路径 schema：声明路径导出嵌套公开字段，未声明路径与嵌套凭据排除；凭据形态路径声明整条拒绝（第十四轮阻断 1 + 第十五轮阻断 1）', async () => {
     const project = await buildFixtureProject();
     const rich = {
       ...project,
@@ -543,23 +593,90 @@ describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻�
         },
       }),
     );
-    // 顶层键整值导出；路径末端键按路径导出
-    for (const kept of ['dark', 'alice', 'sk-nested-2']) {
+    // 顶层键整值导出；路径末端键按路径导出；路径含凭据形态键（auth/apiKey）
+    // 的整条声明拒绝 —— sk-nested-2 绝不进包（第十五轮阻断 1）
+    for (const kept of ['dark', 'alice']) {
       expect(json, `声明键值 ${kept} 必须进入包`).toContain(kept);
     }
     // 未声明键与嵌套凭据排除
-    for (const leaked of ['sk-direct-1', 'alice@example.com', 'tok-nested-3']) {
+    for (const leaked of ['sk-direct-1', 'alice@example.com', 'sk-nested-2', 'tok-nested-3']) {
       expect(json, `未声明凭据 ${leaked} 不得进入包`).not.toContain(leaked);
     }
-    // 投影结果只含声明路径：profile 段只有 username 与 auth.apiKey
+    // 投影结果只含声明路径：profile 段只有 username，auth 整段排除
     const parsed = await parseProjectPackage(json);
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     const plugin = (parsed.project.pluginData as Record<string, Record<string, unknown>>)['com.example'];
     expect(plugin).toEqual({
       theme: 'dark',
-      profile: { username: 'alice', auth: { apiKey: 'sk-nested-2' } },
+      profile: { username: 'alice' },
     });
+  });
+
+  it('声明顺序无关：冻结项目下祖先与路径声明重叠的两种顺序结果一致且不抛错（第十五轮严重 2）', async () => {
+    const project = await buildFixtureProject();
+    const frozen = {
+      ...project,
+      pluginData: Object.freeze({
+        'com.example': Object.freeze({
+          profile: Object.freeze({ username: 'alice', email: 'alice@example.com' }),
+          theme: 'dark',
+        }),
+      }),
+    } as Project;
+    // trie 归一：祖先声明（profile）覆盖冗余后代路径声明，与声明顺序无关 ——
+    // 旧 merge 实现会原地改写投影中的源引用，冻结项目下先祖先后路径的顺序抛
+    // TypeError，反序成功、结果互异；纯函数投影下两种顺序都不抛错且结果一致
+    const order1 = buildProjectPackage(frozen, {
+      includePrivate: true,
+      publicKeysByPlugin: { 'com.example': ['profile', ['profile', 'username']] },
+    });
+    const order2 = buildProjectPackage(frozen, {
+      includePrivate: true,
+      publicKeysByPlugin: { 'com.example': [['profile', 'username'], 'profile'] },
+    });
+    expect(order1.project.pluginData).toBeUndefined();
+    expect(JSON.stringify(order1)).toBe(JSON.stringify(order2));
+  });
+
+  it('pluginData 命名空间与叶值访问器拒绝导出且 getter 不执行（第十五轮一般 6）', async () => {
+    const project = await buildFixtureProject();
+    // 命名空间层访问器：旧浅展开 {…read.value} 会执行 getter（用户对象代码在
+    // 导出管道内运行）；descriptor 语义下读取即拒绝，getter 全程不执行
+    let namespaceGetterCalls = 0;
+    const namespaceData: Record<string, unknown> = {};
+    Object.defineProperty(namespaceData, 'com.example', {
+      get: () => {
+        namespaceGetterCalls += 1;
+        return { theme: 'dark' };
+      },
+      enumerable: true,
+    });
+    expect(() =>
+      buildProjectPackage({ ...project, pluginData: namespaceData } as unknown as Project, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': ['theme'] },
+      }),
+    ).toThrow(/访问器属性/);
+    expect(namespaceGetterCalls).toBe(0);
+
+    // 叶值访问器：结构化克隆/投影同样不得物化 getter，拒绝且不执行
+    let leafGetterCalls = 0;
+    const leafData: Record<string, unknown> = { 'com.example': {} };
+    Object.defineProperty(leafData['com.example'], 'theme', {
+      get: () => {
+        leafGetterCalls += 1;
+        return 'dark';
+      },
+      enumerable: true,
+    });
+    expect(() =>
+      buildProjectPackage({ ...project, pluginData: leafData } as unknown as Project, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': ['theme'] },
+      }),
+    ).toThrow(/访问器属性/);
+    expect(leafGetterCalls).toBe(0);
   });
 
   it('路径 schema：中途缺失/中间层非普通对象/路径含原型键时整条路径回滚，不残留部分投影（第十四轮阻断 1）', async () => {

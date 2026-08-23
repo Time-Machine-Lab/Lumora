@@ -66,14 +66,19 @@ export type DuplicateOutcome =
   | { ok: true; summary: ProjectSummary; fingerprint: string }
   | { ok: false; code: 'not-found' | 'storage-error'; message: string };
 
-/** 条件删除结果（第十四轮严重 4）：副本验证失败后的清理必须 CAS —— 不得误删
- *  另一标签页已打开并保存的更新后合法记录。
- *  - removed: true = 记录存在且内容指纹与期望一致，已删除；
- *  - removed: false = 记录不存在或内容已变化（指纹不符），保留；
- *  - ok: false = 存储故障（读/删失败），记录可能残留。 */
+/** 条件删除结果（第十四轮严重 4 CAS + 第十五轮一般 7 四态）：副本验证失败后
+ *  的清理必须 CAS —— 不得误删另一标签页已打开并保存的更新后合法记录；结果按
+ *  态区分，调用方（UI）不得把「记录已不存在」误报为「记录已变化、已保留」。
+ *  - outcome: 'removed' = 记录存在且内容指纹与期望一致，已删除；
+ *  - outcome: 'missing' = 记录不存在 —— 清理后置条件已满足（可能已被其他
+ *    会话删除），无需也不得声称「已保留」；
+ *  - outcome: 'changed' = 记录存在但内容已变化（指纹不符）或无法验证指纹
+ *    （损坏记录），保留；
+ *  - ok: false = 存储故障（读/删/锁失败），记录可能残留。 */
 export type RemoveIfOutcome =
-  | { ok: true; removed: true }
-  | { ok: true; removed: false }
+  | { ok: true; outcome: 'removed' }
+  | { ok: true; outcome: 'missing' }
+  | { ok: true; outcome: 'changed' }
   | { ok: false; message: string };
 
 export type RenameOutcome =

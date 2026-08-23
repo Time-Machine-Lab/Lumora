@@ -1351,3 +1351,49 @@ describe('ProjectAutosaver：慢保存失败的延迟错误广播按 {uri, sessi
     autosaver.dispose();
   });
 });
+
+describe('ProjectAutosaver：队列占位期间 A→B→A 的会话代捕获（第十五轮严重 3）', () => {
+  it('慢 reconcile 占队列时旧 A1 保存任务在切回 A 后作废：不写回已丢弃快照、不推进基线（修复前误判 fresh 写回）', async () => {
+    const { editor, store, autosaver } = await wired(20);
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(60); // 首轮对账完成：rev0 落盘，队列空
+
+    // 慢 reconcile 占队列（setStore 重复接线会入队 reconcile，load 延迟 300ms）：
+    // A1 入队后排在其后，执行被推迟到 A→B→A0 切换完成之后
+    const realLoad = store.load.bind(store);
+    vi.spyOn(store, 'load').mockImplementationOnce(async (uri) => {
+      await new Promise((r) => setTimeout(r, 300));
+      return realLoad(uri);
+    });
+    autosaver.setStore(store);
+
+    // 编辑 A → rev1 → 防抖到点 → A1 入队（入队时捕获会话代 N）
+    editor.addObject(createGroupObject());
+    const saveSpy = vi.spyOn(store, 'save');
+    await settle(40);
+
+    // 慢 reconcile 挂起期间 A→B→A0（switchOpen 保留 A0 的 rev0 基线、无排空
+    // 入队；会话代 N→N+2，currentUri 回到 A）：修复前 A1 执行时读到的
+    // this.session 已是新代、uri 也是 A → 误判 fresh → 把已丢弃快照写回并
+    // 推进基线；修复后以入队时代（N）复验 → 直接作废，一次保存都不发生
+    autosaver.switchOpen(createSampleProject('lumora://project/b', '项目B'));
+    autosaver.switchOpen({ ...base }); // A0 = 与存储一致的 rev0 内容（基线 rev0）
+    await settle(400);
+
+    // 修复前 A1 会写回一次（X rev1、基线推进到 1）；修复后作废零写回
+    const aSaves = saveSpy.mock.calls.filter(([p]) => p.uri === A);
+    expect(aSaves.length).toBe(0);
+    // 存储仍是首轮对账的 rev0 原内容（未被已丢弃快照覆盖）
+    const storedA = await store.load(A);
+    expect(storedA).not.toBeNull();
+    expect(storedA!.revision).toBe(0);
+    expect(storedA!.objects.length).toBe(base.objects.length);
+    // 编辑器保持 A0 打开（未被打断）
+    expect(editor.getProject()!.uri).toBe(A);
+    expect(editor.getProject()!.revision).toBe(0);
+    saveSpy.mockRestore();
+    autosaver.dispose();
+  });
+});

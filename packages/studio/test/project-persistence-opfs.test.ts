@@ -5,7 +5,7 @@ import { createStudioRuntime } from '../src/runtime/studio-runtime';
 import type { StudioRuntime } from '../src/runtime/studio-runtime';
 import { ProjectStore } from '../src/persistence/project-store';
 import { OpfsProjectStore } from '../src/persistence/project-store-opfs';
-import { MemDirectoryHandle } from './opfs-fs-shim';
+import { MemDirectoryHandle, stubOpfsNavigator } from './opfs-fs-shim';
 
 const DB = 'lumora-test-persist-opfs';
 
@@ -24,17 +24,10 @@ async function makeRuntime(storage?: 'indexeddb' | 'opfs') {
 }
 
 beforeEach(async () => {
-  // 同一测试内多次 init（多运行时模拟多标签页）共享同一 OPFS 根
-  const root = new MemDirectoryHandle('root');
-  vi.stubGlobal(
-    'navigator',
-    Object.create(navigator, {
-      storage: {
-        value: { getDirectory: async () => root },
-        configurable: true,
-      },
-    }),
-  );
+  // 同一测试内多次 init（多运行时模拟多标签页）共享同一 OPFS 根；
+  // 同时挂互斥 Web Locks 模拟（jsdom 无 navigator.locks）——生产路径无
+  // Web Locks 会因第十五轮固化检查禁用 OPFS（create 返回 null）
+  stubOpfsNavigator(new MemDirectoryHandle('root'));
   await OpfsProjectStore.drop(DB);
   await ProjectStore.drop(DB);
 });

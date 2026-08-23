@@ -33,7 +33,7 @@ import type { AutosaveState } from './autosave';
 import { ProjectStore } from './project-store';
 import { OpfsProjectStore } from './project-store-opfs';
 import { estimateStorage, failureMessage, stableStringify } from './project-storage';
-import type { DuplicateOutcome, ProjectStorage, ProjectSummary, SaveOutcome, StorageBackend } from './project-storage';
+import type { DuplicateOutcome, ProjectStorage, ProjectSummary, RemoveIfOutcome, SaveOutcome, StorageBackend } from './project-storage';
 
 export interface PersistenceEventMap extends Record<string, unknown> {
   'save-state': { state: AutosaveState };
@@ -205,17 +205,23 @@ export class ProjectPersistence {
     project: Project,
     name?: string,
   ): Promise<{ ok: true; project: Project } | { ok: false; message: string }> {
-    if (!this.store) return { ok: false, message: '本地持久化不可用' };
-    const copy: Project = {
-      ...structuredClone(project),
-      uri: `lumora://project/${genId('p')}`,
-      name: name ?? `${project.name} 副本`,
-      createdAt: new Date().toISOString(),
-      revision: 0,
-    };
-    const result = await this.store.save(copy, null);
-    if (!result.ok) return { ok: false, message: result.message };
-    return this.verifyCopy(copy.uri, stableStringify(copy));
+    // 第十五轮严重 5：入口级异常归一 —— 克隆/保存/验证的意外 reject 一律返回
+    // 类型化失败，绝不向上抛异常（副本残留由 verifyCopy 的清理如实报告）
+    try {
+      if (!this.store) return { ok: false, message: '本地持久化不可用' };
+      const copy: Project = {
+        ...structuredClone(project),
+        uri: `lumora://project/${genId('p')}`,
+        name: name ?? `${project.name} 副本`,
+        createdAt: new Date().toISOString(),
+        revision: 0,
+      };
+      const result = await this.store.save(copy, null);
+      if (!result.ok) return { ok: false, message: result.message };
+      return this.verifyCopy(copy.uri, stableStringify(copy));
+    } catch (error) {
+      return { ok: false, message: `另存副本失败：${failureMessage(error)}` };
+    }
   }
 
   /**
@@ -265,42 +271,50 @@ export class ProjectPersistence {
    *  打开中的项目以编辑器快照为准（磁盘记录可能落后于未保存变更）；未打开的走存储。
    *  返回副本内容指纹（调用方二次加载失败时的 CAS 清理依据，第十四轮严重 4/5）。 */
   async duplicateProject(uri: string, name?: string): Promise<DuplicateOutcome> {
-    if (!this.store) {
-      return { ok: false, code: 'not-found', message: '本地持久化不可用' };
-    }
-    if (this.currentUri === uri) {
-      const project = this.editor.getProject();
-      if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
-      const copy: Project = {
-        ...structuredClone(project),
-        uri: `lumora://project/${genId('p')}`,
-        name: name ?? `${project.name} 副本`,
-        createdAt: new Date().toISOString(),
-        revision: 0,
-      };
-      const fingerprint = stableStringify(copy);
-      const result = await this.store.save(copy, null);
-      if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
-      // 与 saveSnapshotAsNew 同一验证管道（第十一轮严重 #3 + 第十二轮严重 #5）：
-      // 存储写入成功 ≠ 可打开，验证/清理经异常安全封装（verifyCopy）—— 失败
-      // 或 reject 均清除记录（CAS），副本未产生，调用方不得报成功
-      const verified = await this.verifyCopy(copy.uri, fingerprint);
-      if (!verified.ok) {
-        return { ok: false, code: 'storage-error', message: verified.message };
+    // 第十五轮严重 5：入口级异常归一 —— 克隆/保存/验证/存储复制的意外 reject
+    // 一律返回类型化 storage-error，UI 无需兜底 catch
+    try {
+      if (!this.store) {
+        return { ok: false, code: 'not-found', message: '本地持久化不可用' };
       }
-      return {
-        ok: true,
-        summary: {
-          uri: copy.uri,
-          name: copy.name,
-          savedAt: new Date().toISOString(),
+      if (this.currentUri === uri) {
+        const project = this.editor.getProject();
+        if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
+        const copy: Project = {
+          ...structuredClone(project),
+          uri: `lumora://project/${genId('p')}`,
+          name: name ?? `${project.name} 副本`,
+          createdAt: new Date().toISOString(),
           revision: 0,
-          schemaVersion: copy.schemaVersion,
-        },
-        fingerprint,
-      };
+        };
+        const fingerprint = stableStringify(copy);
+        const result = await this.store.save(copy, null);
+        if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
+        // 与 saveSnapshotAsNew 同一验证管道（第十一轮严重 #3 + 第十二轮严重 #5）：
+        // 存储写入成功 ≠ 可打开，验证/清理经异常安全封装（verifyCopy）—— 失败
+        // 或 reject 均清除记录（CAS），副本未产生，调用方不得报成功
+        const verified = await this.verifyCopy(copy.uri, fingerprint);
+        if (!verified.ok) {
+          return { ok: false, code: 'storage-error', message: verified.message };
+        }
+        return {
+          ok: true,
+          summary: {
+            uri: copy.uri,
+            name: copy.name,
+            savedAt: new Date().toISOString(),
+            revision: 0,
+            schemaVersion: copy.schemaVersion,
+          },
+          fingerprint,
+        };
+      }
+      // await 而非 return promise：store.duplicate 的 reject 必须落在入口
+      // try/catch 内归一为类型化失败（return promise 的 reject 会逃逸出 catch）
+      return await this.store.duplicate(uri, name);
+    } catch (error) {
+      return { ok: false, code: 'storage-error', message: `复制失败：${failureMessage(error)}` };
     }
-    return this.store.duplicate(uri, name);
   }
 
   /**
@@ -365,14 +379,21 @@ export class ProjectPersistence {
     return { ok: true, project: verified.project };
   }
 
-  /** 副本清理的报告后缀（验证失败时移除损坏记录；第十四轮严重 4 CAS）：
-   *  已删除返回空串；记录已变化（另一会话已保存）返回「已保留」提示；存储故障
-   *  返回「记录保留、可手动删除」—— removeIfUnchanged 的失败不掩盖验证失败
-   *  结论，但调用方必须知道记录是否残留。 */
+  /** 副本清理的报告后缀（验证失败时移除损坏记录；第十四轮严重 4 CAS + 第十五轮
+   *  严重 4/一般 7 四态）：已删除（removed）或记录已不存在（missing，清理后置
+   *  条件已满足）返回空串；记录已变化/损坏（changed，另一会话已保存）返回
+   *  「已保留」提示；存储故障返回「记录保留、可手动删除」。removeIfUnchanged 的
+   *  失败与意外 reject（连接关闭/锁失败）都归一为后缀文案，绝不向 UI 抛未处理
+   *  的 Promise —— 不掩盖验证失败结论，但调用方必须知道记录是否残留。 */
   private async reportCopyCleanup(uri: string, expectedFingerprint: string | null): Promise<string> {
     if (!this.store) return '；清理失败，损坏记录保留，可手动删除';
-    const outcome = await this.store.removeIfUnchanged(uri, expectedFingerprint);
-    if (outcome.ok && outcome.removed) return '';
+    let outcome: RemoveIfOutcome;
+    try {
+      outcome = await this.store.removeIfUnchanged(uri, expectedFingerprint);
+    } catch (error) {
+      return `；清理失败，损坏记录保留，可手动删除（${failureMessage(error)}）`;
+    }
+    if (outcome.ok && outcome.outcome !== 'changed') return '';
     if (outcome.ok) return '；副本记录已变化（可能已被其他会话保存），已保留该记录，可手动删除';
     return `；清理失败，损坏记录保留，可手动删除（${outcome.message}）`;
   }
@@ -411,7 +432,13 @@ export class ProjectPersistence {
    * 不再二次触碰源对象，绝不裸抛。
    */
   exportCurrent(
-    options: { includePrivate?: boolean; publicKeysByPlugin?: Record<string, readonly (string | readonly string[])[]> } = {},
+    options: {
+      includePrivate?: boolean;
+      publicKeysByPlugin?: Record<string, readonly (string | readonly string[])[]>;
+      // 第十五轮阻断 1：宿主直读 manifest.privateSettings 原样传入，core 端对
+      // 公开声明与 privateSettings/凭据形态键的重叠逐条拒绝（不依赖插件自觉）
+      privateKeysByPlugin?: Record<string, readonly string[]>;
+    } = {},
   ): ExportResult {
     const project = this.editor.getProject();
     if (!project) return { ok: false, message: '当前没有打开的项目' };
@@ -420,6 +447,7 @@ export class ProjectPersistence {
       pkg = buildProjectPackage(project, {
         includePrivate: options.includePrivate ?? false,
         publicKeysByPlugin: options.publicKeysByPlugin,
+        privateKeysByPlugin: options.privateKeysByPlugin,
       });
     } catch (error) {
       return { ok: false, message: `项目无法导出（构建失败）：${failureMessage(error)}` };

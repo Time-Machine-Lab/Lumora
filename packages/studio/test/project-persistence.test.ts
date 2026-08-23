@@ -518,26 +518,48 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     await runtime.dispose();
   });
 
-  it('exportCurrent 编码预检：数组非索引键（allowlist 放行键内含 pluginData.arr.extra）→ 类型化失败，不产出丢字段的包', async () => {
+  it('exportCurrent 编码预检：数组非索引键（settings 契约字段承载）→ 类型化失败；整对象声明被叶值校验剥离（第十五轮阻断 1）', async () => {
+    // 剥离路径经真实入口：带非索引自有键的数组（JSON.stringify 会静默丢键）作
+    // 整对象声明 —— 字符串声明仅允许叶值，数组整值被剥离 → 包正常导出且不含
+    // 该字段
     const runtime = await makeRuntime();
     const project = runtime.persistence.createProject('不可导出');
-    // allowlist 放行的值内含带非索引自有键的数组（JSON.stringify 会静默丢键）
     const arr = [1, 2] as unknown as Record<string, unknown>;
     arr.extra = 3;
     runtime.openProject({ ...project, pluginData: { 'com.example': { arr: arr as unknown as unknown[] } } } as Project);
     await settle(40);
-    // 已注册插件（显式 allowlist 放行该键）后编码预检对最终投影视图拒绝（第十三轮）
-    const result = await runtime.persistence.exportCurrent({
+    const stripped = await runtime.persistence.exportCurrent({
       includePrivate: true,
       publicKeysByPlugin: { 'com.example': ['arr'] },
     });
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.message).toContain('无法导出');
-    expect(result.message).toContain('array-extra-keys');
-    // 不含私有设置时 pluginData 不进包：导出成功（插件私有数据不污染公开包）
-    expect(runtime.persistence.exportCurrent().ok).toBe(true);
+    expect(stripped.ok).toBe(true);
+    if (!stripped.ok) return;
+    expect(stripped.text).not.toContain('"arr"');
     await runtime.dispose();
+
+    // 契约承载路径（绕过编辑器 schema 校验 —— settings.fps 类型检查在编辑器
+    // 边界拦截坏值，这里直接注入投影视图）：契约字段原样保留 → 编码预检对
+    // 最终投影视图拒绝（第十三轮语义保留）
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, dbName: DB });
+    const spy = vi.spyOn(editor, 'getProject').mockReturnValue({
+      ...createSampleProject('lumora://project/bad', '坏数据'),
+      settings: { fps: arr as unknown as number, aspect: [16, 9] } as unknown as Project['settings'],
+    } as Project);
+    try {
+      const result = persistence.exportCurrent({ includePrivate: true });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.message).toContain('无法导出');
+      expect(result.message).toContain('array-extra-keys');
+      // settings 是项目核心契约（与 includePrivate 无关）：坏值经契约字段进入
+      // 最终投影，两种导出模式都拒绝 —— 不得产出丢字段的包
+      expect(persistence.exportCurrent().ok).toBe(false);
+    } finally {
+      spy.mockRestore();
+      await persistence.dispose();
+    }
   });
 
   it('exportCurrent 根级反射：访问器顶层字段 → 类型化失败，getter 副作用不发生（第十一轮一般 #6）', async () => {
@@ -619,21 +641,42 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     }
   });
 
-  it('exportCurrent 编码预检：循环引用扩展字段（allowlist 放行键内含）→ 类型化失败', async () => {
+  it('exportCurrent 编码预检：循环引用（settings 契约字段承载）→ 类型化失败；整对象声明被叶值校验剥离（第十五轮阻断 1）', async () => {
+    // 剥离路径经真实入口：循环对象作整对象声明 —— trie 投影遇非叶对象即剥离，
+    // 包正常导出且不含该字段
     const runtime = await makeRuntime();
     const project = runtime.persistence.createProject('循环项目');
     const loop: Record<string, unknown> = {};
     loop.self = loop;
     runtime.openProject({ ...project, pluginData: { 'com.example': { loop } } } as Project);
     await settle(40);
-    const result = await runtime.persistence.exportCurrent({
+    const stripped = await runtime.persistence.exportCurrent({
       includePrivate: true,
       publicKeysByPlugin: { 'com.example': ['loop'] },
     });
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.message).toContain('circular-reference');
+    expect(stripped.ok).toBe(true);
+    if (!stripped.ok) return;
+    expect(stripped.text).not.toContain('"loop"');
     await runtime.dispose();
+
+    // 契约承载路径（绕过编辑器 schema 校验直接注入投影视图）：循环引用经契约
+    // 字段原样进入最终投影 → 编码预检拒绝
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, dbName: DB });
+    const spy = vi.spyOn(editor, 'getProject').mockReturnValue({
+      ...createSampleProject('lumora://project/bad', '坏数据'),
+      settings: { fps: loop as unknown as number, aspect: [16, 9] } as unknown as Project['settings'],
+    } as Project);
+    try {
+      const result = persistence.exportCurrent({ includePrivate: true });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.message).toContain('circular-reference');
+    } finally {
+      spy.mockRestore();
+      await persistence.dispose();
+    }
   });
 
   it('exportCurrent 编码预检：BigInt/循环引用位于契约外字段（投影剥离）→ 不阻断导出（第十二轮一般 #10）', async () => {
@@ -762,17 +805,39 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     expect(
       runtime.persistence.exportCurrent({ includePrivate: true, publicKeysByPlugin: { 'com.example': [] } }).ok,
     ).toBe(true);
-    const result = await runtime.persistence.exportCurrent({
+    // 字符串声明仅允许叶值（null/string/number/boolean）：BigInt 非叶值 →
+    // 声明被剥离，包正常导出且不含该字段（第十五轮阻断 1：BigInt 走不了
+    // 投影，编码预检的 bigint 拒绝改由契约字段承载，见下）
+    const stripped = await runtime.persistence.exportCurrent({
       includePrivate: true,
       publicKeysByPlugin: { 'com.example': ['big'] },
     });
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.message).toContain('无法导出');
-    expect(result.message).toContain('bigint-value');
+    expect(stripped.ok).toBe(true);
+    if (!stripped.ok) return;
+    expect(stripped.text).not.toContain('"big"');
     // 不含私有设置时 pluginData 不进包：导出成功
     expect(runtime.persistence.exportCurrent().ok).toBe(true);
     await runtime.dispose();
+
+    // 契约承载路径（绕过编辑器 schema 校验直接注入投影视图）：BigInt 经契约
+    // 字段原样进入最终投影 → 编码预检归一为类型化失败（第九轮 #2 语义保留）
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, dbName: DB });
+    const spy = vi.spyOn(editor, 'getProject').mockReturnValue({
+      ...createSampleProject('lumora://project/big', 'BigInt 项目'),
+      settings: { fps: 9007199254740993n as unknown as number, aspect: [16, 9] } as unknown as Project['settings'],
+    } as Project);
+    try {
+      const result = persistence.exportCurrent({ includePrivate: true });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.message).toContain('无法导出');
+      expect(result.message).toContain('bigint-value');
+    } finally {
+      spy.mockRestore();
+      await persistence.dispose();
+    }
   });
 
   it('导出导入往返 + 键级 allowlist（第十三轮阻断 2）：显式声明的键进包，未声明键（含凭据形态键名）排除', async () => {
@@ -812,27 +877,30 @@ describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出
     expect(rawExport.text).not.toContain('sk-leak-1');
     expect(rawExport.text).not.toContain('client-secret-2');
 
-    // 显式 allowlist：只有声明的键进包，未声明键（含凭据形态键名之外的组合词）排除
+    // 显式 allowlist：只有声明的键进包，未声明键排除；凭据形态键名（apiKey/
+    // clientSecret）的声明本身被拒绝（第十五轮阻断 1）—— 即使显式声明也不得
+    // 进包，绝不出现「插件声明了就放行」的凭据出口
     const exported = runtime.persistence.exportCurrent({
       includePrivate: true,
-      publicKeysByPlugin: { 'com.example': ['apiKey', 'clientSecret'] },
+      publicKeysByPlugin: { 'com.example': ['keyboardLayout', 'monkeyPatch', 'apiKey', 'clientSecret'] },
     });
     expect(exported.ok).toBe(true);
     if (!exported.ok) return;
-    expect(exported.text).toContain('sk-leak-1');
-    expect(exported.text).toContain('client-secret-2');
-    expect(exported.text).not.toContain('kb-intl');
+    expect(exported.text).toContain('kb-intl');
+    expect(exported.text).toContain('"off"');
+    expect(exported.text).not.toContain('sk-leak-1');
+    expect(exported.text).not.toContain('client-secret-2');
 
     const imported = await runtime.persistence.importPackage(exported.text);
     expect(imported.ok).toBe(true);
     if (!imported.ok) return;
     const plugin = (imported.project.pluginData as Record<string, Record<string, string>>)['com.example'];
-    expect(plugin.keyboardLayout).toBeUndefined();
+    expect(plugin.keyboardLayout).toBe('kb-intl');
+    expect(plugin.monkeyPatch).toBe('off');
     expect(plugin.tokenizerConfig).toBeUndefined();
-    expect(plugin.monkeyPatch).toBeUndefined();
     expect(plugin.hotkeyMap).toBeUndefined();
-    expect(plugin.apiKey).toBe('sk-leak-1');
-    expect(plugin.clientSecret).toBe('client-secret-2');
+    expect(plugin.apiKey).toBeUndefined();
+    expect(plugin.clientSecret).toBeUndefined();
 
     // 导入结果可正常打开（往返内容与编辑器不变量兼容）
     runtime.openProject(imported.project);
@@ -924,7 +992,7 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
       settings: { fps: 'bad' } as unknown as Project['settings'],
     };
     const removeIfUnchanged = vi.fn(
-      async (_uri: string, _expectedFingerprint: string | null) => ({ ok: true, removed: true }) as const,
+      async (_uri: string, _expectedFingerprint: string | null) => ({ ok: true, outcome: 'removed' }) as const,
     );
     const store: ProjectStorage = {
       kind: 'indexeddb',
@@ -984,7 +1052,7 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
   it('验证阶段 loadProject reject（load 抛异常）→ 类型化失败并清除副本（第十二轮严重 #5）', async () => {
     const editor = new SceneEditor();
     const removeIfUnchanged = vi.fn(
-      async (_uri: string, _expectedFingerprint: string | null) => ({ ok: true, removed: true }) as const,
+      async (_uri: string, _expectedFingerprint: string | null) => ({ ok: true, outcome: 'removed' }) as const,
     );
     const store: ProjectStorage = {
       kind: 'indexeddb',
@@ -1072,7 +1140,7 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
       settings: { fps: 'bad' } as unknown as Project['settings'],
     };
     const removeIfUnchanged = vi.fn(
-      async (_uri: string, _expectedFingerprint: string | null) => ({ ok: true, removed: false }) as const,
+      async (_uri: string, _expectedFingerprint: string | null) => ({ ok: true, outcome: 'changed' }) as const,
     );
     const store: ProjectStorage = {
       kind: 'indexeddb',
@@ -1112,7 +1180,7 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
   it('loadCopyForOpen：load reject → 类型化失败并 CAS 清理副本，不产生未处理 reject（第十四轮严重 5）', async () => {
     const editor = new SceneEditor();
     const removeIfUnchanged = vi.fn(
-      async (_uri: string, _expectedFingerprint: string | null) => ({ ok: true, removed: true }) as const,
+      async (_uri: string, _expectedFingerprint: string | null) => ({ ok: true, outcome: 'removed' }) as const,
     );
     const store: ProjectStorage = {
       kind: 'indexeddb',
@@ -1141,6 +1209,102 @@ describe('ProjectPersistence：复制路径保存后统一验证与失败清理�
     expect(removeIfUnchanged).toHaveBeenCalledTimes(1);
     expect(removeIfUnchanged).toHaveBeenCalledWith('lumora://project/copy', 'fingerprint-at-create');
     await persistence.dispose();
+  });
+
+  /** 第十五轮严重 5 回归：入口级异常归一专用 store（默认全成功，按需覆盖） */
+  function okStore(overrides: Partial<ProjectStorage> = {}): ProjectStorage {
+    const store: ProjectStorage = {
+      kind: 'indexeddb',
+      list: vi.fn(async () => []),
+      load: vi.fn(async () => null),
+      save: vi.fn(async () => ({ ok: true }) as const),
+      remove: vi.fn(async () => true),
+      removeIfUnchanged: vi.fn(async () => ({ ok: true, outcome: 'removed' }) as const),
+      rename: vi.fn(async () => ({ ok: true }) as const),
+      duplicate: vi.fn(async () => ({ ok: false, code: 'not-found', message: 'not mocked' }) as const),
+      close: vi.fn(),
+    };
+    return { ...store, ...overrides };
+  }
+
+  it('saveSnapshotAsNew：store.save 意外 reject → 类型化「另存副本失败」，绝不向上抛（第十五轮严重 5）', async () => {
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({
+      store: okStore({
+        save: vi.fn(async () => {
+          throw new Error('quota exceeded');
+        }),
+      }),
+    });
+
+    const result = await persistence.saveSnapshotAsNew(
+      createSampleProject('lumora://project/src', '源项目'),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.message).toContain('另存副本失败');
+    expect(result.message).toContain('quota exceeded');
+    await persistence.dispose();
+  });
+
+  it('duplicateProject（当前项目分支）：store.save 意外 reject → 类型化 storage-error（第十五轮严重 5）', async () => {
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    editor.openProject(createSampleProject('lumora://project/open', '打开中项目'));
+    await persistence.init({
+      store: okStore({
+        save: vi.fn(async () => {
+          throw new Error('quota exceeded');
+        }),
+      }),
+    });
+
+    const result = await persistence.duplicateProject('lumora://project/open');
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('storage-error');
+    expect(result.message).toContain('复制失败');
+    expect(result.message).toContain('quota exceeded');
+    await persistence.dispose();
+  });
+
+  it('duplicateProject（存储复制分支）：store.duplicate 意外 reject（源 load 抛错传播）→ 类型化 storage-error（第十五轮严重 5）', async () => {
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({
+      store: okStore({
+        duplicate: vi.fn(async () => {
+          throw new Error('idb transaction aborted');
+        }),
+      }),
+    });
+
+    const result = await persistence.duplicateProject('lumora://project/closed');
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('storage-error');
+    expect(result.message).toContain('复制失败');
+    expect(result.message).toContain('idb transaction aborted');
+    await persistence.dispose();
+  });
+
+  it('dispose 竞态：释放后调用复制入口返回类型化「本地持久化不可用」，不抛异常（第十五轮严重 5）', async () => {
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ store: okStore() });
+    await persistence.dispose();
+
+    const dup = await persistence.duplicateProject('lumora://project/x');
+    expect(dup.ok).toBe(false);
+    if (dup.ok) return;
+    expect(dup.code).toBe('not-found');
+    expect(dup.message).toContain('本地持久化不可用');
+
+    const copy = await persistence.saveSnapshotAsNew(createSampleProject('lumora://project/src', '源项目'));
+    expect(copy.ok).toBe(false);
+    if (copy.ok) return;
+    expect(copy.message).toContain('本地持久化不可用');
   });
 });
 
