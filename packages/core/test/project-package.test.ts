@@ -367,6 +367,101 @@ describe('工程包凭据清除（NFR-008：嵌套扩展数据递归清除）', 
       expect(json, `普通键 ${key} 必须保留`).toContain(`safe-${key}`);
     }
   });
+
+  it('secret 族组合词矩阵（第九轮 #3）：全部敏感族（secret/password/credential/authorization）按同一组合词策略清除，含大小写与 provider 前后缀', async () => {
+    const project = await buildFixtureProject();
+    const stripped: Record<string, string> = {
+      // 无分隔符连续串：单一词，必须由核心词子串覆盖（不再依赖有限枚举）
+      SUPERSECRETVALUE: 'supersecret-1',
+      DBPASSWORDVALUE: 'dbpassword-2',
+      servicecredentialvalue: 'svc-cred-3',
+      OAUTHCLIENTSECRETVALUE: 'oauth-secret-4',
+      // 大小写变体
+      SuperSecretValue: 'supersecret-5',
+      dbPasswordValue: 'dbpassword-6',
+      serviceCredential: 'svc-cred-7',
+      authorizationToken: 'auth-tok-8',
+      // provider 前缀/后缀
+      openaiClientSecret: 'openai-secret-9',
+      clientSecretForAnthropic: 'anthropic-secret-10',
+      databasePassword: 'db-pwd-11',
+      bearerAuthorization: 'bearer-auth-12',
+      xAuthSecret: 'x-auth-13',
+      authPassword: 'auth-pwd-14',
+      credentialsJson: 'creds-15',
+    };
+    const rich = {
+      ...project,
+      pluginData: { 'com.example': { ...stripped, nested: { ...stripped } } },
+    } as Project;
+    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
+    for (const value of Object.values(stripped)) {
+      expect(json, `凭据族值 ${value} 不得进入包`).not.toContain(value);
+    }
+  });
+
+  it('普通插件设置组合词保留（第九轮 #4）：keyboardLayout/tokenizerConfig/monkeyPatch/hotkeyMap 及大小写/分隔符变体不被凭据启发式误删', async () => {
+    const project = await buildFixtureProject();
+    const preserved: Record<string, string> = {
+      keyboardLayout: 'layout-1',
+      tokenizerConfig: 'tokenizer-1',
+      monkeyPatch: 'monkey-1',
+      hotkeyMap: 'hotkey-1',
+      // 大小写/分隔符变体（规范化后同入白名单）
+      KeyboardLayout: 'layout-2',
+      KEYBOARD_LAYOUT: 'layout-3',
+      keyboard_layout: 'layout-4',
+      tokenizer_config: 'tokenizer-2',
+      TOKENIZER_CONFIG: 'tokenizer-3',
+      MonkeyPatch: 'monkey-2',
+      monkey_patch: 'monkey-3',
+      HotkeyMap: 'hotkey-2',
+      HOTKEY_MAP: 'hotkey-3',
+      hotkey_map: 'hotkey-4',
+    };
+    const rich = { ...project, pluginData: { 'com.example': preserved } } as Project;
+    const json = JSON.stringify(buildProjectPackage(rich, { includePrivate: true }));
+    for (const value of Object.values(preserved)) {
+      expect(json, `普通设置值 ${value} 必须保留`).toContain(value);
+    }
+  });
+
+  it('导出导入往返回归（第九轮 #4）：benign 组合词随包往返保留，敏感族不进入包', async () => {
+    const project = await buildFixtureProject();
+    const rich = {
+      ...project,
+      pluginData: {
+        'com.example': {
+          keyboardLayout: 'kb-intl',
+          tokenizerConfig: 'cl100k-base',
+          monkeyPatch: 'off',
+          hotkeyMap: 'default',
+          shortcutKey: 'Ctrl+K',
+          apiKey: 'sk-leak-1',
+          accessToken: 'tok-leak-2',
+          clientSecret: 'client-secret-3',
+        },
+      },
+    } as Project;
+    const pkg = buildProjectPackage(rich, { includePrivate: true });
+    const text = serializeProjectPackage(pkg);
+    const parsed = await parseProjectPackage(text);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, Record<string, string>>)['com.example'];
+    expect(plugin.keyboardLayout).toBe('kb-intl');
+    expect(plugin.tokenizerConfig).toBe('cl100k-base');
+    expect(plugin.monkeyPatch).toBe('off');
+    expect(plugin.hotkeyMap).toBe('default');
+    expect(plugin.shortcutKey).toBe('Ctrl+K');
+    expect(plugin.apiKey).toBeUndefined();
+    expect(plugin.accessToken).toBeUndefined();
+    expect(plugin.clientSecret).toBeUndefined();
+    const json = JSON.stringify(parsed.project);
+    expect(json).not.toContain('sk-leak-1');
+    expect(json).not.toContain('tok-leak-2');
+    expect(json).not.toContain('client-secret-3');
+  });
 });
 
 describe('parseProjectPackage：导出 → 导入 完整恢复（AC1）', () => {

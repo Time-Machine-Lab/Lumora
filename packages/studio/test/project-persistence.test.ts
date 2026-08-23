@@ -607,3 +607,92 @@ describe('ProjectPersistence：图结构损坏与导出编码预检（第六轮 
     await persistence.dispose();
   });
 });
+
+describe('ProjectPersistence：第九轮 #1/#2/#4 回归（切换广播、导出预检先于克隆、往返回归）', () => {
+  it('reloadOpenProject 的最终切换只广播一次 save-state —— 序列无中间态（第九轮 #1）', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('重载项目');
+    runtime.openProject(project);
+    runtime.editor.addObject(createGroupObject());
+    await settle(60); // rev1 已存
+
+    const states: string[] = [];
+    runtime.persistence.events.on('save-state', ({ state }) => states.push(state.status));
+    const reloaded = await runtime.persistence.reloadOpenProject();
+    expect(reloaded.ok).toBe(true);
+    // 切换期间 resetTo/编辑器事件分发产生的中间态全部被广播守卫吸收：
+    // 监听器只收到分发返回后按最新编辑器状态发布的唯一一次最终态
+    expect(states).toEqual(['clean']);
+    expect(runtime.editor.getProject()!.revision).toBe(1);
+    await runtime.dispose();
+  });
+
+  it('exportCurrent 真实入口：非纯对象（Date）在开时被编辑器拒绝；BigInt 由导出预检先于构建归一为类型化失败（第九轮 #2）', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('不可导出');
+    // 非纯对象（Date）：编辑器开时 JSON 纯结构校验直接拒绝 —— 这类值根本到不了
+    // 导出路径（exportCurrent 的预检在编辑器保证之上兜底，防御纵深）
+    await expect(
+      runtime.openProject({ ...project, pluginData: { 'com.example': { at: new Date() } } } as Project),
+    ).rejects.toThrow(/JSON 结构/);
+
+    // BigInt 是原始值：通过编辑器开时校验进入项目，但 JSON.stringify 会抛
+    // TypeError —— 修复前 exportCurrent 在序列化阶段裸抛异常（调用方拿到崩溃而
+    // 非类型化失败）；修复后反射预检先于构建在原始导出字段上拒绝
+    const opened = await runtime.openProject({
+      ...project,
+      pluginData: { 'com.example': { big: 9007199254740993n } },
+    } as Project);
+    expect(opened.ok).toBe(true);
+    const result = await runtime.persistence.exportCurrent({ includePrivate: true });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.message).toContain('无法导出');
+    expect(result.message).toContain('bigint-value');
+    // 不含私有设置时 pluginData 不进包：导出成功
+    expect(runtime.persistence.exportCurrent().ok).toBe(true);
+    await runtime.dispose();
+  });
+
+  it('导出导入往返回归（第九轮 #4）：benign 组合词设置随包往返保留，凭据族不进入包', async () => {
+    const runtime = await makeRuntime();
+    const project = runtime.persistence.createProject('往返回归');
+    runtime.openProject({
+      ...project,
+      pluginData: {
+        'com.example': {
+          keyboardLayout: 'kb-intl',
+          tokenizerConfig: 'cl100k-base',
+          monkeyPatch: 'off',
+          hotkeyMap: 'default',
+          apiKey: 'sk-leak-1',
+          clientSecret: 'client-secret-2',
+        },
+      },
+    } as Project);
+    await settle(40);
+
+    const exported = runtime.persistence.exportCurrent({ includePrivate: true });
+    expect(exported.ok).toBe(true);
+    if (!exported.ok) return;
+    expect(exported.text).not.toContain('sk-leak-1');
+    expect(exported.text).not.toContain('client-secret-2');
+
+    const imported = await runtime.persistence.importPackage(exported.text);
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    const plugin = (imported.project.pluginData as Record<string, Record<string, string>>)['com.example'];
+    expect(plugin.keyboardLayout).toBe('kb-intl');
+    expect(plugin.tokenizerConfig).toBe('cl100k-base');
+    expect(plugin.monkeyPatch).toBe('off');
+    expect(plugin.hotkeyMap).toBe('default');
+    expect(plugin.apiKey).toBeUndefined();
+    expect(plugin.clientSecret).toBeUndefined();
+
+    // 导入结果可正常打开（往返内容与编辑器不变量兼容）
+    runtime.openProject(imported.project);
+    await settle(40);
+    expect(runtime.editor.getProject()!.name).toBe('往返回归');
+    await runtime.dispose();
+  });
+});

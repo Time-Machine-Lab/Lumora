@@ -446,27 +446,53 @@ describe('JSON 编码契约三路共享矩阵（第七轮 #4：IDB / OPFS / 导�
 });
 
 describe('save 同步不可变快照（第八轮 #1）：保存挂起期间改写入参不改变落盘内容', () => {
-  it('IDB：首个 await 后改写入参 uri —— CAS 与写入都按入口快照（落盘目标不被改写）', async () => {
+  it('IDB：保存挂起期间改写入参 uri —— CAS 与写入都按入口快照（落盘目标不被改写）', async () => {
     const store = await ProjectStore.create(DB);
     if (!store) return;
     const p = project('lumora://project/a', '快照测试', 0);
-    let reads = 0;
-    // 读一次返回 a、之后返回 b：模拟「预检/首读后调用方把 uri 改成另一个项目」——
-    // 修复前 save 在 await 后再次读 project.uri 写入 b（跨项目静默覆盖）；
-    // 修复后入口同步快照固定为 a（结构化克隆只读一次）
-    Object.defineProperty(p, 'uri', {
-      configurable: true,
-      enumerable: true,
-      get() {
-        reads += 1;
-        return reads === 1 ? 'lumora://project/a' : 'lumora://project/b';
-      },
+    const realSave = store.save.bind(store);
+    vi.spyOn(store, 'save').mockImplementation(async (incoming, expected) => {
+      // 真实 save 已同步完成预检与快照生成（首个 await 前）；此刻改写入参
+      // uri —— 后续 CAS/写入必须仍按入口快照（a），不得写成 b（跨项目覆盖）
+      const promise = realSave(incoming, expected);
+      incoming.uri = 'lumora://project/b';
+      return promise;
     });
     const result = await store.save(p, null);
     expect(result.ok).toBe(true);
     expect(await store.load('lumora://project/a')).not.toBeNull();
     expect(await store.load('lumora://project/b')).toBeNull();
+    vi.mocked(store.save).mockRestore();
     store.close();
+  });
+
+  it('IDB：访问器属性项目 —— 反射预检先于克隆拒绝（第九轮 #2：先克隆再检查会物化访问器，检查形同虚设）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    try {
+      const p = project('lumora://project/a', '快照测试', 0);
+      let reads = 0;
+      Object.defineProperty(p, 'uri', {
+        configurable: true,
+        enumerable: true,
+        get() {
+          reads += 1;
+          return reads === 1 ? 'lumora://project/a' : 'lumora://project/b';
+        },
+      });
+      // 反射级预检先于任何克隆：访问器（JSON.stringify 会调用 getter、结构化克隆
+      // 会物化）直接拒绝 —— 绝不静默落盘 getter 物化结果（原第八轮 #1 的
+      // 「读一次固定」语义被第九轮 #2 的访问器拒绝语义取代）
+      const result = await store.save(p, null);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.code).toBe('storage-error');
+      expect(result.message).toContain('accessor-property');
+      expect(await store.load('lumora://project/a')).toBeNull();
+      expect(await store.load('lumora://project/b')).toBeNull();
+    } finally {
+      store.close();
+    }
   });
 
   it('IDB：保存挂起期间注入不可编码值 —— 落盘内容与入口一致（不产生两后端失真的记录）', async () => {
@@ -490,6 +516,53 @@ describe('save 同步不可变快照（第八轮 #1）：保存挂起期间改�
     expect('extra' in loaded!).toBe(false);
     store.close();
   });
+});
+
+describe('反射预检先于克隆（第九轮 #2）：结构化克隆会删除/物化这些结构，克隆后再检查形同虚设', () => {
+  const SHAPES: Array<{ name: string; problem: string; tamper: (p: Project) => void }> = [
+    {
+      name: 'Symbol 键',
+      problem: 'symbol-key',
+      tamper: (p) => {
+        (p as unknown as Record<symbol, unknown>)[Symbol('私有')] = '仅 Symbol 可见';
+      },
+    },
+    {
+      name: '不可枚举属性',
+      problem: 'non-enumerable-property',
+      tamper: (p) => {
+        Object.defineProperty(p, 'hiddenField', { value: '不可枚举', enumerable: false });
+      },
+    },
+    {
+      name: '非纯对象（Date 实例）',
+      problem: 'non-plain-object',
+      tamper: (p) => {
+        (p.settings as Record<string, unknown>).expiresAt = new Date('2030-01-01T00:00:00Z');
+      },
+    },
+  ];
+
+  for (const shape of SHAPES) {
+    it(`IDB：${shape.name} —— save 拒绝且不落盘（修复前被克隆删除/物化，IDB 重载后字段丢失而 save 仍报成功）`, async () => {
+      const store = await ProjectStore.create(DB);
+      if (!store) return;
+      try {
+        const p = project('lumora://project/a', '预检测试', 0);
+        shape.tamper(p);
+        const result = await store.save(p, null);
+        expect(result.ok).toBe(false);
+        if (result.ok) return;
+        expect(result.code).toBe('storage-error');
+        expect(result.message).toContain(shape.problem);
+        // 预检在任何克隆/事务之前：拒绝后无任何记录写入
+        expect(await store.load('lumora://project/a')).toBeNull();
+        expect(await store.list()).toEqual([]);
+      } finally {
+        store.close();
+      }
+    });
+  }
 });
 
 describe('未打开项目的写前变更管道（第八轮 #4）：未来 schema 拒绝写前变更', () => {
@@ -536,6 +609,66 @@ describe('未打开项目的写前变更管道（第八轮 #4）：未来 schema
     }
     // 副本已被清理：只剩源项目
     expect((await store.list()).map((s) => s.uri)).toEqual(['lumora://project/a']);
+    store.close();
+  });
+
+  it('duplicate：验证读取抛错（load reject）→ 清理副本并如实报错，绝不遗留半成品复制（第九轮 #5）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    await store.save(project('lumora://project/a', '源项目', 1));
+    const realLoad = store.load.bind(store);
+    let loadCount = 0;
+    let copyUri: string | null = null;
+    vi.spyOn(store, 'load').mockImplementation(async (uri) => {
+      loadCount += 1;
+      if (loadCount === 2) {
+        copyUri = uri;
+        throw new Error('读取验证失败');
+      }
+      return realLoad(uri);
+    });
+    const result = await store.duplicate('lumora://project/a');
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe('storage-error');
+      expect(result.message).toContain('复制成功但副本无法加载验证');
+      expect(result.message).toContain('已清理'); // 清理成功才声称「已清理」
+    }
+    vi.mocked(store.load).mockRestore();
+    expect(copyUri).not.toBeNull();
+    expect(await store.load(copyUri!)).toBeNull(); // 半成品副本确实被删除
+    expect((await store.list()).map((s) => s.uri)).toEqual(['lumora://project/a']);
+    store.close();
+  });
+
+  it('duplicate：副本清理 remove 抛错 —— 如实说明清理失败与副本保留，绝不掩盖（第九轮 #5）', async () => {
+    const store = await ProjectStore.create(DB);
+    if (!store) return;
+    await store.save(project('lumora://project/a', '源项目', 1));
+    const realLoad = store.load.bind(store);
+    let loadCount = 0;
+    let copyUri: string | null = null;
+    vi.spyOn(store, 'load').mockImplementation(async (uri) => {
+      loadCount += 1;
+      if (loadCount === 2) {
+        copyUri = uri;
+        return null; // 校验失败路径进入清理
+      }
+      return realLoad(uri);
+    });
+    vi.spyOn(store, 'remove').mockRejectedValue(new Error('删除事务中止'));
+    const result = await store.duplicate('lumora://project/a');
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe('storage-error');
+      expect(result.message).toContain('副本清理失败');
+      expect(result.message).toContain('副本记录保留');
+      expect(result.message).not.toContain('已清理');
+    }
+    vi.mocked(store.remove).mockRestore();
+    vi.mocked(store.load).mockRestore();
+    expect(copyUri).not.toBeNull();
+    expect(await store.load(copyUri!)).not.toBeNull(); // 清理失败：副本记录确实保留
     store.close();
   });
 });

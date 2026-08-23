@@ -224,8 +224,21 @@ export class OpfsProjectStore implements ProjectStorage {
    * 提交边界 = writable.close()（落盘）。
    */
   async save(project: Project, expectedStoredRevision?: number | null): Promise<SaveOutcome> {
+    // 反射级 JSON 预检必须先于任何克隆（第九轮 #2，PM 复核属实）：structuredClone
+    // 会删除 Symbol 键与不可枚举属性、物化访问器 —— 先克隆再检查，原输入中的
+    // 这些结构在克隆结果里已不可见，检查形同虚设：OPFS 文件重载后字段静默丢失
+    // 而 save 仍返回 { ok: true }。预检作用于原输入本身（getter 属性经描述符
+    // 判定为 accessor-property 即拒绝，不会触发 getter 副作用），随后才克隆。
+    const encodingProblem = findJsonEncodingProblem(project);
+    if (encodingProblem) {
+      return {
+        ok: false,
+        code: 'storage-error',
+        message: `项目包含无法本地保存的数据（${encodingProblem}），保存被拒绝`,
+      };
+    }
     // 首个 await 前同步生成唯一不可变快照（第八轮 #1）：调用方可在保存挂起期间
-    // 任意改写入参 project（如改 uri），后续 URI/预检/CAS/指纹/写入全部只读该
+    // 任意改写入参 project（如改 uri），后续 URI/CAS/指纹/写入全部只读该
     // 快照 —— 杜绝「CAS 按 A 查询、写入按 A'」的静默跨项目覆盖。
     // 结构化克隆抛错（DataCloneError/输入 getter 副作用）归一为类型化失败。
     let snapshot: Project;
@@ -236,17 +249,6 @@ export class OpfsProjectStore implements ProjectStorage {
         ok: false,
         code: 'storage-error',
         message: `项目无法本地保存（不可结构化克隆）：${failureMessage(error)}`,
-      };
-    }
-    // 写入前 JSON 可编码性预检：与 IndexedDB 后端契约一致（第五轮 #8）——
-    // OPFS 以 JSON 文本落盘，循环引用/BigInt 会抛错、undefined/非有限数值会静默
-    // 失真；两后端对同一数据必须有一致的接受/拒绝语义
-    const encodingProblem = findJsonEncodingProblem(snapshot);
-    if (encodingProblem) {
-      return {
-        ok: false,
-        code: 'storage-error',
-        message: `项目包含无法本地保存的数据（${encodingProblem}），保存被拒绝`,
       };
     }
     return this.withLock(async () => {
@@ -355,7 +357,9 @@ export class OpfsProjectStore implements ProjectStorage {
   }
 
   /** 复制项目：新 uri + 名称（缺省「原名 副本」）+ 重置 revision/createdAt；语义与
-   *  ProjectStore 一致（写前迁移/校验 + 复制后加载验证，第八轮 #4）。 */
+   *  ProjectStore 一致（写前迁移/校验 + 复制后加载验证，第八轮 #4）。
+   *  复制后验证/清理纳入异常安全类型化流程（第九轮 #5）：验证读取抛错、清理
+   *  remove 抛错都如实返回，绝不遗留「半成品副本」假象。 */
   async duplicate(uri: string, name?: string): Promise<DuplicateOutcome> {
     const project = await this.load(uri);
     if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
@@ -371,10 +375,22 @@ export class OpfsProjectStore implements ProjectStorage {
     };
     const result = await this.save(copy, null);
     if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
-    const loaded = await this.load(copy.uri);
+    let loaded: Project | null;
+    try {
+      loaded = await this.load(copy.uri);
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'storage-error',
+        message: `复制成功但副本无法加载验证（${failureMessage(error)}），${await this.cleanupCopy(copy.uri)}`,
+      };
+    }
     if (!loaded || validateProjectSchema(loaded) || validateProjectStructure(loaded)) {
-      await this.remove(copy.uri);
-      return { ok: false, code: 'storage-error', message: '复制成功但副本无法加载，已清理并取消复制' };
+      return {
+        ok: false,
+        code: 'storage-error',
+        message: `复制成功但副本无法通过加载校验，${await this.cleanupCopy(copy.uri)}`,
+      };
     }
     return {
       ok: true,
@@ -386,6 +402,17 @@ export class OpfsProjectStore implements ProjectStorage {
         schemaVersion: copy.schemaVersion,
       },
     };
+  }
+
+  /** 清理复制失败留下的副本：仅在 remove 成功后声称「已清理」；任何失败如实
+   *  说明副本保留（可手动删除），绝不掩盖清理失败（第九轮 #5）。 */
+  private async cleanupCopy(uri: string): Promise<string> {
+    try {
+      await this.remove(uri);
+      return '已清理并取消复制';
+    } catch (error) {
+      return `副本清理失败（${failureMessage(error)}），副本记录保留，可手动删除`;
+    }
   }
 
   /** 关闭连接（幂等；OPFS 无连接语义，应用卸载前调用以对齐接口）。 */

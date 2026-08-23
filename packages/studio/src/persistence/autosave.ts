@@ -109,6 +109,16 @@ export class ProjectAutosaver {
   private disposed = false;
   /** 会话代：open/close/resetTo 递增；异步续体据此识别过期任务并丢弃其结果 */
   private session = 0;
+  /** 状态广播临界区深度（第九轮 #1）：switchOpen 的 resetTo + editor.openProject
+   *  整轮事件分发期间 emit 一律丢弃（代际失效）—— 编辑器提交可能在分发中嵌套
+   *  触发 close/open（重入），中间态（idle/clean/dirty 抖动）不得外泄；临界区
+   *  结束后由 switchOpen 以最新编辑器状态统一发布一次最终态 */
+  private broadcastGuard = 0;
+  /** 状态广播代际（第九轮 #1）：emit 分发期间监听器回调可能同步提交编辑，
+   *  嵌套触发新的 emit —— 外层正在分发的状态此时已陈旧（新状态已先送达部分
+   *  监听器）。每轮分发开启新代际，每次回调后复验：代际已变（发生过嵌套发布）
+   *  立即终止本轮分发，绝不让陈旧状态在更新状态之后送达其余监听器 */
+  private broadcastEpoch = 0;
   /** 锁存错误（revision 冲突 / 恢复快照待处理）：编辑不得自行转 dirty 隐藏解决入口 */
   private latched: LatchedError | null = null;
   /** 切换/关闭时保存失败被保留的旧项目快照（按 uri），重新打开时明示可恢复 */
@@ -247,13 +257,15 @@ export class ProjectAutosaver {
   }
 
   /**
-   * 原子切换（第八轮 #5）：autosaver 状态重置与编辑器提交合并为不向外广播的
-   * 原子操作 —— resetTo 不 emit，编辑器 openProject 完成后由 project:changed 链
-   * （persistence 监听 → changed()）按新基线判定净/脏后广播一次；监听器在
-   * save-state 回调中同步提交编辑时走正常 dirty 路径（此时切换已完成，不再有
-   * 「后续 openProject 覆盖新编辑」的窗口）。
+   * 原子切换（第八轮 #5 + 第九轮 #1）：autosaver 状态重置与编辑器提交合并为
+   * 不向外广播的原子操作 —— resetTo 不 emit，editor.openProject 的整轮事件分发
+   * 期间所有状态广播被广播守卫（broadcastGuard）丢弃（代际失效），分发返回后
+   * 以最新编辑器状态统一发布一次最终态；监听器不会看到「基线已换但编辑器未切」
+   * 或「切换过程抖动」的任何中间态，在 save-state 回调中同步提交的编辑也只会
+   * 落在已切换完成的内容上（正常 dirty 路径，不再有「后续 openProject 覆盖
+   * 新编辑」的窗口）。
    * 编辑器提交失败时回滚 autosaver 状态并上抛（防御：传入项目已通过存储校验
-   * 与结构化克隆，正常不会抛错）。
+   * 与结构化克隆，正常不会抛错）；失败路径同样零广播，由调用方返回类型化失败。
    */
   switchOpen(project: Project): void {
     const prevUri = this.currentUri;
@@ -266,9 +278,11 @@ export class ProjectAutosaver {
     const prevRecovery = this.recovery.get(project.uri);
     const prevRecoveryHas = this.recovery.has(project.uri);
     this.resetTo(project);
+    this.broadcastGuard += 1;
     try {
       this.editor.openProject(project);
     } catch (error) {
+      this.broadcastGuard -= 1;
       this.currentUri = prevUri;
       this.pending = prevPending;
       this.saveQueued = prevQueued;
@@ -279,6 +293,21 @@ export class ProjectAutosaver {
       if (prevRecoveryHas) this.recovery.set(project.uri, prevRecovery!);
       else this.recovery.delete(project.uri);
       throw error;
+    }
+    this.broadcastGuard -= 1;
+    // 临界区结束：以最新编辑器状态统一发布一次最终态（期间被守卫吸收的
+    // changed() 链已维护 pending/定时器，此处只补最后一次状态广播）
+    const current = this.editor.getProject();
+    if (current && current.uri === this.currentUri) {
+      if (this.latched && this.latched.uri === current.uri) {
+        this.emit({ status: 'error', code: this.latched.code, message: this.latched.message });
+      } else if (this.isUnsaved(current)) {
+        this.emit({ status: 'dirty' });
+      } else {
+        this.emit(this.store ? { status: 'clean' } : { status: 'memory' });
+      }
+    } else {
+      this.emit({ status: 'idle' });
     }
   }
 
@@ -689,6 +718,16 @@ export class ProjectAutosaver {
   }
 
   private emit(state: AutosaveState): void {
-    for (const listener of [...this.stateListeners]) listener(state);
+    // 切换临界区内一律丢弃（代际失效）：最终态由 switchOpen 在分发返回后统一发布
+    if (this.broadcastGuard > 0) return;
+    // 嵌套发布终止旧代际（第九轮 #1）：分发中监听器同步提交编辑会嵌套触发新的
+    // emit —— 每轮回调后复验代际，发生过嵌套发布立即终止本轮，陈旧状态不得在
+    // 更新状态之后送达其余监听器
+    this.broadcastEpoch += 1;
+    const epoch = this.broadcastEpoch;
+    for (const listener of [...this.stateListeners]) {
+      if (epoch !== this.broadcastEpoch) return;
+      listener(state);
+    }
   }
 }

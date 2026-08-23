@@ -110,6 +110,7 @@ export type {
   ProjectMigrationErrorKind,
 } from './project/migrate';
 export {
+  PUBLIC_PROJECT_FIELDS,
   buildProjectPackage,
   estimatePackageBytes,
   MAX_PACKAGE_TEXT_BYTES,

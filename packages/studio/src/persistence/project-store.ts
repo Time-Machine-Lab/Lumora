@@ -129,8 +129,21 @@ export class ProjectStore implements ProjectStorage {
    * 读-比-写与提交在同一 readwrite 事务内，且以事务 complete 为完成边界。
    */
   async save(project: Project, expectedStoredRevision?: number | null): Promise<SaveOutcome> {
+    // 反射级 JSON 预检必须先于任何克隆（第九轮 #2，PM 复核属实）：structuredClone
+    // 会删除 Symbol 键与不可枚举属性、物化访问器 —— 先克隆再检查，原输入中的
+    // 这些结构在克隆结果里已不可见，检查形同虚设：IDB 重载后字段静默丢失而
+    // save 仍返回 { ok: true }。预检作用于原输入本身（getter 属性经描述符
+    // 判定为 accessor-property 即拒绝，不会触发 getter 副作用），随后才克隆。
+    const encodingProblem = findJsonEncodingProblem(project);
+    if (encodingProblem) {
+      return {
+        ok: false,
+        code: 'storage-error',
+        message: `项目包含无法本地保存的数据（${encodingProblem}），保存被拒绝`,
+      };
+    }
     // 首个 await 前同步生成唯一不可变快照（第八轮 #1）：调用方可在保存挂起期间
-    // 任意改写入参 project（如改 uri），后续 URI/预检/CAS/指纹/写入全部只读该
+    // 任意改写入参 project（如改 uri），后续 URI/CAS/指纹/写入全部只读该
     // 快照 —— 杜绝「CAS 按 A 查询、写入按 A'」的静默跨项目覆盖。
     // 结构化克隆抛错（DataCloneError/输入 getter 副作用）归一为类型化失败。
     let snapshot: Project;
@@ -141,17 +154,6 @@ export class ProjectStore implements ProjectStorage {
         ok: false,
         code: 'storage-error',
         message: `项目无法本地保存（不可结构化克隆）：${failureMessage(error)}`,
-      };
-    }
-    // 事务前 JSON 可编码性预检：与 OPFS 后端（JSON 文件）契约一致 —— 循环引用/
-    // BigInt 会让 JSON 序列化抛错、undefined/非有限数值会静默丢字段或失真，
-    // IndexedDB 的 structuredClone 却能原样保存 → 两后端落盘内容不一致（第五轮 #8）
-    const encodingProblem = findJsonEncodingProblem(snapshot);
-    if (encodingProblem) {
-      return {
-        ok: false,
-        code: 'storage-error',
-        message: `项目包含无法本地保存的数据（${encodingProblem}），保存被拒绝`,
       };
     }
     const transaction = this.db.transaction(PROJECTS_STORE, 'readwrite');
@@ -230,13 +232,16 @@ export class ProjectStore implements ProjectStorage {
     }
   }
 
-  /** 删除项目；返回是否真的存在并删除。 */
+  /** 删除项目；返回是否真的存在并删除。以事务提交为删除完成边界（第九轮 #5）：
+   *  请求成功 ≠ 事务已提交 —— 调用方（复制清理）仅在事务提交后才有权声称
+   *  「已清理」；事务中止/出错时如实拒绝（抛错），绝不在删除未落定时报成功。 */
   async remove(uri: string): Promise<boolean> {
     const transaction = this.db.transaction(PROJECTS_STORE, 'readwrite');
     const store = transaction.objectStore(PROJECTS_STORE);
     const existing = await request(store.get(uri) as IDBRequest<StoredProject | undefined>);
     if (!existing) return false;
     await request(store.delete(uri) as IDBRequest<undefined>);
+    await transactionDone(transaction);
     return true;
   }
 
@@ -256,7 +261,9 @@ export class ProjectStore implements ProjectStorage {
 
   /** 复制项目：新 uri + 名称（缺省「原名 副本」）+ 重置 revision/createdAt。
    *  写前先迁移/校验（第八轮 #4）；新 uri 首存走创建语义（null），防与并发创建的碰撞；
-   *  保存成功后验证副本可加载，失败清理副本并报错（不留下不可用的半成品复制）。 */
+   *  保存成功后验证副本可加载，失败清理副本并报错（不留下不可用的半成品复制）。
+   *  复制后验证/清理纳入异常安全类型化流程（第九轮 #5）：验证读取抛错、清理
+   *  remove 抛错或删除事务中止都如实返回，绝不遗留「半成品副本」假象。 */
   async duplicate(uri: string, name?: string): Promise<DuplicateOutcome> {
     const project = await this.load(uri);
     if (!project) return { ok: false, code: 'not-found', message: '项目不存在' };
@@ -272,10 +279,22 @@ export class ProjectStore implements ProjectStorage {
     };
     const result = await this.save(copy, null);
     if (!result.ok) return { ok: false, code: 'storage-error', message: result.message };
-    const loaded = await this.load(copy.uri);
+    let loaded: Project | null;
+    try {
+      loaded = await this.load(copy.uri);
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'storage-error',
+        message: `复制成功但副本无法加载验证（${failureMessage(error)}），${await this.cleanupCopy(copy.uri)}`,
+      };
+    }
     if (!loaded || validateProjectSchema(loaded) || validateProjectStructure(loaded)) {
-      await this.remove(copy.uri);
-      return { ok: false, code: 'storage-error', message: '复制成功但副本无法加载，已清理并取消复制' };
+      return {
+        ok: false,
+        code: 'storage-error',
+        message: `复制成功但副本无法通过加载校验，${await this.cleanupCopy(copy.uri)}`,
+      };
     }
     return {
       ok: true,
@@ -287,6 +306,17 @@ export class ProjectStore implements ProjectStorage {
         schemaVersion: copy.schemaVersion,
       },
     };
+  }
+
+  /** 清理复制失败留下的副本：仅在 remove 成功（删除事务已提交）后声称「已清理」；
+   *  任何失败如实说明副本保留（可手动删除），绝不掩盖清理失败（第九轮 #5）。 */
+  private async cleanupCopy(uri: string): Promise<string> {
+    try {
+      await this.remove(uri);
+      return '已清理并取消复制';
+    } catch (error) {
+      return `副本清理失败（${failureMessage(error)}），副本记录保留，可手动删除`;
+    }
   }
 
   /** 关闭连接（幂等；应用卸载前调用）。 */

@@ -1020,3 +1020,91 @@ describe('ProjectAutosaver：首存失败 flush 诚实 / 分叉检测（TML-53 �
     autosaver.dispose();
   });
 });
+
+describe('ProjectAutosaver：切换广播守卫与代际失效（第九轮 #1 阻断回归）', () => {
+  it('switchOpen 整轮切换只广播一次最终态 —— save-state 序列无中间态', async () => {
+    const { editor, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    editor.openProject(createSampleProject(A, '项目A'));
+    await settle(60); // 基线落盘
+
+    // 切换中编辑器 openProject 的整轮事件分发会触发 changed() 链（pending 更新、
+    // 定时器）—— 修复前 resetTo 与分发期间的中间态泄漏到监听器（dirty/clean
+    // 抖动、基线已换但编辑器未切的错位状态）；修复后广播守卫吸收全部中间态，
+    // 分发返回后以最新编辑器状态统一发布一次最终态
+    const seq: AutosaveState[] = [];
+    autosaver.onState((s) => seq.push(s));
+    const B = createSampleProject('lumora://project/b', '项目B');
+    autosaver.switchOpen(B);
+
+    expect(seq.length).toBe(1);
+    expect(seq[0].status).toBe('clean');
+    expect(editor.getProject()?.uri).toBe('lumora://project/b');
+    autosaver.dispose();
+  });
+
+  it('switchOpen 编辑器提交失败 —— 零广播、autosaver 状态回滚、异常上抛', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(60);
+
+    // 结构校验失败（activeSceneId 指向不存在的场景）→ openProject 原子失败：
+    // 修复前 resetTo 已先执行，失败后 autosaver 与编辑器状态错位（基线换到 B、
+    // 编辑器仍是 A，后续保存按 B 的基线 CAS 全部失败）；修复后整轮回滚并上抛
+    const broken = createSampleProject('lumora://project/b', '项目B');
+    (broken as { activeSceneId: string }).activeSceneId = '不存在的场景';
+
+    const seq: AutosaveState[] = [];
+    autosaver.onState((s) => seq.push(s));
+    expect(() => autosaver.switchOpen(broken)).toThrow();
+    expect(seq).toEqual([]); // 失败路径零广播
+    expect(editor.getProject()?.uri).toBe(A); // 编辑器保持原项目
+    expect(autosaver.getRecovery('lumora://project/b')).toBeNull();
+
+    // 回滚后自动保存照常工作：新编辑按 A 的原基线落盘（rev1）
+    editor.addObject(createGroupObject());
+    await settle(60);
+    const stored = await store.load(A);
+    expect(stored!.revision).toBe(1);
+    expect(stored!.objects.length).toBe(base.objects.length + 1);
+    autosaver.dispose();
+  });
+
+  it('双状态监听器同步重入 —— 陈旧分发终止，监听器不再收到倒置状态', async () => {
+    const { editor, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const base = createSampleProject(A, '项目A');
+    editor.openProject(base);
+    await settle(60); // 基线落盘
+
+    // 监听器 1 在最终 clean 广播中同步提交编辑（嵌套 dirty 分发立即开始）；
+    // 修复前外层分发不终止 —— 监听器 2 在嵌套 dirty 之后仍收到陈旧的 clean
+    // （倒置序列 dirty → clean）；修复后代际失效终止外层分发，监听器 2 只看到
+    // 嵌套的最新状态，陈旧 clean 永不送达
+    const seq2: AutosaveState[] = [];
+    let reentered = false;
+    autosaver.onState((s) => {
+      if (s.status === 'clean' && !reentered) {
+        reentered = true;
+        editor.addObject(createGroupObject());
+      }
+    });
+    autosaver.onState((s) => seq2.push(s));
+
+    editor.addObject(createGroupObject()); // 触发一次保存 → 完成后广播 clean
+    await settle(120);
+    expect(reentered).toBe(true);
+
+    // 监听器 2 序列中不得出现 dirty 紧随其后的陈旧 clean（倒置）；
+    // 合法落盘序列为 dirty → saving → clean，clean 后无再起的 dirty
+    const statuses = seq2.map((s) => s.status);
+    for (let i = 0; i < statuses.length - 1; i += 1) {
+      expect([statuses[i], statuses[i + 1]]).not.toEqual(['dirty', 'clean']);
+    }
+    // 重入编辑保留（两次编辑都在，未被陈旧分发覆盖）
+    expect(editor.getProject()?.objects.length).toBe(base.objects.length + 2);
+    autosaver.dispose();
+  });
+});

@@ -18,6 +18,7 @@ import { TypedEventEmitter, createBlankProject, genId } from '@lumora/core';
 import type { Project, SceneEditor } from '@lumora/core';
 import {
   CURRENT_PROJECT_SCHEMA_VERSION,
+  PUBLIC_PROJECT_FIELDS,
   buildProjectPackage,
   estimatePackageBytes,
   findJsonEncodingProblem,
@@ -27,12 +28,12 @@ import {
   validateProjectSchema,
   validateProjectStructure,
 } from '@lumora/core';
-import type { MissingAssetWarning, PackageImportError } from '@lumora/core';
+import type { MissingAssetWarning, PackageImportError, ProjectPackage } from '@lumora/core';
 import { ProjectAutosaver } from './autosave';
 import type { AutosaveState } from './autosave';
 import { ProjectStore } from './project-store';
 import { OpfsProjectStore } from './project-store-opfs';
-import { estimateStorage } from './project-storage';
+import { estimateStorage, failureMessage } from './project-storage';
 import type { DuplicateOutcome, ProjectStorage, ProjectSummary, SaveOutcome, StorageBackend } from './project-storage';
 
 export interface PersistenceEventMap extends Record<string, unknown> {
@@ -304,22 +305,41 @@ export class ProjectPersistence {
   }
 
   /**
-   * 导出当前项目为 `.lumora` 工程包（同步纯构建）。
+   * 导出当前项目为 `.lumora` 工程包（同步纯构建，绝不抛异常）。
    * includePrivate 显式开启时允许包含插件私有设置（pluginData）；
    * 凭据族字段（apiKey/token/secret/…）任何情况下都不进入包（NFR-008）。
+   * 编码预检（第九轮 #2）作用于「将被导出字段的原始值」而非构建后的克隆包：
+   * buildProjectPackage 先 structuredClone 再投影 —— Symbol 键/不可枚举属性/
+   * 访问器已在克隆中被删除或物化，克隆后再检查看不到原输入问题，会静默产出
+   * 丢字段的包。此处先按同一白名单（PUBLIC_PROJECT_FIELDS + 可选 pluginData）
+   * 从原项目投影导出字段（引用原值，反射检查看到的就是原图），预检通过后才
+   * 构建；构建/序列化抛错（DataCloneError/getter 副作用）归一为类型化失败。
    */
   exportCurrent(options: { includePrivate?: boolean } = {}): ExportResult {
     const project = this.editor.getProject();
     if (!project) return { ok: false, message: '当前没有打开的项目' };
-    const pkg = buildProjectPackage(project, { includePrivate: options.includePrivate ?? false });
-    // 导出前置编码预检（第六轮 #5）：不可 JSON 编码的数据（undefined/NaN/BigInt/
-    // 循环引用/数组非索引键）在序列化中会抛错或静默失真 —— 在包构建前拒绝并
-    // 返回类型化失败，绝不产出丢字段的包
-    const problem = findJsonEncodingProblem(pkg);
+    const includePrivate = options.includePrivate ?? false;
+    const projected: Record<string, unknown> = {};
+    for (const field of PUBLIC_PROJECT_FIELDS) {
+      if (project[field] !== undefined) projected[field] = project[field];
+    }
+    if (includePrivate && project.pluginData !== undefined) projected.pluginData = project.pluginData;
+    const problem = findJsonEncodingProblem(projected);
     if (problem) {
       return { ok: false, message: `项目包含无法导出的数据（${problem}），导出被拒绝` };
     }
-    const text = serializeProjectPackage(pkg);
+    let pkg: ProjectPackage;
+    try {
+      pkg = buildProjectPackage(project, { includePrivate });
+    } catch (error) {
+      return { ok: false, message: `项目无法导出（构建失败）：${failureMessage(error)}` };
+    }
+    let text: string;
+    try {
+      text = serializeProjectPackage(pkg);
+    } catch (error) {
+      return { ok: false, message: `项目无法导出（序列化失败）：${failureMessage(error)}` };
+    }
     return { ok: true, text, filename: `${safeFilename(project.name)}.lumora`, bytes: estimatePackageBytes(text) };
   }
 
