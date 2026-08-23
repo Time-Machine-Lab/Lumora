@@ -1528,3 +1528,95 @@ describe('ProjectAutosaver：flush 任务执行时重读最新内容（第十八
     autosaver.dispose();
   });
 });
+
+describe('ProjectAutosaver：flush 排队期间会话失效（第十九轮严重 3）', () => {
+  it('flush 排队期间项目关闭：任务执行时会话已失效 → 等待 superseding drain 并传播其失败（quota-exceeded），不得映射为成功；恢复快照保留', async () => {
+    const editor = new SceneEditor();
+    const store = await ProjectStore.create(DB);
+    expect(store).not.toBeNull();
+    if (!store) return;
+    openStores.push(store);
+    const realLoad = store.load.bind(store);
+    const realSave = store.save.bind(store);
+    let delayFirstLoad = true;
+    const A_URI = 'lumora://project/a';
+    // 首轮 reconcile 的 load 延迟 120ms 占住串行链：flush 任务排队等待执行
+    store.load = async (uri) => {
+      if (delayFirstLoad) {
+        delayFirstLoad = false;
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      return realLoad(uri);
+    };
+    // A 的一切保存（关闭后的 superseding drain；reconcile 首存因会话失效被丢弃）
+    // 返回 quota-exceeded —— 修复前 drain 失败只写 recovery 不传播，flush 任务
+    // 对 uri 不匹配直接 {ok:true}，外层假报成功
+    store.save = async (p, expected) => {
+      if (p.uri === A_URI) return { ok: false, code: 'quota-exceeded', message: '模拟配额不足' };
+      return realSave(p, expected);
+    };
+    const autosaver = new ProjectAutosaver(editor, store, { debounceMs: DEBOUNCE });
+    editor.events.on('project:changed', ({ project }) => autosaver.changed(project));
+
+    editor.openProject(createSampleProject(A_URI));
+    await settle(5);
+    editor.addObject(createGroupObject()); // rev1 → pending 捕获
+    const flushing = autosaver.flush(); // 链被慢 reconcile 占用：flush 任务入队（执行前会话必失效）
+    editor.reset(); // 关闭：触发 changed(null) → close() → 会话递增 + enqueueDrain(A)
+    const outcome = await flushing;
+
+    // drain 的失败如实传播：flush 不再声称成功（修复前 {ok:true}）
+    expect(outcome).toEqual({ ok: false, code: 'quota-exceeded', message: '模拟配额不足' });
+    // A 未落盘：内容保留为恢复快照（不丢、不假报）
+    expect(autosaver.getRecovery(A_URI)).not.toBeNull();
+    autosaver.dispose();
+  });
+
+  it('flush 排队期间 A→B 切换 + drain 失败：flush 传播 drain 失败（不得放行），A 内容留在恢复快照，B 不受污染', async () => {
+    const editor = new SceneEditor();
+    const store = await ProjectStore.create(DB);
+    expect(store).not.toBeNull();
+    if (!store) return;
+    openStores.push(store);
+    const realLoad = store.load.bind(store);
+    const realSave = store.save.bind(store);
+    let delayFirstLoad = true;
+    const A_URI = 'lumora://project/a';
+    const B_URI = 'lumora://project/b';
+    store.load = async (uri) => {
+      if (delayFirstLoad) {
+        delayFirstLoad = false;
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      return realLoad(uri);
+    };
+    // A 的一切保存（A→B 切换的 superseding drain；reconcile 首存因会话失效被丢弃）
+    // 失败；B 的保存全部走真实实现
+    store.save = async (p, expected) => {
+      if (p.uri === A_URI) return { ok: false, code: 'quota-exceeded', message: '模拟配额不足' };
+      return realSave(p, expected);
+    };
+    const autosaver = new ProjectAutosaver(editor, store, { debounceMs: DEBOUNCE });
+    editor.events.on('project:changed', ({ project }) => autosaver.changed(project));
+
+    editor.openProject(createSampleProject(A_URI));
+    await settle(5);
+    editor.addObject(createGroupObject()); // A rev1 → pending 捕获
+    const flushing = autosaver.flush(); // 链被慢 reconcile 占用：flush 任务入队
+    editor.openProject(createSampleProject(B_URI)); // A→B：open(B) → 会话递增 + enqueueDrain(A)
+    const outcome = await flushing;
+
+    // drain 失败传播给正在等待的 flush：切换不得被假成功放行
+    expect(outcome).toEqual({ ok: false, code: 'quota-exceeded', message: '模拟配额不足' });
+    // A 的 rev1 内容未落盘（存储中无 A 记录；reconcile 首存因会话失效被丢弃），
+    // 未保存内容保留为恢复快照 —— 不丢、不假报
+    expect(autosaver.getRecovery(A_URI)).not.toBeNull();
+    const storedA = await loadStored(store, A_URI);
+    expect(storedA).toBeNull();
+    // B 不受 A 的失败污染：首存完成，当前会话 flush 正常放行
+    const storedB = await loadStored(store, B_URI);
+    expect(storedB).not.toBeNull();
+    expect((await autosaver.flush()).ok).toBe(true);
+    autosaver.dispose();
+  });
+});

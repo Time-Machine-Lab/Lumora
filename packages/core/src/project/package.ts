@@ -312,21 +312,29 @@ function isSafeExportKey(key: string): boolean {
   return key !== '__proto__' && key !== 'constructor' && key !== 'prototype';
 }
 
-/** 凭据形态判定（第十五轮阻断 1 + 第十七轮阻断 1/严重 2 + 第十八轮重构）：
- *  公开声明路径任意层出现完整凭据形态即整条声明拒绝 —— 「凭据永不导出」
- *  不依赖插件自觉声明 privateSettings，显式声明凭据键也不是放行依据。
- *  判定为 NFKC 规范化 + 整段 token 化后的完整凭据序列匹配（第十八轮），
- *  分两路：
- *  1. 整键单个 token：单复数归一后与精确凭据键比对（password/passwd/apikey/
- *     privatekey/secret/token/credential(s)/auth）；
- *  2. 整键多个 token：相邻 token 对单复数归一后与凭据复合序列比对
- *     （api+key、pass+word、private+key、access/refresh+token、client+secret、
- *     stored+password、auth+header、private+setting）。
- *  任意命中即拒绝。tokenizerConfig/authorName/apiVersion/tokenBudget/
- *  renderPass/passCount/authMode 等仅含 token/auth/pass/api 子串的合法键
- *  不在任何完整序列中，放行（第十七轮严重 2 回归）。连续大写缩写保留为
- *  一个 token（APIKey → api|key、PASSWORD → password、API_KEY → api|key），
- *  不再按单个大写字母拆分导致全大写/缩写键漏判（第十八轮阻断 1）。 */
+/** 凭据形态判定（第十五轮阻断 1 + 第十七轮阻断 1/严重 2 + 第十八轮重构 +
+ *  第十九轮阻断 1 重写）：公开声明路径任意层出现完整凭据形态即整条声明拒绝 ——
+ *  「凭据永不导出」不依赖插件自觉声明 privateSettings，显式声明凭据键也不是
+ *  放行依据。判定为 NFKC 规范化 + 整段 token 化（第十八轮）+ 任意 token 位置
+ *  高置信凭据词（第十九轮）：
+ *  1. 任意 token 位置单复数归一后与高置信凭据词比对（password/passwd/apikey/
+ *     privatekey/secret/token/credential(s)/auth），命中即拒绝 —— 不再只在
+ *     整键单 token 时检查，多 token 键（databasePassword/passwordHash/
+ *     password1/bearerToken/sessionToken/oauthToken/jwtSecret/webhookSecret/
+ *     secretValue/userCredentials/token1）不再依赖固定相邻词对；
+ *  2. 相邻 token 对再与凭据复合序列比对（api+key、pass+word、private+key、
+ *     access/refresh+token、client+secret、stored+password、auth+header、
+ *     private+setting）—— api_key/pass_word/private_key 等无高置信词但语义
+ *     明确的复合键仍拒绝；
+ *  3. 非 ASCII 一律拒绝（fail-closed）：密码/访问令牌/密钥等 ASCII 分词器
+ *     产生零 token，混拼段非 ASCII 部分也会被静默丢弃 —— 无法完整判定凭据
+ *     形态即拒绝。
+ *  任意命中即拒绝。tokenizerConfig/tokenizerModel/authorName/authorizationMode/
+ *  apiVersion/MONKEYPATCH/HOTKEYMAP/keyboardLayout 等仅含 tokenizer/author/api
+ *  等非凭据词的键放行；tokenBudget/authMode 因含 token/auth 高置信词，自
+ *  第十九轮起拒绝。连续大写缩写保留为一个 token（APIKey → api|key、PASSWORD
+ *  → password、API_KEY → api|key），不再按单个大写字母拆分导致全大写/缩写键
+ *  漏判（第十八轮阻断 1）。 */
 const CREDENTIAL_EXACT_KEYS = new Set([
   'password',
   'passwd',
@@ -374,14 +382,19 @@ function credentialTokens(key: string): string[] {
     .map((word) => word.toLowerCase());
 }
 
-function isCredentialShapeKey(key: string): boolean {
-  const tokens = credentialTokens(key);
-  if (tokens.length === 0) return false;
-  if (tokens.length === 1) {
+/** 对完整 token 列表做凭据形态判定（单键与路径声明共用；路径跨 segment 拼接后
+ *  复用同一判定，['api','key'] ≡ 'apikey' ≡ api_key，第十九轮阻断 2）。 */
+function isCredentialShapeTokens(joined: string, tokens: string[]): boolean {
+  // 非 ASCII 一律拒绝（fail-closed，第十九轮阻断 1）：密码/访问令牌/密钥等
+  // ASCII 分词器产生零 token，混拼段（['profile','密码']）非 ASCII 部分也会被
+  // 静默丢弃 —— 无法完整判定凭据形态即拒绝（/u 模式 \w 不覆盖 CJK，用
+  // 无控制字符的 U+00A0+ 范围显式检查；全角键 NFKC 后已归为 ASCII，走下方
+  // 正常判定）
+  if (/[^ -~]/.test(joined.normalize('NFKC'))) return true;
+  for (const token of tokens) {
     for (const base of CREDENTIAL_EXACT_KEYS) {
-      if (matchesCredentialWord(tokens[0], base)) return true;
+      if (matchesCredentialWord(token, base)) return true;
     }
-    return false;
   }
   for (let i = 0; i < tokens.length - 1; i += 1) {
     const a = tokens[i];
@@ -391,6 +404,10 @@ function isCredentialShapeKey(key: string): boolean {
     }
   }
   return false;
+}
+
+function isCredentialShapeKey(key: string): boolean {
+  return isCredentialShapeTokens(key, credentialTokens(key));
 }
 
 /** 整值导出仅允许 JSON primitive 叶值（第十五轮阻断 1）：对象/数组整值导出会
@@ -407,7 +424,9 @@ type ExportTrie = Map<string, ExportTrie | 'leaf'>;
 
 /** 声明列表规范化为 trie（纯数据，无合并/原地改写）：顶层字符串声明置 leaf
  *  （祖先覆盖：其下路径声明忽略）；路径数组逐层建分支。任一路径键含原型键、
- *  privateSettings 重叠或凭据形态键时整条声明拒绝（fail-closed）。 */
+ *  privateSettings 重叠时整条声明拒绝；凭据形态判定以完整路径统一 token 化
+ *  执行（跨 segment 相邻序列，第十九轮阻断 2）—— 命中即整条声明拒绝
+ *  （fail-closed）。 */
 function buildExportTrie(
   declarations: readonly (string | readonly string[])[],
   privateKeys: readonly string[],
@@ -422,11 +441,24 @@ function buildExportTrie(
       continue;
     }
     if (!Array.isArray(declaration) || declaration.length === 0) continue; // 畸形/空路径：忽略
+    // 第十九轮阻断 2：完整路径统一 token 化后跨 segment 检查凭据序列 —— 逐段
+    // 判定可被路径数组表示法绕过（['api','key'] 逐段均非凭据词但等价于 api_key）。
+    // 两种 token 化缺一不可：全小写 segment 拼接会合并成一个 token
+    // （'private'+'setting' → privatesetting，逐段 flatMap 保边界）；而跨
+    // segment 的 camelCase 边界（'ap'+'iKey' → apiKey）只有整串拼接才能还原
+    const joinedPath = declaration.join('');
+    const perSegmentTokens = declaration.flatMap((segment) => credentialTokens(segment));
+    if (
+      isCredentialShapeTokens(joinedPath, credentialTokens(joinedPath)) ||
+      isCredentialShapeTokens(joinedPath, perSegmentTokens)
+    ) {
+      continue;
+    }
     let node = root;
     let rejected = false;
     for (let i = 0; i < declaration.length; i += 1) {
       const key = declaration[i];
-      if (typeof key !== 'string' || !isSafeExportKey(key) || privateKeys.includes(key) || isCredentialShapeKey(key)) {
+      if (typeof key !== 'string' || !isSafeExportKey(key) || privateKeys.includes(key)) {
         rejected = true;
         break;
       }

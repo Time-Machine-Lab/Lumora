@@ -32,6 +32,11 @@ export const AUTOSAVE_DEBOUNCE_MS = 2000;
 /** flush 稳定排空的轮次上限：连续排空仍不一致视为无法稳定（防御编辑风暴） */
 export const MAX_FLUSH_DRAIN_ROUNDS = 32;
 
+/** flush 入队任务的内部结果：done = 任务体已保存（或确认无需保存）；superseded =
+ *  排队期间会话失效（关闭/切换），由 superseding drain 承载，flush() 等待链尾后
+ *  读取其结果传播（第十九轮严重 3） */
+type FlushTaskResult = { kind: 'done'; outcome: SaveOutcome } | { kind: 'superseded' };
+
 export type AutosaveState =
   | { status: 'idle' } // 无打开项目
   | { status: 'clean' } // 已同步保存
@@ -131,6 +136,11 @@ export class ProjectAutosaver {
   private latched: LatchedError | null = null;
   /** 切换/关闭时保存失败被保留的旧项目快照（按 uri），重新打开时明示可恢复 */
   private readonly recovery = new Map<string, Project>();
+  /** 各 uri 最近一次 superseding drain 的结果（第十九轮严重 3）：flush 任务在
+   *  排队期间会话失效（关闭/切换）后，flush() 等待链尾读取此记录并传播 ——
+   *  不把「已排空给 superseding drain」映射为成功。open 同 uri 时清除旧代
+   *  记录（上一代失败的残留不得误导新一代 flush）。 */
+  private readonly drainOutcomeByUri = new Map<string, SaveOutcome>();
 
   constructor(
     private readonly editor: SceneEditor,
@@ -223,6 +233,9 @@ export class ProjectAutosaver {
     // 新项目尚无「已确认落盘」记录：基线置 null（create-only 语义），数字基线
     // 仅由对账的 load/保存成功建立 —— 首存失败不被吞，后续保存仍按创建语义重试
     this.committedByUri.set(project.uri, null);
+    // 上一代该 uri 的 drain 结果已随会话作废（第十九轮严重 3）：新一代 flush
+    // 不得误读旧代失败/成功记录
+    this.drainOutcomeByUri.delete(project.uri);
     if (prevUri !== null && previous !== null) {
       this.enqueueDrain(prevUri, previous);
     }
@@ -360,6 +373,11 @@ export class ProjectAutosaver {
    * 净/脏以 committed baseline 判定（isUnsaved）：首存失败（baseline 仍为 null）
    * 时即使 revision 未变也必须重试保存 —— 失败如实返回，调用方不得放行关闭/切换
    * （内容仍在编辑器与恢复快照中），绝不假报成功。
+   * 排队期间会话失效（关闭/切换，第十九轮严重 3）：任务体捕获 {uri, session}，
+   * 执行时已失效则返回 superseded —— 旧项目未保存内容由 close/open 同步排入的
+   * superseding drain 承载，flush() 等待链尾后读取该 drain 的结果并传播
+   * （失败如实返回，不得映射为成功）；无 drain（内容已由在途保存落盘或已净）时
+   * 按恢复快照是否存在判定，绝不放行「内容仍在恢复区」的假成功。
    * 返回类型化结果：保存失败或锁存错误（冲突/恢复待处理）都如实返回。
    */
   async flush(): Promise<SaveOutcome> {
@@ -367,6 +385,7 @@ export class ProjectAutosaver {
     // 仅内存模式：无可持久化内容，排空无意义也不阻塞关闭
     if (!this.store) return { ok: true };
     this.cancelTimer();
+    const session = this.session;
     for (let i = 0; i < MAX_FLUSH_DRAIN_ROUNDS; i += 1) {
       if (this.latched && this.latched.uri === this.currentUri) {
         // 锁存错误下排空无法稳定：返回锁存错误，由调用方阻断关闭/切换并引导显式解决
@@ -380,15 +399,36 @@ export class ProjectAutosaver {
         // 时，重放 rev1 会以旧 revision 覆写较新记录触发假 revision-conflict
         // （锁存后关闭/切换被错误阻断）；与 runSave 任务体一致地按绑定 uri
         // 取 pending/编辑器最新快照保存，已净（runSave 已落盘最新内容）则直接成功
-        const outcome = await this.enqueue<SaveOutcome>(async (): Promise<SaveOutcome> => {
-          if (this.disposed) return { ok: true };
+        const result = await this.enqueue<FlushTaskResult>(async (): Promise<FlushTaskResult> => {
+          if (this.disposed) return { kind: 'done', outcome: { ok: true } };
+          if (!this.isFresh(uri, session)) {
+            // 第十九轮严重 3：排队期间会话失效（关闭/切换）——旧项目未保存内容
+            // 已由 close/open 同步排入 superseding drain（drain 排在当前任务之后，
+            // 任务体直接 await 会自锁，故返回 superseded 由 flush() 等待链尾读取）
+            return { kind: 'superseded' };
+          }
           const latest = this.pending ?? this.editor.getProject();
-          if (!latest || latest.uri !== uri) return { ok: true };
-          if (!this.isUnsaved(latest)) return { ok: true };
-          return this.saveSnapshot(latest);
+          if (!latest || latest.uri !== uri) return { kind: 'done', outcome: { ok: true } };
+          if (!this.isUnsaved(latest)) return { kind: 'done', outcome: { ok: true } };
+          return { kind: 'done', outcome: await this.saveSnapshot(latest) };
         });
-        if (!outcome.ok) return outcome;
-        continue;
+        if (result.kind === 'done') {
+          if (!result.outcome.ok) return result.outcome;
+          continue;
+        }
+        // superseded：会话失效必然先于任务执行发生，superseding drain 已在链上；
+        // 等待链尾（含 drain）后读取其结果传播 —— 失败如实返回，不得映射为成功
+        await this.chainTail;
+        const drained = this.drainOutcomeByUri.get(uri);
+        if (drained) return drained;
+        if (this.recovery.has(uri)) {
+          return {
+            ok: false,
+            code: 'storage-error',
+            message: '项目未保存内容未能落盘（已保留为恢复快照），请重试',
+          };
+        }
+        return { ok: true };
       }
       // 无脏快照时仍等待在途保存（含首存）完成，复查后再放行：
       // 等待期间可能落败（下轮重试）或产生新编辑（下轮追平）
@@ -664,7 +704,9 @@ export class ProjectAutosaver {
   /**
    * 旧项目的排空：执行时以该 uri 的已提交基线做 CAS（在途结果已推进基线，不会冲突）。
    * 成功推进基线并清除该 uri 的恢复快照；失败把快照保留为恢复快照（内容不丢），
-   * 不污染当前项目状态。
+   * 不污染当前项目状态。结果（含失败，第十九轮严重 3）记录到 drainOutcomeByUri，
+   * 供排队期间会话失效的 flush() 读取传播 —— drain 失败不再只写 recovery 静默
+   * 吞掉，正在等待的调用方如实收到失败。
    */
   private enqueueDrain(uri: string, snapshot: Project): void {
     if (!this.store) return;
@@ -672,6 +714,7 @@ export class ProjectAutosaver {
       if (this.disposed) return;
       const expected = this.committedByUri.get(uri)?.revision ?? null;
       const result = await this.storeSave(snapshot, expected);
+      this.drainOutcomeByUri.set(uri, result);
       if (result.ok) {
         const prev = this.committedByUri.get(uri);
         this.committedByUri.set(uri, {

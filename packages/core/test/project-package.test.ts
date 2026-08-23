@@ -389,7 +389,7 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(parsed.project.pluginData).toEqual({ 'com.example': expected });
   });
 
-  it('凭据形态判定为完整序列匹配：分隔符/camelCase/全大写/全角/复数组合词顶层与嵌套路径一律拒绝，仅含 token/auth/pass/api 子串的合法键放行（第十七轮 + 第十八轮回归）', async () => {
+  it('凭据形态判定为任意 token 位置高置信词 + 相邻复合序列：分隔符/camelCase/全大写/全角/复数/数字后缀/连写/非 ASCII 键顶层与嵌套路径一律拒绝，仅含 tokenizer/author/api 等非凭据词的合法键放行（第十七轮 + 第十八轮 + 第十九轮回归）', async () => {
     const project = await buildFixtureProject();
     const pluginData = {
       'com.example': {
@@ -421,9 +421,28 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         accessTokens: 'leak-22',
         clientSecrets: 'leak-23',
         storedPasswords: 'leak-24',
-        // 放行组：完整词包含 token/auth 的合法键（旧子串匹配误剥）；
-        // 第十八轮严重 2：仅含 pass/token/api/auth 子串的复合词不在任何完整
-        // 凭据序列中，放行
+        // 第十九轮阻断 1：多 token 键任意位置命中高置信凭据词即拒绝（不再只在
+        // 整键单 token 时检查、不再依赖 9 组固定相邻词对）
+        databasePassword: 'leak-26',
+        passwordHash: 'leak-27',
+        password1: 'leak-28',
+        bearerToken: 'leak-29',
+        sessionToken: 'leak-30',
+        oauthToken: 'leak-31',
+        jwtSecret: 'leak-32',
+        webhookSecret: 'leak-33',
+        secretValue: 'leak-34',
+        userCredentials: 'leak-35',
+        token1: 'leak-36',
+        // 非 ASCII 键分词为空不得放行（fail-closed）
+        密码: 'leak-37',
+        访问令牌: 'leak-38',
+        密钥: 'leak-39',
+        // tokenBudget/authMode 含 token/auth 高置信词：自第十九轮起拒绝
+        tokenBudget: 'leak-40',
+        authMode: 'leak-41',
+        // 放行组：完整词包含 tokenizer/author/api 的合法键（旧子串匹配误剥）；
+        // 第十八轮严重 2：仅含 pass/api 子串且不在任何凭据序列中的复合词放行
         tokenizerConfig: 'keep-1',
         tokenizerModel: 'keep-2',
         authorName: 'keep-3',
@@ -434,10 +453,8 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         HOTKEYMAP: 'keep-8',
         api: 'keep-9',
         apiVersion: 'keep-10',
-        tokenBudget: 'keep-11',
         renderPass: 'keep-12',
         passCount: 'keep-13',
-        authMode: 'keep-14',
       },
     };
     const pkg = buildProjectPackage({ ...project, pluginData }, {
@@ -458,16 +475,14 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
     expect(plugin.HOTKEYMAP).toBe('keep-8');
     expect(plugin.api).toBe('keep-9');
     expect(plugin.apiVersion).toBe('keep-10');
-    expect(plugin.tokenBudget).toBe('keep-11');
     expect(plugin.renderPass).toBe('keep-12');
     expect(plugin.passCount).toBe('keep-13');
-    expect(plugin.authMode).toBe('keep-14');
     const json = JSON.stringify(parsed.project);
-    for (let i = 1; i <= 25; i += 1) {
+    for (let i = 1; i <= 41; i += 1) {
       if (i === 9) continue; // 裸 api 不再拒绝（第十八轮严重 2 修正）
       expect(json).not.toContain(`leak-${i}`);
     }
-    for (let i = 1; i <= 14; i += 1) expect(json).toContain(`keep-${i}`);
+    for (const i of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13]) expect(json).toContain(`keep-${i}`);
     // 嵌套路径声明同判据：路径任意层命中完整凭据序列整条声明拒绝；合法组合词路径放行
     const nestedPkg = buildProjectPackage(
       {
@@ -492,14 +507,29 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
               clientSecrets: 'n-14',
               storedPasswords: 'n-15',
               privateKeys: 'n-16',
+              // 第十九轮阻断 1：多 token 键任意位置高置信词、数字后缀、非 ASCII
+              databasePassword: 'n-17',
+              passwordHash: 'n-18',
+              password1: 'n-19',
+              bearerToken: 'n-20',
+              sessionToken: 'n-21',
+              oauthToken: 'n-22',
+              jwtSecret: 'n-23',
+              webhookSecret: 'n-24',
+              secretValue: 'n-25',
+              userCredentials: 'n-26',
+              token1: 'n-27',
+              密码: 'n-28',
+              访问令牌: 'n-29',
+              密钥: 'n-30',
+              tokenBudget: 'n-31',
+              authMode: 'n-32',
               tokenizerConfig: 'n-ok-1',
               authorName: 'n-ok-2',
               authorizationMode: 'n-ok-3',
               apiVersion: 'n-ok-4',
-              tokenBudget: 'n-ok-5',
               renderPass: 'n-ok-6',
               passCount: 'n-ok-7',
-              authMode: 'n-ok-8',
             },
           },
         },
@@ -525,14 +555,28 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
             ['profile', 'clientSecrets'],
             ['profile', 'storedPasswords'],
             ['profile', 'privateKeys'],
+            ['profile', 'databasePassword'],
+            ['profile', 'passwordHash'],
+            ['profile', 'password1'],
+            ['profile', 'bearerToken'],
+            ['profile', 'sessionToken'],
+            ['profile', 'oauthToken'],
+            ['profile', 'jwtSecret'],
+            ['profile', 'webhookSecret'],
+            ['profile', 'secretValue'],
+            ['profile', 'userCredentials'],
+            ['profile', 'token1'],
+            ['profile', '密码'],
+            ['profile', '访问令牌'],
+            ['profile', '密钥'],
+            ['profile', 'tokenBudget'],
+            ['profile', 'authMode'],
             ['profile', 'tokenizerConfig'],
             ['profile', 'authorName'],
             ['profile', 'authorizationMode'],
             ['profile', 'apiVersion'],
-            ['profile', 'tokenBudget'],
             ['profile', 'renderPass'],
             ['profile', 'passCount'],
-            ['profile', 'authMode'],
           ],
         },
       },
@@ -548,11 +592,54 @@ describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥
         authorName: 'n-ok-2',
         authorizationMode: 'n-ok-3',
         apiVersion: 'n-ok-4',
-        tokenBudget: 'n-ok-5',
         renderPass: 'n-ok-6',
         passCount: 'n-ok-7',
-        authMode: 'n-ok-8',
       },
+    });
+  });
+
+  it('凭据形态判定跨路径 segment：路径数组声明统一 token 化后拒绝相邻凭据序列，不再被表示法绕过（第十九轮阻断 2）', async () => {
+    const project = await buildFixtureProject();
+    // ['api','key'] ≡ api_key：逐段判定均非凭据词（api/key 不在高置信集合），
+    // 但完整路径 token 化后相邻序列 api+key 命中 —— 修复前整组放行
+    const pkg = buildProjectPackage(
+      {
+        ...project,
+        pluginData: {
+          'com.example': {
+            api: { key: 'p-1' },
+            pass: { word: 'p-2' },
+            private: { key: 'p-3', setting: 'p-4' },
+            profile: { api: { version: 'p-ok-1' } },
+            render: { pass: 'p-ok-2' },
+          },
+        },
+      },
+      {
+        includePrivate: true,
+        publicKeysByPlugin: {
+          'com.example': [
+            ['api', 'key'],
+            ['pass', 'word'],
+            ['private', 'key'],
+            ['private', 'setting'],
+            ['profile', 'api', 'version'],
+            ['render', 'pass'],
+          ],
+        },
+      },
+    );
+    const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, unknown>)['com.example'];
+    // 四组路径数组声明全部拒绝：{api:{key}}/{{pass:{word}}/{{private:{key,setting}} 不进包
+    const json = JSON.stringify(parsed.project);
+    for (let i = 1; i <= 4; i += 1) expect(json).not.toContain(`p-${i}`);
+    // 合法跨 segment 组合（api+version、render+pass 不在凭据序列）正常导出
+    expect(plugin).toEqual({
+      profile: { api: { version: 'p-ok-1' } },
+      render: { pass: 'p-ok-2' },
     });
   });
 
