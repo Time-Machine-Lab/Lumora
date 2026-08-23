@@ -538,7 +538,7 @@ describe('反射预检先于克隆（第九轮 #2）：结构化克隆会删除/
       name: '非纯对象（Date 实例）',
       problem: 'non-plain-object',
       tamper: (p) => {
-        (p.settings as Record<string, unknown>).expiresAt = new Date('2030-01-01T00:00:00Z');
+        (p.settings as unknown as Record<string, unknown>).expiresAt = new Date('2030-01-01T00:00:00Z');
       },
     },
   ];
