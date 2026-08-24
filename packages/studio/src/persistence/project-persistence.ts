@@ -70,6 +70,11 @@ export class ProjectPersistence {
   // 第三十二轮严重 4：init 幂等合并 —— 并发/重复 init 共享同一 in-flight 执行
   // （修复前并发 init 都在 store 置位前越过守卫，重复创建存储、早到者泄漏）
   private initPromise: Promise<void> | null = null;
+  // 第三十三轮严重 4：待关闭的晚到 store —— 存储创建挂起期间 dispose 已开始，
+  // init 重查发现已释放时不再吞掉关闭失败：store 转入此字段，dispose 的 commit
+  // 收敛点负责真实关闭并传播失败（失败时 dispose 返回 {ok:false} 可重试，关闭
+  // 成功后置 null；修复前空 catch 丢弃唯一引用、dispose 永久缓存成功，连接泄漏）
+  private lateStore: ProjectStorage | null = null;
   readonly events = new TypedEventEmitter<PersistenceEventMap>();
 
   constructor(private readonly editor: SceneEditor) {
@@ -124,13 +129,16 @@ export class ProjectPersistence {
           ? await OpfsProjectStore.create(options.dbName)
           : await ProjectStore.create(options.dbName));
       if (!store) return; // 存储不可用：静默降级（仅内存编辑），与旧语义一致
-      // await 挂起期间 dispose() 已成功：晚到 store 不得挂到已销毁的 persistence
-      if (this.disposed) {
-        try {
-          store.close();
-        } catch {
-          // 关闭晚到存储失败不阻塞 init 完成（store 未挂入，无泄漏面残留）
-        }
+      // await 挂起期间 dispose() 已开始/完成：晚到 store 不得挂到已销毁的
+      // persistence —— 转入 lateStore 待关闭（第三十三轮严重 4），由 dispose
+      // 的 commit 收敛点真实关闭并传播失败（修复前此处空 catch 丢弃唯一引用，
+      // dispose 已永久缓存成功、无重试入口，连接泄漏不可恢复）。第三十三轮
+      // 严重 4 明确：判定必须包含「dispose 在途」（disposePromise 非空，正等待
+      // 收敛点）—— 修复前只看 disposed，dispose 等待期间的晚到 store 走正常
+      // 挂载，close 失败被 commit best-effort 归档进 message 假报「终态已达成」；
+      // 待关闭 store 是独立步骤状态，close 失败必须 {ok:false} 可重试
+      if (this.disposed || this.disposePromise) {
+        this.lateStore = store;
         return;
       }
       this.store = store;
@@ -138,9 +146,18 @@ export class ProjectPersistence {
       if (options.debounceMs !== undefined) this.autosaver.setDebounceMs(options.debounceMs);
     })();
     const inFlight = this.initPromise;
-    void inFlight.then(() => {
-      if (this.initPromise === inFlight) this.initPromise = null;
-    });
+    // 第三十三轮一般 5：成功/失败双分支 settle 清理 —— 修复前 success-only
+    // then 派生未处理拒绝（调用方 await 原 promise 也无济于事），且拒绝后
+    // initPromise 永久复用 rejected promise：注入后端/未来实现拒绝时后续
+    // init 永远拿到同一失败、无法重试
+    void inFlight.then(
+      () => {
+        if (this.initPromise === inFlight) this.initPromise = null;
+      },
+      () => {
+        if (this.initPromise === inFlight) this.initPromise = null;
+      },
+    );
     return inFlight;
   }
 
@@ -558,28 +575,68 @@ export class ProjectPersistence {
     // dispose() 同型）
     if (this.disposePromise) return this.disposePromise;
     this.disposePromise = (async (): Promise<SaveOutcome> => {
+      // preflight（第三十二轮阻断 2 拆分 + 第三十三轮阻断 2 明确语义）：flush/
+      // recovery 检查无任何 teardown —— 失败即返回 {ok:false}，autosaver/订阅/
+      // store 全部保留，运行时恢复普通可编辑状态（编辑仍进 autosave、可落盘）。
+      // 意外拒绝同样归一为可恢复失败（autosaver 内部无部分 teardown 泄漏）
+      let preflight: SaveOutcome;
       try {
-        // 第三十二轮阻断 2：flush/recovery preflight 与终态释放分开 —— preflight
-        // （autosaver.dispose）无 teardown，失败即返回、现场完整保留；终态释放
-        // 逐步骤执行且各步骤幂等，完成标记（disposed）在全部步骤成功后写入。
-        // 修复前 disposed 在 teardown 前置位：store.close() 等抛错后重试走
-        // 「已释放」短路返回成功裁决，未关闭的连接/订阅随假成功泄漏
-        const outcome = await this.autosaver.dispose();
-        if (!outcome.ok) return outcome;
-        this.unsubscribeEditor?.dispose();
-        this.unsubscribeEditor = null;
-        this.store?.close();
-        this.store = null;
-        this.currentUri = null;
-        this.events.dispose();
-        this.disposed = true;
-        return { ok: true };
+        preflight = await this.autosaver.dispose();
       } catch (error) {
-        // 第三十一轮严重 3：意外拒绝归一为类型化失败 —— 绝不把 unhandled
-        // rejection 交给调用方；失败后 disposed 未置位，可重试（已完成的步骤
-        // 幂等，重试只补做未完成步骤）
         return { ok: false, code: 'storage-error', message: failureMessage(error) };
       }
+      if (!preflight.ok) return preflight;
+      // commit 前置收敛点（第三十三轮严重 4）：等待在途 init settle —— 存储创建
+      // 挂起时 dispose 已开始，晚到的 store 经 init 的 disposed 重查转入 lateStore；
+      // 在此真实关闭并传播失败（失败时 dispose 返回 {ok:false}、未置终态标记，
+      // 重试补做关闭；修复前 close 抛错被 init 空 catch 吞掉，唯一引用丢失、
+      // dispose 永久缓存成功无重试入口）
+      const inFlightInit = this.initPromise;
+      if (inFlightInit) {
+        try {
+          await inFlightInit;
+        } catch {
+          // init 自身失败：已 settle 清理（第三十三轮一般 5），lateStore 检查接管
+        }
+      }
+      if (this.lateStore) {
+        const late = this.lateStore;
+        try {
+          late.close();
+          this.lateStore = null;
+        } catch (error) {
+          return { ok: false, code: 'storage-error', message: `晚到存储关闭失败：${failureMessage(error)}` };
+        }
+      }
+      // commit（终态 best-effort 收敛，第三十三轮阻断 2）：autosaver 已释放、
+      // 订阅即将拆除 —— 运行态不可恢复，宿主不得继续编辑（「可编辑但不可保存」
+      // 死壳是数据丢失面）。剩余步骤逐项尽力执行，任何失败不中断收敛（宿主
+      // 卸载不因单个资源失败卡死），完成标记（disposed）在全部步骤尝试后置位；
+      // 失败原因并入 message，ok 仍为 true —— 终态已达成、可安全卸载，不再以
+      // {ok:false} 冒充「运行态完整」（修复前 store.close() 抛错返回 {ok:false}
+      // 但 autosaver 已永久释放：宿主保持挂载重试，新编辑不再进 autosave、
+      // 随重试的编辑器销毁丢失）
+      const failures: string[] = [];
+      try {
+        this.unsubscribeEditor?.dispose();
+      } catch (error) {
+        failures.push(failureMessage(error));
+      }
+      this.unsubscribeEditor = null;
+      try {
+        this.store?.close();
+      } catch (error) {
+        failures.push(failureMessage(error));
+      }
+      this.store = null;
+      this.currentUri = null;
+      try {
+        this.events.dispose();
+      } catch (error) {
+        failures.push(failureMessage(error));
+      }
+      this.disposed = true;
+      return failures.length === 0 ? { ok: true } : { ok: true, message: `终态释放部分失败：${failures.join('；')}` };
     })();
     const inFlight = this.disposePromise;
     // 失败：清空缓存允许重试 —— 仅当 ref 仍指向本次结果（并发调用共享同一

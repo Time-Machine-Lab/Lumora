@@ -602,6 +602,27 @@ function collapsedCredentialForm(key: string): string {
   return normalizeCredentialKey(key).replace(/[^a-z0-9]/g, '');
 }
 
+/** BENIGN 白名单判定专用规范化（第三十三轮阻断 1）：NFKC（全角/兼容字符归
+ *  一，全角空格→ASCII 空格）→ 小写 → 去分隔符。与 collapsedCredentialForm 的
+ *  关键区别：**不丢弃非 ASCII 内容** —— 修复前 collapsed 的 [^a-z0-9] 把
+ *  CJK/日/韩凭据根词一并剥除，'密码tokenizerConfig' → 'tokenizerconfig' 与
+ *  良性键碰撞而放行（值进包）。白名单是精确豁免：只允许「ASCII 写法 +
+ *  NFKC/大小写/分隔等价」，任何含非 ASCII 内容的键形态保留内容后无法与纯
+ *  ASCII 白名单条目相等；全角『；』等 NFKC 转 ASCII 的兼容分隔符仍正确剥除 */
+function benignCredentialForm(key: string): string {
+  const nfkc = key.normalize('NFKC').toLowerCase();
+  // 剥除 ASCII 非字母数字与 NBSP（NFKC 不转 NBSP；全角空格经 NFKC 已转 ASCII
+  // 空格后一并剥除），保留全部非 ASCII 内容（逐码点过滤，避免控制字符正则）
+  let out = '';
+  for (const ch of nfkc) {
+    const code = ch.codePointAt(0)!;
+    if (code === 0xa0) continue;
+    if (code < 0x80 && !(ch >= 'a' && ch <= 'z') && !(ch >= '0' && ch <= '9')) continue;
+    out += ch;
+  }
+  return out;
+}
+
 /** 完整凭据词匹配（含单复数归一）：token 与基准词相等，或 token 是规则复数
  *  （词尾 -s，长度 > 3）剥尾后与基准词相等（tokens→token、secrets→secret、
  *  passwords→password、credentials→credential）。直接相等优先：pass/access
@@ -692,22 +713,31 @@ const CREDENTIAL_SUFFIX_STRIP_MAX = 12;
  *  （['access','tokenizer','config'] ≡ accesstokenizerconfig）与全小写变体经
  *  同一契约放行 —— 整键命中 BENIGN_CREDENTIAL_KEYS 的合法歧义键，其无边界形态
  *  在分词兜底中一并豁免（apiKeyboardLayout/compassWordWrap 等 ≥2 段序列的合法
- *  键路径声明与字符串声明等价） */
+ *  键路径声明与字符串声明等价）。第三十三轮阻断 1：集合以 benignCredentialForm
+ *  构建 —— 不丢弃非 ASCII 内容的独立规范化（白名单键全为 ASCII，对纯 ASCII
+ *  键与旧 collapsed 结果一致；含非 ASCII 的键形态不可能命中集合） */
 const BENIGN_CREDENTIAL_COLLAPSED: ReadonlySet<string> = (() => {
   const forms = new Set<string>();
-  for (const key of BENIGN_CREDENTIAL_KEYS) forms.add(collapsedCredentialForm(key));
+  for (const key of BENIGN_CREDENTIAL_KEYS) forms.add(benignCredentialForm(key));
   return forms;
 })();
 
-/** 良性凭据歧义键判定（第三十二轮严重 3 统一规范化）：所有判定位置（顶层整键、
- *  joined 整键、嵌套叶键、拆分后缀）一律查 collapsed 规范化集合 —— 顶层
- *  'TOKENIZERCONFIG'、叶 ['profile','TOKENIZERCONFIG']、根 ['tokenizer','config']
- *  与嵌套拆分 ['profile','tokenizer','config'] 是同一良性键的不同写法，判定必须
- *  一致（修复前顶层/叶用大小写敏感原始 Set.has、joined 用规范化集合，同一键因
- *  写法不同放行/拒绝分叉：根 ['cookie','consent'] 与顶层 'cookieconsent' 即同键
- *  异判的实例） */
+/** 良性凭据歧义键判定（第三十二轮严重 3 统一规范化 + 第三十三轮阻断 1 加固）：
+ * 所有判定位置（顶层整键、joined 整键、嵌套叶键、拆分后缀）一律查规范化集合
+ *  —— 顶层 'TOKENIZERCONFIG'、叶 ['profile','TOKENIZERCONFIG']、根
+ *  ['tokenizer','config'] 与嵌套拆分 ['profile','tokenizer','config'] 是同一良性
+ *  键的不同写法，判定必须一致（第三十二轮修复前顶层/叶用大小写敏感原始
+ *  Set.has、joined 用规范化集合，同一键因写法不同放行/拒绝分叉：根
+ *  ['cookie','consent'] 与顶层 'cookieconsent' 即同键异判的实例）。
+ *  第三十三轮阻断 1 双保险：任何 BENIGN 短路前先执行 CJK/日/韩凭据根检查 ——
+ *  规范化层面已不丢弃非 ASCII（'密码tokenizerConfig' → '密码tokenizerconfig'
+ *  无法与 ASCII 白名单条目碰撞），根检查再加一道显式防线：含凭据根的键无论
+ *  形态如何一律不豁免，杜绝未来规范化调整再次引入碰撞（修复前
+ *  '密码tokenizerConfig'/'パスワードauthMode' 等剥非 ASCII 后命中集合被放行，
+ *  凭据值随公开声明进包） */
 function isBenignCredentialKey(key: string): boolean {
-  return BENIGN_CREDENTIAL_COLLAPSED.has(collapsedCredentialForm(key));
+  if (containsCredentialCjkRoot(key)) return false;
+  return BENIGN_CREDENTIAL_COLLAPSED.has(benignCredentialForm(key));
 }
 
 /** 任意偏移字典分词凭据形态兜底（第二十九轮阻断 1 + 第三十轮阻断 1 重写 +

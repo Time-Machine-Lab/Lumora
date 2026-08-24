@@ -59,7 +59,9 @@ export type SaveFailureCode =
   | 'recovery-available';
 
 export type SaveOutcome =
-  | { ok: true }
+  // 第三十三轮阻断 2：终态 commit 为 best-effort 收敛 —— ok:true 分支允许携带
+  // 可选 message（终态释放部分失败明细归档；调用方可安全卸载，失败不阻断终态）
+  | { ok: true; message?: string }
   | { ok: false; code: SaveFailureCode; message: string; storedRevision?: number };
 
 export type DuplicateOutcome =

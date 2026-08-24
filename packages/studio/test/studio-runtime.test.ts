@@ -243,37 +243,41 @@ describe('StudioRuntime：dispose 幂等合并 single-flight（第三十一轮�
   });
 });
 
-describe('StudioRuntime：终态释放可失败者先行（第三十二轮阻断 2）', () => {
-  it('host.dispose() 抛错：dispose 如实失败且编辑器保留（契约真实），重试补做剩余步骤成功', async () => {
+describe('StudioRuntime：终态释放 best-effort 收敛（第三十二轮阻断 2 + 第三十三轮阻断 2）', () => {
+  it('host.dispose() 抛错：终态仍收敛返回 {ok:true} 并携带失败明细，编辑器完整销毁（修复前 {ok:false} 但 persistence 已永久释放 —— 死壳）', async () => {
     const runtime = createStudioRuntime();
     const db = 'lumora-test-runtime-host-throw';
     await ProjectStore.drop(db);
     await runtime.init({ dbName: db, debounceMs: 60_000 });
-    await runtime.openProject(createSampleProject('lumora://project/r32-host', '宿主停用失败'));
+    await runtime.openProject(createSampleProject('lumora://project/r33-host', '宿主停用失败'));
 
     const hostDisposeSpy = vi.spyOn(runtime.host, 'dispose');
     hostDisposeSpy.mockRejectedValueOnce(new Error('模拟插件停用失败'));
 
     const outcome = await runtime.dispose();
-    expect(outcome).toEqual({ ok: false, message: '模拟插件停用失败' });
-    // 失败契约真实：编辑器保留未销毁（修复前 editor 在 host.dispose() 前已
-    // 销毁，{ok:false} 的「编辑器保留可重试/可保全内容」语义与现场不符）；
-    // host.dispose 抛错未执行真实停用，宿主快照同样保留（未 teardown）
-    expect(() => runtime.editor.openProject(createSampleProject())).not.toThrow();
-    expect(runtime.host.getProject()).not.toBeNull();
-
-    // 重试：persistence 已释放（幂等短路）、host 重试成功、编辑器最后销毁
-    const retried = await runtime.dispose();
-    expect(retried).toEqual({ ok: true });
-    expect(hostDisposeSpy).toHaveBeenCalledTimes(2);
+    // commit 阶段失败不再以 {ok:false} 冒充「运行态完整」：终态已收敛
+    // （persistence 释放、host 尝试停用、事件订阅拆除、编辑器销毁），失败
+    // 明细并入 message —— 宿主拿到 {ok:true} 即可安全卸载，不会保持挂载
+    // 面对「可编辑但不可保存」的死壳（修复前返回 {ok:false}、宿主保持挂载
+    // 重试，新编辑随重试的编辑器销毁丢失 —— 审查员点名未验证可落盘）
+    expect(outcome.ok).toBe(true);
+    expect(outcome.message).toContain('模拟插件停用失败');
+    // 终态收敛：编辑器已销毁（best-effort 不中断后续步骤）
     expect(() => runtime.editor.openProject(createSampleProject())).toThrow('编辑器已释放');
+    expect(hostDisposeSpy).toHaveBeenCalledTimes(1);
+
+    // 终态后 dispose 幂等短路：重试不再触碰 host —— 成功裁决连同失败明细
+    // 一并归档复用（与第三十一轮「成功后永久复用同一成功结果对象」同语义）
+    const retried = await runtime.dispose();
+    expect(retried).toEqual({ ok: true, message: '终态释放部分失败：模拟插件停用失败' });
+    expect(hostDisposeSpy).toHaveBeenCalledTimes(1);
     hostDisposeSpy.mockRestore();
     await ProjectStore.drop(db);
   });
 });
 
-describe('StudioRuntime：init/dispose 竞态（第三十二轮严重 4）', () => {
-  it('init 挂起期间 dispose 先成功：晚到 store 关闭并丢弃，不残留连接', async () => {
+describe('StudioRuntime：init/dispose 竞态（第三十二轮严重 4 + 第三十三轮收敛）', () => {
+  it('init 挂起期间 dispose 先开始：晚到 store 在收敛点被关闭并丢弃，不残留连接', async () => {
     const runtime = createStudioRuntime();
     const db = 'lumora-test-runtime-init-race';
     await ProjectStore.drop(db);
@@ -289,17 +293,39 @@ describe('StudioRuntime：init/dispose 竞态（第三十二轮严重 4）', () 
     );
 
     const initPromise = runtime.init({ dbName: db });
-    const disposeOutcome = await runtime.dispose();
-    expect(disposeOutcome).toEqual({ ok: true });
+    // dispose 先开始：preflight 通过后在 commit 前置收敛点等待在途 init settle
+    // （第三十三轮严重 4 —— 修复前 dispose 不等 init，晚到 store 的 close 抛错
+    // 被空 catch 吞掉，唯一引用丢失、连接泄漏；测试必须先建 disposePromise 再
+    // releaseCreate，否则收敛点等待挂死）
+    const disposePromise = runtime.dispose();
 
-    releaseCreate(lateStore); // 晚到的 store 到达
+    releaseCreate(lateStore); // 晚到的 store 到达（disposed 尚未置位 → 正常挂载）
     await initPromise;
-    // 晚到 store 被持久化层关闭并丢弃：不挂到已销毁 persistence
+    const disposeOutcome = await disposePromise;
+    expect(disposeOutcome).toEqual({ ok: true });
+    // 晚到 store 被 dispose commit 的 store.close() 关闭：不残留连接
     expect(closeSpy).toHaveBeenCalledTimes(1);
     expect(runtime.persistence.available).toBe(false);
     createSpy.mockRestore();
     closeSpy.mockRestore();
     lateStore!.close();
+    await ProjectStore.drop(db);
+  });
+});
+
+describe('StudioRuntime：init 拒绝不污染 single-flight（第三十三轮一般 5）', () => {
+  it('init 拒绝 settle 后缓存清理：后续 init 重试走新一轮并成功', async () => {
+    const runtime = createStudioRuntime();
+    const db = 'lumora-test-runtime-init-reject';
+    await ProjectStore.drop(db);
+    const createSpy = vi.spyOn(ProjectStore, 'create').mockRejectedValueOnce(new Error('模拟存储打开失败'));
+    await expect(runtime.init({ dbName: db })).rejects.toThrow('模拟存储打开失败');
+    // 拒绝 settle 后 single-flight 缓存已清理：重试走新一轮真实创建并成功
+    // （修复前 success-only 清理永久复用 rejected promise，后续 init 永远失败）
+    await runtime.init({ dbName: db });
+    expect(runtime.persistence.available).toBe(true);
+    createSpy.mockRestore();
+    await runtime.dispose();
     await ProjectStore.drop(db);
   });
 });

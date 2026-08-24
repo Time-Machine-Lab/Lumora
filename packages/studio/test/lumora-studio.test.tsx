@@ -292,23 +292,26 @@ describe('LumoraStudio', () => {
     expect(disposeSpy).toHaveBeenCalledTimes(2);
   });
 
-  it('阻断 2：cache.dispose 抛错归一为类型化失败；完成标记未置位，重试补做缓存释放成功（修复前标记先置位，重试跳过缓存释放假报成功、缓存泄漏）', async () => {
+  it('阻断 2/3：close() 成功收敛，cache.dispose 作为终态最后一步恰好释放一次（内部故障注入走真实路径，见 content-cache.test.ts —— 修复前 mock 整个 dispose 抛错恰好避开内部路径，假报失败实为假成功）', async () => {
     const handle = createRef<LumoraStudioHandle>();
     const cacheDisposeSpy = vi.spyOn(ContentCache.prototype, 'dispose');
-    cacheDisposeSpy.mockImplementationOnce(() => {
-      throw new Error('模拟缓存崩溃');
-    });
     render(<LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" />);
     await screen.findByTestId('test-panel');
-    const { close } = handle.current!;
+    const { runtime, close } = handle.current!;
+    const runtimeDisposeSpy = vi.spyOn(runtime, 'dispose');
 
     const outcome = await close();
-    expect(outcome).toEqual({ ok: false, message: '模拟缓存崩溃' });
-    // 失败后缓存完成标记未置位（修复前 cacheDisposedRef 在 dispose() 前置位，
-    // 重试跳过缓存释放直接返回成功 —— 缓存资源泄漏）：重试真实执行
-    // cache.dispose，补做未完成的释放
+    expect(outcome).toEqual({ ok: true });
+    // 终态收敛：runtime 终态释放 + 缓存恰好释放一次（cache.dispose 契约为
+    // best-effort 不抛错，内部逐资源清理；close() 不再因缓存故障返回
+    // {ok:false} —— 修复前 cache 抛错返回 {ok:false} 但 runtime 已销毁，
+    // 宿主保持挂载面对死壳、重试时跳过缓存释放假报成功）
+    expect(cacheDisposeSpy).toHaveBeenCalledTimes(1);
+    expect(runtimeDisposeSpy).toHaveBeenCalledTimes(1);
+    // 成功后幂等：重复 close 复用成功裁决，不再触碰 runtime 与缓存
     expect(await close()).toEqual({ ok: true });
-    expect(cacheDisposeSpy).toHaveBeenCalledTimes(2);
+    expect(cacheDisposeSpy).toHaveBeenCalledTimes(1);
+    expect(runtimeDisposeSpy).toHaveBeenCalledTimes(1);
   });
 
   it('StrictMode 下 effect 卸载重放不破坏运行时：插件只启动一次，命令可用，真实卸载仍释放', async () => {

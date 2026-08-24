@@ -97,19 +97,23 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       } catch (error) {
         outcome = { ok: false, message: error instanceof Error ? error.message : String(error) };
       }
+      // preflight 失败（冲刷失败 / 未解决恢复 fork）：运行时无任何 teardown，
+      // 完整可编辑 —— 宿主保持挂载重试，缓存也不释放（第三十轮严重 6 语义）
       if (!outcome.ok) return outcome;
-      try {
-        if (!cacheDisposedRef.current) {
+      // 终态 commit 已收敛（runtime 已终态释放）：缓存释放是终态的最后一步。
+      // cache.dispose 契约为 best-effort 不抛错（内部逐资源清理，第三十三轮
+      // 阻断 3）—— 意外拒绝归一后仍返回成功：运行态已收敛，卸载不受阻。
+      // 修复前 cache 抛错返回 {ok:false}，但 runtime 已销毁：宿主保持挂载
+      // 面对「可编辑但不可保存」死壳，重试时跳过缓存释放假报成功
+      if (!cacheDisposedRef.current) {
+        try {
           cache.dispose();
-          // 第三十二轮阻断 2：完成标记在步骤成功后写入 —— 修复前先置位后
-          // dispose，cache.dispose() 抛错时返回 {ok:false} 但标记已置位，
-          // 重试跳过缓存释放假报成功（资源缓存泄漏）
-          cacheDisposedRef.current = true;
+        } catch {
+          // best-effort：缓存资源释放失败不阻断卸载语义（终态已达成）
         }
-        return { ok: true };
-      } catch (error) {
-        return { ok: false, message: error instanceof Error ? error.message : String(error) };
+        cacheDisposedRef.current = true;
       }
+      return { ok: true };
     })();
     const inFlight = closeInFlightRef.current;
     // 失败：清空缓存允许重试 —— 仅当 ref 仍指向本次结果（并发调用共享同一

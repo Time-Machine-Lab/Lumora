@@ -96,9 +96,17 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
         initialized = true;
       })();
       const inFlight = initPromise;
-      void inFlight.then(() => {
-        if (initPromise === inFlight) initPromise = null;
-      });
+      // 第三十三轮一般 5：成功/失败双分支 settle 清理 —— 修复前 success-only
+      // then 派生未处理拒绝，且拒绝后 initPromise 永久复用 rejected promise
+      // （后续 init 永远失败、无法重试）
+      void inFlight.then(
+        () => {
+          if (initPromise === inFlight) initPromise = null;
+        },
+        () => {
+          if (initPromise === inFlight) initPromise = null;
+        },
+      );
       return inFlight;
     },
     async openProject(project, options = {}) {
@@ -144,27 +152,44 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
       // 非 async 直接返回缓存 promise，并发调用拿到同一对象（与 close() 同型）
       if (disposePromise) return disposePromise;
       disposePromise = (async (): Promise<{ ok: boolean; message?: string }> => {
+        // preflight（第二十八轮阻断 4 + 第三十三轮阻断 2 明确语义）：冲刷自动
+        // 保存（flush 需读取未销毁的编辑器）+ recovery 检查 —— 无任何 teardown，
+        // 失败即返回 {ok:false}，persistence/编辑器/宿主全部保留，运行时恢复
+        // 普通可编辑状态（编辑仍进 autosave、可落盘）。意外拒绝同样归一为
+        // 可恢复失败
+        let outcome: { ok: boolean; message?: string };
         try {
-          // 第二十八轮阻断 4：先冲刷自动保存（flush 需读取未销毁的编辑器），
-          // 失败时如实返回且不 teardown —— 不置 disposed/不移监听/不销毁
-          // 编辑器与宿主，调用方可重试或引导用户「另存副本」保全未保存内容
-          const outcome = await persistence.dispose();
-          if (!outcome.ok) return { ok: false, message: outcome.message };
-          // 第三十二轮阻断 2：终态释放「可失败者先行」—— 插件停用（可能抛错）
-          // 在编辑器销毁前执行。修复前 editor 先销毁、host 后停用：host 失败时
-          // 返回 {ok:false} 的「编辑器保留可重试」契约与现场不符（编辑器已销毁），
-          // 且插件停用期读到的编辑器已是死实例。全部步骤幂等，完成标记
-          // （disposed）在最后写入 —— 失败重试只补做未完成步骤
-          await host.dispose();
-          unsubscribe.dispose();
-          editor.dispose();
-          disposed = true;
-          return { ok: true };
+          outcome = await persistence.dispose();
         } catch (error) {
-          // 第三十一轮严重 3：意外拒绝归一为类型化失败 —— 绝不把 unhandled
-          // rejection 交给 close() 调用方；失败后 disposed 未置位，可重试
           return { ok: false, message: error instanceof Error ? error.message : String(error) };
         }
+        if (!outcome.ok) return { ok: false, message: outcome.message };
+        // commit（终态 best-effort 收敛，第三十三轮阻断 2）：persistence 已终态
+        // 释放（autosaver 停止、订阅已拆、store 已关）—— 运行态不可恢复，宿主
+        // 不得继续编辑（「可编辑但不可保存」死壳是数据丢失面）。host/事件订阅/
+        // 编辑器逐项尽力释放，任何失败不中断收敛（修复前 host.dispose() 失败
+        // 即返回 {ok:false}，但 persistence 已永久释放：宿主保持挂载面对死壳，
+        // 重试时新编辑随编辑器销毁丢失）；完成标记（disposed）在全部步骤尝试
+        // 后置位，失败原因并入 message —— ok 仍为 true（终态已收敛、可安全
+        // 卸载），不再以 {ok:false} 冒充运行态完整
+        const failures: string[] = [];
+        try {
+          await host.dispose();
+        } catch (error) {
+          failures.push(error instanceof Error ? error.message : String(error));
+        }
+        try {
+          unsubscribe.dispose();
+        } catch (error) {
+          failures.push(error instanceof Error ? error.message : String(error));
+        }
+        try {
+          editor.dispose();
+        } catch (error) {
+          failures.push(error instanceof Error ? error.message : String(error));
+        }
+        disposed = true;
+        return failures.length === 0 ? { ok: true } : { ok: true, message: `终态释放部分失败：${failures.join('；')}` };
       })();
       const inFlight = disposePromise;
       // 失败：清空缓存允许重试 —— 仅当 ref 仍指向本次结果（并发调用共享同一

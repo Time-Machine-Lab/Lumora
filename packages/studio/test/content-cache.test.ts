@@ -541,3 +541,79 @@ describe('resolveFormat：显式格式 > 扩展名 > mime', () => {
     expect(resolveFormat('car.txt', 'text/plain', 'gltf')).toBe('gltf'); // 显式最高优先级
   });
 });
+
+describe('第三十三轮阻断 3：内部 GPU disposer 抛错不中断收敛（真实资源故障注入）', () => {
+  /** 带真实纹理的 gltf：geometry + material(map) + texture 三层 GPU 资源 */
+  function makeTexturedGltf(): { gltf: GLTF; geometry: THREE.BufferGeometry; material: THREE.Material; texture: THREE.Texture } {
+    const gltf = makeGltf();
+    const mesh = gltf.scene.children[0] as THREE.Mesh;
+    const texture = new THREE.Texture();
+    mesh.material.map = texture;
+    return { gltf, geometry: mesh.geometry, material: mesh.material, texture };
+  }
+
+  it('geometry.dispose 抛错：dispose 不抛错、material/texture 仍释放、完成标记真实置位（修复前遍历中断假报成功）', async () => {
+    const { gltf, geometry, material, texture } = makeTexturedGltf();
+    const geometrySpy = vi.spyOn(geometry, 'dispose').mockImplementationOnce(() => {
+      throw new Error('模拟几何体释放崩溃');
+    });
+    const materialSpy = vi.spyOn(material, 'dispose');
+    const textureSpy = vi.spyOn(texture, 'dispose');
+
+    const cache = new ContentCache({ loader: vi.fn(async () => gltf) });
+    const lease = cache.acquire('h', BYTES, { format: 'glb' });
+    await lease.content; // entry.gltf 就绪
+
+    // 故障注入走真实内部路径（修复前 mock 整个 ContentCache.dispose() 恰好
+    // 避开该路径，外层假报成功）：disposeGltf 逐资源 best-effort —— geometry
+    // 释放失败不中断 material/texture 释放；dispose 恒完整收敛不抛错，
+    // 「disposed=true」恒等于全部条目真实执行过清理
+    expect(() => cache.dispose()).not.toThrow();
+    expect(geometrySpy).toHaveBeenCalledTimes(1); // 抛错被 best-effort 吞掉
+    expect(materialSpy).toHaveBeenCalledTimes(1); // 其余资源仍释放
+    expect(textureSpy).toHaveBeenCalledTimes(1);
+    expect(cache.isReady('h')).toBe(false); // 条目已收尾移出
+    // 完成标记后置：二次 dispose no-op，不再触碰任何资源
+    cache.dispose();
+    expect(materialSpy).toHaveBeenCalledTimes(1);
+    expect(() => cache.acquire('h', BYTES, { format: 'glb' })).toThrow('缓存已释放');
+  });
+
+  it('geometry/material/texture dispose 全部抛错：逐资源独立 best-effort，dispose 仍完整收敛', async () => {
+    const { gltf, geometry, material, texture } = makeTexturedGltf();
+    vi.spyOn(geometry, 'dispose').mockImplementationOnce(() => {
+      throw new Error('模拟几何体释放崩溃');
+    });
+    vi.spyOn(material, 'dispose').mockImplementationOnce(() => {
+      throw new Error('模拟材质释放崩溃');
+    });
+    vi.spyOn(texture, 'dispose').mockImplementationOnce(() => {
+      throw new Error('模拟纹理释放崩溃');
+    });
+
+    const cache = new ContentCache({ loader: vi.fn(async () => gltf) });
+    const lease = cache.acquire('h', BYTES, { format: 'glb' });
+    await lease.content;
+
+    expect(() => cache.dispose()).not.toThrow();
+    expect(cache.isReady('h')).toBe(false);
+    cache.dispose(); // 完成标记已置位：二次 no-op
+  });
+
+  it('loader 在途条目 dispose 后 settle：收尾仍逐资源 best-effort，条目不残留（修复前 torn 先置位，条目从清理路径消失）', async () => {
+    const resolvers: ((gltf: GLTF) => void)[] = [];
+    const loader = vi.fn(() => new Promise<GLTF>((resolve) => resolvers.push(resolve)));
+    const cache = new ContentCache({ loader });
+    cache.acquire('h', BYTES, { format: 'glb' });
+    cache.dispose(); // 在途条目：保留到 settle，由 settle 处理器独立收尾
+    const gltf = makeGltf();
+    vi.spyOn(geometryOf(gltf), 'dispose').mockImplementationOnce(() => {
+      throw new Error('模拟几何体释放崩溃');
+    });
+
+    resolvers[0]!(gltf);
+    await flush();
+    // settle 收尾吞掉抛错、torn 后置：条目完整移出（不因抛错留下半清理状态）
+    expect(cache.has('h')).toBe(false);
+  });
+});

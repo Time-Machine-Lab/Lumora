@@ -1743,6 +1743,153 @@ describe('工程包构建：单一高置信段默认拒绝 + 单调后缀剥除 
   });
 });
 
+describe('第三十三轮阻断 1：CJK/日/韩凭据根不得经 BENIGN 规范化碰撞放行', () => {
+  // 审查员复现集：修复前 collapsedCredentialForm 的 [^a-z0-9] 把 CJK/日/韩凭据根词
+  // 一并剥除 —— '密码tokenizerConfig' → 'tokenizerconfig' 命中良性白名单放行且值进包；
+  // 控制项 '密码blob' 剥后 'blob' 不命中白名单、走 CJK 根检查被拒 —— 同含凭据根的
+  // 两个键仅因 BENIGN 碰撞分化，证明泄漏来自白名单短路
+  const cjkTopLevel = [
+    '密码tokenizerConfig',
+    'tokenizerConfig密码',
+    '密碼tokenBudget',
+    'パスワードauthMode',
+    '비밀번호tokenizerConfig',
+    '密码blob', // 控制项：无 BENIGN 碰撞时本来就拒绝
+  ];
+  const cjkNestedLeaves = [
+    ['profile', '密码tokenizerConfig'],
+    ['profile', 'tokenizerConfig密码'],
+    ['profile', '密碼tokenBudget'],
+    ['profile', 'パスワードauthMode'],
+    ['profile', '비밀번호tokenizerConfig'],
+  ];
+  const cjkSplitPaths = [
+    ['profile', '密码', 'tokenizer', 'config'],
+    ['profile', 'tokenizer', 'config', '密码'],
+    ['profile', '密碼', 'token', 'budget'],
+    ['profile', 'パスワード', 'auth', 'mode'],
+  ];
+
+  it('顶层整键：CJK/日/韩凭据根 + 良性键前缀/后缀拼接全部拒绝，值不进包', async () => {
+    const project = await buildFixtureProject();
+    for (const key of cjkTopLevel) {
+      const error = expectCredentialDeclarationRejected(() =>
+        buildProjectPackage(
+          { ...project, pluginData: { 'com.example': { [key]: 'leak-r33' } } },
+          { includePrivate: true, publicKeysByPlugin: { 'com.example': [key] } },
+        ),
+      );
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(key) });
+    }
+  });
+
+  it('嵌套叶键：与顶层同一判据，CJK 凭据根落叶键一律拒绝', async () => {
+    const project = await buildFixtureProject();
+    for (const path of cjkNestedLeaves) {
+      const error = expectCredentialDeclarationRejected(() =>
+        buildProjectPackage(
+          { ...project, pluginData: { 'com.example': { profile: { [path[1]!]: 'leak-r33' } } } },
+          { includePrivate: true, publicKeysByPlugin: { 'com.example': [path] } },
+        ),
+      );
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(path) });
+    }
+  });
+
+  it('拆分路径：CJK 根落任意段（叶段/中间段/后缀段）均拒绝，良性后缀识别不再吞掉非 ASCII 前缀', async () => {
+    const project = await buildFixtureProject();
+    for (const path of cjkSplitPaths) {
+      const error = expectCredentialDeclarationRejected(() =>
+        buildProjectPackage(
+          { ...project, pluginData: {} },
+          { includePrivate: true, publicKeysByPlugin: { 'com.example': [path] } },
+        ),
+      );
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(path) });
+    }
+  });
+
+  it('BENIGN 反向矩阵：纯 ASCII 良性键（含全角分隔变体）声明与数据无损往返，修复不误伤', async () => {
+    const project = await buildFixtureProject();
+    const pluginData: Record<string, unknown> = {
+      'com.example': {
+        tokenizerConfig: 'keep-1',
+        'TOKENIZER；CONFIG': 'keep-2', // 全角分号经 NFKC → ASCII 分隔符剥除，仍命中白名单
+        tokenBudget: 'keep-3',
+        authMode: 'keep-4',
+        cookieConsent: 'keep-5',
+        profile: {
+          tokenizerConfig: 'keep-6',
+          tokenizer: { config: 'keep-7' },
+          cookie: { consent: 'keep-8' },
+          token: { budget: 'keep-9' },
+        },
+      },
+    };
+    const declarations: Array<string | readonly string[]> = [
+      'tokenizerConfig',
+      'TOKENIZER；CONFIG',
+      'tokenBudget',
+      'authMode',
+      'cookieConsent',
+      ['profile', 'tokenizerConfig'],
+      ['profile', 'tokenizer', 'config'],
+      ['profile', 'cookie', 'consent'],
+      ['profile', 'token', 'budget'],
+    ];
+    const pkg = buildProjectPackage({ ...project, pluginData }, {
+      includePrivate: true,
+      publicKeysByPlugin: { 'com.example': declarations },
+    });
+    const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, unknown>)['com.example'];
+    expect(plugin).toEqual({
+      tokenizerConfig: 'keep-1',
+      'TOKENIZER；CONFIG': 'keep-2',
+      tokenBudget: 'keep-3',
+      authMode: 'keep-4',
+      cookieConsent: 'keep-5',
+      profile: {
+        tokenizerConfig: 'keep-6',
+        tokenizer: { config: 'keep-7' },
+        cookie: { consent: 'keep-8' },
+        token: { budget: 'keep-9' },
+      },
+    });
+  });
+
+  it('真实嵌套数据往返：含 CJK 凭据根的声明即使混合合法键也整体构建失败（manifest 级校验先于数据投影）', async () => {
+    const project = await buildFixtureProject();
+    // 合法键 tokenizerConfig 与凭据根键混同声明：凭据根声明拒绝 → 整次构建失败，
+    // 不存在「凭据键静默不进包、合法键照常进包」的假成功路径
+    expectCredentialDeclarationRejected(() =>
+      buildProjectPackage(
+        {
+          ...project,
+          pluginData: {
+            'com.example': {
+              tokenizerConfig: 'keep',
+              profile: { 密码tokenizerConfig: 'leak', tokenizer: { config: { 密码: 'leak' } } },
+            },
+          },
+        },
+        {
+          includePrivate: true,
+          publicKeysByPlugin: {
+            'com.example': [
+              'tokenizerConfig',
+              ['profile', '密码tokenizerConfig'],
+              ['profile', 'tokenizer', 'config', '密码'],
+            ],
+          },
+        },
+      ),
+    );
+  });
+});
+
 describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻断 1 / 一般 8 / 一般 9）', () => {
   it('嵌套凭据不进包：objects/scenes/tracks/资产元数据中的契约外字段默认导出与 includePrivate 一律排除', async () => {
     const project = await buildFixtureProject();
