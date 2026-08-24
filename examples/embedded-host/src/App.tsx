@@ -167,6 +167,10 @@ const STORAGE = new URLSearchParams(window.location.search).get('storage') === '
 
 export default function App() {
   const [mounted, setMounted] = useState(true);
+  // 第三十一轮严重 3：卸载进行中（close() 未 settle）时禁用触发按钮 ——
+  // 双击/连点不再并发进入卸载流程；close() 本身是 single-flight（重复调用
+  // 共享同一 in-flight 裁决），此处是 UI 层对同一问题的第一道防线
+  const [closing, setClosing] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const handleRef = useRef<LumoraStudioHandle | null>(null);
 
@@ -193,17 +197,24 @@ export default function App() {
 
   const toggleMount = async () => {
     if (mounted) {
-      const subscriptionCount = handleRef.current?.runtime.events.handlerCount ?? 0;
-      // 第三十轮严重 6：卸载走 handle.close() 可等待屏障 —— 冲刷失败/未解决
-      // 恢复 fork 时释放被拒绝，保持挂载并记录原因（未落盘内容仍可恢复），
-      // 绝不「假装已卸载」丢弃内容
-      const outcome = await handleRef.current?.close();
-      if (outcome && !outcome.ok) {
-        appendLog(`卸载被拒绝：${outcome.message ?? '运行时释放失败'} —— Studio 保持挂载，请先解决未保存内容`);
-        return;
+      // 第三十一轮严重 3：卸载进行中禁止再次进入（双击/连点防护）
+      if (closing) return;
+      setClosing(true);
+      try {
+        const subscriptionCount = handleRef.current?.runtime.events.handlerCount ?? 0;
+        // 第三十轮严重 6：卸载走 handle.close() 可等待屏障 —— 冲刷失败/未解决
+        // 恢复 fork 时释放被拒绝，保持挂载并记录原因（未落盘内容仍可恢复），
+        // 绝不「假装已卸载」丢弃内容
+        const outcome = await handleRef.current?.close();
+        if (outcome && !outcome.ok) {
+          appendLog(`卸载被拒绝：${outcome.message ?? '运行时释放失败'} —— Studio 保持挂载，请先解决未保存内容`);
+          return;
+        }
+        appendLog(`卸载 Studio：释放前事件订阅数 ${subscriptionCount} —— 运行时已释放`);
+        setMounted(false);
+      } finally {
+        setClosing(false);
       }
-      appendLog(`卸载 Studio：释放前事件订阅数 ${subscriptionCount} —— 运行时已释放`);
-      setMounted(false);
     } else {
       setMounted(true);
     }
@@ -217,6 +228,7 @@ export default function App() {
           <button
             type="button"
             data-testid="reopen-last-export"
+            disabled={closing}
             onClick={() => {
               const raw = localStorage.getItem('lumora.demo.last-export');
               if (!raw) {
@@ -233,8 +245,8 @@ export default function App() {
           >
             重开上次导出（新运行时）
           </button>
-          <button type="button" data-testid="studio-mount-toggle" onClick={toggleMount}>
-            {mounted ? '卸载 Studio（释放资源）' : '重新挂载 Studio'}
+          <button type="button" data-testid="studio-mount-toggle" disabled={closing} onClick={toggleMount}>
+            {closing ? '正在释放资源…' : mounted ? '卸载 Studio（释放资源）' : '重新挂载 Studio'}
           </button>
         </div>
       </header>

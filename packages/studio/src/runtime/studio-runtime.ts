@@ -63,6 +63,9 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
   const persistence = new ProjectPersistence(editor);
   let disposed = false;
   let initialized = false;
+  // 第三十一轮严重 3：dispose 幂等合并（single-flight）—— 并发调用共享同一
+  // in-flight 执行，成功后永久复用结果；失败 settle 后清空缓存允许重试
+  let disposePromise: Promise<{ ok: boolean; message?: string }> | null = null;
   // 编辑器每次变更（提交/撤销/重做/打开/关闭）都同步宿主快照并广播给插件
   const unsubscribe = editor.events.on('project:changed', ({ project }) => {
     if (disposed) return;
@@ -115,18 +118,39 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
       return { ok: true };
     },
     getProject: () => editor.getProject(),
-    async dispose() {
-      if (disposed) return { ok: true };
-      // 第二十八轮阻断 4：先冲刷自动保存（flush 需读取未销毁的编辑器），失败
-      // 时如实返回且不 teardown —— 不置 disposed/不移监听/不销毁编辑器与宿主，
-      // 调用方可重试或引导用户「另存副本」保全未保存内容
-      const outcome = await persistence.dispose();
-      if (!outcome.ok) return { ok: false, message: outcome.message };
-      disposed = true;
-      unsubscribe.dispose();
-      editor.dispose();
-      await host.dispose();
-      return { ok: true };
+    dispose(): Promise<{ ok: boolean; message?: string }> {
+      // 第三十一轮严重 3：成功后永久复用同一成功结果对象（重复调用不再触碰
+      // persistence/编辑器/宿主）
+      if (disposed) return disposePromise ?? Promise.resolve({ ok: true });
+      // 第三十一轮严重 3：幂等合并 —— 并发调用共享同一 in-flight 执行
+      // （修复前并发调用都在 disposed 置位前越过守卫，重复冲刷/重复 teardown）；
+      // 非 async 直接返回缓存 promise，并发调用拿到同一对象（与 close() 同型）
+      if (disposePromise) return disposePromise;
+      disposePromise = (async (): Promise<{ ok: boolean; message?: string }> => {
+        try {
+          // 第二十八轮阻断 4：先冲刷自动保存（flush 需读取未销毁的编辑器），
+          // 失败时如实返回且不 teardown —— 不置 disposed/不移监听/不销毁
+          // 编辑器与宿主，调用方可重试或引导用户「另存副本」保全未保存内容
+          const outcome = await persistence.dispose();
+          if (!outcome.ok) return { ok: false, message: outcome.message };
+          unsubscribe.dispose();
+          editor.dispose();
+          await host.dispose();
+          disposed = true;
+          return { ok: true };
+        } catch (error) {
+          // 第三十一轮严重 3：意外拒绝归一为类型化失败 —— 绝不把 unhandled
+          // rejection 交给 close() 调用方；失败后 disposed 未置位，可重试
+          return { ok: false, message: error instanceof Error ? error.message : String(error) };
+        }
+      })();
+      const inFlight = disposePromise;
+      // 失败：清空缓存允许重试 —— 仅当 ref 仍指向本次结果（并发调用共享同一
+      // promise，慢成员 settle 时不得清掉已在重试的新一轮）
+      void inFlight.then((outcome) => {
+        if (!outcome.ok && disposePromise === inFlight) disposePromise = null;
+      });
+      return inFlight;
     },
   };
 }

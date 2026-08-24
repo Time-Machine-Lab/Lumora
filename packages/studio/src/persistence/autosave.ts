@@ -147,8 +147,24 @@ export class ProjectAutosaver {
    *  监听器）。每轮分发开启新代际，每次回调后复验：代际已变（发生过嵌套发布）
    *  立即终止本轮分发，绝不让陈旧状态在更新状态之后送达其余监听器 */
   private broadcastEpoch = 0;
-  /** 锁存错误（revision 冲突 / 恢复快照待处理）：编辑不得自行转 dirty 隐藏解决入口 */
-  private latched: LatchedError | null = null;
+  /** 锁存错误（revision 冲突 / 恢复快照待处理）：编辑不得自行转 dirty 隐藏解决入口。
+   *  第三十一轮阻断 2 改按 uri 分键：非当前 uri 的重试/对账失败只锁存该 uri
+   *  （该 uri 重新打开或恢复解决时呈现），绝不覆盖当前项目的锁存 —— 修复前
+   *  单一 latched 字段被非当前 uri 的 retryRecovery 冲突覆写后，当前 uri 的
+   *  flush/close 屏障失去锁存拦截、恢复解决入口消失 */
+  private readonly latchedByUri = new Map<string, LatchedError>();
+  /** 当前 uri 的锁存（getter/setter 统一经 latchedByUri 分键读写） */
+  private get latched(): LatchedError | null {
+    if (this.currentUri === null) return null;
+    return this.latchedByUri.get(this.currentUri) ?? null;
+  }
+  private set latched(error: LatchedError | null) {
+    if (error === null) {
+      if (this.currentUri !== null) this.latchedByUri.delete(this.currentUri);
+      return;
+    }
+    this.latchedByUri.set(error.uri, error);
+  }
   /** 切换/关闭时保存失败被保留的旧项目快照（按 uri → 按 generation 的多 fork），
    *  重新打开时明示可恢复（第二十八轮阻断 2：同一 uri 多次保存失败各自入录
    *  独立 fork，保存成功只清除「自己覆盖的恢复项」—— 指纹一致即落盘内容就是
@@ -305,7 +321,8 @@ export class ProjectAutosaver {
     this.currentUri = null;
     this.pending = null;
     this.saveQueued = null;
-    this.latched = null;
+    // 第三十一轮阻断 2：按 uri 清除锁存（setter 在 currentUri 置空后是空操作）
+    if (prevUri !== null) this.latchedByUri.delete(prevUri);
     if (prevUri !== null && previous !== null) {
       this.enqueueDrain(prevUri, previous, drainingEpoch);
     }
@@ -701,9 +718,10 @@ export class ProjectAutosaver {
             // 完成后由 changed() 链广播一次），与已落盘内容对齐
             this.switchOpen(snapshot);
           } else {
-            // 第三十轮阻断 4：非当前 uri 的 valid 成功且无剩余 fork → 解除该
-            // uri 锁存（advanceBaseline 不再代劳清除）
-            if (this.latched?.uri === uri) this.latched = null;
+            // 第三十轮阻断 4 + 第三十一轮阻断 2：非当前 uri 的 valid 成功且无
+            // 剩余 fork → 解除该 uri 锁存（advanceBaseline 不再代劳清除；
+            // 按 uri 分键，绝不动其他 uri 的锁存）
+            this.latchedByUri.delete(uri);
           }
         } else if (result.code === 'revision-conflict') {
           // 第三十轮阻断 4：失败同样复验该代 fork —— 保存 await 期间该代已被
@@ -742,9 +760,10 @@ export class ProjectAutosaver {
             this.latched = { uri, code: 'recovery-available', message };
             if (uri === this.currentUri) this.emit({ status: 'error', code: 'recovery-available', message });
           } else if (uri === this.currentUri) {
-            // 第三十轮阻断 4：valid 成功且无剩余 fork → 显式解除本 uri 锁存
-            // （advanceBaseline 不再代劳 —— 陈旧成功不得清掉较新的锁存）
-            if (this.latched?.uri === uri) this.latched = null;
+            // 第三十轮阻断 4 + 第三十一轮阻断 2：valid 成功且无剩余 fork → 显式
+            // 解除本 uri 锁存（advanceBaseline 不再代劳 —— 陈旧成功不得清掉
+            // 较新的锁存；按 uri 分键删除）
+            this.latchedByUri.delete(uri);
             this.emit(this.store ? { status: 'clean' } : { status: 'memory' });
           }
         } else if (result.code === 'revision-conflict') {
@@ -832,7 +851,8 @@ export class ProjectAutosaver {
       if (uri === this.currentUri) this.emit({ status: 'error', code: 'recovery-available', message });
       return;
     }
-    if (this.latched?.uri === uri && this.latched.code === 'recovery-available') this.latched = null;
+    // 第三十一轮阻断 2：按 uri 分键解除 recovery-available 锁存（uri 可能非当前）
+    if (this.latchedByUri.get(uri)?.code === 'recovery-available') this.latchedByUri.delete(uri);
     if (uri === this.currentUri) {
       const current = this.editor.getProject();
       if (current && this.isUnsaved(current)) this.emit({ status: 'dirty' });
@@ -880,7 +900,8 @@ export class ProjectAutosaver {
   clearRecovery(uri: string): void {
     if (!this.recovery.has(uri)) return;
     this.recovery.delete(uri);
-    if (this.latched?.uri === uri && this.latched.code === 'recovery-available') this.latched = null;
+    // 第三十一轮阻断 2：按 uri 分键解除 recovery-available 锁存（uri 可能非当前）
+    if (this.latchedByUri.get(uri)?.code === 'recovery-available') this.latchedByUri.delete(uri);
     if (uri === this.currentUri) {
       const current = this.editor.getProject();
       if (current && this.isUnsaved(current)) this.emit({ status: 'dirty' });
@@ -1127,6 +1148,9 @@ export class ProjectAutosaver {
   }
 
   private latch(error: LatchedError): void {
+    // 第三十一轮阻断 2：按 uri 分键写入（setter）—— 非当前 uri 的锁存与当前
+    // uri 的锁存互不覆盖（修复前单一 latched 字段被非当前 uri 的 retryRecovery
+    // 冲突覆写，当前 uri 的锁存与屏障失效）
     this.latched = error;
     // 第三十轮阻断 4：广播仅限当前 uri —— 非当前 uri 的重试/对账失败只更新锁存
     // 状态（该 uri 重新打开或恢复解决时呈现），绝不向当前项目的监听器广播
@@ -1171,8 +1195,10 @@ export class ProjectAutosaver {
       if (this.recovery.has(project.uri)) {
         const message =
           '该项目存在未保存的恢复快照（上次保存失败）。可「另存副本」保留未保存内容，或「重试保存」';
-        if (this.latched?.uri !== project.uri || this.latched.code !== 'recovery-available') {
-          this.latched = { uri: project.uri, code: 'recovery-available', message };
+        // 第三十一轮阻断 2：按 uri 分键 —— project.uri 可能非当前（旧会话在途
+        // 保存成功），只更新该 uri 自己的锁存，绝不覆盖其他 uri 的锁存
+        if (this.latchedByUri.get(project.uri)?.code !== 'recovery-available') {
+          this.latchedByUri.set(project.uri, { uri: project.uri, code: 'recovery-available', message });
         }
         if (this.isFresh(project.uri, session)) {
           if (this.pending === project) this.pending = null;
@@ -1180,7 +1206,8 @@ export class ProjectAutosaver {
         }
         return;
       }
-      if (this.latched?.uri === project.uri) this.latched = null;
+      // 第三十一轮阻断 2：成功落盘按 uri 清除该 uri 的锁存
+      this.latchedByUri.delete(project.uri);
       if (!this.isFresh(project.uri, session)) return;
       if (this.pending === project) this.pending = null;
       const current = this.editor.getProject();

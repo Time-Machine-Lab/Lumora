@@ -2047,3 +2047,92 @@ describe('ProjectAutosaver：重试恢复代绑定与卸载拒绝（第二十九
     expect(await autosaver.dispose()).toEqual({ ok: true });
   });
 });
+
+describe('ProjectAutosaver：按 uri 分键锁存（第三十一轮阻断 2 回归）', () => {
+  it('阻断2：双 URI 双 fork —— 非当前 A 的 retryRecovery 冲突不覆盖当前 B 的锁存，B 的 flush/dispose 屏障与解决入口保持（修复前单一 latched 字段被 A 覆写，B 的恢复锁存丢失、屏障假放行）', async () => {
+    const { editor, store, autosaver } = await wired();
+    const A = 'lumora://project/a';
+    const B = 'lumora://project/b';
+    const realSave = store.save.bind(store);
+    let aDrainFailed = false;
+    let bDrainFailed = false;
+    let aRetryConflicted = false;
+    store.save = async (p, expected) => {
+      // A rev1 首次保存失败 → fork A（切到 B 时的排空）
+      if (!aDrainFailed && p.uri === A && p.revision === 1) {
+        aDrainFailed = true;
+        return { ok: false, code: 'storage-error', message: '模拟 A 存储错误' };
+      }
+      // B rev1 首次保存失败 → fork B（关闭 B 时的排空）
+      if (!bDrainFailed && p.uri === B && p.revision === 1) {
+        bDrainFailed = true;
+        return { ok: false, code: 'storage-error', message: '模拟 B 存储错误' };
+      }
+      // A 的重试保存（基线 0）首次失败为 revision 冲突
+      if (!aRetryConflicted && p.uri === A && p.revision === 1 && expected === 0) {
+        aRetryConflicted = true;
+        return { ok: false, code: 'revision-conflict', message: '模拟 A 冲突' };
+      }
+      return realSave(p, expected);
+    };
+
+    // fork A：A rev1 排空失败（切到 B 时）
+    editor.openProject(createSampleProject(A));
+    await settle(10); // A 首存完成
+    editor.addObject(createGroupObject()); // A rev1
+    editor.openProject(createSampleProject(B)); // 排空 A rev1 → 失败 → fork A
+    await settle(60); // drain A 完成 + B 首存完成
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+
+    // fork B：B rev1 排空失败（关闭 B 时）
+    editor.addObject(createGroupObject()); // B rev1
+    editor.reset(); // changed(null) → close → 排空 B rev1 → 失败 → fork B
+    await settle(60);
+    expect(autosaver.getRecovery(B)).not.toBeNull();
+
+    // 重开 B（以存储中的 B rev0 为内容 —— createSampleProject 的 id 随机，
+    // 直接重开新实例会因同 revision 分叉锁存 revision-conflict 而非恢复入口）
+    // → 对账锁存 recovery-available；B 为当前项目
+    const storedB = await loadStored(store, B);
+    expect(storedB).not.toBeNull();
+    if (!storedB) return;
+    editor.openProject(storedB);
+    await settle(60); // reconcile → 锁存 B recovery-available
+    expect(autosaver.getRecovery(B)).not.toBeNull();
+
+    // 非当前 A 的重试冲突：按 uri 锁存 A，不得触碰 B 的锁存
+    const conflicted = await autosaver.retryRecovery(A);
+    expect(conflicted).toEqual({ ok: false, code: 'revision-conflict', message: '模拟 A 冲突' });
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+
+    // 当前 B 的 flush 屏障保持：返回 B 自己的 recovery-available（修复前单一
+    // latched 字段被 A 冲突覆写后 gate 的 uri 校验落空，flush 假放行 ok:true）
+    const flushed = await autosaver.flush();
+    expect(flushed).toEqual({
+      ok: false,
+      code: 'recovery-available',
+      message: '该项目存在未保存的恢复快照（上次保存失败）。可「另存副本」保留未保存内容，或「重试保存」',
+    });
+
+    // 关闭 B 后 dispose 屏障同样保持：仍有双 fork 未解决 → 拒绝释放
+    editor.reset(); // close B
+    await settle(10);
+    const refused = await autosaver.dispose();
+    expect(refused).toEqual({
+      ok: false,
+      code: 'recovery-available',
+      message: '存在未保存的恢复快照（上次保存失败），运行时已保留；请先「另存副本」或「重试保存」后再释放',
+    });
+    // 未被 dispose：自动保存仍可用、双 fork 均保留
+    expect(autosaver.getRecovery(A)).not.toBeNull();
+    expect(autosaver.getRecovery(B)).not.toBeNull();
+
+    // 逐个解决：clearRecovery(B) 显式放弃 → A 重试真实保存成功 → 释放成功
+    autosaver.clearRecovery(B);
+    expect(autosaver.getRecovery(B)).toBeNull();
+    const retried = await autosaver.retryRecovery(A);
+    expect(retried.ok).toBe(true);
+    expect(autosaver.getRecovery(A)).toBeNull();
+    expect(await autosaver.dispose()).toEqual({ ok: true });
+  });
+});

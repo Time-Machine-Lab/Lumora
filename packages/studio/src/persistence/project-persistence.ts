@@ -64,6 +64,9 @@ export class ProjectPersistence {
   private unsubscribeEditor: { dispose(): void } | null = null;
   private currentUri: string | null = null;
   private disposed = false;
+  // 第三十一轮严重 3：dispose 幂等合并（single-flight）—— 并发调用共享同一
+  // in-flight 执行，成功后永久复用结果；失败 settle 后清空缓存允许重试
+  private disposePromise: Promise<SaveOutcome> | null = null;
   readonly events = new TypedEventEmitter<PersistenceEventMap>();
 
   constructor(private readonly editor: SceneEditor) {
@@ -519,17 +522,38 @@ export class ProjectPersistence {
    *  未解决的恢复 fork 时如实返回失败 —— 不得继续 teardown（断开监听/关闭存储/
    *  清 events），调用方（StudioRuntime）据此保留编辑器与存储供重试或显式解决，
    *  绝不「假装已卸载」丢弃未落盘内容。 */
-  async dispose(): Promise<SaveOutcome> {
-    if (this.disposed) return { ok: true };
-    const outcome = await this.autosaver.dispose();
-    if (!outcome.ok) return outcome;
-    this.disposed = true;
-    this.unsubscribeEditor?.dispose();
-    this.unsubscribeEditor = null;
-    this.store?.close();
-    this.store = null;
-    this.currentUri = null;
-    this.events.dispose();
-    return { ok: true };
+  dispose(): Promise<SaveOutcome> {
+    // 第三十一轮严重 3：成功后永久复用同一成功结果对象（不再触碰 autosaver/订阅）
+    if (this.disposed) return this.disposePromise ?? Promise.resolve({ ok: true });
+    // 第三十一轮严重 3：幂等合并 —— 并发调用共享同一 in-flight 执行
+    // （修复前并发调用都在 disposed 置位前越过守卫，重复冲刷/重复 teardown）；
+    // 非 async 直接返回缓存 promise，并发调用拿到同一对象（与 close()/runtime
+    // dispose() 同型）
+    if (this.disposePromise) return this.disposePromise;
+    this.disposePromise = (async (): Promise<SaveOutcome> => {
+      try {
+        const outcome = await this.autosaver.dispose();
+        if (!outcome.ok) return outcome;
+        this.disposed = true;
+        this.unsubscribeEditor?.dispose();
+        this.unsubscribeEditor = null;
+        this.store?.close();
+        this.store = null;
+        this.currentUri = null;
+        this.events.dispose();
+        return { ok: true };
+      } catch (error) {
+        // 第三十一轮严重 3：意外拒绝归一为类型化失败 —— 绝不把 unhandled
+        // rejection 交给调用方；失败后 disposed 未置位，可重试
+        return { ok: false, code: 'storage-error', message: failureMessage(error) };
+      }
+    })();
+    const inFlight = this.disposePromise;
+    // 失败：清空缓存允许重试 —— 仅当 ref 仍指向本次结果（并发调用共享同一
+    // promise，慢成员 settle 时不得清掉已在重试的新一轮）
+    void inFlight.then((outcome) => {
+      if (!outcome.ok && this.disposePromise === inFlight) this.disposePromise = null;
+    });
+    return inFlight;
   }
 }

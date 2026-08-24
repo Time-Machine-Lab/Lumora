@@ -1673,8 +1673,24 @@ describe('ProjectPersistence：第二十八轮回归（多 fork 恢复 / drain w
 });
 
 describe('ProjectPersistence：第三十轮回归（重试代隔离：陈旧失败不锁存不广播 / 陈旧成功不清较新锁存）', () => {
-  const latchedOf = (p: ProjectPersistence): { uri: string; code: string } | null =>
-    (p as unknown as { autosaver: { latched: { uri: string; code: string } | null } }).autosaver.latched;
+  // 第三十一轮阻断 2 后锁存按 uri 分键：缺省读当前 uri（等价旧单一 getter），
+  // 显式传 uri 可读非当前项目的锁存（该 uri 的解决入口仍保留在 latchedByUri 中）
+  const latchedOf = (
+    p: ProjectPersistence,
+    uri?: string,
+  ): { uri: string; code: string } | null => {
+    const autosaver = (
+      p as unknown as {
+        autosaver: {
+          currentUri: string | null;
+          latchedByUri: Map<string, { uri: string; code: string }>;
+        };
+      }
+    ).autosaver;
+    const key = uri ?? autosaver.currentUri;
+    if (key === null) return null;
+    return autosaver.latchedByUri.get(key) ?? null;
+  };
 
   it('阻断4：重试保存失败期间恢复记录被清除 → 取消且不锁存冲突、不向当前项目广播（非当前 uri）', async () => {
     const editor = new SceneEditor();
@@ -1776,7 +1792,7 @@ describe('ProjectPersistence：第三十轮回归（重试代隔离：陈旧失�
     const retrying = persistence.retryRecovery(A);
     await settle(20); // 保存挂起中
     persistence.clearRecoveryGeneration(A, gen2, fp2);
-    expect(latchedOf(persistence)).toMatchObject({ uri: A, code: 'recovery-available' });
+    expect(latchedOf(persistence, A)).toMatchObject({ uri: A, code: 'recovery-available' });
     const outcome = await retrying;
     // 落盘虽成功，但保存 await 期间该代已被消费 → 本次重试取消
     expect(outcome.ok).toBe(false);
@@ -1786,7 +1802,7 @@ describe('ProjectPersistence：第三十轮回归（重试代隔离：陈旧失�
     }
     // 陈旧成功不得清除较新锁存（修复前 advanceBaseline 直接清 latch）：剩余 fork
     // gen1 仍以 recovery-available 锁存呈现解决入口，绝不假报已保存
-    expect(latchedOf(persistence)).toMatchObject({ uri: A, code: 'recovery-available' });
+    expect(latchedOf(persistence, A)).toMatchObject({ uri: A, code: 'recovery-available' });
     expect(persistence.getRecoverySnapshot(A)).not.toBeNull();
     expect(persistence.getRecoverySnapshot(A)!.objects.length).toBe(base.objects.length + 1);
     // 锁存保留 → 释放仍被拒绝（gen1 内容仅存恢复区，绝不因 teardown 沉没）
@@ -1795,8 +1811,53 @@ describe('ProjectPersistence：第三十轮回归（重试代隔离：陈旧失�
     if (!refused.ok) expect(refused.code).toBe('recovery-available');
     // 显式解决（放弃恢复快照）后：锁存解除，释放成功
     persistence.clearRecovery(A);
-    expect(latchedOf(persistence)).toBeNull();
+    expect(latchedOf(persistence, A)).toBeNull();
     const disposed = await persistence.dispose();
     expect(disposed.ok).toBe(true);
+  });
+});
+
+describe('ProjectPersistence：dispose 幂等合并 single-flight（第三十一轮严重 3）', () => {
+  it('并发 dispose 共享同一 in-flight 执行；失败后清空缓存可重试，成功后永久复用', async () => {
+    const editor = new SceneEditor();
+    const store = await openStandaloneStore();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, store });
+    editor.openProject(createSampleProject('lumora://project/r31-sf', '并发释放'));
+
+    const autosaver = (
+      persistence as unknown as {
+        autosaver: { dispose: () => Promise<{ ok: boolean; code?: string; message?: string }> };
+      }
+    ).autosaver;
+    const disposeSpy = vi.spyOn(autosaver, 'dispose');
+    disposeSpy.mockResolvedValueOnce({ ok: false, code: 'storage-error', message: '模拟冲刷失败' });
+
+    const first = persistence.dispose();
+    const second = persistence.dispose();
+    // 非 async 直接返回缓存 promise：并发调用拿到同一对象（发布先行，只执行一次）
+    expect(second).toBe(first);
+    const outcome = await first;
+    expect(outcome).toMatchObject({ ok: false, message: '模拟冲刷失败' });
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+    // 失败后不 teardown：编辑器/store/事件总线都保留，可重试保全内容
+    expect(editor.getProject()).not.toBeNull();
+
+    // 失败 settle 后缓存清空 → 重试执行新一轮，成功（编辑器归运行时所有，
+    // persistence 层不重置；teardown 证据：store 置空、currentUri 清空）
+    disposeSpy.mockRestore();
+    const retried = await persistence.dispose();
+    expect(retried).toEqual({ ok: true });
+    expect((persistence as unknown as { store: unknown }).store).toBeNull();
+    expect((persistence as unknown as { currentUri: unknown }).currentUri).toBeNull();
+
+    // 成功后永久复用成功结果：重复调用幂等，不再触碰 autosaver
+    const retrySpy = vi.spyOn(autosaver, 'dispose');
+    const again = persistence.dispose();
+    const again2 = persistence.dispose();
+    expect(again2).toBe(again);
+    await expect(again).resolves.toEqual({ ok: true });
+    expect(retrySpy).not.toHaveBeenCalled();
+    retrySpy.mockRestore();
   });
 });

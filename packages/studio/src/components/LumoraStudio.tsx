@@ -79,15 +79,42 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   // 第三十轮严重 6：统一卸载屏障 —— 卸载 cleanup 与宿主显式卸载共用同一通道。
   // 释放失败（冲刷失败 / 未解决恢复 fork）时运行时保留未 teardown，缓存也不
   // 释放（宿主重试期间壳层完整可用）；成功才释放缓存，且只释放一次（宿主
-  // 多次调用 / cleanup 与显式调用并发时不会重复 dispose）
-  const close = useCallback(async (): Promise<{ ok: boolean; message?: string }> => {
-    const outcome = await runtime.dispose();
-    if (!outcome.ok) return { ok: false, message: outcome.message };
-    if (!cacheDisposedRef.current) {
-      cacheDisposedRef.current = true;
-      cache.dispose();
-    }
-    return { ok: true };
+  // 多次调用 / cleanup 与显式调用并发时不会重复 dispose）。
+  // 第三十一轮严重 3 改 single-flight：发布先行 —— 首次调用把 in-flight 结果
+  // promise 缓存进 closeInFlightRef，close() 直接返回该缓存（非 async 包装，
+  // 并发调用拿到同一 promise 对象，双击/StrictMode cleanup 与宿主显式调用
+  // 并发时 runtime.dispose 只执行一次）；失败 settle 后清空缓存允许重试
+  // （运行时未 teardown，壳层完整可用），成功后永久复用成功结果（已全部释放，
+  // 重复调用幂等）。runtime/cache 的意外拒绝归一为类型化失败返回，绝不把
+  // unhandled rejection 交给调用方
+  const closeInFlightRef = useRef<Promise<{ ok: boolean; message?: string }> | null>(null);
+  const close = useCallback((): Promise<{ ok: boolean; message?: string }> => {
+    if (closeInFlightRef.current) return closeInFlightRef.current;
+    closeInFlightRef.current = (async (): Promise<{ ok: boolean; message?: string }> => {
+      let outcome: { ok: boolean; message?: string };
+      try {
+        outcome = await runtime.dispose();
+      } catch (error) {
+        outcome = { ok: false, message: error instanceof Error ? error.message : String(error) };
+      }
+      if (!outcome.ok) return outcome;
+      try {
+        if (!cacheDisposedRef.current) {
+          cacheDisposedRef.current = true;
+          cache.dispose();
+        }
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, message: error instanceof Error ? error.message : String(error) };
+      }
+    })();
+    const inFlight = closeInFlightRef.current;
+    // 失败：清空缓存允许重试 —— 仅当 ref 仍指向本次结果（并发调用共享同一
+    // promise，慢成员 settle 时不得清掉已在重试的新一轮）
+    void inFlight.then((settled) => {
+      if (!settled.ok && closeInFlightRef.current === inFlight) closeInFlightRef.current = null;
+    });
+    return inFlight;
   }, [runtime, cache]);
 
   useImperativeHandle(ref, () => ({ runtime, close }), [runtime, close]);

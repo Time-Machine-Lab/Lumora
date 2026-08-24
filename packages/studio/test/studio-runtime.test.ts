@@ -200,3 +200,43 @@ describe('StudioRuntime：首存失败的切换屏障（TML-53 第四轮 #2 运�
     await ProjectStore.drop(db);
   });
 });
+
+describe('StudioRuntime：dispose 幂等合并 single-flight（第三十一轮严重 3）', () => {
+  it('并发 dispose 共享同一 in-flight 执行；失败后清空缓存可重试，成功后永久复用', async () => {
+    const runtime = createStudioRuntime();
+    const db = 'lumora-test-runtime-singleflight';
+    await ProjectStore.drop(db);
+    await runtime.init({ dbName: db, debounceMs: 20 });
+    await runtime.openProject(createSampleProject('lumora://project/r31-runtime', '并发释放'));
+
+    // 首次 dispose 失败：persistence 冲刷失败 → 运行时不 teardown
+    const disposeSpy = vi.spyOn(runtime.persistence, 'dispose');
+    disposeSpy.mockResolvedValueOnce({ ok: false, message: '模拟冲刷失败' });
+
+    const first = runtime.dispose();
+    const second = runtime.dispose();
+    // 非 async 直接返回缓存 promise：并发调用拿到同一对象（发布先行，只执行一次）
+    expect(second).toBe(first);
+    const outcome = await first;
+    expect(outcome).toEqual({ ok: false, message: '模拟冲刷失败' });
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+    // 失败后不 teardown：编辑器仍完整可用（重试/保全未落盘内容的通道未被销毁）
+    expect(() => runtime.editor.openProject(createSampleProject())).not.toThrow();
+
+    // 失败 settle 后缓存清空 → 重试执行新一轮，成功
+    disposeSpy.mockRestore();
+    const retried = await runtime.dispose();
+    expect(retried).toEqual({ ok: true });
+
+    // 成功后永久复用成功结果：重复调用幂等，不再触碰 persistence
+    const retrySpy = vi.spyOn(runtime.persistence, 'dispose');
+    const again = runtime.dispose();
+    const again2 = runtime.dispose();
+    expect(again2).toBe(again);
+    await expect(again).resolves.toEqual({ ok: true });
+    expect(retrySpy).not.toHaveBeenCalled();
+    retrySpy.mockRestore();
+
+    await ProjectStore.drop(db);
+  });
+});

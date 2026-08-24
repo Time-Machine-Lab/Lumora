@@ -70,7 +70,7 @@ function Host() {
 
 - **typed 事件**：`handle.current.runtime.events.on('project:opened' | 'plugin:state-changed' | 'command:executed' | ...)`；自定义事件经 `onAny` 透传。
 - **打开/关闭项目**：`handle.current.runtime.openProject(project)` / `closeProject()`。
-- **资源释放**：组件卸载时自动停用全部插件、移除全部订阅、销毁事件总线与 WebGL 场景（`runtime.dispose()` 幂等）。
+- **卸载屏障（可等待）**：宿主卸载组件前必须先 `await handle.current.close()` —— 冲刷未保存变更后停用全部插件、移除全部订阅、销毁事件总线与 WebGL 场景（幂等；失败可重试）。返回 `{ ok: false }` 表示释放被拒绝（冲刷失败 / 存在未解决的恢复 fork），此时运行时未 teardown、**组件必须保持挂载**：先解决未保存内容（重试保存 / 另存副本 / 显式丢弃恢复快照）再重试 `close()`，成功后才能真正卸载 UI。绝不「不等待直接卸载」或「假装已卸载」丢弃内容。
 - **场景槽位**：传入 `scene={(project) => ...}` 可替换内置 Three.js 场景视图。
 
 ## 插件开发指南

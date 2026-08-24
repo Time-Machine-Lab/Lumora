@@ -439,7 +439,11 @@ function isSafeExportKey(key: string): boolean {
  *  为凭据形态后，apiKeyboardLayout（api|key）、compassWordWrap（word 段）、
  *  privateKeyboardShortcuts（private|key）、accessTokenizerConfig
  *  （access|token）等合法歧义键为保持放行在此整键显式豁免（第二十三轮严重 5
- *  语义延续） */
+ *  语义延续）。第三十一轮阻断 1 扩展：分词兜底改为「单一高置信 kind/root 命中
+ *  即默认拒绝」后，单段 token/auth/password 命中的合法歧义键（tokenizer 系、
+ *  authorName、authorizationMode、passwordless，产品契约确认非认证载体语义）
+ *  同样逐项登记于此表（精确整键命中才豁免；passwordblob/tokendata/secretconfig
+ *  等不在此表的键默认拒绝） */
 const BENIGN_CREDENTIAL_KEYS = new Set([
   'tokenBudget',
   'authMode',
@@ -450,6 +454,12 @@ const BENIGN_CREDENTIAL_KEYS = new Set([
   'compassWordWrap',
   'privateKeyboardShortcuts',
   'accessTokenizerConfig',
+  'tokenizerConfig',
+  'tokenizerModel',
+  'tokenizerConfigModel',
+  'authorName',
+  'authorizationMode',
+  'passwordless',
 ]);
 
 /** 凭据类词（kind）：作为「语义角色」参与有边界判定 —— 任意 token 位置精确
@@ -673,6 +683,11 @@ const CREDENTIAL_SEGMENT_DICT: ReadonlySet<string> = (() => {
  *  是 81 字符 ...sessionid 泄漏的根源） */
 const CREDENTIAL_SEGMENT_MAX_LENGTH = 80;
 
+/** 后缀剥除防御上限（第三十一轮阻断 1）：单调剥除达到此层仍未稳定（无后缀可
+ *  剥）即 fail-closed 拒绝 —— 病态超长后缀链绝不因「剥不干净」放行；正常键
+ *  （apikeyv2beta 等 2~3 层）远低于上限，'pass' 残余闭合路径在 12 层内必达 */
+const CREDENTIAL_SUFFIX_STRIP_MAX = 12;
+
 /** BENIGN 键的无边界形态豁免（第三十轮阻断 1）：路径数组声明跨 segment 拼接
  *  （['access','tokenizer','config'] ≡ accesstokenizerconfig）与全小写变体经
  *  同一契约放行 —— 整键命中 BENIGN_CREDENTIAL_KEYS 的合法歧义键，其无边界形态
@@ -684,20 +699,23 @@ const BENIGN_CREDENTIAL_COLLAPSED: ReadonlySet<string> = (() => {
   return forms;
 })();
 
-/** 任意偏移字典分词凭据形态兜底（第二十九轮阻断 1 + 第三十轮阻断 1 重写）：
- *  对无边界形态（数字已剥除）检测任意偏移的连续字典词序列 —— 存在一段 ≥2 个
- *  连续字典词、且其中含凭据词段（kind 词/拉丁根词，任意位置）或相邻复合对/
- *  敏感限定组合即拒绝。不要求整键完整分词：未知业务限定词（stripe/custom/
- *  vendor/legacy/payment 等）不在字典，旧「整键完整分词 + credentialSeen」
- *  判定被其阻断而 fail-open（stripeapikey 等六组探针泄漏）。单段词不足为凭：
- *  tokenizerConfig 的 token、authorizationMode 的 auth、passwordless 的
- *  password、renderpass 的 pass、keyboard 的 key 等单段 run 无凭据语境，放行
- *  —— ≥2 段序列的合法键（apiKeyboardLayout/compassWordWrap 等）经
- *  BENIGN_CREDENTIAL_KEYS 整键豁免（无边界形态见 BENIGN_CREDENTIAL_COLLAPSED）。
+/** 任意偏移字典分词凭据形态兜底（第二十九轮阻断 1 + 第三十轮阻断 1 重写 +
+ *  第三十一轮阻断 1 改单命中默认拒绝）：
+ *  对无边界形态（数字已剥除）检测任意偏移的连续字典词序列 —— 序列中任一凭据
+ *  词段（kind 词/拉丁根词，任意位置）或相邻复合对/敏感限定组合命中即拒绝。
+ *  不要求整键完整分词：未知业务限定词（stripe/custom/vendor/legacy/payment
+ *  等）不在字典，旧「整键完整分词 + credentialSeen」判定被其阻断而 fail-open
+ *  （stripeapikey 等六组探针泄漏）；第三十轮的「≥2 段连续词序列」阈值仍被
+ *  非字典尾词阻断而 fail-open（passwordblob/tokendata/secretconfig/
+ *  sessionhandle/cookiejar 等「单高置信段 + 未知词」形态泄漏，审查员第三十一轮
+ *  阻断 1）—— 单一高置信命中即默认拒绝。合法歧义键的 token/auth/password
+ *  单段（tokenizerConfig/authorizationMode/passwordless 等）全部经
+ *  BENIGN_CREDENTIAL_KEYS 整键精确豁免（无边界形态见 BENIGN_CREDENTIAL_COLLAPSED，
+ *  路径数组拼接 ≡ 字符串声明同表放行）。
  *  每位置取最长字典词（pass|word 重叠于 password 时取 password —— 复合对子分词
- *  不构成独立凭据序列，passwordless/oldpasswordx 等合法键不误伤；password 等真
- *  pass+word 连写仍闭合）。复数段经 matchesCredentialWord 归一（clientsecrets →
- *  client|secrets）。长度上限超限即拒（fail-closed）。 */
+ *  不构成独立凭据序列；password 等真 pass+word 连写仍闭合）。复数段经
+ *  matchesCredentialWord 归一（clientsecrets → client|secrets）。长度上限超限
+ *  即拒（fail-closed）。 */
 function hasCredentialSegmentation(collapsed: string): boolean {
   if (BENIGN_CREDENTIAL_COLLAPSED.has(collapsed)) return false;
   if (collapsed.length > CREDENTIAL_SEGMENT_MAX_LENGTH) return true;
@@ -722,13 +740,11 @@ function hasCredentialSegmentation(collapsed: string): boolean {
     return false;
   };
   // 任意偏移 + 最长字典词优先：每个起点沿唯一路径推进（无分支，无需 memo），
-  // 累计 ≥2 个连续字典词且含凭据词段/相邻复合对即拒绝；80 字符上限封顶开销
+  // 任一凭据词段/相邻复合对命中即拒绝；80 字符上限封顶开销
   const n = collapsed.length;
   for (let start = 0; start < n; start += 1) {
     let pos = start;
     let prev: string | null = null;
-    let credentialSeen = false;
-    let runLen = 0;
     while (pos < n) {
       let best = '';
       for (let end = n; end > pos; end -= 1) {
@@ -739,10 +755,8 @@ function hasCredentialSegmentation(collapsed: string): boolean {
         }
       }
       if (best === '') break;
-      if (prev !== null && isCredentialAdjacentPair(prev, best)) credentialSeen = true;
-      if (isCredentialSegment(best)) credentialSeen = true;
-      runLen += 1;
-      if (runLen >= 2 && credentialSeen) return true;
+      if (prev !== null && isCredentialAdjacentPair(prev, best)) return true;
+      if (isCredentialSegment(best)) return true;
       prev = best;
       pos += best.length;
     }
@@ -848,23 +862,33 @@ function stripOneCredentialSuffix(collapsed: string): string | null {
   return null;
 }
 
-/** 凭据形态判定入口（第二十八轮阻断 1）：先走核心判定，再逐层剥除有界后缀
- *  （版本 + 环境白名单），每剥一层把余量**重新 tokenize** 再走核心判定 ——
- *  apitokenv2 → apitoken（kind-suffix 拆 api|token 命中）、apikeyprod →
- *  apikey（复合表）、apikeyv2beta → apikeyv2 → apikey（多标签逐层剥）。
- *  上限 4 层防呆；版本后缀剥尽后余量恰为 'pass'（pass2/passv2/passver2）
+/** 凭据形态判定入口（第二十八轮阻断 1 + 第三十一轮阻断 1 改单调剥除）：先走
+ *  核心判定，再逐层剥除有界后缀（版本 + 环境白名单），每剥一层把余量**重新
+ *  tokenize** 再走核心判定 —— apitokenv2 → apitoken（kind-suffix 拆 api|token
+ *  命中）、apikeyprod → apikey（复合表）、apikeyv2beta → apikeyv2 → apikey
+ *  （多标签逐层剥）。
+ *  单调剥除直至稳定（无后缀可剥）：固定 4 层上限对「pass + 5 层以上环境后缀」
+ *  （passprodprodprodprodprod，'pass' 单段非凭据形态、核心判定不命中）仍
+ *  fail-open（剥 4 层剩 passprod 放行）—— 逐层剥到余量恰为 'pass' 才闭合；
+ *  达到防御上限仍未稳定（病态超长后缀链）一律拒绝（fail-closed，绝不因
+ *  「剥不干净」放行）。版本后缀剥尽后余量恰为 'pass'（pass2/passv2/passver2）
  *  默认拒绝 —— 裸 'pass'（['render','pass'] 路径）与 'passCount' 等合法形态
  *  不受影响，产品若确认 pass2 为渲染语义可经 BENIGN_CREDENTIAL_KEYS 显式豁免 */
 function isCredentialShapeTokens(joined: string, tokens: string[]): boolean {
   if (isCredentialShapeCore(joined, tokens)) return true;
   let collapsed = collapsedCredentialForm(joined);
-  for (let depth = 0; depth < 4; depth += 1) {
+  let stable = false;
+  for (let depth = 0; depth < CREDENTIAL_SUFFIX_STRIP_MAX; depth += 1) {
     const next = stripOneCredentialSuffix(collapsed);
-    if (next === null || next === collapsed) break;
+    if (next === null || next === collapsed) {
+      stable = true;
+      break;
+    }
     collapsed = next;
     if (collapsed === 'pass') return true;
     if (isCredentialShapeCore(collapsed, credentialTokens(collapsed))) return true;
   }
+  if (!stable) return true; // 达到防御上限仍未稳定：病态后缀链，fail-closed 拒绝
   return false;
 }
 
@@ -909,6 +933,12 @@ function buildExportTrie(
       continue;
     }
     if (!Array.isArray(declaration) || declaration.length === 0) continue; // 畸形/空路径：忽略
+    const joinedPath = declaration.join('');
+    // 第三十一轮阻断 1：整键（路径拼接 ≡ 字符串声明，无边界形态同表）为良性
+    // 豁免键时跳过逐段凭据判定 —— ['access','tokenizer','config'] ≡
+    // accesstokenizerconfig 的 tokenizer 段独立成键会因「单一高置信命中」误拒；
+    // 良性整键的安全键/私键逐段校验仍由下方 trie 构建循环执行
+    const joinedBenign = BENIGN_CREDENTIAL_COLLAPSED.has(collapsedCredentialForm(joinedPath));
     // 第二十三轮阻断 3：先对每个 segment/叶键做上下文判定（segment 独立成键时
     // 的凭据形态，含豁免表 —— ['profile','token']/['profile','auth'] 的裸
     // token/auth segment 不再被「整条路径 token 总数」稀释，逐段判定即拒绝），
@@ -917,11 +947,13 @@ function buildExportTrie(
     // joined 判定闭合 —— 两种 token 化缺一不可：全小写 segment 拼接会合并成
     // 一个 token（'private'+'setting' → privatesetting，逐段 flatMap 保边界）；
     // 而跨 segment 的 camelCase 边界（'ap'+'iKey' → apiKey）只有整串拼接才能还原
-    if (declaration.some((segment) => typeof segment === 'string' && isCredentialShapeKey(segment))) {
+    if (
+      !joinedBenign &&
+      declaration.some((segment) => typeof segment === 'string' && isCredentialShapeKey(segment))
+    ) {
       rejections.push({ plugin, path: JSON.stringify(declaration) });
       continue;
     }
-    const joinedPath = declaration.join('');
     // 第二十五轮：豁免叶键（tokenBudget/authMode）的 token 不参与跨 segment
     // 判定 —— ['profile','tokenBudget'] 的 kind 词（token）落中间位不得触发
     // kind 任意位置拒绝；段内 kind 词已被逐 segment standalone 判定覆盖
