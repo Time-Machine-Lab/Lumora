@@ -808,6 +808,10 @@ export class SceneEditor {
   }
 
   setGuide(kind: 'thirds' | 'safeFrame', enabled: boolean): void {
+    // 第四十轮阻断 1：严格比较的运行时 allowlist 先于任何计算属性访问 ——
+    // kind 若为带 Symbol.toPrimitive 的对象，属性键转换可同步关闭准入/dispose，
+    // 外层不得跨过线性化点提交（非字符串一律静默拒绝，转换不被触发）
+    if (kind !== 'thirds' && kind !== 'safeFrame') return;
     const baseline = this.captureViewBaseline();
     if (this.guardViewReentry(baseline)) return;
     // 同值 no-op（R11-3，对齐 setViewMode same 检查）：不推进事务版本、

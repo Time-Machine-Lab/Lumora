@@ -2580,3 +2580,61 @@ describe('ProjectPersistence：第三十九轮修复回归（审查员 8/24 09:1
     expect(events).toHaveLength(0);
   });
 });
+
+describe('ProjectPersistence：第四十轮修复回归（审查员 8/24 10:12 复审）', () => {
+  it('阻断 1：setGuide 的 Symbol.toPrimitive 内同步 closeAdmission —— 非字符串在强制转换前被静默拒绝，view/版本/事件均不动，合法 kind 不受影响', () => {
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    const before = editor.getView();
+    const version = editor.getMutationVersion();
+    const events: unknown[] = [];
+    editor.events.on('view:changed', (e) => events.push(e));
+    let closed = false;
+    // 修复前属性键转换发生在 guard 之后：toPrimitive 内关准入后外层仍写入
+    // guides.thirds、推进版本并发事件；修复后转换根本不发生
+    const kind = {
+      [Symbol.toPrimitive]() {
+        closed = true;
+        editor.closeAdmission();
+        return 'thirds';
+      },
+    } as unknown as 'thirds' | 'safeFrame';
+    editor.setGuide(kind, false);
+    expect(closed).toBe(false);
+    expect(editor.getView()).toEqual(before);
+    expect(editor.getMutationVersion()).toBe(version);
+    expect(events).toHaveLength(0);
+    // 合法字符串 kind 依旧可用（编辑器未被意外关准入）
+    editor.setGuide('thirds', false);
+    expect(editor.getView().guides.thirds).toBe(false);
+  });
+
+  it('阻断 1：setGuide 的 Symbol.toPrimitive 内同步 dispose —— 转换不触发、终态不被任何晚到写入改写', () => {
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    const version = editor.getMutationVersion();
+    let disposed = false;
+    const kind = {
+      [Symbol.toPrimitive]() {
+        disposed = true;
+        editor.dispose();
+        return 'thirds';
+      },
+    } as unknown as 'thirds' | 'safeFrame';
+    editor.setGuide(kind, false);
+    // 修复前 dispose 后外层仍把终态默认视图写成 thirds:false（版本 +1）
+    expect(disposed).toBe(false);
+    expect(editor.getProject()).not.toBeNull();
+    expect(editor.getMutationVersion()).toBe(version);
+    // 真实 dispose 后的终态：默认视图（thirds/safeFrame 均为 true）不可被
+    // 随后任何 setGuide 改写——合法 kind 与恶意对象两条路径均静默拒绝
+    editor.dispose();
+    expect(editor.getProject()).toBeNull();
+    const terminalView = editor.getView();
+    const terminalVersion = editor.getMutationVersion();
+    editor.setGuide('thirds', false);
+    editor.setGuide(kind, false);
+    expect(editor.getView()).toEqual(terminalView);
+    expect(editor.getMutationVersion()).toBe(terminalVersion);
+  });
+});
