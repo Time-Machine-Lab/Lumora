@@ -1861,3 +1861,90 @@ describe('ProjectPersistence：dispose 幂等合并 single-flight（第三十一
     retrySpy.mockRestore();
   });
 });
+
+describe('ProjectPersistence：终态释放逐步骤完成标记（第三十二轮阻断 2）', () => {
+  it('store.close() 抛错：dispose 如实失败且已释放标记不置位，重试补做未完成步骤成功（修复前假报成功、连接泄漏）', async () => {
+    const editor = new SceneEditor();
+    const store = await openStandaloneStore();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, store });
+    editor.openProject(createSampleProject('lumora://project/r32-close-throw', '释放失败'));
+
+    const closeSpy = vi.spyOn(store, 'close');
+    closeSpy.mockImplementationOnce(() => {
+      throw new Error('模拟关闭失败');
+    });
+    const outcome = await persistence.dispose();
+    expect(outcome).toMatchObject({
+      ok: false,
+      code: 'storage-error',
+      message: expect.stringContaining('模拟关闭失败'),
+    });
+    // 失败后已释放标记未置位（修复前 disposed 在 teardown 前置位 —— 重试走
+    // 「已释放」短路返回成功裁决，未关闭的连接随假成功泄漏）
+    expect((persistence as unknown as { disposed: boolean }).disposed).toBe(false);
+
+    // 重试真实执行：autosaver 已释放（幂等短路）、订阅已移除、store 重试关闭
+    const retried = await persistence.dispose();
+    expect(retried).toEqual({ ok: true });
+    expect(closeSpy).toHaveBeenCalledTimes(2);
+    expect((persistence as unknown as { store: unknown }).store).toBeNull();
+    closeSpy.mockRestore();
+  });
+});
+
+describe('ProjectPersistence：init/dispose 竞态 —— 晚到 store 关闭并丢弃（第三十二轮严重 4）', () => {
+  it('存储创建挂起期间 dispose 先成功：晚到 store 关闭、不挂到已销毁 persistence（连接泄漏）', async () => {
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    const lateStore = await openStandaloneStore();
+    const closeSpy = vi.spyOn(lateStore, 'close');
+
+    let releaseCreate!: (store: ProjectStore | null) => void;
+    const createSpy = vi.spyOn(ProjectStore, 'create').mockImplementationOnce(
+      () => new Promise<ProjectStore | null>((resolve) => {
+        releaseCreate = resolve;
+      }),
+    );
+
+    const initPromise = persistence.init({ dbName: 'r32-race' });
+    // dispose 在存储创建挂起期间完成（修复前：晚到 store 挂到已销毁 persistence，
+    // autosaver 持有一个永不关闭的连接）
+    const disposeOutcome = await persistence.dispose();
+    expect(disposeOutcome).toEqual({ ok: true });
+    expect((persistence as unknown as { disposed: boolean }).disposed).toBe(true);
+
+    releaseCreate(lateStore); // 晚到的 store 到达
+    await initPromise;
+    // 晚到 store 立即关闭并丢弃：不挂入、不泄漏
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    expect(persistence.available).toBe(false);
+    expect(persistence.backend).toBeNull();
+    createSpy.mockRestore();
+    closeSpy.mockRestore();
+  });
+
+  it('并发 init 共享同一 in-flight 执行（修复前并发调用重复创建存储，早到者泄漏）', async () => {
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    const store = await openStandaloneStore();
+
+    let releaseCreate!: (s: ProjectStore | null) => void;
+    const createSpy = vi.spyOn(ProjectStore, 'create').mockImplementationOnce(
+      () => new Promise<ProjectStore | null>((resolve) => {
+        releaseCreate = resolve;
+      }),
+    );
+    const first = persistence.init({ dbName: 'r32-double-init' });
+    const second = persistence.init({ dbName: 'r32-double-init' });
+    expect(second).toBe(first); // single-flight：同一 in-flight 执行
+    releaseCreate(store);
+    await first;
+    await second;
+    expect(createSpy).toHaveBeenCalledTimes(1);
+    expect(persistence.available).toBe(true);
+    const outcome = await persistence.dispose();
+    expect(outcome).toEqual({ ok: true });
+    createSpy.mockRestore();
+  });
+});

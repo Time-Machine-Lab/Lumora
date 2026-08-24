@@ -292,7 +292,7 @@ describe('LumoraStudio', () => {
     expect(disposeSpy).toHaveBeenCalledTimes(2);
   });
 
-  it('严重 3：cache.dispose 抛错归一为类型化失败；缓存已标记释放，重试不再二次 dispose 直接成功', async () => {
+  it('阻断 2：cache.dispose 抛错归一为类型化失败；完成标记未置位，重试补做缓存释放成功（修复前标记先置位，重试跳过缓存释放假报成功、缓存泄漏）', async () => {
     const handle = createRef<LumoraStudioHandle>();
     const cacheDisposeSpy = vi.spyOn(ContentCache.prototype, 'dispose');
     cacheDisposeSpy.mockImplementationOnce(() => {
@@ -304,8 +304,11 @@ describe('LumoraStudio', () => {
 
     const outcome = await close();
     expect(outcome).toEqual({ ok: false, message: '模拟缓存崩溃' });
+    // 失败后缓存完成标记未置位（修复前 cacheDisposedRef 在 dispose() 前置位，
+    // 重试跳过缓存释放直接返回成功 —— 缓存资源泄漏）：重试真实执行
+    // cache.dispose，补做未完成的释放
     expect(await close()).toEqual({ ok: true });
-    expect(cacheDisposeSpy).toHaveBeenCalledTimes(1);
+    expect(cacheDisposeSpy).toHaveBeenCalledTimes(2);
   });
 
   it('StrictMode 下 effect 卸载重放不破坏运行时：插件只启动一次，命令可用，真实卸载仍释放', async () => {

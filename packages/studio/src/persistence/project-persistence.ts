@@ -67,6 +67,9 @@ export class ProjectPersistence {
   // 第三十一轮严重 3：dispose 幂等合并（single-flight）—— 并发调用共享同一
   // in-flight 执行，成功后永久复用结果；失败 settle 后清空缓存允许重试
   private disposePromise: Promise<SaveOutcome> | null = null;
+  // 第三十二轮严重 4：init 幂等合并 —— 并发/重复 init 共享同一 in-flight 执行
+  // （修复前并发 init 都在 store 置位前越过守卫，重复创建存储、早到者泄漏）
+  private initPromise: Promise<void> | null = null;
   readonly events = new TypedEventEmitter<PersistenceEventMap>();
 
   constructor(private readonly editor: SceneEditor) {
@@ -105,16 +108,40 @@ export class ProjectPersistence {
   }
 
   /** 初始化：打开存储并接入自动保存。幂等；storage 缺省为 indexeddb。
-   *  options.store 为测试注入（跳过按后端创建，直接使用给定存储实例）。 */
-  async init(
+   *  options.store 为测试注入（跳过按后端创建，直接使用给定存储实例）。
+   *  第三十二轮严重 4：init 为 single-flight —— 并发调用共享同一 in-flight 执行；
+   *  存储创建挂起期间 dispose() 先成功时，晚到的 store 立即关闭并丢弃，
+   *  绝不挂到已销毁的 persistence（连接泄漏）。 */
+  init(
     options: { debounceMs?: number; dbName?: string; storage?: StorageBackend; store?: ProjectStorage } = {},
   ): Promise<void> {
-    if (this.disposed || this.store) return;
-    this.store =
-      options.store ??
-      (options.storage === 'opfs' ? await OpfsProjectStore.create(options.dbName) : await ProjectStore.create(options.dbName));
-    this.autosaver.setStore(this.store);
-    if (options.debounceMs !== undefined) this.autosaver.setDebounceMs(options.debounceMs);
+    if (this.disposed || this.store) return Promise.resolve();
+    if (this.initPromise) return this.initPromise;
+    this.initPromise = (async (): Promise<void> => {
+      const store =
+        options.store ??
+        (options.storage === 'opfs'
+          ? await OpfsProjectStore.create(options.dbName)
+          : await ProjectStore.create(options.dbName));
+      if (!store) return; // 存储不可用：静默降级（仅内存编辑），与旧语义一致
+      // await 挂起期间 dispose() 已成功：晚到 store 不得挂到已销毁的 persistence
+      if (this.disposed) {
+        try {
+          store.close();
+        } catch {
+          // 关闭晚到存储失败不阻塞 init 完成（store 未挂入，无泄漏面残留）
+        }
+        return;
+      }
+      this.store = store;
+      this.autosaver.setStore(this.store);
+      if (options.debounceMs !== undefined) this.autosaver.setDebounceMs(options.debounceMs);
+    })();
+    const inFlight = this.initPromise;
+    void inFlight.then(() => {
+      if (this.initPromise === inFlight) this.initPromise = null;
+    });
+    return inFlight;
   }
 
   /** 最近项目列表（按保存时间倒序）。存储/锁故障抛归一化错误（UI catch 后
@@ -532,19 +559,25 @@ export class ProjectPersistence {
     if (this.disposePromise) return this.disposePromise;
     this.disposePromise = (async (): Promise<SaveOutcome> => {
       try {
+        // 第三十二轮阻断 2：flush/recovery preflight 与终态释放分开 —— preflight
+        // （autosaver.dispose）无 teardown，失败即返回、现场完整保留；终态释放
+        // 逐步骤执行且各步骤幂等，完成标记（disposed）在全部步骤成功后写入。
+        // 修复前 disposed 在 teardown 前置位：store.close() 等抛错后重试走
+        // 「已释放」短路返回成功裁决，未关闭的连接/订阅随假成功泄漏
         const outcome = await this.autosaver.dispose();
         if (!outcome.ok) return outcome;
-        this.disposed = true;
         this.unsubscribeEditor?.dispose();
         this.unsubscribeEditor = null;
         this.store?.close();
         this.store = null;
         this.currentUri = null;
         this.events.dispose();
+        this.disposed = true;
         return { ok: true };
       } catch (error) {
         // 第三十一轮严重 3：意外拒绝归一为类型化失败 —— 绝不把 unhandled
-        // rejection 交给调用方；失败后 disposed 未置位，可重试
+        // rejection 交给调用方；失败后 disposed 未置位，可重试（已完成的步骤
+        // 幂等，重试只补做未完成步骤）
         return { ok: false, code: 'storage-error', message: failureMessage(error) };
       }
     })();

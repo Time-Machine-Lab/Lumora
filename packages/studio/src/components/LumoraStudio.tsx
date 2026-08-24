@@ -100,8 +100,11 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       if (!outcome.ok) return outcome;
       try {
         if (!cacheDisposedRef.current) {
-          cacheDisposedRef.current = true;
           cache.dispose();
+          // 第三十二轮阻断 2：完成标记在步骤成功后写入 —— 修复前先置位后
+          // dispose，cache.dispose() 抛错时返回 {ok:false} 但标记已置位，
+          // 重试跳过缓存释放假报成功（资源缓存泄漏）
+          cacheDisposedRef.current = true;
         }
         return { ok: true };
       } catch (error) {

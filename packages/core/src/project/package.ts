@@ -699,6 +699,17 @@ const BENIGN_CREDENTIAL_COLLAPSED: ReadonlySet<string> = (() => {
   return forms;
 })();
 
+/** 良性凭据歧义键判定（第三十二轮严重 3 统一规范化）：所有判定位置（顶层整键、
+ *  joined 整键、嵌套叶键、拆分后缀）一律查 collapsed 规范化集合 —— 顶层
+ *  'TOKENIZERCONFIG'、叶 ['profile','TOKENIZERCONFIG']、根 ['tokenizer','config']
+ *  与嵌套拆分 ['profile','tokenizer','config'] 是同一良性键的不同写法，判定必须
+ *  一致（修复前顶层/叶用大小写敏感原始 Set.has、joined 用规范化集合，同一键因
+ *  写法不同放行/拒绝分叉：根 ['cookie','consent'] 与顶层 'cookieconsent' 即同键
+ *  异判的实例） */
+function isBenignCredentialKey(key: string): boolean {
+  return BENIGN_CREDENTIAL_COLLAPSED.has(collapsedCredentialForm(key));
+}
+
 /** 任意偏移字典分词凭据形态兜底（第二十九轮阻断 1 + 第三十轮阻断 1 重写 +
  *  第三十一轮阻断 1 改单命中默认拒绝）：
  *  对无边界形态（数字已剥除）检测任意偏移的连续字典词序列 —— 序列中任一凭据
@@ -717,7 +728,7 @@ const BENIGN_CREDENTIAL_COLLAPSED: ReadonlySet<string> = (() => {
  *  matchesCredentialWord 归一（clientsecrets → client|secrets）。长度上限超限
  *  即拒（fail-closed）。 */
 function hasCredentialSegmentation(collapsed: string): boolean {
-  if (BENIGN_CREDENTIAL_COLLAPSED.has(collapsed)) return false;
+  if (isBenignCredentialKey(collapsed)) return false;
   if (collapsed.length > CREDENTIAL_SEGMENT_MAX_LENGTH) return true;
   if (collapsed.length === 0) return false;
   const isDictWord = (w: string): boolean =>
@@ -888,12 +899,21 @@ function isCredentialShapeTokens(joined: string, tokens: string[]): boolean {
     if (collapsed === 'pass') return true;
     if (isCredentialShapeCore(collapsed, credentialTokens(collapsed))) return true;
   }
-  if (!stable) return true; // 达到防御上限仍未稳定：病态后缀链，fail-closed 拒绝
+  if (!stable) {
+    // 第三十二轮一般 5：预算耗尽前最后一次剥除可能恰好剥到稳定安全基键
+    // （第 CREDENTIAL_SUFFIX_STRIP_MAX 层剥除到达基键，stable 标志未及置位）
+    // —— 耗尽预算后再探测一次：已无可剥后缀则按当前余量正常放行（修复前
+    // 一律按 stable=false 误拒，theme+prod×12 明明剥到 'theme' 仍被拒绝）；
+    // 仍可剥（真病态超长后缀链，预算内剥不完）fail-closed 拒绝
+    const next = stripOneCredentialSuffix(collapsed);
+    if (next === null || next === collapsed) return false;
+    return true;
+  }
   return false;
 }
 
 function isCredentialShapeKey(key: string): boolean {
-  if (BENIGN_CREDENTIAL_KEYS.has(key)) return false;
+  if (isBenignCredentialKey(key)) return false;
   return isCredentialShapeTokens(key, credentialTokens(key));
 }
 
@@ -934,52 +954,63 @@ function buildExportTrie(
     }
     if (!Array.isArray(declaration) || declaration.length === 0) continue; // 畸形/空路径：忽略
     const joinedPath = declaration.join('');
-    // 第三十一轮阻断 1：整键（路径拼接 ≡ 字符串声明，无边界形态同表）为良性
-    // 豁免键时跳过逐段凭据判定 —— ['access','tokenizer','config'] ≡
-    // accesstokenizerconfig 的 tokenizer 段独立成键会因「单一高置信命中」误拒；
-    // 良性整键的安全键/私键逐段校验仍由下方 trie 构建循环执行
-    const joinedBenign = BENIGN_CREDENTIAL_COLLAPSED.has(collapsedCredentialForm(joinedPath));
-    // 第二十三轮阻断 3：先对每个 segment/叶键做上下文判定（segment 独立成键时
-    // 的凭据形态，含豁免表 —— ['profile','token']/['profile','auth'] 的裸
-    // token/auth segment 不再被「整条路径 token 总数」稀释，逐段判定即拒绝），
-    // 再执行跨 segment 组合检查。第十九轮阻断 2：跨 segment 相邻序列与无边界
-    // 连写（['api','key'] ≡ api_key、['client','secret'] ≡ clientsecret）由
-    // joined 判定闭合 —— 两种 token 化缺一不可：全小写 segment 拼接会合并成
-    // 一个 token（'private'+'setting' → privatesetting，逐段 flatMap 保边界）；
-    // 而跨 segment 的 camelCase 边界（'ap'+'iKey' → apiKey）只有整串拼接才能还原
-    if (
-      !joinedBenign &&
-      declaration.some((segment) => typeof segment === 'string' && isCredentialShapeKey(segment))
-    ) {
-      rejections.push({ plugin, path: JSON.stringify(declaration) });
-      continue;
+    // 第三十二轮严重 3：良性豁免统一为「末尾段序列（规范化 joined）命中良性
+    // 集合」的最长后缀识别 —— 整键（['tokenizer','config'] ≡ tokenizerConfig）、
+    // 叶键（['profile','tokenizerConfig']）与嵌套拆分（['profile','tokenizer',
+    // 'config'] ≡ ['profile','tokenizerConfig']）同一判据；大小写经
+    // isBenignCredentialKey 归一（'TOKENIZERCONFIG' ≡ 'tokenizerConfig'）。
+    // 命中后该良性键自身的 token 不参与任何凭据判定 —— 修复前整键豁免只短路
+    // 逐段 standalone 判定，else 分支的 joined/perSegment 检查仍命中 kind 词
+    // （根 ['cookie','consent'] 与顶层 'cookieconsent' 同一键异判：顶层放行、
+    // 路径拒绝）；只对前缀执行统一判据（第二十五轮语义保留：豁免键的 kind 词
+    // 不触发跨 segment 命中，前缀独立判定）。良性整键的安全键/私键逐段校验
+    // 仍由下方 trie 构建循环执行
+    let benignSuffixLen = 0;
+    const maxSuffix = Math.min(declaration.length, 3); // 良性键至多拆 3 段
+    for (let i = maxSuffix; i >= 1; i -= 1) {
+      const suffix = declaration.slice(-i);
+      if (suffix.every((s) => typeof s === 'string') && isBenignCredentialKey(suffix.join(''))) {
+        benignSuffixLen = i;
+        break;
+      }
     }
-    // 第二十五轮：豁免叶键（tokenBudget/authMode）的 token 不参与跨 segment
-    // 判定 —— ['profile','tokenBudget'] 的 kind 词（token）落中间位不得触发
-    // kind 任意位置拒绝；段内 kind 词已被逐 segment standalone 判定覆盖
-    // （segment 为裸 kind 词时上面已拒绝）。豁免叶键只做前缀序列判定：
-    // joined 重分词会把 'profile'+'tokenBudget' 的边界抹掉还原成
-    // 'profiletoken'（kind-suffix 扩展拆出 token）误拒；前缀本身按统一判据
-    // 判定（kind/复合对/无边界形态/数字后缀变体全覆盖），合法歧义字段继续
-    // 走 BENIGN_CREDENTIAL_KEYS 显式豁免
-    const leaf = declaration[declaration.length - 1];
-    const leafBenign = typeof leaf === 'string' && BENIGN_CREDENTIAL_KEYS.has(leaf);
-    if (leafBenign) {
-      const prefix = declaration.slice(0, -1);
-      const prefixJoined = prefix.join('');
-      const prefixTokens = prefix.flatMap((segment) => credentialTokens(segment));
+    if (benignSuffixLen === 0) {
+      // 第二十三轮阻断 3：先对每个 segment/叶键做上下文判定（segment 独立成键时
+      // 的凭据形态，含豁免表 —— ['profile','token']/['profile','auth'] 的裸
+      // token/auth segment 不再被「整条路径 token 总数」稀释，逐段判定即拒绝），
+      // 再执行跨 segment 组合检查。第十九轮阻断 2：跨 segment 相邻序列与无边界
+      // 连写（['api','key'] ≡ api_key、['client','secret'] ≡ clientsecret）由
+      // joined 判定闭合 —— 两种 token 化缺一不可：全小写 segment 拼接会合并成
+      // 一个 token（'private'+'setting' → privatesetting，逐段 flatMap 保边界）；
+      // 而跨 segment 的 camelCase 边界（'ap'+'iKey' → apiKey）只有整串拼接才能还原
       if (
-        isCredentialShapeTokens(prefixJoined, credentialTokens(prefixJoined)) ||
-        isCredentialShapeTokens(prefixJoined, prefixTokens)
+        declaration.some((segment) => typeof segment === 'string' && isCredentialShapeKey(segment))
+      ) {
+        rejections.push({ plugin, path: JSON.stringify(declaration) });
+        continue;
+      }
+      const perSegmentTokens = declaration.flatMap((segment) => credentialTokens(segment));
+      if (
+        isCredentialShapeTokens(joinedPath, credentialTokens(joinedPath)) ||
+        isCredentialShapeTokens(joinedPath, perSegmentTokens)
       ) {
         rejections.push({ plugin, path: JSON.stringify(declaration) });
         continue;
       }
     } else {
-      const perSegmentTokens = declaration.flatMap((segment) => credentialTokens(segment));
+      // 第二十五轮：豁免键的 token 不参与跨 segment 判定 ——
+      // ['profile','tokenBudget'] 的 kind 词（token）落中间位不得触发 kind
+      // 任意位置拒绝；段内 kind 词已被逐 segment standalone 判定覆盖（segment
+      // 为裸 kind 词时上面已拒绝）。豁免键只做前缀序列判定：joined 重分词会把
+      // 'profile'+'tokenBudget' 的边界抹掉还原成 'profiletoken'（kind-suffix
+      // 扩展拆出 token）误拒；前缀本身按统一判据判定（kind/复合对/无边界形态/
+      // 数字后缀变体全覆盖），合法歧义字段继续走 BENIGN_CREDENTIAL_KEYS 显式豁免
+      const prefix = declaration.slice(0, -benignSuffixLen);
+      const prefixJoined = prefix.join('');
+      const prefixTokens = prefix.flatMap((segment) => credentialTokens(segment));
       if (
-        isCredentialShapeTokens(joinedPath, credentialTokens(joinedPath)) ||
-        isCredentialShapeTokens(joinedPath, perSegmentTokens)
+        isCredentialShapeTokens(prefixJoined, credentialTokens(prefixJoined)) ||
+        isCredentialShapeTokens(prefixJoined, prefixTokens)
       ) {
         rejections.push({ plugin, path: JSON.stringify(declaration) });
         continue;

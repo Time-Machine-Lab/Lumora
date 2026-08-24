@@ -210,8 +210,10 @@ describe('StudioRuntime：dispose 幂等合并 single-flight（第三十一轮�
     await runtime.openProject(createSampleProject('lumora://project/r31-runtime', '并发释放'));
 
     // 首次 dispose 失败：persistence 冲刷失败 → 运行时不 teardown
+    // （第三十二轮阻断 1：SaveOutcome 失败分支必填 code —— 缺 code 的 mock
+    // 使精确 head 的 tsc TS2345，门禁「全绿」不成立）
     const disposeSpy = vi.spyOn(runtime.persistence, 'dispose');
-    disposeSpy.mockResolvedValueOnce({ ok: false, message: '模拟冲刷失败' });
+    disposeSpy.mockResolvedValueOnce({ ok: false, code: 'storage-error', message: '模拟冲刷失败' });
 
     const first = runtime.dispose();
     const second = runtime.dispose();
@@ -237,6 +239,67 @@ describe('StudioRuntime：dispose 幂等合并 single-flight（第三十一轮�
     expect(retrySpy).not.toHaveBeenCalled();
     retrySpy.mockRestore();
 
+    await ProjectStore.drop(db);
+  });
+});
+
+describe('StudioRuntime：终态释放可失败者先行（第三十二轮阻断 2）', () => {
+  it('host.dispose() 抛错：dispose 如实失败且编辑器保留（契约真实），重试补做剩余步骤成功', async () => {
+    const runtime = createStudioRuntime();
+    const db = 'lumora-test-runtime-host-throw';
+    await ProjectStore.drop(db);
+    await runtime.init({ dbName: db, debounceMs: 60_000 });
+    await runtime.openProject(createSampleProject('lumora://project/r32-host', '宿主停用失败'));
+
+    const hostDisposeSpy = vi.spyOn(runtime.host, 'dispose');
+    hostDisposeSpy.mockRejectedValueOnce(new Error('模拟插件停用失败'));
+
+    const outcome = await runtime.dispose();
+    expect(outcome).toEqual({ ok: false, message: '模拟插件停用失败' });
+    // 失败契约真实：编辑器保留未销毁（修复前 editor 在 host.dispose() 前已
+    // 销毁，{ok:false} 的「编辑器保留可重试/可保全内容」语义与现场不符）；
+    // host.dispose 抛错未执行真实停用，宿主快照同样保留（未 teardown）
+    expect(() => runtime.editor.openProject(createSampleProject())).not.toThrow();
+    expect(runtime.host.getProject()).not.toBeNull();
+
+    // 重试：persistence 已释放（幂等短路）、host 重试成功、编辑器最后销毁
+    const retried = await runtime.dispose();
+    expect(retried).toEqual({ ok: true });
+    expect(hostDisposeSpy).toHaveBeenCalledTimes(2);
+    expect(() => runtime.editor.openProject(createSampleProject())).toThrow('编辑器已释放');
+    hostDisposeSpy.mockRestore();
+    await ProjectStore.drop(db);
+  });
+});
+
+describe('StudioRuntime：init/dispose 竞态（第三十二轮严重 4）', () => {
+  it('init 挂起期间 dispose 先成功：晚到 store 关闭并丢弃，不残留连接', async () => {
+    const runtime = createStudioRuntime();
+    const db = 'lumora-test-runtime-init-race';
+    await ProjectStore.drop(db);
+    const lateStore = await ProjectStore.create(db);
+    expect(lateStore).not.toBeNull();
+    const closeSpy = vi.spyOn(lateStore!, 'close');
+
+    let releaseCreate!: (s: ProjectStore | null) => void;
+    const createSpy = vi.spyOn(ProjectStore, 'create').mockImplementationOnce(
+      () => new Promise<ProjectStore | null>((resolve) => {
+        releaseCreate = resolve;
+      }),
+    );
+
+    const initPromise = runtime.init({ dbName: db });
+    const disposeOutcome = await runtime.dispose();
+    expect(disposeOutcome).toEqual({ ok: true });
+
+    releaseCreate(lateStore); // 晚到的 store 到达
+    await initPromise;
+    // 晚到 store 被持久化层关闭并丢弃：不挂到已销毁 persistence
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    expect(runtime.persistence.available).toBe(false);
+    createSpy.mockRestore();
+    closeSpy.mockRestore();
+    lateStore!.close();
     await ProjectStore.drop(db);
   });
 });

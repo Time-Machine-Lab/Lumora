@@ -66,6 +66,11 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
   // 第三十一轮严重 3：dispose 幂等合并（single-flight）—— 并发调用共享同一
   // in-flight 执行，成功后永久复用结果；失败 settle 后清空缓存允许重试
   let disposePromise: Promise<{ ok: boolean; message?: string }> | null = null;
+  // 第三十二轮严重 4：init 幂等合并 —— 并发 init 共享同一 in-flight 执行
+  // （修复前 initialized 在 await 前置位，并发 init 重复创建存储；存储创建
+  // 挂起期间 dispose 先成功时，晚到的 persistence.init 会把 store 挂到已销毁
+  // 的 persistence，连接泄漏）
+  let initPromise: Promise<void> | null = null;
   // 编辑器每次变更（提交/撤销/重做/打开/关闭）都同步宿主快照并广播给插件
   const unsubscribe = editor.events.on('project:changed', ({ project }) => {
     if (disposed) return;
@@ -79,10 +84,22 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
     get events() {
       return host.events;
     },
-    async init(options) {
-      if (initialized || disposed) return;
-      initialized = true;
-      await persistence.init(options);
+    init(options): Promise<void> {
+      if (initialized || disposed) return Promise.resolve();
+      if (initPromise) return initPromise;
+      // 完成标记在 persistence.init 成功后写入（第三十二轮严重 4）：修复前
+      // initialized 在 await 前置位 —— 存储创建挂起期间 dispose 先成功时，
+      // 晚到的 init 仍标记「已初始化」；持久化层自行关闭晚到 store，此处
+      // 以 persistence.init 完成（而非开始）作为真实完成点
+      initPromise = (async (): Promise<void> => {
+        await persistence.init(options);
+        initialized = true;
+      })();
+      const inFlight = initPromise;
+      void inFlight.then(() => {
+        if (initPromise === inFlight) initPromise = null;
+      });
+      return inFlight;
     },
     async openProject(project, options = {}) {
       // 切换屏障：替换编辑器前稳定排空当前项目的未保存变更。失败时旧项目保持打开，
@@ -133,9 +150,14 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
           // 编辑器与宿主，调用方可重试或引导用户「另存副本」保全未保存内容
           const outcome = await persistence.dispose();
           if (!outcome.ok) return { ok: false, message: outcome.message };
+          // 第三十二轮阻断 2：终态释放「可失败者先行」—— 插件停用（可能抛错）
+          // 在编辑器销毁前执行。修复前 editor 先销毁、host 后停用：host 失败时
+          // 返回 {ok:false} 的「编辑器保留可重试」契约与现场不符（编辑器已销毁），
+          // 且插件停用期读到的编辑器已是死实例。全部步骤幂等，完成标记
+          // （disposed）在最后写入 —— 失败重试只补做未完成步骤
+          await host.dispose();
           unsubscribe.dispose();
           editor.dispose();
-          await host.dispose();
           disposed = true;
           return { ok: true };
         } catch (error) {

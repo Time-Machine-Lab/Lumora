@@ -1580,6 +1580,39 @@ describe('工程包构建：单一高置信段默认拒绝 + 单调后缀剥除 
     }
   });
 
+  it('一般 5：后缀剥除预算边界 —— 11/12 层剥到稳定安全基键放行，13 层超预算 fail-closed', async () => {
+    const project = await buildFixtureProject();
+    // 安全基键 theme（非凭据段）+ prod×N：单调剥除到 'theme' 即稳定。
+    // 第 12 次剥除恰好到达基键时 stable 标志未及置位 —— 修复前 off-by-one
+    // 把 theme+prod×12 误拒（theme+prod×11 因第 12 次迭代探测到无可剥后缀
+    // 置位 stable 而放行，×12 却在循环耗尽时按 stable=false 拒绝）
+    const theme11 = `theme${'prod'.repeat(11)}`;
+    const theme12 = `theme${'prod'.repeat(12)}`;
+    const pluginData = {
+      'com.example': { [theme11]: 'r32-keep-11', [theme12]: 'r32-keep-12' },
+    };
+    const pkg = buildProjectPackage({ ...project, pluginData }, {
+      includePrivate: true,
+      publicKeysByPlugin: { 'com.example': [theme11, theme12] },
+    });
+    const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, Record<string, string>>)['com.example'];
+    expect(plugin[theme11]).toBe('r32-keep-11');
+    expect(plugin[theme12]).toBe('r32-keep-12');
+
+    // 13 层：12 层预算内剥不完（余量 themeprod 仍可剥）→ fail-closed 整包拒绝
+    const theme13 = `theme${'prod'.repeat(13)}`;
+    const error = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project, pluginData: { 'com.example': { [theme13]: 'r32-reject-13' } } }, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': [theme13] },
+      }),
+    );
+    expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(theme13) });
+  });
+
   it('阻断 1：良性单命中豁免往返 —— 单段 token/auth/password 命中的合法键（tokenizer 系/authorName/authorizationMode/passwordless）与既有 BENIGN 键全量放行，路径数组形态与字符串声明等价', async () => {
     const project = await buildFixtureProject();
     const benignKeys = [
@@ -1600,8 +1633,10 @@ describe('工程包构建：单一高置信段默认拒绝 + 单调后缀剥除 
       'passwordless',
     ];
     // 路径数组形态 ≡ 字符串声明（BENIGN 整键拼接，['tokenizer','config'] ≡
-    // tokenizerConfig 等）；['cookie','consent'] 不在其列 —— cookie 段独立成键
-    // 本身即凭据形态，嵌套声明依旧拒绝（第二十三轮阻断 3 语义）
+    // tokenizerConfig 等）；第三十二轮严重 3 起末尾拆分形态经 isBenignCredentialKey
+    // 统一判定（['cookie','consent'] ≡ 'cookieConsent'、嵌套拆分
+    // ['profile','tokenizer','config'] ≡ ['profile','tokenizerConfig']，大小写
+    // 不敏感），裸 kind 段（['profile','token'] 等）依旧拒绝（第二十三轮阻断 3）
     const benignPaths: Array<readonly string[]> = [
       ['tokenizer', 'config'],
       ['tokenizer', 'model'],
@@ -1625,6 +1660,86 @@ describe('工程包构建：单一高置信段默认拒绝 + 单调后缀剥除 
     for (let i = 0; i < benignKeys.length; i += 1) {
       expect(json).toContain(`r31-keep-${i}`);
     }
+  });
+
+  it('严重 3：良性豁免统一规范化 —— 顶层/嵌套叶/整键/嵌套拆分同一键同一判定，真实嵌套数据大小写与字符串/路径变体往返', async () => {
+    const project = await buildFixtureProject();
+    const pluginData: Record<string, unknown> = {
+      'com.example': {
+        // 顶层大小写变体（修复前 'TOKENIZERCONFIG' 经 core 未命中碰巧放行，
+        // 'SESSIONMODE'/'cookieconsent' 同理 —— 现在经统一 helper 显式豁免）
+        TOKENIZERCONFIG: 'r32-1',
+        SESSIONMODE: 'r32-2',
+        cookieconsent: 'r32-3',
+        profile: {
+          // 嵌套叶大小写变体（修复前 ['profile','TOKENIZERCONFIG'] 拒绝、
+          // ['profile','tokenizerConfig'] 放行 —— 同一键异判）
+          TOKENIZERCONFIG: 'r32-4',
+          tokenizerConfig: 'r32-5',
+          // 嵌套拆分（修复前根 ['tokenizer','config'] 放行、嵌套同路径拒绝；
+          // kind 词段 'cookie'/'session' 因处于良性键拆分形态而豁免）
+          tokenizer: { config: 'r32-6' },
+          cookie: { consent: 'r32-7' },
+          session: { mode: 'r32-8' },
+          // 叶良性键与拆分形态等价（['profile','token','budget'] ≡
+          // ['profile','tokenBudget']）
+          tokenBudget: 'r32-9',
+          token: { budget: 'r32-10' },
+        },
+      },
+    };
+    const declarations: Array<string | readonly string[]> = [
+      'TOKENIZERCONFIG',
+      'SESSIONMODE',
+      'cookieconsent',
+      ['profile', 'TOKENIZERCONFIG'],
+      ['profile', 'tokenizerConfig'],
+      ['profile', 'tokenizer', 'config'],
+      ['profile', 'cookie', 'consent'],
+      ['profile', 'session', 'mode'],
+      ['profile', 'tokenBudget'],
+      ['profile', 'token', 'budget'],
+    ];
+    const pkg = buildProjectPackage({ ...project, pluginData }, {
+      includePrivate: true,
+      publicKeysByPlugin: { 'com.example': declarations },
+    });
+    const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, unknown>)['com.example'];
+    expect(plugin).toEqual({
+      TOKENIZERCONFIG: 'r32-1',
+      SESSIONMODE: 'r32-2',
+      cookieconsent: 'r32-3',
+      profile: {
+        TOKENIZERCONFIG: 'r32-4',
+        tokenizerConfig: 'r32-5',
+        tokenizer: { config: 'r32-6' },
+        cookie: { consent: 'r32-7' },
+        session: { mode: 'r32-8' },
+        tokenBudget: 'r32-9',
+        token: { budget: 'r32-10' },
+      },
+    });
+    // 统一判据不扩大放行面：带良性后缀的路径其余段仍按前缀判据拒绝
+    const prefixError = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage(
+        { ...project, pluginData: { 'com.example': { profile: { apikey: { tokenizer: { config: 'x' } } } } } },
+        { includePrivate: true, publicKeysByPlugin: { 'com.example': [['profile', 'apikey', 'tokenizer', 'config']] } },
+      ),
+    );
+    expect(prefixError.declarations).toEqual([{ plugin: 'com.example', path: '["profile","apikey","tokenizer","config"]' }]);
+    // 裸 kind 段（非良性键拆分形态）依旧拒绝
+    const bareError = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage(
+        { ...project, pluginData: { 'com.example': { profile: { token: 'x', cookie: { value: 'y' } } } } },
+        { includePrivate: true, publicKeysByPlugin: { 'com.example': [['profile', 'token'], ['profile', 'cookie', 'value']] } },
+      ),
+    );
+    expect(bareError.declarations).toHaveLength(2);
+    expect(bareError.declarations).toContainEqual({ plugin: 'com.example', path: '["profile","token"]' });
+    expect(bareError.declarations).toContainEqual({ plugin: 'com.example', path: '["profile","cookie","value"]' });
   });
 });
 
