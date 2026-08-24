@@ -133,6 +133,19 @@ export class ProjectPersistence {
   init(
     options: { debounceMs?: number; dbName?: string; storage?: StorageBackend; store?: ProjectStorage } = {},
   ): Promise<void> {
+    // 第三十六轮严重 2：dispose 挂起（准入已关、尚未裁决）时晚到 init 等待
+    // 裁决 —— 修复前直接 resolved no-op：runtime.init() 无条件写
+    // initialized=true，dispose preflight 失败重开准入后 runtime 层已短路、
+    // 后续 init 不再触碰 persistence，持久化永久仅内存（available=false）。
+    // 等待语义：dispose 成功（终态）→ no-op（运行态已销毁，无初始化意义）；
+    // dispose 失败（运行态保留、准入已重开、disposePromise 已清空）→ 递归
+    // 继续执行真实初始化（store 真实挂载、编辑真实落盘）
+    if (!this.initAdmissionOpen && !this.disposed && this.disposePromise) {
+      return this.disposePromise.then(() => {
+        if (this.disposed) return;
+        return this.init(options);
+      });
+    }
     // 第三十五轮严重 3：dispose() 同步关闭准入后，晚到 init 直接 no-op ——
     // 修复前 dispose-first/init-second 仍会启动创建任务，close() 抛错被吞、
     // 公开 close 永久成功但连接泄漏
@@ -635,6 +648,14 @@ export class ProjectPersistence {
       try {
         sealed = await this.autosaver.dispose();
       } catch (error) {
+        // 第三十六轮严重 3：autosaver 已开始终态化（disposed 置位）后的异常
+        // 不得解释为可恢复失败重开准入 —— 两层死壳（UI 保留但 autosave
+        // no-op、重试因 disposed 假成功）。该异常理论上已被 autosaver 内部
+        // 归一（forceTeardown 逐步骤 best-effort、dispose 全路径归档为
+        // {ok:true,message}），此处为防御兜底：归档进终态 message 继续 commit
+        if (this.autosaver.isDisposed) {
+          return this.commitDispose([`自动保存终态清理失败：${failureMessage(error)}`]);
+        }
         this.disposePhase = 'idle';
         this.initAdmissionOpen = true;
         return { ok: false, code: 'storage-error', message: failureMessage(error) };
@@ -644,43 +665,9 @@ export class ProjectPersistence {
         this.initAdmissionOpen = true;
         return sealed;
       }
-      // commit（终态 best-effort 收敛，第三十三轮阻断 2 + 第三十四轮阻断 3）：
-      // autosaver 已成功封存（disposed=true、窗口监听已移除）—— 自此任何失败
-      // 不再返回可恢复 {ok:false}（宿主不得再面对「可编辑但不可保存」死壳），
-      // 剩余步骤（lateStore/正式 store 关闭、编辑器订阅、事件总线）逐项尽力
-      // 收敛，失败并入 message、ok 仍为 true
-      this.disposePhase = 'committing';
-      const failures: string[] = [];
-      if (this.lateStore) {
-        const late = this.lateStore;
-        try {
-          late.close();
-          this.lateStore = null;
-        } catch (error) {
-          failures.push(`晚到存储关闭失败：${failureMessage(error)}`);
-        }
-      }
-      try {
-        this.unsubscribeEditor?.dispose();
-      } catch (error) {
-        failures.push(failureMessage(error));
-      }
-      this.unsubscribeEditor = null;
-      try {
-        this.store?.close();
-      } catch (error) {
-        failures.push(failureMessage(error));
-      }
-      this.store = null;
-      this.currentUri = null;
-      try {
-        this.events.dispose();
-      } catch (error) {
-        failures.push(failureMessage(error));
-      }
-      this.disposed = true;
-      this.disposePhase = 'disposed';
-      return failures.length === 0 ? { ok: true } : { ok: true, message: `终态释放部分失败：${failures.join('；')}` };
+      // sealed.ok：终态化开始 —— sealed.message（autosaver 终态清理部分失败
+      // 明细，第三十六轮严重 3）并入终态 message 透传，绝不丢弃诊断
+      return this.commitDispose(sealed.message ? [sealed.message] : []);
     })();
     const inFlight = this.disposePromise;
     // 失败：清空缓存允许重试 —— 仅当 ref 仍指向本次结果（并发调用共享同一
@@ -689,5 +676,48 @@ export class ProjectPersistence {
       if (!outcome.ok && this.disposePromise === inFlight) this.disposePromise = null;
     });
     return inFlight;
+  }
+
+  /**
+   * 终态 commit（第三十三轮阻断 2 + 第三十四轮阻断 3，第三十六轮严重 3 拆出）：
+   * autosaver 已成功封存（disposed=true、窗口监听已移除）后调用 —— 自此任何
+   * 失败不再返回可恢复 {ok:false}（宿主不得再面对「可编辑但不可保存」死壳），
+   * 剩余步骤（lateStore/正式 store 关闭、编辑器订阅、事件总线）逐项尽力收敛，
+   * 失败并入 message、ok 仍为 true。sealedMessages 为 autosaver 终态阶段归档
+   * 的明细（其 forceTeardown 部分失败等），与 commit 自身失败一并透传。
+   */
+  private commitDispose(sealedMessages: string[]): SaveOutcome {
+    this.disposePhase = 'committing';
+    const failures: string[] = [...sealedMessages];
+    if (this.lateStore) {
+      const late = this.lateStore;
+      try {
+        late.close();
+        this.lateStore = null;
+      } catch (error) {
+        failures.push(`晚到存储关闭失败：${failureMessage(error)}`);
+      }
+    }
+    try {
+      this.unsubscribeEditor?.dispose();
+    } catch (error) {
+      failures.push(failureMessage(error));
+    }
+    this.unsubscribeEditor = null;
+    try {
+      this.store?.close();
+    } catch (error) {
+      failures.push(failureMessage(error));
+    }
+    this.store = null;
+    this.currentUri = null;
+    try {
+      this.events.dispose();
+    } catch (error) {
+      failures.push(failureMessage(error));
+    }
+    this.disposed = true;
+    this.disposePhase = 'disposed';
+    return failures.length === 0 ? { ok: true } : { ok: true, message: `终态释放部分失败：${failures.join('；')}` };
   }
 }

@@ -120,6 +120,12 @@ export class ProjectAutosaver {
   }
   /** 最新未保存快照（编辑器的只读冻结快照）：编辑后立即捕获，reset/close 后仍可冲刷 */
   private pending: Project | null = null;
+  /** 变更代（第三十六轮阻断 1）：changed() 每次捕获项目变更 +1 —— dispose() 的
+   *  flush 判 clean 后在同一同步段复查 epoch/pending 未变化才允许封存（密封
+   *  原子化）：微任务窗口内到达的编辑必须继续冲刷，绝不取消 timer 置 disposed
+   *  丢内容。epoch 覆盖「编辑已在 flush 排空」场景（pending 已清但确有新编辑，
+   *  须再确认一轮），pending 为主哨兵。 */
+  private changeEpoch = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
   /** 排队占位（第十七轮严重 3，所有权化）：{ 入队会话代, 一次性 ticket } ——
    *  - 新会话 runSave 遇同会话占位即 return；旧会话占位不阻塞，直接覆盖重入队；
@@ -225,6 +231,12 @@ export class ProjectAutosaver {
     }
   }
 
+  /** 是否已终态化（第三十六轮严重 3：ProjectPersistence 的 dispose 防御兜底
+   *  需要区分「异常来自终态段」与「异常来自可恢复段」） */
+  get isDisposed(): boolean {
+    return this.disposed;
+  }
+
   /** 订阅保存状态变化；返回取消订阅函数。 */
   onState(listener: (state: AutosaveState) => void): () => void {
     this.stateListeners.add(listener);
@@ -253,6 +265,9 @@ export class ProjectAutosaver {
   /** 编辑器事件入口：project:changed（含 null = 关闭）。 */
   changed(project: Project | null): void {
     if (this.disposed) return;
+    // 第三十六轮阻断 1：任何到达的项目变更（含关闭）都递增变更代 —— dispose
+    // 的密封裁决据此识别「flush 判 clean 之后才到达」的微任务窗口编辑
+    this.changeEpoch += 1;
     if (!project) {
       this.close();
       return;
@@ -939,24 +954,45 @@ export class ProjectAutosaver {
   }
 
   /**
-   * 强制终态清理（第三十四轮阻断 3）：仅由 ProjectPersistence 的 commit 段在
-   * preflight 通过后调用 —— preflight 与 commit 之间出现的新编辑若二次冲刷
-   * 失败，dispose() 会返回 {ok:false} 拒绝终态化；但 commit 已不可回退（宿主
-   * 将卸载、运行态已收敛），此时强制移除监听/清理状态，绝不残留窗口级监听
-   * （未落盘内容在 flush 失败路径已进入恢复快照；极端竞态下的瞬时内容随
-   * 运行时整体回收，卸载语义下尽力而为）。
+   * 强制终态清理（第三十四轮阻断 3 + 第三十六轮严重 3）：仅由 dispose() 在
+   * flush 通过后调用。逐步骤 best-effort —— 每步独立 try/catch，任一
+   * removeEventListener/stateListeners 清理抛错都被归档并继续后续步骤，绝不
+   * 因抛错留下 disposed=true 但监听残留的假终态；返回失败明细由 dispose()
+   * 并入终态 {ok:true,message}（开始终态化后的异常一律归档为终态，绝不
+   * 向上传播被解释为可恢复失败）。
    */
-  forceTeardown(): void {
-    this.cancelTimer();
-    if (this.disposed) return;
+  forceTeardown(): string[] {
+    const failures: string[] = [];
+    const capture = (step: string, error: unknown): void => {
+      failures.push(`${step}：${error instanceof Error ? error.message : String(error)}`);
+    };
+    try {
+      this.cancelTimer();
+    } catch (error) {
+      capture('清理自动保存计时器', error);
+    }
+    if (this.disposed) return failures;
     this.disposed = true;
     if (typeof window !== 'undefined') {
-      window.removeEventListener('pagehide', this.handlePageHide);
+      try {
+        window.removeEventListener('pagehide', this.handlePageHide);
+      } catch (error) {
+        capture('移除 pagehide 监听', error);
+      }
     }
     if (typeof document !== 'undefined') {
-      document.removeEventListener('visibilitychange', this.handleVisibility);
+      try {
+        document.removeEventListener('visibilitychange', this.handleVisibility);
+      } catch (error) {
+        capture('移除 visibilitychange 监听', error);
+      }
     }
-    this.stateListeners.clear();
+    try {
+      this.stateListeners.clear();
+    } catch (error) {
+      capture('清理状态监听', error);
+    }
+    return failures;
   }
 
   async dispose(): Promise<SaveOutcome> {
@@ -969,19 +1005,49 @@ export class ProjectAutosaver {
     // 归一为可恢复失败 —— 修复前 reject 向上传播，ProjectPersistence 的 catch
     // 只收集 message 未确保 autosaver 终态（disposed 恒 false、pagehide 等窗口
     // 监听残留），宿主却已置 disposed=true 假完成
-    let outcome: SaveOutcome;
-    try {
-      outcome = await this.preflightDispose();
-    } catch (error) {
-      return {
-        ok: false,
-        code: 'storage-error',
-        message: error instanceof Error ? error.message : String(error),
-      };
+    // 第三十六轮阻断 1：flush 判 clean 与 seal 原子化 —— preflight 通过后先
+    // await null 让与本次 dispose 同一事件循环轮排入的微任务（含宿主探针的
+    // queueMicrotask 编辑）先执行，再于同一同步段复查 pending/epoch 未变化
+    // 才封存，否则继续冲刷追平。修复前 flush 先判 clean、编辑随后进 pending
+    // 启 timer、forceTeardown 取消 timer 置 disposed 返回 {ok:true} —— 内容丢失
+    for (;;) {
+      const epochAtFlushStart = this.changeEpoch;
+      let outcome: SaveOutcome;
+      try {
+        outcome = await this.preflightDispose();
+      } catch (error) {
+        return {
+          ok: false,
+          code: 'storage-error',
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
+      if (!outcome.ok) return outcome;
+      // 排水一拍：本同步段之前排入的微任务编辑此刻已执行（pending 已置 /
+      // epoch 已递增）—— 该排水点本身不产生间隙，复查在完全同步的同一段
+      // 完成，编辑不可能插在复查与封存之间
+      await null;
+      // 密封裁决只看变更代：未保存内容只能经 changed() 进入（pending 置位
+      // 必伴随 epoch 递增），flush 返回 ok 已保证无未保存内容 —— pending 仍
+      // 非空只可能是仅内存模式（store 为 null 时 flush 直接 ok 不清 pending）
+      // 或已净的陈旧通知，二者都不携带可丢失内容，若把 pending 纳入裁决会在
+      // 这些场景死循环
+      if (this.changeEpoch === epochAtFlushStart) break;
     }
-    if (!outcome.ok) return outcome;
-    this.forceTeardown();
-    return { ok: true };
+    // 第三十六轮严重 3：开始终态化 —— 此后任何异常都归档为终态 {ok:true,
+    // message}，绝不解释为可恢复失败（修复前 forceTeardown 内 removeEventListener
+    // 抛错越过 autosaver 使 ProjectPersistence 误判可恢复 {ok:false} 重开准入：
+    // UI 保留但 autosave no-op、重试因 disposed 假成功且监听清理不补做 ——
+    // 两层死壳）
+    let failures: string[] = [];
+    try {
+      failures = this.forceTeardown();
+    } catch (error) {
+      failures = [error instanceof Error ? error.message : String(error)];
+    }
+    return failures.length === 0
+      ? { ok: true }
+      : { ok: true, message: `终态清理部分失败：${failures.join('；')}` };
   }
 
   private readonly handlePageHide = () => {

@@ -241,6 +241,34 @@ describe('LumoraStudio', () => {
     disposeSpy.mockRestore();
   });
 
+  it('宿主 async onCloseError 回调 rejection 被吸收（第三十六轮一般 4：修复前 try/catch 只捕同步异常，宿主传 async 回调时返回 Promise 的 rejection 被丢弃、产生 unhandledrejection）', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (event: PromiseRejectionEvent) => {
+      unhandled.push(event.reason);
+    };
+    window.addEventListener('unhandledrejection', onUnhandled);
+    // async 回调：invokeCloseError 需吸收返回 thenable 的 rejection
+    const onCloseError = vi.fn(async (_message: string) => {
+      throw new Error('宿主异步回调崩溃');
+    });
+    const { unmount } = render(
+      <LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" onCloseError={onCloseError} />,
+    );
+    await screen.findByTestId('test-panel');
+    const { runtime } = handle.current!;
+    const disposeSpy = vi.spyOn(runtime, 'dispose');
+    disposeSpy.mockResolvedValueOnce({ ok: false, message: '模拟冲刷失败' });
+    unmount();
+    await waitFor(() => expect(onCloseError).toHaveBeenCalledTimes(1));
+    expect(onCloseError.mock.calls[0]![0]).toBe('模拟冲刷失败');
+    // 链尾无未处理拒绝（修复前 async rejection 外溢）
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(unhandled).toHaveLength(0);
+    window.removeEventListener('unhandledrejection', onUnhandled);
+    disposeSpy.mockRestore();
+  });
+
   it('严重 3：并发一败一成 —— close() 并发调用共享同一 in-flight 裁决（双击/连点不再重复 teardown），失败后清空缓存允许重试，成功释放缓存恰一次', async () => {
     const handle = createRef<LumoraStudioHandle>();
     const cacheDisposeSpy = vi.spyOn(ContentCache.prototype, 'dispose');

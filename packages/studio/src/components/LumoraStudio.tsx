@@ -24,6 +24,29 @@ import '../lumora.css';
  */
 const mountedRoots = new Set<HTMLElement>();
 
+/**
+ * 第三十六轮一般 4：宿主 onCloseError 回调的统一安全调用 —— 同步 throw 隔离，
+ * 返回 thenable（async 回调）的 rejection 吸收（挂空 catch 接住，绝不产生
+ * unhandledrejection）。修复前调用点各自 try/catch 只覆盖同步异常，宿主传
+ * async 回调时 Promise rejection 被直接丢弃。
+ */
+function invokeCloseError(
+  callback: ((message: string) => void | Promise<void>) | undefined,
+  message: string,
+): void {
+  if (!callback) return;
+  try {
+    const result = callback(message);
+    if (result && typeof (result as Promise<void>).then === 'function') {
+      void Promise.resolve(result).catch(() => {
+        // 吸收宿主异步回调的 rejection，不让其外溢为未处理拒绝
+      });
+    }
+  } catch {
+    // 宿主同步 throw 已隔离，不外溢
+  }
+}
+
 export interface LumoraStudioProps {
   /** 挂载时注册的插件描述符；注册按声明顺序串行执行 */
   plugins?: PluginDescriptor[];
@@ -32,8 +55,10 @@ export interface LumoraStudioProps {
   initialProject?: Project;
   onError?: (error: unknown) => void;
   /** 卸载失败回调（第三十轮严重 6）：卸载屏障返回失败时收到失败原因（字符串），
-   *  运行时保留未 teardown —— 宿主应保持壳层挂载并等待 handle.close() 重试 */
-  onCloseError?: (message: string) => void;
+   *  运行时保留未 teardown —— 宿主应保持壳层挂载并等待 handle.close() 重试。
+   *  允许 async 回调（第三十六轮一般 4：rejection 由壳层统一吸收，绝不产生
+   *  未处理拒绝） */
+  onCloseError?: (message: string) => void | Promise<void>;
   /** 场景槽位，缺省为内置 3D 场景编辑器视口 */
   scene?: (project: Project | null) => ReactNode;
   /** 本地存储后端（缺省 indexeddb；opfs = Origin Private File System） */
@@ -185,23 +210,16 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
           // 仍可恢复，绝不「假装已卸载」丢弃内容；资源缓存随成功释放（恰好
           // 一次），宿主重试期间壳层仍完整可用。宿主确需放弃内容时先经
           // persistence.clearRecovery 显式丢弃后重试
-          // 第三十五轮一般 5：宿主 onCloseError 回调抛错时隔离 —— 修复前回调
-          // 直接在 fulfilled/rejected 回调内执行，宿主异常使派生 promise 无
-          // catch 处理，产生 unhandledrejection
+          // 第三十五轮一般 5 + 第三十六轮一般 4：宿主 onCloseError 回调统一经
+          // invokeCloseError 调用 —— 同步 throw 隔离、返回 thenable 的 rejection
+          // 吸收（修复前只捕同步异常，async 回调的 Promise rejection 被丢弃、
+          // 产生 unhandledrejection）
           void close().then(
             (outcome) => {
-              try {
-                if (!outcome.ok) onCloseErrorRef.current?.(outcome.message ?? '运行时释放失败');
-              } catch {
-                // 宿主回调自身抛错不得外溢为未处理拒绝
-              }
+              if (!outcome.ok) invokeCloseError(onCloseErrorRef.current, outcome.message ?? '运行时释放失败');
             },
             (error) => {
-              try {
-                onCloseErrorRef.current?.(error instanceof Error ? error.message : String(error));
-              } catch {
-                // 宿主回调自身抛错不得外溢为未处理拒绝
-              }
+              invokeCloseError(onCloseErrorRef.current, error instanceof Error ? error.message : String(error));
             },
           );
         }
