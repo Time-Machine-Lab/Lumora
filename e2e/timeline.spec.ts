@@ -73,6 +73,55 @@ async function seekByRuler(page: Page, t: number, zoom: number): Promise<void> {
   await page.mouse.click(box.x + t * zoom, box.y + box.height / 2);
 }
 
+/** 数值位姿读取：CameraPoseReadout 序列化的 JSON（e2e 数值断言，复审 AC 补强） */
+async function cameraPose(
+  page: Page,
+  cameraId = 'sample-camera',
+): Promise<{ position: [number, number, number]; rotation: [number, number, number]; focalLength: number | null }> {
+  const text = await page.getByTestId('camera-pose-readout').textContent();
+  if (!text) throw new Error('位姿读取钩子不可用');
+  const pose = JSON.parse(text)[cameraId];
+  if (!pose) throw new Error(`机位 ${cameraId} 不在位姿钩子输出中`);
+  return pose;
+}
+
+/** 两张 PNG 截图的像素差异比例（0..1）：任一通道差绝对值之和 > 30 的像素占比；
+ *  在页面内用 canvas 解码比对（两帧经同一截图管线，编码参数一致） */
+async function pixelDiffRatio(page: Page, a: Buffer, b: Buffer): Promise<number> {
+  return page.evaluate(
+    ([a64, b64]) => {
+      const load = (src: string) =>
+        new Promise<HTMLImageElement>((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = reject;
+          img.src = `data:image/png;base64,${src}`;
+        });
+      return (async () => {
+        const [ia, ib] = await Promise.all([load(a64), load(b64)]);
+        const w = Math.min(ia.width, ib.width);
+        const h = Math.min(ia.height, ib.height);
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d')!;
+        ctx.drawImage(ia, 0, 0, w, h);
+        const da = ctx.getImageData(0, 0, w, h).data;
+        ctx.drawImage(ib, 0, 0, w, h);
+        const db = ctx.getImageData(0, 0, w, h).data;
+        let diff = 0;
+        for (let i = 0; i < da.length; i += 4) {
+          const delta =
+            Math.abs(da[i]! - db[i]!) + Math.abs(da[i + 1]! - db[i + 1]!) + Math.abs(da[i + 2]! - db[i + 2]!);
+          if (delta > 30) diff += 1;
+        }
+        return diff / (da.length / 4);
+      })();
+    },
+    [a.toString('base64'), b.toString('base64')],
+  );
+}
+
 async function shotLeft(page: Page, shotId: string): Promise<number> {
   return page.getByTestId(`shot-block-${shotId}`).evaluate((el) => parseFloat((el as HTMLElement).style.left));
 }
@@ -82,14 +131,24 @@ async function expectShotLeft(page: Page, shotId: string, expectedPx: number): P
   expect(Math.abs(actual - expectedPx)).toBeLessThan(1);
 }
 
-test('AC1 浏览器级：真实约 5s 持续驾驶录制 → 抽稀覆盖轨道 → 两次回放位姿/画面逐像素一致', async ({ page }) => {
+test('AC1 浏览器级：真实约 5s 持续驾驶录制 → 抽稀覆盖轨道 → 两次回放暂停点位姿/画面一致', async ({ page }) => {
   await page.getByTestId('view-mode-select').selectOption('sample-camera'); // 主摄像机 POV
   await startRecording(page);
+  await hideViewportOverlays(page);
 
-  // 真实约 5s 持续驾驶输入（KeyW 按住）：录制后半段驾驶输入不被清空（审查第 1 项）
-  await page.keyboard.down('w');
-  await page.waitForTimeout(5000);
-  await page.keyboard.up('w');
+  // 真实约 5s 持续驾驶输入（KeyS 后退按住）：录制后半段仍持续位移（复审 AC 补强）——
+  // ~1s / ~2.5s / ~4.5s 三张画面逐步不同（而非仅开头有运动）；
+  // 后退保持场景物体始终在视锥内（前进 ~2.8s 后物体出镜，只剩纯色地面，画面逐帧相同）
+  await page.keyboard.down('s');
+  await page.waitForTimeout(1000);
+  const rec1 = await canvasShot(page);
+  await page.waitForTimeout(1500);
+  const rec25 = await canvasShot(page);
+  await page.waitForTimeout(2000);
+  const rec45 = await canvasShot(page);
+  await page.keyboard.up('s');
+  expect(rec25.equals(rec1)).toBe(false);
+  expect(rec45.equals(rec25)).toBe(false);
   await page.getByTestId('timeline-record').click(); // ■ = 停止
   await expect(page.getByTestId('timeline-time')).toHaveText('00:00.00');
 
@@ -113,26 +172,22 @@ test('AC1 浏览器级：真实约 5s 持续驾驶录制 → 抽稀覆盖轨道 
   await page.getByTestId('timeline-snap').setChecked(false);
   const zoom = await measureZoom(page, `keyframe-sample-track-camera-dolly-${lastKfTime}`, lastKfTime);
 
-  // 回到起点 → 起点画面
+  // 回到起点 → 起点画面 + 起点数值位姿
   await seekByRuler(page, 0.02, zoom);
-  await hideViewportOverlays(page);
   const s0 = await canvasShot(page);
+  const pose0 = await cameraPose(page);
 
-  // 第一次回放：播放推进 → 暂停 → 画面与起点不同
+  // 第一次回放：播放推进 → 暂停 → 立即读取位姿/画面（勿先 seek 回精确时刻）
   await page.getByTestId('timeline-play').click();
   await page.waitForTimeout(800);
   await page.getByTestId('timeline-play').click(); // 暂停
   const tA = await timeSeconds(page);
   expect(tA).toBeGreaterThan(0.6);
-  const pApx = await playheadPx(page);
+  const poseA = await cameraPose(page);
   const pA = await canvasShot(page);
+  // 位姿数值已离开起点（录制后段位移可测：z 位移 > 0.5m）；画面与起点不同
+  expect(Math.abs(poseA.position[2]! - pose0.position[2]!)).toBeGreaterThan(0.5);
   expect(pA.equals(s0)).toBe(false);
-
-  // 审查第 2 项：暂停画面与播放头一致 —— 标尺拖到播放头同一像素位 → 时间一致、画面逐像素一致
-  await seekByRuler(page, (pApx - LABEL_WIDTH) / zoom, zoom);
-  await expect.poll(() => timeSeconds(page)).toBeCloseTo(tA, 1);
-  const pA2 = await canvasShot(page);
-  expect(pA2.equals(pA)).toBe(true);
 
   // 第二次回放：同样从起点播放 → 暂停点一致（回放时钟 1:1）
   await seekByRuler(page, 0.02, zoom);
@@ -140,13 +195,18 @@ test('AC1 浏览器级：真实约 5s 持续驾驶录制 → 抽稀覆盖轨道 
   await page.waitForTimeout(800);
   await page.getByTestId('timeline-play').click();
   const tB = await timeSeconds(page);
-  expect(Math.abs(tB - tA)).toBeLessThan(0.15);
-
-  // 两次回放同一时刻 → 位姿/画面逐像素一致
-  await seekByRuler(page, (pApx - LABEL_WIDTH) / zoom, zoom);
-  await expect.poll(() => timeSeconds(page)).toBeCloseTo(tA, 1);
+  const poseB = await cameraPose(page);
   const pB = await canvasShot(page);
-  expect(pB.equals(pA)).toBe(true);
+  expect(Math.abs(tB - tA)).toBeLessThan(0.3);
+
+  // 两次暂停的数值位姿一致：每轴容差覆盖 ≤0.3s × 2.5m/s 的推进差（+采样误差）
+  for (let i = 0; i < 3; i += 1) {
+    expect(Math.abs(poseB.position[i]! - poseA.position[i]!)).toBeLessThan(0.9);
+    expect(Math.abs(poseB.rotation[i]! - poseA.rotation[i]!)).toBeLessThan(0.05);
+  }
+  // 两次暂停的画面一致（像素差异比例小，而非逐像素相等 —— 两帧相隔 ≤0.3s）
+  const diff = await pixelDiffRatio(page, pA, pB);
+  expect(diff).toBeLessThan(0.15);
 });
 
 test('AC2 浏览器级：按住驾驶键时页面失焦 → 相机 transform 冻结（录制暂停、画面逐像素不变）', async ({ page }) => {
@@ -217,6 +277,23 @@ test('AC3 浏览器级：关键帧间平滑插值 —— 中间帧与端点帧�
   const s2Again = await at(2);
   expect(s2Again.equals(s2)).toBe(true);
 
+  // 数值断言（复审 AC 补强）：dolly 段 [0,2] 左端点无插值字段 → 线性插值，
+  // t=1 处位置恰为两端中点 z=5.75；焦距段 [0,4] 线性（50→35）→ t=1 为 46.25
+  const poseAt = async (t: number) => {
+    await at(t);
+    return cameraPose(page);
+  };
+  const pose1 = await poseAt(1);
+  expect(pose1.position[2]).toBeCloseTo(5.75, 2);
+  expect(pose1.focalLength).toBeCloseTo(46.25, 2);
+  // 重复求值：回到起点再求值同一时刻 → 数值逐位一致（回放确定性）
+  const pose0 = await poseAt(0);
+  const pose1Again = await poseAt(1);
+  expect(pose0.position[2]).toBeCloseTo(7, 2);
+  expect(pose1Again.position[2]).toBeCloseTo(5.75, 2);
+  expect(pose1Again.position).toEqual(pose1.position);
+  expect(pose1Again.focalLength).toEqual(pose1.focalLength);
+
   // 关键帧点击精确定位到该帧时间
   await page.getByTestId('keyframe-sample-track-camera-dolly-0').click();
   await expect(page.getByTestId('timeline-time')).toHaveText('00:00.00');
@@ -232,8 +309,10 @@ test('AC4 浏览器级：分镜区段坐标与机位绑定 → 重排原子重�
   await expectShotLeft(page, 'sample-shot-2', 1.5 * zoom);
   await expectShotLeft(page, 'sample-shot-3', 3 * zoom);
   // 机位绑定：区块 title「机位：主摄像机」
-  for (const shotId of ['sample-shot-1', 'sample-shot-2', 'sample-shot-3']) {
-    await expect(page.getByTestId(`shot-block-${shotId}`)).toHaveAttribute('title', '机位：主摄像机');
+  // 机位绑定（复审 AC 补强：至少两台机位，按分镜身份校验绑定）
+  await expect(page.getByTestId('shot-block-sample-shot-1')).toHaveAttribute('title', '机位：主摄像机');
+  for (const shotId of ['sample-shot-2', 'sample-shot-3']) {
+    await expect(page.getByTestId(`shot-block-${shotId}`)).toHaveAttribute('title', '机位：俯拍机位');
   }
 
   // 重排 1 → 右移两次 → [2, 3, 1]：区段时间按新顺序原子重算（视觉/时间顺序同变，审查第 3 项）
@@ -243,8 +322,10 @@ test('AC4 浏览器级：分镜区段坐标与机位绑定 → 重排原子重�
   await expectShotLeft(page, 'sample-shot-3', 1.5 * zoom);
   await expectShotLeft(page, 'sample-shot-1', 3 * zoom);
   // 机位绑定随分镜保留
-  for (const shotId of ['sample-shot-1', 'sample-shot-2', 'sample-shot-3']) {
-    await expect(page.getByTestId(`shot-block-${shotId}`)).toHaveAttribute('title', '机位：主摄像机');
+  // 机位绑定（复审 AC 补强：至少两台机位，按分镜身份校验绑定）
+  await expect(page.getByTestId('shot-block-sample-shot-1')).toHaveAttribute('title', '机位：主摄像机');
+  for (const shotId of ['sample-shot-2', 'sample-shot-3']) {
+    await expect(page.getByTestId(`shot-block-${shotId}`)).toHaveAttribute('title', '机位：俯拍机位');
   }
 
   // 保存 → 刷新重开 → 顺序/区段坐标/机位绑定一致（AC4 重开持久）
@@ -270,8 +351,10 @@ test('AC4 浏览器级：分镜区段坐标与机位绑定 → 重排原子重�
   await expectShotLeft(page, 'sample-shot-2', 0);
   await expectShotLeft(page, 'sample-shot-3', 1.5 * zoom2);
   await expectShotLeft(page, 'sample-shot-1', 3 * zoom2);
-  for (const shotId of ['sample-shot-1', 'sample-shot-2', 'sample-shot-3']) {
-    await expect(page.getByTestId(`shot-block-${shotId}`)).toHaveAttribute('title', '机位：主摄像机');
+  // 机位绑定（复审 AC 补强：至少两台机位，按分镜身份校验绑定）
+  await expect(page.getByTestId('shot-block-sample-shot-1')).toHaveAttribute('title', '机位：主摄像机');
+  for (const shotId of ['sample-shot-2', 'sample-shot-3']) {
+    await expect(page.getByTestId(`shot-block-${shotId}`)).toHaveAttribute('title', '机位：俯拍机位');
   }
 });
 

@@ -21,7 +21,7 @@ const HERE = fileURLToPath(new URL('.', import.meta.url));
  *
  * 用宿主自身的「卸载 Studio」先释放 IndexedDB 连接（deleteDatabase 在连接存在时
  * 会一直 pending 并阻塞后续 open），再删除数据库，等价于「清空浏览器本地数据」；
- * 重新挂载后从空存储导入工程包，校验 3 台摄像机、模型与层级引用全部恢复，
+ * 重新挂载后从空存储导入工程包，校验 4 台摄像机、模型与层级引用全部恢复，
  * 且项目已持久化（刷新后仍可从最近项目重新打开）。
  *
  * AC4 隐私剥离（NFR-008）：向 e2e 源项目注入插件私有设置（pluginData，含嵌套
@@ -44,21 +44,21 @@ interface LumoraPackage {
   };
 }
 
-test('AC1 导出→清空→导入：模型、三镜头完整恢复且已持久化', async ({ page }) => {
+test('AC1 导出→清空→导入：模型、四镜头完整恢复且已持久化', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByTestId('studio-empty-hint')).toBeVisible();
 
-  // 1. 打开示例项目并追加两台摄像机（共 3 台镜头；模型 = 立方体/球体/圆锥）
+  // 1. 打开示例项目并追加两台摄像机（共 4 台镜头；模型 = 立方体/球体/圆锥）
   await page.getByTestId('open-sample-project').click();
   await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
   for (let i = 0; i < 2; i++) {
     await page.getByTestId('add-object').click();
     await page.getByTestId('add-摄像机').click();
   }
-  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
+  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(4);
   await expect(page.locator('.lumora-tree-row__type--primitive')).toHaveCount(4);
 
-  // 2. 导出工程包，捕获下载并校验包内容（含三镜头；默认不含私有数据，NFR-008）
+  // 2. 导出工程包，捕获下载并校验包内容（含四镜头；默认不含私有数据，NFR-008）
   const downloadPromise = page.waitForEvent('download');
   await page.getByTestId('project-menu').click();
   await page.getByTestId('project-export').click();
@@ -72,7 +72,7 @@ test('AC1 导出→清空→导入：模型、三镜头完整恢复且已持久�
   const pkg = JSON.parse(readFileSync(exportPath, 'utf8')) as LumoraPackage;
   expect(pkg.manifest.format).toBe('lumora.project');
   expect(pkg.manifest.includePrivate).toBe(false);
-  expect(pkg.project.objects.filter((o) => o.type === 'camera')).toHaveLength(3);
+  expect(pkg.project.objects.filter((o) => o.type === 'camera')).toHaveLength(4);
   expect(pkg.project.pluginData).toBeUndefined();
   // 轨道（TML-88）：示例项目轨道随包导出，objectId 引用指向包内对象
   expect(pkg.project.tracks!.length).toBeGreaterThan(0);
@@ -105,7 +105,7 @@ test('AC1 导出→清空→导入：模型、三镜头完整恢复且已持久�
   // 4. 导入工程包：数据与引用完整恢复
   await page.setInputFiles('[data-testid="project-import-input"]', exportPath);
   await expect(page.getByTestId('studio-empty-hint')).not.toBeVisible();
-  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
+  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(4);
   await expect(page.locator('.lumora-tree-row__type--primitive')).toHaveCount(4);
   await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
   await expect(page.getByTestId('event-log')).toContainText('项目已打开: 示例项目');
@@ -131,14 +131,14 @@ test('AC1 导出→清空→导入：模型、三镜头完整恢复且已持久�
   await expect(page.getByTestId('recent-project')).toContainText('示例项目');
   await page.locator('[data-testid="recent-project"] .lumora-project-menu__recent-open').click();
   await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
-  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
+  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(4);
 });
 
 test('AC1b 真实 GLB 模型资产：导入渲染 + 载荷引用往返（TML-53 第四轮 #9）', async ({ page }) => {
-  // 1. Node 端构建含真实小型 GLB 网格（nested-mesh.glb，17KB 真模型）、三镜头与轨道的工程包
+  // 1. Node 端构建含真实小型 GLB 网格（nested-mesh.glb，17KB 真模型）、四镜头与轨道的工程包
   const editor = new SceneEditor();
   editor.openProject(createSampleProject());
-  // 追加两台摄像机（共 3 台镜头，与 AC1 一致：镜头都在活动场景，浏览器树可见）
+  // 追加两台摄像机（共 4 台镜头，与 AC1 一致：镜头都在活动场景，浏览器树可见）
   editor.addObject(createCameraObject('机位二'));
   editor.addObject(createCameraObject('机位三'));
   const glbBytes = readFileSync(join(HERE, '..', 'packages', 'studio', 'test', 'fixtures', 'nested-mesh.glb'));
@@ -190,18 +190,18 @@ test('AC1b 真实 GLB 模型资产：导入渲染 + 载荷引用往返（TML-53 
     'utf8',
   );
 
-  // 2. 浏览器导入：真实 GLB 模型行可见、三镜头齐全、项目已持久化
+  // 2. 浏览器导入：真实 GLB 模型行可见、四镜头齐全、项目已持久化
   await page.goto('/');
   await expect(page.getByTestId('studio-empty-hint')).toBeVisible();
   await page.getByTestId('project-menu').click();
   await page.setInputFiles('[data-testid="project-import-input"]', glbPath);
   await expect(page.getByTestId('studio-empty-hint')).not.toBeVisible();
   await expect(page.getByTestId('tree-row-real-model-obj')).toBeVisible();
-  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
+  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(4);
   await expect(page.getByTestId('event-log')).toContainText('项目已打开');
   await expect(page.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 10_000 });
 
-  // 3. 再导出：GLB 载荷逐字节往返、tracks 完整、模型与三镜头引用未断裂
+  // 3. 再导出：GLB 载荷逐字节往返、tracks 完整、模型与四镜头引用未断裂
   const reexportPromise = page.waitForEvent('download');
   await page.getByTestId('project-menu').click();
   await page.getByTestId('project-export').click();
@@ -211,7 +211,7 @@ test('AC1b 真实 GLB 模型资产：导入渲染 + 载荷引用往返（TML-53 
   const reexported = JSON.parse(readFileSync(reexportPath, 'utf8')) as LumoraPackage;
   expect(reexported.manifest.assetCount).toBeGreaterThanOrEqual(1);
   expect(reexported.assets?.[assetId]?.payload).toBe(payload);
-  expect(reexported.project.objects.filter((o) => o.type === 'camera')).toHaveLength(3);
+  expect(reexported.project.objects.filter((o) => o.type === 'camera')).toHaveLength(4);
   expect(reexported.project.objects.some((o) => o.type === 'model' && o.id === modelId)).toBe(true);
   expect(reexported.project.tracks).toEqual([...project.tracks, ...tracks]);
   for (const track of reexported.project.tracks!) {
@@ -647,7 +647,7 @@ test('AC2 跨标签页冲突：本地计数追平不覆盖较新保存，须显�
   // A 新增一台摄像机并等待落盘（rev1）
   await pageA.getByTestId('add-object').click();
   await pageA.getByTestId('add-摄像机').click();
-  await expect(pageA.locator('.lumora-tree-row__type--camera')).toHaveCount(2);
+  await expect(pageA.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
   await expect(pageA.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
 
   // B 打开同 uri 示例项目：对账发现本地已存 rev1 ≠ 打开 rev0 → 立即冲突，不预设已保存
@@ -661,18 +661,18 @@ test('AC2 跨标签页冲突：本地计数追平不覆盖较新保存，须显�
   await pageB.getByTestId('add-摄像机').click();
   await expect(pageB.getByTestId('save-state-badge')).toHaveText(/保存失败/, { timeout: 6000 });
   await expect(pageA.getByTestId('save-state-badge')).toHaveText('已保存');
-  await expect(pageA.locator('.lumora-tree-row__type--camera')).toHaveCount(2);
+  await expect(pageA.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
 
   // B 显式解决「加载较新版本」：内容切换为 A 的已存内容，冲突解除
   await pageB.getByTestId('save-reload').click();
-  await expect(pageB.locator('.lumora-tree-row__type--camera')).toHaveCount(2);
+  await expect(pageB.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
   await expect(pageB.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
 
   // 解决后 B 可正常保存（基于已存内容追加，rev2）
   await pageB.getByTestId('add-object').click();
   await pageB.getByTestId('add-摄像机').click();
   await expect(pageB.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
-  await expect(pageB.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
+  await expect(pageB.locator('.lumora-tree-row__type--camera')).toHaveCount(4);
 });
 
 test('窄屏（375px）：菜单与对话框不超出视口，Escape 关闭且不误清背景选择', async ({ page }) => {

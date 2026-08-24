@@ -45,20 +45,20 @@ test('OPFS 后端 AC1：导出→清空→导入完整恢复，数据落 OPFS �
   await page.goto('/?storage=opfs');
   await expect(page.getByTestId('studio-empty-hint')).toBeVisible();
 
-  // 1. 打开示例项目并追加两台摄像机（共 3 台镜头）
+  // 1. 打开示例项目并追加两台摄像机（共 4 台镜头）
   await page.getByTestId('open-sample-project').click();
   await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
   for (let i = 0; i < 2; i++) {
     await page.getByTestId('add-object').click();
     await page.getByTestId('add-摄像机').click();
   }
-  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
+  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(4);
   await expect(page.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
 
   // 数据已写入 OPFS 目录（真实文件系统校验，而非 IndexedDB）
   expect(await opfsProjectFiles(page)).toHaveLength(1);
 
-  // 2. 导出工程包并校验内容（含三镜头）
+  // 2. 导出工程包并校验内容（含四镜头）
   const downloadPromise = page.waitForEvent('download');
   await page.getByTestId('project-menu').click();
   await page.getByTestId('project-export').click();
@@ -71,7 +71,7 @@ test('OPFS 后端 AC1：导出→清空→导入完整恢复，数据落 OPFS �
   const pkg = JSON.parse(readFileSync(exportPath, 'utf8')) as {
     project: { objects: Array<{ type: string }> };
   };
-  expect(pkg.project.objects.filter((o) => o.type === 'camera')).toHaveLength(3);
+  expect(pkg.project.objects.filter((o) => o.type === 'camera')).toHaveLength(4);
 
   // 3. 清空本地数据：卸载 Studio → 删除 OPFS 根目录 → 重新挂载
   await page.getByTestId('project-menu').click(); // 收起菜单
@@ -86,7 +86,7 @@ test('OPFS 后端 AC1：导出→清空→导入完整恢复，数据落 OPFS �
   // 4. 导入工程包：数据与引用完整恢复
   await page.setInputFiles('[data-testid="project-import-input"]', exportPath);
   await expect(page.getByTestId('studio-empty-hint')).not.toBeVisible();
-  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
+  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(4);
   await expect(page.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
   expect(await opfsProjectFiles(page)).toHaveLength(1);
 
@@ -96,7 +96,7 @@ test('OPFS 后端 AC1：导出→清空→导入完整恢复，数据落 OPFS �
   await expect(page.getByTestId('recent-project')).toContainText('示例项目');
   await page.locator('[data-testid="recent-project"] .lumora-project-menu__recent-open').click();
   await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
-  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
+  await expect(page.locator('.lumora-tree-row__type--camera')).toHaveCount(4);
 });
 
 test('OPFS 后端 AC2：跨标签页冲突按 CAS 拒绝，显式「加载较新版本」解决', async ({ context }) => {
@@ -109,7 +109,7 @@ test('OPFS 后端 AC2：跨标签页冲突按 CAS 拒绝，显式「加载较新
   // A 新增一台摄像机并等待落盘（rev1）
   await pageA.getByTestId('add-object').click();
   await pageA.getByTestId('add-摄像机').click();
-  await expect(pageA.locator('.lumora-tree-row__type--camera')).toHaveCount(2);
+  await expect(pageA.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
   await expect(pageA.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
 
   // B 打开同 uri 示例项目：对账发现本地已存 rev1 ≠ 打开 rev0 → 立即冲突
@@ -123,17 +123,17 @@ test('OPFS 后端 AC2：跨标签页冲突按 CAS 拒绝，显式「加载较新
   await pageB.getByTestId('add-摄像机').click();
   await expect(pageB.getByTestId('save-state-badge')).toHaveText(/保存失败/, { timeout: 6000 });
   await expect(pageA.getByTestId('save-state-badge')).toHaveText('已保存');
-  await expect(pageA.locator('.lumora-tree-row__type--camera')).toHaveCount(2);
+  await expect(pageA.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
 
   // B 显式解决「加载较新版本」：内容切换为 A 的已存内容，冲突解除
   await pageB.getByTestId('save-reload').click();
-  await expect(pageB.locator('.lumora-tree-row__type--camera')).toHaveCount(2);
+  await expect(pageB.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
   await expect(pageB.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
 
   // 解决后 B 可正常保存（基于已存内容追加，rev2）
   await pageB.getByTestId('add-object').click();
   await pageB.getByTestId('add-摄像机').click();
   await expect(pageB.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
-  await expect(pageB.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
-  await expect(pageA.locator('.lumora-tree-row__type--camera')).toHaveCount(2);
+  await expect(pageB.locator('.lumora-tree-row__type--camera')).toHaveCount(4);
+  await expect(pageA.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
 });

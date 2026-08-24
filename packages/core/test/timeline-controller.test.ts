@@ -151,6 +151,32 @@ describe('TimelineController：播放/暂停与 tick 推进', () => {
     expect(states).toEqual([true, false]);
   });
 
+  it('末尾 play()：time:changed 监听器同步 setDuration(0) → 复验后不进入 playing（复审一般项 5）', () => {
+    const timeline = new TimelineController({ duration: 4 });
+    timeline.seek(4); // 末尾
+    const states: boolean[] = [];
+    timeline.events.on('state:changed', (p) => states.push(p.playing));
+    timeline.events.on('time:changed', () => timeline.setDuration(0));
+    timeline.play();
+    expect(timeline.isPlaying()).toBe(false);
+    expect(timeline.getDuration()).toBe(0);
+    expect(timeline.getTime()).toBe(0);
+    expect(states).toEqual([]); // 不得发出 playing:true，也不得留下 {duration:0, playing:true}
+  });
+
+  it('末尾 play()：time:changed 监听器同步重入 play() → 只发一次 state:changed(true)', () => {
+    const timeline = new TimelineController({ duration: 4 });
+    timeline.seek(4); // 末尾
+    let playingCount = 0;
+    timeline.events.on('time:changed', () => timeline.play());
+    timeline.events.on('state:changed', (p) => {
+      if (p.playing) playingCount += 1;
+    });
+    timeline.play();
+    expect(playingCount).toBe(1);
+    expect(timeline.isPlaying()).toBe(true);
+  });
+
   it('loop 开启：越过末尾按 duration 取模绕回', () => {
     const timeline = new TimelineController({ fps: 24, duration: 4, loop: true });
     timeline.seek(3.8); // 吸附到 91/24

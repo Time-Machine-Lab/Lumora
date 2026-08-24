@@ -99,6 +99,10 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   sessionRef.current = session;
   // 分镜缩略图截图通道：EditorViewport 的 FrameCaptureBridge 挂载后可用
   const captureRef = useRef<(() => string | null) | null>(null);
+  // 通道就绪状态：仅写 ref 不触发渲染，缩略图链依赖该状态在通道就绪后重跑
+  // （复审阻断 2：初载时 effect 早于 FrameCaptureBridge 挂载而空转）
+  const [captureReady, setCaptureReady] = useState(false);
+  const handleCaptureReady = useCallback((ready: boolean) => setCaptureReady(ready), []);
 
   const cacheRef = useRef<ContentCache | null>(null);
   if (!cacheRef.current) cacheRef.current = new ContentCache();
@@ -349,6 +353,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
                 cache={cache}
                 session={session}
                 captureRef={captureRef}
+                onCaptureReady={handleCaptureReady}
               />
             )}
             {!project && (
@@ -364,6 +369,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
               project={project}
               selection={editorState.selection}
               captureRef={captureRef}
+              captureReady={captureReady}
             />
           )}
         </main>

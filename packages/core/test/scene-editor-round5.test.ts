@@ -354,7 +354,13 @@ describe('M1 结构校验边界（O(n) 索引 + DFS）', () => {
     const editor = new SceneEditor();
     const project = createSampleProject();
     const objects: SceneObjectData[] = [...project.objects];
-    const rootIds: string[] = ['sample-group', 'sample-ground', 'sample-light', 'sample-camera'];
+    const rootIds: string[] = [
+      'sample-group',
+      'sample-ground',
+      'sample-light',
+      'sample-camera',
+      'sample-camera-2',
+    ];
     for (let i = 0; i < 1000; i += 1) {
       const id = `bulk-${i}`;
       objects.push({

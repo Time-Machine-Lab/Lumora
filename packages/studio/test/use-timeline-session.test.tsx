@@ -185,6 +185,50 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     expect(live().timeline.isPlaying()).toBe(false);
   });
 
+  it('同 URI 项目重开（会话令牌递增）→ 录制立即取消，样本不写入新项目（复审阻断 3）', () => {
+    mount();
+    act(() => live().startRecording('sample-camera'));
+    act(() => live().confirmOverwrite());
+    act(() => vi.advanceTimersByTime(300));
+    expect(live().recorder.active).toBe(true);
+    // 同 URI 重开：仅按 uri 判定会把旧会话误判为同一会话；会话令牌已变
+    act(() => editor.openProject(createSampleProject()));
+    expect(live().recorder.active).toBe(false);
+    expect(live().state.recording).toBe(false);
+    expect(live().timeline.isPlaying()).toBe(false);
+    expect(editor.getProject()!.tracks.every((t) => !t.name.startsWith('录制'))).toBe(true);
+  });
+
+  it('覆盖确认绑定会话：同 URI 重开后 pending 作废，新项目同 ID 相机不误启动录制（复审阻断 3）', () => {
+    mount();
+    act(() => live().startRecording('sample-camera'));
+    expect(live().state.overwritePending).toBe(true);
+    // 新项目包含同 ID 相机（示例项目重开）；旧确认必须失效
+    act(() => editor.openProject(createSampleProject()));
+    expect(live().state.overwritePending).toBe(false);
+    act(() => live().confirmOverwrite());
+    expect(live().recorder.active).toBe(false);
+    expect(live().state.recording).toBe(false);
+  });
+
+  it('录制扩容后绑定机位被删除 → 取消录制并把时长收敛回项目时长（复审阻断 3）', () => {
+    mount();
+    act(() => live().startRecording('sample-camera'));
+    act(() => live().confirmOverwrite());
+    // 录制超过示例项目时长（4.5s）→ 时长按整秒分块扩容
+    act(() => vi.advanceTimersByTime(6000));
+    expect(live().timeline.getDuration()).toBeGreaterThanOrEqual(6);
+    act(() => {
+      editor.setSelection(['sample-camera']);
+      editor.deleteSelection();
+    });
+    expect(live().recorder.active).toBe(false);
+    expect(live().state.recording).toBe(false);
+    const converged = getProjectDuration(editor.getProject()!);
+    expect(live().timeline.getDuration()).toBeCloseTo(converged, 6);
+    expect(live().state.duration).toBeCloseTo(converged, 6);
+  });
+
   it('覆盖确认期间目标机位被删除 → 确认不再开始录制（审查第 7 项重验）', () => {
     mount();
     act(() => live().startRecording('sample-camera'));

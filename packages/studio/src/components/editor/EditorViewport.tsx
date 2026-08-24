@@ -32,6 +32,9 @@ interface EditorViewportProps {
   session?: TimelineSession | null;
   /** 帧截图通道：FrameCaptureBridge 在 Canvas 内注册（分镜缩略图用） */
   captureRef?: React.RefObject<(() => string | null) | null>;
+  /** 截图通道就绪通知（FrameCaptureBridge 挂载/卸载时回调；缩略图链据此
+   *  启动，复审阻断 2） */
+  onCaptureReady?: (ready: boolean) => void;
 }
 
 /** 沿父链找到最近的对象 id（GLB 内容网格挂在模型组下，需要向上追溯）。
@@ -57,6 +60,7 @@ export function EditorViewport({
   cache,
   session = null,
   captureRef: captureRefProp,
+  onCaptureReady,
 }: EditorViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<THREE.Group | null>(null);
@@ -208,10 +212,13 @@ export function EditorViewport({
         />
         {!cameraView && <OrbitControls makeDefault enableDamping enabled={!dragging} />}
         <CameraProxy cameraRef={cameraRef} />
-        <FrameCaptureBridge captureRef={captureRef} />
+        <FrameCaptureBridge captureRef={captureRef} onCaptureReady={onCaptureReady} />
       </Canvas>
       {session && (
-        <PlaybackDriver session={session} editor={editor} rootRef={rootRef} skipIdsRef={skipIdsRef} />
+        <>
+          <PlaybackDriver session={session} editor={editor} rootRef={rootRef} skipIdsRef={skipIdsRef} />
+          <CameraPoseReadout session={session} editor={editor} rootRef={rootRef} />
+        </>
       )}
       {cameraView && containerSize && project && (
         <GuidesOverlay rect={fitRect(containerSize.width, containerSize.height, aspect)} view={view} />
@@ -355,13 +362,67 @@ function CameraProxy({ cameraRef }: { cameraRef: React.MutableRefObject<THREE.Ca
 }
 
 /**
+ * 数值位姿读取钩子（e2e AC1/AC3 数值断言）：把各相机节点当前的 position /
+ * rotation / focalLength 序列化进隐藏 span 的 textContent，播放、暂停、项目
+ * 变更时刷新（无需 React 状态，零重渲染成本）。订阅注册在 PlaybackDriver
+ * 之后，同一次事件里读到的是已应用轨道求值的位姿。
+ */
+function CameraPoseReadout({
+  session,
+  editor,
+  rootRef,
+}: {
+  session: TimelineSession;
+  editor: SceneEditor;
+  rootRef: React.RefObject<THREE.Group | null>;
+}) {
+  const hostRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const refresh = () => {
+      const root = rootRef.current;
+      const project = editor.getProject();
+      if (!root || !project) return;
+      const poses: Record<string, unknown> = {};
+      for (const object of project.objects) {
+        if (object.type !== 'camera') continue;
+        const node = findNode(root, object.id);
+        if (!node) continue;
+        const focal = (node.userData as Record<string, unknown>).focalLength;
+        poses[object.id] = {
+          position: [node.position.x, node.position.y, node.position.z],
+          rotation: [node.rotation.x, node.rotation.y, node.rotation.z],
+          focalLength: typeof focal === 'number' && Number.isFinite(focal) ? focal : null,
+        };
+      }
+      host.textContent = JSON.stringify(poses);
+    };
+    const subs = [
+      session.timeline.events.on('time:changed', refresh),
+      session.timeline.events.on('state:changed', refresh),
+      editor.events.on('project:changed', refresh),
+    ];
+    refresh();
+    return () => {
+      for (const sub of subs) sub.dispose();
+    };
+  }, [session, editor, rootRef]);
+  return <span ref={hostRef} data-testid="camera-pose-readout" aria-hidden="true" style={{ display: 'none' }} />;
+}
+
+/**
  * 帧截图桥（分镜缩略图）：把「立即截一帧 PNG dataURL」注册给外层。测试 mock 的
  * gl 没有 render/toDataURL，typeof guard 后返回 null（缩略图占位）。
  */
 function FrameCaptureBridge({
   captureRef,
+  onCaptureReady,
 }: {
   captureRef: React.RefObject<(() => string | null) | null>;
+  /** 通道就绪通知：挂载置 true、卸载置 false。仅写 ref 不触发 React 渲染，
+   *  缩略图链依赖该回调启动（复审阻断 2） */
+  onCaptureReady?: (ready: boolean) => void;
 }) {
   const gl = useThree((s) => s.gl);
   const scene = useThree((s) => s.scene);
@@ -379,10 +440,12 @@ function FrameCaptureBridge({
         return null;
       }
     };
+    onCaptureReady?.(true);
     return () => {
       captureRef.current = null;
+      onCaptureReady?.(false);
     };
-  }, [gl, scene, camera, size, captureRef]);
+  }, [gl, scene, camera, size, captureRef, onCaptureReady]);
   return null;
 }
 
@@ -422,8 +485,8 @@ function SceneContent({
     const sceneSwitched = prevProjectRef.current && prevProjectRef.current.activeSceneId !== project.activeSceneId;
     const newSession = session !== sessionRef.current;
     if (current && prevProjectRef.current && !sceneSwitched && !newSession) {
-      const { rebuiltModelIds } = syncScene(current, prevProjectRef.current, project, aspect);
-      if (rebuiltModelIds.length > 0) setContentVersion((v) => v + 1);
+      const { rebuiltModelIds, structuralChange } = syncScene(current, prevProjectRef.current, project, aspect);
+      if (structuralChange || rebuiltModelIds.length > 0) setContentVersion((v) => v + 1);
     } else {
       // 切场景/新会话（或重建）：旧树节点整体释放，避免跨场景残留 GPU 资源
       if (current) {
@@ -434,6 +497,7 @@ function SceneContent({
       rootRef.current = root;
       scene.add(root);
       sessionRef.current = session;
+      setContentVersion((v) => v + 1);
     }
     prevProjectRef.current = project;
   }, [project, scene, rootRef, editor]);
@@ -594,6 +658,13 @@ function EditorGizmo({
   const target = selection.length === 1 && project && root ? findNode(root, selection[0]) : null;
   const data = target ? findObject(project!, target.userData.objectId as string) : undefined;
   const locked = !!data?.locked;
+  // 场景同步（SceneContent 的 useEffect）在渲染后执行，且只重渲染 SceneContent
+  // 子树——本组件首次渲染时选中节点可能尚未挂入场景。命中「选中但节点缺失」
+  // 时补一次重渲染，待同步提交后确定性挂载 gizmo，不再依赖无关状态更新竞速
+  const [, bumpRender] = useState(0);
+  useEffect(() => {
+    if (!target && selection.length === 1 && project) bumpRender((v) => v + 1);
+  }, [target, selection, project]);
   /** 正常提交路径标记：commit 先置位再收尾 dragging，cleanup 据此区分中断回滚 */
   const committedRef = useRef(false);
 

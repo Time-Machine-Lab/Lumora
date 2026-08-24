@@ -275,6 +275,9 @@ export interface TrackSample {
 }
 
 export interface SimplifyOptions {
+  /** 通道语义：rotation 走最短弧 slerp 角距离（与回放 evaluateTrack 同源，
+   *  兼容 Euler 直线误差反例）；缺省按值类型推断（标量=绝对值，Vec3=欧氏距离） */
+  channel?: 'position' | 'rotation' | 'focalLength';
   /** Vec3 通道容差（欧氏距离）：position 单位米（默认 0.01）、rotation 单位弧度（默认 0.01） */
   vecEpsilon?: number;
   /** 标量通道容差（默认 0.1，如焦距 mm） */
@@ -299,9 +302,26 @@ function deviationToSegment(sample: TrackSample, a: TrackSample, b: TrackSample)
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+/** 旋转样本到区间 [a, b] 的偏差：回放求值为两端 quaternion 最短弧 slerp 的
+ *  角距离（与 evaluateTrack 同源）—— 抽稀判定与回放数学一致。Euler 直线
+ *  误差会把落在直线弦上的复合旋转样本误判为「无偏差」而抽成 2 帧，回放却
+ *  走 slerp 产生 0.34rad 级夹角误差（TML-52 复审阻断 1）。 */
+function rotationDeviationToSegment(sample: TrackSample, a: TrackSample, b: TrackSample): number {
+  if (b.time === a.time) return 0;
+  const t = (sample.time - a.time) / (b.time - a.time);
+  const interpolated = rotationEulerAt(a.value as Vec3, b.value as Vec3, t);
+  const q1 = eulerToQuat(
+    (sample.value as Vec3)[0], (sample.value as Vec3)[1], (sample.value as Vec3)[2],
+  );
+  const q2 = eulerToQuat(interpolated[0], interpolated[1], interpolated[2]);
+  const dot = Math.abs(q1[0] * q2[0] + q1[1] * q2[1] + q1[2] * q2[2] + q1[3] * q2[3]);
+  return 2 * Math.acos(Math.min(1, dot));
+}
+
 /**
- * 采样简化（RDP 抽稀）：始终保留首尾样本，递归剔除与「两端连线的线性插值」
- * 偏差不超过容差的中间样本。结果保持时间升序；输入须已按时间升序（非法输入
+ * 采样简化（RDP 抽稀）：始终保留首尾样本，递归剔除与「两端连线的插值」偏差
+ * 不超过容差的中间样本（rotation 通道按 slerp 角距离判定，与回放求值同源，
+ * 其余按欧氏距离/绝对值）。结果保持时间升序；输入须已按时间升序（非法输入
  * 原样返回防御）。递归深度受样本数限制（最坏 O(n) 栈深，n 为 5s@60Hz≈300 级）。
  */
 export function simplifySamples(samples: TrackSample[], options: SimplifyOptions = {}): TrackSample[] {
@@ -311,13 +331,16 @@ export function simplifySamples(samples: TrackSample[], options: SimplifyOptions
   }
   const scalar = typeof samples[0]!.value === 'number';
   const epsilon = scalar ? options.scalarEpsilon ?? DEFAULT_SCALAR_EPSILON : options.vecEpsilon ?? DEFAULT_VEC_EPSILON;
+  const isRotation = options.channel === 'rotation';
   const kept: TrackSample[] = [samples[0]!];
 
   const rdp = (start: number, end: number): void => {
     let maxDeviation = 0;
     let maxIndex = -1;
     for (let i = start + 1; i < end; i += 1) {
-      const deviation = deviationToSegment(samples[i]!, samples[start]!, samples[end]!);
+      const deviation = isRotation
+        ? rotationDeviationToSegment(samples[i]!, samples[start]!, samples[end]!)
+        : deviationToSegment(samples[i]!, samples[start]!, samples[end]!);
       if (deviation > maxDeviation) {
         maxDeviation = deviation;
         maxIndex = i;

@@ -49,7 +49,7 @@ function baseState(): TimelineSessionState {
 }
 
 /** 每次调用独立挂载；同一测试内多个场景必须先 unmount() 上一棵再挂载（screen 查询作用于最新渲染树） */
-function mountPanel(overrides: Partial<TimelineSession> = {}, selection: string[] = []) {
+function mountPanel(overrides: Partial<TimelineSession> = {}, selection: string[] = [], captureReady = false) {
   const editor = new SceneEditor();
   const project = makeProject();
   editor.openProject(project);
@@ -77,7 +77,14 @@ function mountPanel(overrides: Partial<TimelineSession> = {}, selection: string[
   };
   const captureRef = { current: null } as RefObject<(() => string | null) | null>;
   const view = render(
-    <TimelinePanel session={session} editor={editor} project={project} selection={selection} captureRef={captureRef} />,
+    <TimelinePanel
+      session={session}
+      editor={editor}
+      project={project}
+      selection={selection}
+      captureRef={captureRef}
+      captureReady={captureReady}
+    />,
   );
   return { ...view, session, editor, project, timeline, captureRef };
 }
@@ -210,16 +217,17 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     const dialog = screen.getByTestId('overwrite-confirm');
     expect(dialog).toHaveAttribute('role', 'dialog');
     expect(dialog).toHaveAttribute('aria-modal', 'true');
-    // 打开后焦点进入对话框（焦点圈起点）
-    expect(first.container.querySelector('.lumora-timeline__modal')).toHaveFocus();
-    // Escape → 取消覆盖
-    fireEvent.keyDown(window, { key: 'Escape' });
+    // 打开后焦点进入对话框内的首个可聚焦项（焦点圈起点，不再聚焦容器 ——
+    // 容器持焦点时 Shift+Tab 直接逃出对话框，复审一般项 6）
+    expect(screen.getByText('覆盖录制')).toHaveFocus();
+    // 对话框内 Escape → 取消覆盖
+    fireEvent.keyDown(screen.getByText('覆盖录制'), { key: 'Escape' });
     expect(first.session.cancelOverwrite).toHaveBeenCalledTimes(1);
     first.unmount();
 
-    // Delete 被模态 capture 拦截：模拟 LumoraStudio 全局删除处理器（bubble 层）
-    // 注册在模态监听之后 —— stopImmediatePropagation 使其不触发（审查一般项：
-    // 底层全局 Delete 不得穿透模态）
+    // 模态外按键被模态 capture 拦截：模拟 LumoraStudio 全局删除处理器（bubble
+    // 层）注册在模态监听之后 —— stopImmediatePropagation 使其不触发（审查一般
+    // 项：底层全局 Delete 不得穿透模态）
     const second = mountPanel({ state: { ...baseState(), overwritePending: true } });
     let globalSeen = false;
     const onGlobalKeyDown = () => {
@@ -229,10 +237,83 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     fireEvent.keyDown(window, { key: 'Delete' });
     fireEvent.keyDown(window, { key: 'Backspace' });
     fireEvent.keyDown(window, { key: ' ' });
+    fireEvent.keyDown(window, { key: 'd', ctrlKey: true });
     window.removeEventListener('keydown', onGlobalKeyDown);
     expect(globalSeen).toBe(false);
     expect(second.session.cancelOverwrite).not.toHaveBeenCalled();
     second.unmount();
+  });
+
+  it('覆盖确认模态：Tab/Shift+Tab 焦点圈闭环，焦点逃逸到对话框外也拉回（复审一般项 6）', () => {
+    mountPanel({ state: { ...baseState(), overwritePending: true } });
+    const confirm = screen.getByText('覆盖录制');
+    const cancel = screen.getByText('取消');
+    expect(confirm).toHaveFocus();
+    // 首个可聚焦项上 Shift+Tab：回环到末项（修复前逃逸出对话框）
+    fireEvent.keyDown(confirm, { key: 'Tab', shiftKey: true });
+    expect(cancel).toHaveFocus();
+    // 末项上 Tab：回环到首项
+    fireEvent.keyDown(cancel, { key: 'Tab' });
+    expect(confirm).toHaveFocus();
+    // 焦点已在对话框外（模拟浏览器默认移动）→ Tab 拉回首项
+    (document.activeElement as HTMLElement).blur();
+    fireEvent.keyDown(document.body, { key: 'Tab' });
+    expect(confirm).toHaveFocus();
+  });
+
+  it('覆盖确认模态：对话框内应用快捷键被拦、空格放行原生激活；背景 inert（复审一般项 6）', () => {
+    const view = mountPanel({ state: { ...baseState(), overwritePending: true } });
+    const confirm = screen.getByText('覆盖录制');
+    let globalSeen = false;
+    const onGlobal = () => {
+      globalSeen = true;
+    };
+    window.addEventListener('keydown', onGlobal);
+    // 对话框内：应用快捷键拦截（Delete/Backspace/1/2/3、Ctrl/Cmd+K/Z/Y/D）
+    fireEvent.keyDown(confirm, { key: 'Delete' });
+    fireEvent.keyDown(confirm, { key: '1' });
+    fireEvent.keyDown(confirm, { key: 'd', ctrlKey: true });
+    fireEvent.keyDown(confirm, { key: 'k', metaKey: true });
+    expect(globalSeen).toBe(false);
+    // 对话框内空格：只阻断全局冒泡、不 preventDefault（保留按钮原生激活）
+    fireEvent.keyDown(confirm, { key: ' ' });
+    expect(globalSeen).toBe(false);
+    expect(view.session.cancelOverwrite).not.toHaveBeenCalled();
+    expect(view.session.confirmOverwrite).not.toHaveBeenCalled();
+    window.removeEventListener('keydown', onGlobal);
+    // 背景 inert：模态打开时运输栏整体不可达（aria 语义）
+    expect(screen.getByTestId('lumora-timeline').querySelector('.lumora-timeline__content')).toHaveAttribute('inert');
+  });
+
+  it('覆盖确认模态：关闭后焦点还原到触发按钮（复审一般项 6）', () => {
+    // 选中机位使录制按钮可用 —— jsdom 对 disabled 元素调用 focus() 是空操作
+    const view = mountPanel({}, ['cam']);
+    const record = screen.getByTestId('timeline-record');
+    record.focus();
+    view.session.state = { ...baseState(), overwritePending: true };
+    view.rerender(
+      <TimelinePanel
+        session={view.session}
+        editor={view.editor}
+        project={view.project}
+        selection={['cam']}
+        captureRef={view.captureRef}
+      />,
+    );
+    expect(screen.getByText('覆盖录制')).toHaveFocus();
+    fireEvent.keyDown(screen.getByText('覆盖录制'), { key: 'Escape' });
+    expect(view.session.cancelOverwrite).toHaveBeenCalledTimes(1);
+    view.session.state = { ...baseState(), overwritePending: false };
+    view.rerender(
+      <TimelinePanel
+        session={view.session}
+        editor={view.editor}
+        project={view.project}
+        selection={['cam']}
+        captureRef={view.captureRef}
+      />,
+    );
+    expect(record).toHaveFocus();
   });
 
   it('无截图通道时缩略图安全降级：显示机位名而非 img', () => {
@@ -240,5 +321,106 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     const shot = screen.getByTestId('shot-block-s1');
     expect(shot.querySelector('.lumora-timeline__shot-camera')?.textContent).toBe('主相机');
     expect(shot.querySelector('img')).toBeNull();
+  });
+
+  it('截图通道就绪 + 非空 capture → 缺失分镜缩略图补齐（复审阻断 2）', async () => {
+    // jsdom 无真实 rAF 帧回调：同步执行回调，让截图链在一个微任务批次内完成
+    const raf = vi
+      .spyOn(globalThis, 'requestAnimationFrame')
+      .mockImplementation((cb: FrameRequestCallback) => {
+        cb(0);
+        return 1;
+      });
+    const view = mountPanel({}, [], false);
+    // 通道就绪前（captureReady 缺省 false）：即便 capture 非空也不截取
+    expect(screen.getByTestId('shot-block-s1').querySelector('img')).toBeNull();
+    const capture = vi.fn(() => 'data:image/png;base64,abc');
+    view.captureRef.current = capture; // 模拟 FrameCaptureBridge 挂载：仅改稳定 ref
+    view.rerender(
+      <TimelinePanel
+        session={view.session}
+        editor={view.editor}
+        project={view.project}
+        selection={[]}
+        captureRef={view.captureRef}
+        captureReady
+      />,
+    );
+    await act(async () => {});
+    raf.mockRestore();
+    expect(capture).toHaveBeenCalledTimes(3);
+    for (const shotId of ['s1', 's2', 's3']) {
+      expect(screen.getByTestId(`shot-block-${shotId}`).querySelector('img')?.getAttribute('src')).toBe(
+        'data:image/png;base64,abc',
+      );
+    }
+  });
+
+  it('缩略图缓存键含会话令牌与分镜内容身份：项目切换/分镜改动后重新截取（复审阻断 2）', async () => {
+    const raf = vi
+      .spyOn(globalThis, 'requestAnimationFrame')
+      .mockImplementation((cb: FrameRequestCallback) => {
+        cb(0);
+        return 1;
+      });
+    let counter = 0;
+    const capture = vi.fn(() => `data:image/png;base64,img-${(counter += 1)}`);
+    const view = mountPanel({}, [], false);
+    view.captureRef.current = capture;
+    // captureReady 翻转（模拟 FrameCaptureBridge 挂载完成）→ 依赖变化触发效应重跑
+    view.rerender(
+      <TimelinePanel
+        session={view.session}
+        editor={view.editor}
+        project={view.project}
+        selection={[]}
+        captureRef={view.captureRef}
+        captureReady
+      />,
+    );
+    await act(async () => {});
+    expect(counter).toBe(3);
+    expect(screen.getByTestId('shot-block-s1').querySelector('img')?.getAttribute('src')).toBe(
+      'data:image/png;base64,img-1',
+    );
+
+    // 同 URI 重开（会话令牌递增，shot.id 相同）→ 旧键全部失效，重新截取
+    act(() => view.editor.openProject(makeProject()));
+    view.rerender(
+      <TimelinePanel
+        session={view.session}
+        editor={view.editor}
+        project={view.editor.getProject()!}
+        selection={[]}
+        captureRef={view.captureRef}
+        captureReady
+      />,
+    );
+    await act(async () => {});
+    expect(counter).toBe(6);
+    expect(screen.getByTestId('shot-block-s1').querySelector('img')?.getAttribute('src')).toBe(
+      'data:image/png;base64,img-4',
+    );
+
+    // 分镜绑定变化（cameraObjectId 改空）→ 该分镜键失效，单独重截
+    view.rerender(
+      <TimelinePanel
+        session={view.session}
+        editor={view.editor}
+        project={{
+          ...view.editor.getProject()!,
+          shots: view.editor.getProject()!.shots.map((s, i) => (i === 1 ? { ...s, cameraObjectId: null } : s)),
+        }}
+        selection={[]}
+        captureRef={view.captureRef}
+        captureReady
+      />,
+    );
+    await act(async () => {});
+    expect(counter).toBe(7); // 仅 s2 重截
+    expect(screen.getByTestId('shot-block-s2').querySelector('img')?.getAttribute('src')).toBe(
+      'data:image/png;base64,img-7',
+    );
+    raf.mockRestore();
   });
 });

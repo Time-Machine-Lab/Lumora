@@ -610,6 +610,14 @@
   min-height: 0;
 }
 
+/* 运输栏 + 时间画布容器：覆盖确认模态打开时整体 inert（复审一般项 6）。
+ * 与 .lumora-timeline 同为纵向 flex 布局，包裹后布局不变 */
+.lumora-timeline__content {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
 .lumora-timeline__transport {
   display: flex;
   flex-wrap: wrap;

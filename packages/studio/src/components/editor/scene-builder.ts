@@ -373,7 +373,7 @@ export function syncScene(
   previous: Project,
   next: Project,
   aspect: number,
-): { rebuiltModelIds: string[] } {
+): { rebuiltModelIds: string[]; structuralChange: boolean } {
   const idToNode = new Map<string, THREE.Object3D>();
   // 迭代遍历替代 root.traverse（THREE 递归）：深树不爆栈（R8-7）
   const traverseStack: THREE.Object3D[] = [root];
@@ -483,6 +483,7 @@ export function syncScene(
   // 第六遍：不可达节点收尾 —— 从 root 遍历，首个不可达节点即 topmost：
   // 单次 disposeNode 整棵释放并跳过其子树（无重复处置）；无 objectId 的内部
   // 节点（内容子树/占位符）随父保留，不下处置
+  let structuralChange = created.length > 0;
   const removalStack: THREE.Object3D[] = [root];
   while (removalStack.length > 0) {
     const node = removalStack.pop()!;
@@ -497,10 +498,11 @@ export function syncScene(
     if (objectId) {
       node.parent?.remove(node);
       disposeNode(node);
+      structuralChange = true;
       continue;
     }
     for (let i = node.children.length - 1; i >= 0; i--) removalStack.push(node.children[i]!);
   }
 
-  return { rebuiltModelIds };
+  return { rebuiltModelIds, structuralChange };
 }

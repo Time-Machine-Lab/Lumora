@@ -149,6 +149,38 @@ describe('SceneEditor 轨道写入口', () => {
     expect(historyBefore.canUndo).toBe(editor.getHistoryState().canUndo);
   });
 
+  it('commitRecordingTracks：新轨道带 disabled:true 也强制启用（复审阻断 4）', () => {
+    const editor = makeEditor();
+    const batch: TrackData[] = [
+      createTrack('sample-camera', 'scale', '录制主相机·缩放', [
+        { time: 0, value: [1, 1, 1] },
+        { time: 2, value: [1.2, 1.2, 1.2] },
+      ]),
+    ];
+    batch[0]!.disabled = true; // 调用方即使传入禁用状态，录制结果也必须可回放
+    ok(editor.commitRecordingTracks(batch));
+    const stored = editor.getProject()!.tracks.find((t) => t.targetPath === 'scale')!;
+    expect(stored.disabled).toBe(false);
+    expect(stored.keyframes).toHaveLength(2);
+  });
+
+  it('setTrackKeyframes：常规编辑保留禁用状态，不隐式启用（复审阻断 4）', () => {
+    const editor = makeEditor();
+    const existing = editor
+      .getProject()!
+      .tracks.find((t) => t.objectId === 'sample-camera' && t.targetPath === 'position')!;
+    ok(editor.updateTrack(existing.id, (t) => ({ ...t, disabled: true }), '禁用'));
+    ok(
+      editor.setTrackKeyframes(existing.id, [
+        { time: 0, value: [0, 0, 0] },
+        { time: 1, value: [1, 1, 1] },
+      ]),
+    );
+    const stored = editor.getProject()!.tracks.find((t) => t.id === existing.id)!;
+    expect(stored.disabled).toBe(true); // 普通关键帧编辑不得改变开关
+    expect(stored.keyframes).toHaveLength(2);
+  });
+
   it('commitRecordingTracks：入参校验（对象存在/焦距约束/重复通道/关键帧升序）且失败不产生历史', () => {
     const editor = makeEditor();
     const before = editor.getHistoryState();
@@ -248,7 +280,7 @@ describe('SceneEditor 分镜写入口', () => {
     const stored = editor.getProject()!.shots;
     expect(stored.map((s) => s.startTime)).toEqual([0, 1.5, 3]);
     expect(stored.map((s) => s.endTime)).toEqual([1.5, 3, 4.5]);
-    expect(stored.map((s) => s.cameraObjectId)).toEqual(['sample-camera', 'sample-camera', 'sample-camera']);
+    expect(stored.map((s) => s.cameraObjectId)).toEqual(['sample-camera-2', 'sample-camera-2', 'sample-camera']);
     expect(editor.reorderShots([shots[0]!, shots[0]!, shots[1]!]).ok).toBe(false);
     expect(editor.reorderShots([shots[0]!]).ok).toBe(false);
     expect(editor.reorderShots(['ghost', ...shots.slice(1)]).ok).toBe(false);
@@ -275,7 +307,7 @@ describe('SceneEditor 分镜写入口', () => {
     expect(reopened.getProject()!.shots).toEqual(persisted.shots);
     // AC4：重开后区段坐标与机位绑定一致
     expect(reopened.getProject()!.shots.map((s) => s.startTime)).toEqual([0, 1.5, 3]);
-    expect(reopened.getProject()!.shots[0]!.cameraObjectId).toBe('sample-camera');
+    expect(reopened.getProject()!.shots[0]!.cameraObjectId).toBe('sample-camera-2');
   });
 });
 

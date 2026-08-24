@@ -12,7 +12,7 @@ export function createSampleProject(uri = 'lumora://sample-project', name = '示
     revision: 0,
     settings: { fps: 24, aspect: [16, 9] },
     activeSceneId: 'scene-1',
-    scenes: [{ id: 'scene-1', name: '主场景', rootObjectIds: ['sample-group', 'sample-ground', 'sample-light', 'sample-camera'], activeCameraId: 'sample-camera' }],
+    scenes: [{ id: 'scene-1', name: '主场景', rootObjectIds: ['sample-group', 'sample-ground', 'sample-light', 'sample-camera', 'sample-camera-2'], activeCameraId: 'sample-camera' }],
     objects: [
       {
         id: 'sample-group',
@@ -96,6 +96,25 @@ export function createSampleProject(uri = 'lumora://sample-project', name = '示
           aspect: null,
         },
       },
+      {
+        id: 'sample-camera-2',
+        type: 'camera',
+        name: '俯拍机位',
+        parentId: null,
+        transform: { position: [6, 8, 4], rotation: [0, 0, 0], scale: [1, 1, 1] },
+        visible: true,
+        locked: false,
+        camera: {
+          projection: 'perspective',
+          focalLength: 50,
+          fov: focalLengthToFovDeg(50),
+          sensorWidth: 36,
+          sensorHeight: 24,
+          near: 0.1,
+          far: 200,
+          aspect: null,
+        },
+      },
     ],
     tracks: [
       {
@@ -145,8 +164,8 @@ export function createSampleProject(uri = 'lumora://sample-project', name = '示
     ],
     shots: [
       { id: 'sample-shot-1', name: '分镜 1 · 开场全景', cameraObjectId: 'sample-camera', startTime: 0, endTime: 1.5 },
-      { id: 'sample-shot-2', name: '分镜 2 · 推近主体', cameraObjectId: 'sample-camera', startTime: 1.5, endTime: 3 },
-      { id: 'sample-shot-3', name: '分镜 3 · 特写', cameraObjectId: 'sample-camera', startTime: 3, endTime: 4.5 },
+      { id: 'sample-shot-2', name: '分镜 2 · 推近主体', cameraObjectId: 'sample-camera-2', startTime: 1.5, endTime: 3 },
+      { id: 'sample-shot-3', name: '分镜 3 · 特写', cameraObjectId: 'sample-camera-2', startTime: 3, endTime: 4.5 },
     ],
     assets: [],
   };

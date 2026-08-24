@@ -185,9 +185,9 @@ test('对象树键盘导航：Arrow/Home/End/Enter 沿可见行 roving focus，�
   await expect(row('sample-cone')).toBeFocused();
   await expect(page.getByTestId('inspector-name')).toHaveValue('圆锥');
 
-  await page.keyboard.press('End'); // 最后一个可见行
-  await expect(row('sample-camera')).toBeFocused();
-  await expect(page.getByTestId('inspector-name')).toHaveValue('主摄像机');
+  await page.keyboard.press('End'); // 最后一个可见行（示例项目含两台机位）
+  await expect(row('sample-camera-2')).toBeFocused();
+  await expect(page.getByTestId('inspector-name')).toHaveValue('俯拍机位');
   await page.keyboard.press('Home');
   await expect(row('sample-group')).toBeFocused();
 
@@ -664,9 +664,9 @@ test('P0-4 多场景相机/选择隔离：机位按场景过滤，切场景回�
   await page.getByTestId('reopen-last-export').click();
   await expect(page.getByTestId('tree-row-sample-group')).toBeVisible();
 
-  // 场景 A：机位选项只有 sample-camera
+  // 场景 A：机位选项含 sample-camera 与 sample-camera-2
   const modeSelect = page.getByTestId('view-mode-select');
-  await expect(modeSelect.locator('option')).toHaveText(['导演视图', '相机 · 主摄像机']);
+  await expect(modeSelect.locator('option')).toHaveText(['导演视图', '相机 · 主摄像机', '相机 · 俯拍机位']);
 
   // 切到场景 B：树只含 B 相机，机位选项只有 cam-b
   await page.getByTestId('scene-switcher').selectOption('scene-b');
@@ -732,9 +732,52 @@ test.describe('第三轮验收：生产路径（AC1/AC3/AC4）', () => {
     await expect(page.getByTestId('lumora-toasts')).toContainText('已导入模型');
     await expect(page.locator('.lumora-tree-row', { hasText: 'nested-mesh' })).toBeVisible();
 
-    // 内容挂载完成（占位框被 GLB 内容替换），导演视图渲染模型（原点）
-    await page.waitForTimeout(700);
+    // 内容挂载完成（占位框被 GLB 内容替换），导演视图渲染模型（原点）。
+    // GLB 解析/挂载异步，固定等待在负载下会提前采样到未替换的占位框（flake），
+    // 改为轮询紫色占位框像素归零：内容永不到挂载则轮询超时失败（回归语义不变）
     await hideOverlays(page, '.lumora-viewport-toolbar');
+    // 导入自动选中模型 → 变换控件 gizmo 确定性出现（场景同步竞态回归防护：
+    // syncScene 结构变更未触发重渲染时，gizmo 出现与否取决于无关状态更新时序；
+    // 纯红 X 轴 / 纯蓝 Z 轴是场景中唯一接近纯红/纯蓝的像素源，其余物体均为
+    // 阴影化着色，g=107+ 或 b=171+ 不满足 g<50/b<50 的硬阈值）
+    const gizmoPixels = (p: ReturnType<typeof decodePng>): number => {
+      let count = 0;
+      for (let y = 0; y < p.height; y += 2) {
+        for (let x = 0; x < p.width; x += 2) {
+          const [r, g, b] = pngPixel(p, x, y);
+          if ((r > 230 && g < 50 && b < 50) || (b > 230 && r < 50 && g < 50)) count += 1;
+        }
+      }
+      return count;
+    };
+    await expect
+      .poll(
+        async () => gizmoPixels(decodePng(await page.locator('.lumora-viewport canvas').screenshot())),
+        { timeout: 5000 },
+      )
+      .toBeGreaterThan(0);
+    // Escape 清选 → gizmo 消失：gizmo 轴色与占位框启发式同色相，不清选则
+    // 下方的紫色计数恒非零，无法表达「占位框已替换」
+    await page.keyboard.press('Escape');
+    await expect
+      .poll(
+        async () => gizmoPixels(decodePng(await page.locator('.lumora-viewport canvas').screenshot())),
+        { timeout: 5000 },
+      )
+      .toBe(0);
+    await expect
+      .poll(async () => {
+        const p = decodePng(await page.locator('.lumora-viewport canvas').screenshot());
+        let purple = 0;
+        for (let y = 0; y < p.height; y += 2) {
+          for (let x = 0; x < p.width; x += 2) {
+            const [r, g, b] = pngPixel(p, x, y);
+            if (b > 150 && g < r && g < 120) purple += 1;
+          }
+        }
+        return purple;
+      }, { timeout: 5000 })
+      .toBe(0);
     const shot = await page.locator('.lumora-viewport canvas').screenshot();
     await showOverlays(page, '.lumora-viewport-toolbar');
     const png = decodePng(shot);

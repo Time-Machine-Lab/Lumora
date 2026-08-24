@@ -804,8 +804,11 @@ export class SceneEditor {
 
   /**
    * 原子批量 upsert 录制轨道：一次历史提交内按 (objectId, targetPath) 覆盖
-   * 既有轨道（整体替换关键帧并明确重新启用）或追加新轨道。录制三通道必须
-   * 同生共死 —— 分三次提交会在中途失败时留下半成品（TML-52 审查第 7 项）。
+   * 既有轨道（整体替换关键帧）或追加新轨道；两条分支都明确重新启用
+   * （disabled: false）——录制结果必须可回放，禁用轨道不参与求值（TML-52
+   * 复审阻断 4：仅覆盖分支强制启用的旧行为会让新录制轨道静默不可回放）。
+   * 录制三通道必须同生共死 —— 分三次提交会在中途失败时留下半成品
+   * （TML-52 审查第 7 项）。
    */
   commitRecordingTracks(tracks: TrackData[], label = '录制关键帧'): Result {
     const baseline = this.beginIngress();
@@ -841,7 +844,10 @@ export class SceneEditor {
     });
     const existingKeys = new Set(project.tracks.map((t) => `${t.objectId}\u0000${t.targetPath}`));
     for (const track of owned) {
-      if (!existingKeys.has(`${track.objectId}\u0000${track.targetPath}`)) nextTracks.push(track);
+      if (!existingKeys.has(`${track.objectId}\u0000${track.targetPath}`)) {
+        // 追加分支与覆盖分支同语义：强制 disabled: false（复审阻断 4）
+        nextTracks.push({ ...track, disabled: false });
+      }
     }
     return this.commit(baseline, { ...project, tracks: nextTracks }, label);
   }
@@ -890,8 +896,8 @@ export class SceneEditor {
 
   /** 整体替换轨道关键帧（录制提交/关键帧批量编辑），作为一步历史；
    *  校验升序、非负有限时间与值类型（标量通道 vs Vec3 通道）。
-   *  写入同时明确重新启用轨道（disabled: false）——录制结果必须可回放，
-   *  被覆盖的禁用轨道不得继续遮蔽录制内容（TML-52 审查第 6 项）。 */
+   *  常规编辑保留轨道禁用状态 —— disabled 只由界面开关与录制提交
+   *  （commitRecordingTracks）管理（TML-52 复审阻断 4）。 */
   setTrackKeyframes(trackId: string, keyframes: TrackKeyframeData[], label = '更新关键帧'): Result {
     const baseline = this.beginIngress();
     if (!baseline) return failure('未打开项目');
@@ -917,7 +923,7 @@ export class SceneEditor {
       {
         ...project,
         tracks: project.tracks.map((t) =>
-          t.id === trackId ? { ...t, keyframes: owned.keyframes, disabled: false } : t,
+          t.id === trackId ? { ...t, keyframes: owned.keyframes } : t,
         ),
       },
       label,

@@ -159,6 +159,10 @@ export class TimelineController {
     if (this.playing) return;
     if (this.duration <= 0) return; // 空时间线无可播放内容
     if (this.time >= this.duration) this.seek(0); // 末尾重播：经 seek 发 time:changed
+    // seek 的 time:changed 监听器可同步重入（setDuration(0)/嵌套 play()）：
+    // 复验后再置 playing —— 避免 {duration:0, playing:true} 与重复
+    // state:changed(true)（TML-52 复审一般项 5）
+    if (this.playing || this.duration <= 0) return;
     this.playing = true;
     this.events.emit('state:changed', { playing: true });
   }

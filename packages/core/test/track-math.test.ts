@@ -279,3 +279,45 @@ describe('simplifySamples：采样简化（RDP 抽稀）', () => {
     expect(simplifySamples(unsorted)).toHaveLength(3);
   });
 });
+
+describe('rotation 通道 RDP 与回放求值同源（TML-52 复审阻断 1）', () => {
+  /** 反例：复合旋转的中间样本 [π/4,π/4,0] 恰落在两端 Euler 直线弦上
+   *  （旧欧氏偏差 = 0 → 抽成 2 帧），回放走最短弧 slerp 时同一求值点
+   *  产生 0.34 rad 夹角误差 */
+  function counterExample(): TrackSample[] {
+    return [
+      { time: 0, value: [0, 0, 0] },
+      { time: 0.5, value: [Math.PI / 4, Math.PI / 4, 0] },
+      { time: 1, value: [Math.PI / 2, Math.PI / 2, 0] },
+    ];
+  }
+
+  it('回归钉：缺省欧氏距离把反例抽成 2 帧（Euler 直线偏差为 0）', () => {
+    const simplified = simplifySamples(counterExample());
+    expect(simplified.map((s) => s.time)).toEqual([0, 1]);
+  });
+
+  it('rotation 通道按 slerp 角距离判定：0.34 rad > 0.01 容差 → 保留 3 帧', () => {
+    const simplified = simplifySamples(counterExample(), { channel: 'rotation' });
+    expect(simplified.map((s) => s.time)).toEqual([0, 0.5, 1]);
+  });
+
+  it('集成：简化后的旋转轨道在 t=0.5 精确还原中间样本；2 帧版本误差 0.34 rad 量级', () => {
+    const threeFrame = createTrack('sample-camera', 'rotation', 'r', simplifySamples(counterExample(), { channel: 'rotation' }));
+    const kept = evaluateTrack(threeFrame, 0.5)!;
+    // slerp 求值经四元数往返（slerp → 欧拉），与原始关键帧存在 1e-15 量级浮点差，
+    // 而非语义偏差 —— 按分量 1e-12 精度断言
+    for (let i = 0; i < 3; i += 1) {
+      expect(kept.value[i]).toBeCloseTo([Math.PI / 4, Math.PI / 4, 0][i]!, 12);
+    }
+    // 回归钉：2 帧版本（旧行为）在同一求值点产生 0.46 rad 量级的分量误差
+    const twoFrame = createTrack('sample-camera', 'rotation', 'r', simplifySamples(counterExample()));
+    const bad = evaluateTrack(twoFrame, 0.5)!;
+    const error = Math.max(
+      Math.abs(bad.value[0] - Math.PI / 4),
+      Math.abs(bad.value[1] - Math.PI / 4),
+      Math.abs(bad.value[2] - 0),
+    );
+    expect(error).toBeGreaterThan(0.3);
+  });
+});
