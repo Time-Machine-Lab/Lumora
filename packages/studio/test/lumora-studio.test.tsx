@@ -7,6 +7,7 @@ import type { Manifest, PanelContextProps, PluginDescriptor } from '@lumora/core
 import { LumoraStudio } from '../src/components/LumoraStudio';
 import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
 import type { ProjectStorage } from '../src/persistence/project-storage';
+import { ContentCache } from '../src/components/editor/content-cache';
 import { CommandPalette } from '../src/components/CommandPalette';
 
 vi.mock('@react-three/fiber', () => ({
@@ -159,14 +160,15 @@ describe('LumoraStudio', () => {
     expect(events.handlerCount).toBe(0);
   });
 
-  it('卸载时释放失败（未解决恢复 fork）：如实上报 onError、运行时保留可恢复；解决后重试释放成功（第二十九轮严重 6）', async () => {
+  it('卸载时释放失败（未解决恢复 fork）：如实上报 onCloseError、运行时保留可恢复、缓存不释放；解决后经 handle.close() 重试成功（第三十轮严重 6）', async () => {
     const handle = createRef<LumoraStudioHandle>();
-    const onError = vi.fn();
+    const onCloseError = vi.fn();
+    const cacheDisposeSpy = vi.spyOn(ContentCache.prototype, 'dispose');
     const { unmount } = render(
-      <LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" onError={onError} />,
+      <LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" onCloseError={onCloseError} />,
     );
     await screen.findByTestId('test-panel');
-    const runtime = handle.current!.runtime;
+    const { runtime, close } = handle.current!;
     const persistence = runtime.persistence;
     const store = (persistence as unknown as { store: ProjectStorage | null }).store!;
     const A = 'lumora://project/dispose-fail';
@@ -188,23 +190,26 @@ describe('LumoraStudio', () => {
     store.save = realSave;
 
     // 卸载：关闭屏障如实上报失败 —— 修复前 fire-and-forget 丢弃 dispose 结果，
-    // 未落盘内容随 teardown 沉没
+    // 未落盘内容随 teardown 沉没。失败时资源缓存不得释放（宿主重试期间壳层
+    // 完整可用）
     unmount();
-    await waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
-    expect(onError.mock.calls[0]![0]).toBeInstanceOf(Error);
-    expect((onError.mock.calls[0]![0] as Error).message).toContain('恢复快照');
+    await waitFor(() => expect(onCloseError).toHaveBeenCalledTimes(1));
+    expect(onCloseError.mock.calls[0]![0]).toContain('恢复快照');
+    expect(cacheDisposeSpy).not.toHaveBeenCalled();
     // 运行时保留未 teardown：插件与订阅仍在，恢复快照仍可取（宿主可等待
-    // runtime.dispose() 屏障，解决后重试）
+    // handle.close() 屏障，解决后重试）
     expect(runtime.host.getPlugin('com.test.good')?.state).toBe('active');
     expect(runtime.editor.events.handlerCount).toBeGreaterThan(0); // 编辑器订阅未解除
     expect(persistence.getRecoverySnapshot(A)).not.toBeNull();
 
-    // 宿主解决（显式放弃恢复快照）后重试 dispose：成功释放全部资源
+    // 宿主解决（显式放弃恢复快照）后经同一 close() 屏障重试：成功释放全部
+    // 资源与缓存，且缓存恰好释放一次（cleanup 的失败尝试不计数）
     persistence.clearRecovery(A);
-    const outcome = await runtime.dispose();
+    const outcome = await close();
     expect(outcome.ok).toBe(true);
     expect(runtime.host.listPlugins()).toHaveLength(0);
     expect(runtime.events.handlerCount).toBe(0);
+    expect(cacheDisposeSpy).toHaveBeenCalledTimes(1);
   });
 
   it('StrictMode 下 effect 卸载重放不破坏运行时：插件只启动一次，命令可用，真实卸载仍释放', async () => {

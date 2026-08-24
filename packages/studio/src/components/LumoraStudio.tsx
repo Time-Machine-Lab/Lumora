@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { PluginDescriptor, Project } from '@lumora/core';
 import { createStudioRuntime } from '../runtime/studio-runtime';
@@ -31,6 +31,9 @@ export interface LumoraStudioProps {
   /** 挂载后自动打开的项目（同时发出 project:opened 事件） */
   initialProject?: Project;
   onError?: (error: unknown) => void;
+  /** 卸载失败回调（第三十轮严重 6）：卸载屏障返回失败时收到失败原因（字符串），
+   *  运行时保留未 teardown —— 宿主应保持壳层挂载并等待 handle.close() 重试 */
+  onCloseError?: (message: string) => void;
   /** 场景槽位，缺省为内置 3D 场景编辑器视口 */
   scene?: (project: Project | null) => ReactNode;
   /** 本地存储后端（缺省 indexeddb；opfs = Origin Private File System） */
@@ -40,6 +43,11 @@ export interface LumoraStudioProps {
 
 export interface LumoraStudioHandle {
   runtime: StudioRuntime;
+  /** 卸载屏障（第三十轮严重 6）：宿主卸载前可等待的释放 —— 冲刷失败或存在未解决
+   *  恢复 fork 时返回 { ok: false }，运行时保留未 teardown（未落盘内容仍可恢复，
+   *  资源缓存不释放）；成功后运行时与资源缓存一同释放（缓存恰好释放一次）。
+   *  返回即最终裁决，宿主据此决定是否真正卸载 UI / 等待用户解决后重试 */
+  close(): Promise<{ ok: boolean; message?: string }>;
 }
 
 /**
@@ -48,7 +56,7 @@ export interface LumoraStudioHandle {
  * - 卸载时释放全部资源：停用插件、移除订阅、销毁事件总线、资源缓存与 WebGL 场景
  */
 export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(function LumoraStudio(
-  { plugins = [], hostVersion, initialProject, onError, scene, storage, className },
+  { plugins = [], hostVersion, initialProject, onError, onCloseError, scene, storage, className },
   ref,
 ) {
   const runtimeRef = useRef<StudioRuntime | null>(null);
@@ -62,12 +70,27 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   const cacheRef = useRef<ContentCache | null>(null);
   if (!cacheRef.current) cacheRef.current = new ContentCache();
   const cache = cacheRef.current;
+  const cacheDisposedRef = useRef(false);
 
   const [pluginManagerOpen, setPluginManagerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
-  useImperativeHandle(ref, () => ({ runtime }), [runtime]);
+  // 第三十轮严重 6：统一卸载屏障 —— 卸载 cleanup 与宿主显式卸载共用同一通道。
+  // 释放失败（冲刷失败 / 未解决恢复 fork）时运行时保留未 teardown，缓存也不
+  // 释放（宿主重试期间壳层完整可用）；成功才释放缓存，且只释放一次（宿主
+  // 多次调用 / cleanup 与显式调用并发时不会重复 dispose）
+  const close = useCallback(async (): Promise<{ ok: boolean; message?: string }> => {
+    const outcome = await runtime.dispose();
+    if (!outcome.ok) return { ok: false, message: outcome.message };
+    if (!cacheDisposedRef.current) {
+      cacheDisposedRef.current = true;
+      cache.dispose();
+    }
+    return { ok: true };
+  }, [runtime, cache]);
+
+  useImperativeHandle(ref, () => ({ runtime, close }), [runtime, close]);
 
   // 挂载时一次性启动：注册插件并打开初始项目（与 props 变化解耦，避免重复注册）。
   // StrictMode 下 effect 会卸载重放：boot 只执行一次，重放与真实卸载都注册 cleanup，
@@ -109,36 +132,32 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   // StrictMode 重放。因此用「挂载计数 + 延迟确认」：cleanup 先减计数，
   // 重放的下轮 setup 及时加回则取消释放，仅在最终卸载时真正 dispose
   const mountedRef = useRef(0);
-  const onErrorRef = useRef(onError);
-  onErrorRef.current = onError;
+  const onCloseErrorRef = useRef(onCloseError);
+  onCloseErrorRef.current = onCloseError;
   useEffect(() => {
     mountedRef.current += 1;
     return () => {
       mountedRef.current -= 1;
       setTimeout(() => {
         if (mountedRef.current === 0) {
-          // 第二十九轮严重 6：卸载的关闭屏障 —— dispose 结果不得静默丢弃。
-          // 冲刷失败 / 未解决恢复 fork 导致释放失败时如实上报 onError（宿主
-          // 可等待 handle.runtime.dispose() 这一宿主可等待屏障，解决后重试），
-          // 运行时保留未 teardown —— 未落盘内容仍可恢复，绝不「假装已卸载」
-          // 丢弃内容；资源缓存仅随成功释放，宿主重试期间壳层仍完整可用。
-          // 宿主确需放弃内容时先经 persistence.clearRecovery 显式丢弃后重试
-          void runtime.dispose().then(
+          // 第三十轮严重 6：卸载走统一 close() 屏障 —— dispose 结果不得静默
+          // 丢弃。释放失败时如实上报 onCloseError（宿主可等待 handle.close()
+          // 这一可等待屏障，解决后重试），运行时保留未 teardown —— 未落盘内容
+          // 仍可恢复，绝不「假装已卸载」丢弃内容；资源缓存随成功释放（恰好
+          // 一次），宿主重试期间壳层仍完整可用。宿主确需放弃内容时先经
+          // persistence.clearRecovery 显式丢弃后重试
+          void close().then(
             (outcome) => {
-              if (!outcome.ok) {
-                onErrorRef.current?.(new Error(outcome.message ?? '运行时释放失败'));
-                return;
-              }
-              cache.dispose();
+              if (!outcome.ok) onCloseErrorRef.current?.(outcome.message ?? '运行时释放失败');
             },
             (error) => {
-              onErrorRef.current?.(error);
+              onCloseErrorRef.current?.(error instanceof Error ? error.message : String(error));
             },
           );
         }
       }, 0);
     };
-  }, [runtime, cache]);
+  }, [runtime, cache, close]);
 
   // 编辑器快捷键：撤销/重做/复制/删除/取消选择/Gizmo 模式。
   // 按实例作用域（R8-9）：多个 Studio 实例共存时共享 window 监听，

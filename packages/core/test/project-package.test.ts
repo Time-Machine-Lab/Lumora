@@ -1384,6 +1384,117 @@ describe('工程包构建：全小写复合凭据键字典分词兜底 + manifes
   });
 });
 
+describe('工程包构建：任意偏移凭据分段兜底 + fail-closed 长度上限（第三十轮阻断 1）', () => {
+  // 阻断 1：未知业务限定词（stripe/custom/vendor/legacy/payment）阻断旧「整键
+  // 完整分词」判定 → fail-open 泄漏；任意偏移 ≥2 段连续字典词序列（含凭据词段
+  // 或相邻复合对）即拒绝（审查员 06:58 六组探针）
+  const UNKNOWN_QUALIFIER_LEAKS = [
+    'stripeapikey',
+    'customprivatekey',
+    'vendorauthheader',
+    'legacysecretkey',
+    'paymentsessionid',
+    'custompassworddigest',
+  ];
+
+  it('阻断 1：未知业务限定词包裹的凭据序列顶层声明一律拒绝（任意偏移兜底闭合）', async () => {
+    const project = await buildFixtureProject();
+    const pluginData: Record<string, Record<string, string>> = {
+      'com.example': Object.fromEntries(UNKNOWN_QUALIFIER_LEAKS.map((key) => [key, `leak-${key}`])),
+    };
+    const error = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project, pluginData }, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': UNKNOWN_QUALIFIER_LEAKS },
+      }),
+    );
+    expect(error.declarations).toHaveLength(UNKNOWN_QUALIFIER_LEAKS.length);
+    for (const key of UNKNOWN_QUALIFIER_LEAKS) {
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(key) });
+    }
+    expect(error.message).toContain('凭据永不导出');
+  });
+
+  it('阻断 1：六组探针嵌套路径声明（["profile", key]）同样拒绝（逐 segment 独立判定闭合）', async () => {
+    const project = await buildFixtureProject();
+    const pluginData = {
+      'com.example': { profile: Object.fromEntries(UNKNOWN_QUALIFIER_LEAKS.map((key) => [key, `n-${key}`])) },
+    };
+    const declarations: Array<readonly string[]> = UNKNOWN_QUALIFIER_LEAKS.map((key) => ['profile', key]);
+    const error = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project, pluginData }, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': declarations },
+      }),
+    );
+    expect(error.declarations).toHaveLength(UNKNOWN_QUALIFIER_LEAKS.length);
+    for (const key of UNKNOWN_QUALIFIER_LEAKS) {
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(['profile', key]) });
+    }
+  });
+
+  it('阻断 1：81 字符超限键与五层 prod 后缀键同样拒绝（长度上限 fail-closed + 任意偏移兜底）', async () => {
+    const project = await buildFixtureProject();
+    // 81 字符：旧实现 collapsed.length > 80 直接放行（fail-open，81 字符
+    // ...sessionid 泄漏）；fail-closed 后一律按凭据形态拒绝
+    const overlongSessionId = `${'a'.repeat(72)}sessionid`;
+    expect(overlongSessionId.length).toBe(81);
+    // 五层 prod 后缀：后缀剥除上限 4 层后余量 sessionidprod，任意偏移兜底
+    // 检测 session|id 连续词段（旧实现完整分词被 prod 阻断而泄漏）
+    const fiveLayerProd = 'sessionidprodprodprodprodprod';
+    const keys = [overlongSessionId, fiveLayerProd];
+    const pluginData = { 'com.example': Object.fromEntries(keys.map((key) => [key, `v-${key}`])) };
+    const error = expectCredentialDeclarationRejected(() =>
+      buildProjectPackage({ ...project, pluginData }, {
+        includePrivate: true,
+        publicKeysByPlugin: { 'com.example': keys },
+      }),
+    );
+    expect(error.declarations).toHaveLength(keys.length);
+    for (const key of keys) {
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(key) });
+    }
+  });
+
+  it('阻断 1：任意偏移兜底不误伤合法键 —— 良性歧义键（新登记 apiKeyboardLayout 等）与单段词键声明数据无损往返', async () => {
+    const project = await buildFixtureProject();
+    const keepKeys = [
+      // 第三十轮新登记 BENIGN 键（≥2 段序列但产品确认良性，逐项可审计）
+      'apiKeyboardLayout',
+      'compassWordWrap',
+      'privateKeyboardShortcuts',
+      'accessTokenizerConfig',
+      // 单段词键：任意偏移检测的 ≥2 段阈值不误伤
+      'tokenizerConfig',
+      'authorizationMode',
+      'passwordless',
+      'renderPass',
+      'keyboard',
+      'hotkey',
+      'passCount',
+      'wordWrap',
+    ];
+    const pluginData: Record<string, Record<string, string>> = {
+      'com.example': Object.fromEntries(keepKeys.map((key, i) => [key, `r30-keep-${i}`])),
+    };
+    const pkg = buildProjectPackage({ ...project, pluginData }, {
+      includePrivate: true,
+      publicKeysByPlugin: { 'com.example': keepKeys },
+    });
+    const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, Record<string, string>>)['com.example'];
+    for (const [key, value] of Object.entries(pluginData['com.example'])) {
+      expect(plugin[key]).toBe(value);
+    }
+    const json = JSON.stringify(parsed.project);
+    for (let i = 0; i < keepKeys.length; i += 1) {
+      expect(json).toContain(`r30-keep-${i}`);
+    }
+  });
+});
+
 describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻断 1 / 一般 8 / 一般 9）', () => {
   it('嵌套凭据不进包：objects/scenes/tracks/资产元数据中的契约外字段默认导出与 includePrivate 一律排除', async () => {
     const project = await buildFixtureProject();

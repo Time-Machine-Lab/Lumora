@@ -658,10 +658,11 @@ export class ProjectAutosaver {
         return { ok: false, code: 'revision-conflict', message };
       };
 
-      /** 推进已提交基线（磁盘事实已变，无论会话是否仍新鲜），清除锁存标记 */
+      /** 推进已提交基线（磁盘事实已变，无论会话是否仍新鲜）。第三十轮阻断 4：
+       *  不再代劳清除锁存 —— 被取消的陈旧成功（保存 await 期间该代已被清除/更新）
+       *  不得清掉较新的锁存；锁存清理由各分支在复验通过后的真正成功路径显式执行 */
       const advanceBaseline = (saved: Project, fp: string | null): void => {
         this.committedByUri.set(uri, { revision: saved.revision, fingerprint: fp });
-        if (this.latched?.uri === uri) this.latched = null;
       };
 
       if (!current || fpEqual(curFp, snapFp) || fpEqual(curFp, baseFp)) {
@@ -699,8 +700,17 @@ export class ProjectAutosaver {
             // 复验通过：原子切换到恢复快照（autosaver 重置 + 编辑器提交不广播，
             // 完成后由 changed() 链广播一次），与已落盘内容对齐
             this.switchOpen(snapshot);
+          } else {
+            // 第三十轮阻断 4：非当前 uri 的 valid 成功且无剩余 fork → 解除该
+            // uri 锁存（advanceBaseline 不再代劳清除）
+            if (this.latched?.uri === uri) this.latched = null;
           }
         } else if (result.code === 'revision-conflict') {
+          // 第三十轮阻断 4：失败同样复验该代 fork —— 保存 await 期间该代已被
+          // 清除/更新时本次重试已取消，陈旧失败不得锁存冲突或广播给当前项目
+          if (!this.hasRecoveryGeneration(uri, generation)) {
+            return { ok: false, code: 'revision-conflict', message: '恢复快照已被清除或更新，本次重试已取消' };
+          }
           this.latch({ uri, code: 'revision-conflict', message: result.message });
         }
         return result;
@@ -732,15 +742,27 @@ export class ProjectAutosaver {
             this.latched = { uri, code: 'recovery-available', message };
             if (uri === this.currentUri) this.emit({ status: 'error', code: 'recovery-available', message });
           } else if (uri === this.currentUri) {
+            // 第三十轮阻断 4：valid 成功且无剩余 fork → 显式解除本 uri 锁存
+            // （advanceBaseline 不再代劳 —— 陈旧成功不得清掉较新的锁存）
+            if (this.latched?.uri === uri) this.latched = null;
             this.emit(this.store ? { status: 'clean' } : { status: 'memory' });
           }
         } else if (result.code === 'revision-conflict') {
+          // 第三十轮阻断 4：失败同样复验该代 fork —— 陈旧失败不得锁存冲突
+          if (!this.hasRecoveryGeneration(uri, generation)) {
+            return { ok: false, code: 'revision-conflict', message: '恢复快照已被清除或更新，本次重试已取消' };
+          }
           this.latch({ uri, code: 'revision-conflict', message: result.message });
         }
         return result;
       }
       // 三方各不相同（或当前内容不可编码）：真分叉 —— 不写入磁盘，恢复快照保留
-      // 在恢复区（可重试 / 另存副本），绝不静默覆盖当前编辑
+      // 在恢复区（可重试 / 另存副本），绝不静默覆盖当前编辑。
+      // 第三十轮阻断 4：锁存前复验该代 fork 仍在 —— 排队期间被清除/更新的快照
+      // 不产生陈旧分叉锁存
+      if (!this.hasRecoveryGeneration(uri, generation)) {
+        return { ok: false, code: 'revision-conflict', message: '恢复快照已被清除或更新，本次重试已取消' };
+      }
       this.latch({
         uri,
         code: 'revision-conflict',
@@ -1106,7 +1128,11 @@ export class ProjectAutosaver {
 
   private latch(error: LatchedError): void {
     this.latched = error;
-    this.emit({ status: 'error', code: error.code, message: error.message });
+    // 第三十轮阻断 4：广播仅限当前 uri —— 非当前 uri 的重试/对账失败只更新锁存
+    // 状态（该 uri 重新打开或恢复解决时呈现），绝不向当前项目的监听器广播
+    // 其他项目的失败。既有调用方（reconcile/applySaveResult）均只对当前 uri
+    // 锁存，加守卫无行为变化；retryRecovery 的非当前失败由此不再污染当前广播
+    if (error.uri === this.currentUri) this.emit({ status: 'error', code: error.code, message: error.message });
   }
 
   private async storeSave(project: Project, expected: number | null): Promise<SaveOutcome> {

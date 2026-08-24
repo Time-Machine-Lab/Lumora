@@ -394,18 +394,28 @@ function isSafeExportKey(key: string): boolean {
  *     同样拒绝（第二十八轮严重 7：pass2 默认拒绝，如产品确认其为渲染语义可加
  *     BENIGN 白名单显式豁免）。旧 [a-z]*[0-9]+$ 贪心剥尾对全小写形态恒产
  *     空串、是死代码，已废弃；
- *  8. 字典分词兜底（第二十九轮阻断 1）：camelCase 分词无边界时（全小写单 token
- *     sessionid/apikeyvalue/passworddigest 等），第 5/6 项的无边界形态精确相等
- *     只覆盖有限派生候选表，枚举不可闭合。对归一化后的无边界形态（数字剥除）
- *     做记忆化字典分词：任一完整分词命中 kind 词/拉丁根词（任意位置）或相邻
- *     复合对/敏感限定组合即拒绝。字典 = 既有分类表全部词 + 完成分词所需的最小
- *     通用词（id/backup/digest/payload，全部有凭据语境，逐项可审计）；
- *     'pass'/'board'/'less'/'izer'/'author'/'render'/'budget'/'mode' 等过泛词
- *     不入字典 —— renderpass/passwordless/apiKeyboardLayout/
- *     accessTokenizerConfig/tokenBudget 等合法键无完整凭据分词，放行（render|pass
- *     单段 pass 不是 kind/根词、render+pass 不在复合表）。长度上限 80 防病态
- *     输入撑爆 DP。sessionid → session|id、apikeyvalue → api|key|value、
- *     clientsecretbackup → client|secret|backup 等全小写复合凭据键在此闭合。
+ *  8. 任意偏移字典分词兜底（第二十九轮阻断 1 + 第三十轮阻断 1 重写）：camelCase
+ *     分词无边界时（全小写单 token sessionid/apikeyvalue/passworddigest 等），
+ *     第 5/6 项的无边界形态精确相等只覆盖有限派生候选表，枚举不可闭合。对归一
+ *     化后的无边界形态（数字剥除）检测任意偏移的连续字典词序列 —— 存在一段
+ *     ≥2 个连续字典词、且其中含凭据词段（kind 词/拉丁根词，任意位置）或相邻
+ *     复合对/敏感限定组合即拒绝。不再要求整键完整分词：未知业务限定词
+ *     （stripe/custom/vendor/legacy/payment 等）不在字典，旧「整键完整分词 +
+ *     credentialSeen」判定被其阻断而 fail-open（stripeapikey/customprivatekey/
+ *     vendorauthheader/legacysecretkey/paymentsessionid/custompassworddigest
+ *     六组探针与 sessionidprod、xsessionid 等未知词缀包裹序列全部泄漏）。
+ *     字典 = 既有分类表全部词 + 完成分词所需的最小通用词（id/backup/digest/
+ *     payload，全部有凭据语境，逐项可审计）；'board'/'less'/'izer'/'author'/
+ *     'render'/'budget'/'mode'/'wrap'/'count' 等过泛词不入字典。单段词不足为凭
+ *     （tokenizerConfig 的 token、authorizationMode 的 auth、passwordless 的
+ *     password、renderpass 的 pass、keyboard 的 key 均为单段 run，无凭据语境，
+ *     放行）—— ≥2 段序列的合法键（apiKeyboardLayout/compassWordWrap/
+ *     privateKeyboardShortcuts/accessTokenizerConfig）经 BENIGN_CREDENTIAL_KEYS
+ *     整键豁免（第二十三轮严重 5 语义延续，逐项可审计）。长度上限 80 超限即拒
+ *     （fail-closed：旧实现超限放行是 81 字符 ...sessionid 泄漏的根源）。
+ *     sessionid → session|id、apikeyvalue → api|key|value、clientsecretbackup →
+ *     client|secret|backup、stripeapikey → api|key（任意偏移）等全小写复合凭据
+ *     键在此闭合。
  *  任意命中即拒绝。tokenizerConfig/tokenizerModel/authorName/authorizationMode/
  *  apiVersion/MONKEYPATCH/HOTKEYMAP/keyboardLayout/shortcutKey 等仅含
  *  tokenizer/author/api/key 等非凭据形态的键放行。连续大写缩写保留为一个
@@ -425,13 +435,21 @@ function isSafeExportKey(key: string): boolean {
  *  合法歧义字段必须显式登记于此表（随产品公开契约演进，可审计）。
  *  第二十八轮严重 7 扩展：session/cookie 入 kind 集默认拒绝后，产品确认的
  *  良性歧义键（cookieConsent/cookieSettings/sessionMode，非认证载体语义）
- *  在此显式豁免 */
+ *  在此显式豁免。第三十轮阻断 1 扩展：任意偏移分词把 ≥2 段连续字典词序列判定
+ *  为凭据形态后，apiKeyboardLayout（api|key）、compassWordWrap（word 段）、
+ *  privateKeyboardShortcuts（private|key）、accessTokenizerConfig
+ *  （access|token）等合法歧义键为保持放行在此整键显式豁免（第二十三轮严重 5
+ *  语义延续） */
 const BENIGN_CREDENTIAL_KEYS = new Set([
   'tokenBudget',
   'authMode',
   'cookieConsent',
   'cookieSettings',
   'sessionMode',
+  'apiKeyboardLayout',
+  'compassWordWrap',
+  'privateKeyboardShortcuts',
+  'accessTokenizerConfig',
 ]);
 
 /** 凭据类词（kind）：作为「语义角色」参与有边界判定 —— 任意 token 位置精确
@@ -650,17 +668,40 @@ const CREDENTIAL_SEGMENT_DICT: ReadonlySet<string> = (() => {
   return words;
 })();
 
-/** 分词长度上限：超限保守放行（不拒绝）—— 防御病态长键撑爆 DP 状态 */
+/** 分词长度上限（第三十轮阻断 1 改 fail-closed）：超限一律按凭据形态拒绝 ——
+ *  防御病态长键撑爆 DP 状态，且绝不因长度放行（旧实现 length>80 直接放行，
+ *  是 81 字符 ...sessionid 泄漏的根源） */
 const CREDENTIAL_SEGMENT_MAX_LENGTH = 80;
 
-/** 字典分词凭据形态兜底（第二十九轮阻断 1）：对无边界形态（数字已剥除）做
- *  记忆化分词，任一完整分词含凭据形态即拒绝 —— kind 词/拉丁根词任意位置命中，
- *  或相邻两段构成复合对/敏感限定组合。字典不含过泛词，合法键无完整凭据分词
- *  （passwordless/apiKeyboardLayout/renderPass 等）自然放行；复数段经
- *  matchesCredentialWord 归一（clientsecrets → client|secrets）。 */
+/** BENIGN 键的无边界形态豁免（第三十轮阻断 1）：路径数组声明跨 segment 拼接
+ *  （['access','tokenizer','config'] ≡ accesstokenizerconfig）与全小写变体经
+ *  同一契约放行 —— 整键命中 BENIGN_CREDENTIAL_KEYS 的合法歧义键，其无边界形态
+ *  在分词兜底中一并豁免（apiKeyboardLayout/compassWordWrap 等 ≥2 段序列的合法
+ *  键路径声明与字符串声明等价） */
+const BENIGN_CREDENTIAL_COLLAPSED: ReadonlySet<string> = (() => {
+  const forms = new Set<string>();
+  for (const key of BENIGN_CREDENTIAL_KEYS) forms.add(collapsedCredentialForm(key));
+  return forms;
+})();
+
+/** 任意偏移字典分词凭据形态兜底（第二十九轮阻断 1 + 第三十轮阻断 1 重写）：
+ *  对无边界形态（数字已剥除）检测任意偏移的连续字典词序列 —— 存在一段 ≥2 个
+ *  连续字典词、且其中含凭据词段（kind 词/拉丁根词，任意位置）或相邻复合对/
+ *  敏感限定组合即拒绝。不要求整键完整分词：未知业务限定词（stripe/custom/
+ *  vendor/legacy/payment 等）不在字典，旧「整键完整分词 + credentialSeen」
+ *  判定被其阻断而 fail-open（stripeapikey 等六组探针泄漏）。单段词不足为凭：
+ *  tokenizerConfig 的 token、authorizationMode 的 auth、passwordless 的
+ *  password、renderpass 的 pass、keyboard 的 key 等单段 run 无凭据语境，放行
+ *  —— ≥2 段序列的合法键（apiKeyboardLayout/compassWordWrap 等）经
+ *  BENIGN_CREDENTIAL_KEYS 整键豁免（无边界形态见 BENIGN_CREDENTIAL_COLLAPSED）。
+ *  每位置取最长字典词（pass|word 重叠于 password 时取 password —— 复合对子分词
+ *  不构成独立凭据序列，passwordless/oldpasswordx 等合法键不误伤；password 等真
+ *  pass+word 连写仍闭合）。复数段经 matchesCredentialWord 归一（clientsecrets →
+ *  client|secrets）。长度上限超限即拒（fail-closed）。 */
 function hasCredentialSegmentation(collapsed: string): boolean {
-  if (collapsed.length === 0 || collapsed.length > CREDENTIAL_SEGMENT_MAX_LENGTH) return false;
-  const memo = new Map<string, boolean>();
+  if (BENIGN_CREDENTIAL_COLLAPSED.has(collapsed)) return false;
+  if (collapsed.length > CREDENTIAL_SEGMENT_MAX_LENGTH) return true;
+  if (collapsed.length === 0) return false;
   const isDictWord = (w: string): boolean =>
     CREDENTIAL_SEGMENT_DICT.has(w) ||
     (w.length > 3 && w.endsWith('s') && CREDENTIAL_SEGMENT_DICT.has(w.slice(0, -1)));
@@ -680,26 +721,33 @@ function hasCredentialSegmentation(collapsed: string): boolean {
     }
     return false;
   };
-  const find = (pos: number, prev: string | null, credentialSeen: boolean): boolean => {
-    if (pos === collapsed.length) return credentialSeen;
-    const memoKey = `${pos}|${prev ?? ''}|${credentialSeen ? 1 : 0}`;
-    const cached = memo.get(memoKey);
-    if (cached !== undefined) return cached;
-    let result = false;
-    for (let end = pos + 1; end <= collapsed.length; end += 1) {
-      const w = collapsed.slice(pos, end);
-      if (!isDictWord(w)) continue;
-      const shape =
-        credentialSeen || isCredentialSegment(w) || (prev !== null && isCredentialAdjacentPair(prev, w));
-      if (find(end, w, shape)) {
-        result = true;
-        break;
+  // 任意偏移 + 最长字典词优先：每个起点沿唯一路径推进（无分支，无需 memo），
+  // 累计 ≥2 个连续字典词且含凭据词段/相邻复合对即拒绝；80 字符上限封顶开销
+  const n = collapsed.length;
+  for (let start = 0; start < n; start += 1) {
+    let pos = start;
+    let prev: string | null = null;
+    let credentialSeen = false;
+    let runLen = 0;
+    while (pos < n) {
+      let best = '';
+      for (let end = n; end > pos; end -= 1) {
+        const w = collapsed.slice(pos, end);
+        if (isDictWord(w)) {
+          best = w;
+          break;
+        }
       }
+      if (best === '') break;
+      if (prev !== null && isCredentialAdjacentPair(prev, best)) credentialSeen = true;
+      if (isCredentialSegment(best)) credentialSeen = true;
+      runLen += 1;
+      if (runLen >= 2 && credentialSeen) return true;
+      prev = best;
+      pos += best.length;
     }
-    memo.set(memoKey, result);
-    return result;
-  };
-  return find(0, null, false);
+  }
+  return false;
 }
 
 /** 凭据形态核心判定（第二十八轮阻断 1 拆分）：对完整 token 列表做凭据形态判定

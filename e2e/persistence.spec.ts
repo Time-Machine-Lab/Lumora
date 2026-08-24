@@ -467,7 +467,12 @@ test('第二十九轮 e2e：真实 manifest → ProjectMenu → includePrivate �
   await expect(page.getByTestId('studio-empty-hint')).toBeVisible();
   await page.getByTestId('open-plugin-manager').click();
   await expect(page.getByTestId('plugin-state-com.example.settings')).toContainText('运行中');
-  await expect(page.locator('[data-testid^="plugin-reason-"]').first()).toContainText('Manifest 非法');
+  // 第三十轮一般 4：精确定位缺 manifest 的失败项 —— 缺 id 的非法 Manifest 以
+  // 自增 instanceId `<unknown:1>` 登记；此前 .first() 会命中既有
+  // broken-manifest 插件（com.example.brokenmanifest），未证明 no-manifest 场景
+  await expect(page.getByTestId('plugin-row-<unknown:1>')).toContainText('Manifest 非法');
+  await expect(page.getByTestId('plugin-reason-<unknown:1>')).toContainText('Manifest 非法');
+  await expect(page.getByTestId('plugin-reason-com.example.brokenmanifest')).toContainText('Manifest 非法');
   await page.getByTestId('close-plugin-manager').click();
   await expect(page.getByTestId('plugin-manager')).not.toBeVisible();
 
@@ -558,6 +563,78 @@ test('第二十九轮 e2e：真实 manifest 声明凭据键（exportableSettings
   await expect(page.getByTestId('lumora-toasts')).toContainText(/凭据永不导出/);
   await noDownload;
   expect(downloadHappened).toBe(false);
+});
+
+test('第三十轮 e2e：真实 manifest 逐类显式声明凭据键（B1 全小写复合 / S7 session-cookie / CJK 敏感词）→ includePrivate 导出整包拒绝，不产生下载', async ({
+  page,
+}) => {
+  const tmpDir = join(HERE, '.tmp');
+  mkdirSync(tmpDir, { recursive: true });
+  // 每类一个独立命名空间插件（?plugins=leaky-<类别> 只注册对应类别），逐类
+  // 断言：声明一旦真实存在于 manifest，构建期整包拒绝、UI 只报错不下载 ——
+  // 修复前 B1/S7/CJK 键只写 pluginData（未声明），即使分类器完全失效也通过
+  const categories = [
+    {
+      param: 'leaky-b1',
+      pluginId: 'com.example.leaky.b1',
+      key: 'sessionid',
+      uri: 'lumora://project/round30-leaky-b1',
+      name: '第三十轮B1泄漏源',
+    },
+    {
+      param: 'leaky-s7',
+      pluginId: 'com.example.leaky.s7',
+      key: 'cookieHeader',
+      uri: 'lumora://project/round30-leaky-s7',
+      name: '第三十轮S7泄漏源',
+    },
+    {
+      param: 'leaky-cjk',
+      pluginId: 'com.example.leaky.cjk',
+      key: '访问令牌',
+      uri: 'lumora://project/round30-leaky-cjk',
+      name: '第三十轮CJK泄漏源',
+    },
+  ];
+  for (const category of categories) {
+    const sourcePath = join(tmpDir, `tml53-round30-${category.param}-source.lumora`);
+    const sourceEditor = new SceneEditor();
+    sourceEditor.openProject(createSampleProject());
+    const sourcePkg = buildProjectPackage(
+      { ...sourceEditor.getProject()!, uri: category.uri, name: category.name },
+      { includePrivate: true },
+    );
+    sourcePkg.project.pluginData = { [category.pluginId]: { theme: 'dark', [category.key]: 'sk-e2e-round30-leaky' } };
+    writeFileSync(sourcePath, serializeProjectPackage(sourcePkg), 'utf8');
+
+    await page.goto(`/?plugins=${category.param}`);
+    await expect(page.getByTestId('studio-empty-hint')).toBeVisible();
+    // 类别插件必须以合法 manifest 注册（id 反向域名风格），声明才进入导出校验链
+    await page.getByTestId('open-plugin-manager').click();
+    await expect(page.getByTestId(`plugin-state-${category.pluginId}`)).toContainText('运行中');
+    await page.getByTestId('close-plugin-manager').click();
+    await expect(page.getByTestId('plugin-manager')).not.toBeVisible();
+    await page.getByTestId('project-menu').click();
+    await page.setInputFiles('[data-testid="project-import-input"]', sourcePath);
+    await expect(page.getByTestId('studio-empty-hint')).not.toBeVisible();
+    await expect(page.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 10_000 });
+
+    await page.getByTestId('project-menu').click();
+    await page.getByTestId('project-export-include-private').check();
+    await expect(page.getByTestId('project-export-include-private')).toBeChecked();
+    let downloadHappened = false;
+    const noDownload = page
+      .waitForEvent('download', { timeout: 2000 })
+      .then(() => {
+        downloadHappened = true;
+      })
+      .catch(() => undefined);
+    await page.getByTestId('project-export').click();
+    await expect(page.getByTestId('lumora-toasts')).toContainText(/无法导出/, { timeout: 5000 });
+    await expect(page.getByTestId('lumora-toasts')).toContainText(/凭据永不导出/);
+    await noDownload;
+    expect(downloadHappened).toBe(false);
+  }
 });
 
 test('AC2 跨标签页冲突：本地计数追平不覆盖较新保存，须显式「加载较新版本」解决', async ({ context }) => {

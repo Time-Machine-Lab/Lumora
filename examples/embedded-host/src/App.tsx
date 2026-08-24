@@ -119,7 +119,32 @@ const leakySettingsPlugin: PluginDescriptor = {
   }),
 };
 
-const LEAKY_SETTINGS = new URLSearchParams(window.location.search).get('plugins') === 'leaky';
+/** 第三十轮一般 4：逐类真实 manifest 显式声明凭据键 —— B1 无边界全小写复合
+ *  （sessionid）、S7 session/cookie 系列（cookieHeader）、CJK 敏感词（访问令牌）
+ *  各注册独立命名空间插件；仅 ?plugins=leaky-<类别> 时注册对应类别，
+ *  includePrivate 导出逐类断言整包拒绝且不产生下载。
+ *  id 必须为反向域名风格（validateManifest ID_PATTERN 不允许连字符），
+ *  否则 manifest 校验失败、声明不生效、导出静默剥离而非整包拒绝 */
+const leakyCategoryPlugin = (id: string, name: string, credentialKey: string): PluginDescriptor => ({
+  manifest: {
+    schemaVersion: '1',
+    id,
+    name,
+    version: '0.1.0',
+    entry: './dist/index.js',
+    exportableSettings: [credentialKey, 'theme'],
+  } satisfies Manifest,
+  entry: async () => ({
+    default: {
+      activate: (context) => context.contribute({}),
+    },
+  }),
+});
+const LEAKY_B1 = leakyCategoryPlugin('com.example.leaky.b1', '泄漏声明插件 B1', 'sessionid');
+const LEAKY_S7 = leakyCategoryPlugin('com.example.leaky.s7', '泄漏声明插件 S7', 'cookieHeader');
+const LEAKY_CJK = leakyCategoryPlugin('com.example.leaky.cjk', '泄漏声明插件 CJK', '访问令牌');
+
+const LEAKY_PLUGINS = new URLSearchParams(window.location.search).get('plugins');
 
 const PLUGINS: PluginDescriptor[] = [
   mockPlugin,
@@ -128,7 +153,10 @@ const PLUGINS: PluginDescriptor[] = [
   explodingPlugin,
   settingsPlugin,
   noManifestPlugin,
-  ...(LEAKY_SETTINGS ? [leakySettingsPlugin] : []),
+  ...(LEAKY_PLUGINS === 'leaky' ? [leakySettingsPlugin] : []),
+  ...(LEAKY_PLUGINS === 'leaky-b1' ? [LEAKY_B1] : []),
+  ...(LEAKY_PLUGINS === 'leaky-s7' ? [LEAKY_S7] : []),
+  ...(LEAKY_PLUGINS === 'leaky-cjk' ? [LEAKY_CJK] : []),
 ];
 
 /** 默认只记录事件摘要；?debug=full 时输出完整 payload（大数据量下会产生 GB 级字符串，仅限调试） */
@@ -163,9 +191,17 @@ export default function App() {
     };
   }, [mounted]);
 
-  const toggleMount = () => {
+  const toggleMount = async () => {
     if (mounted) {
       const subscriptionCount = handleRef.current?.runtime.events.handlerCount ?? 0;
+      // 第三十轮严重 6：卸载走 handle.close() 可等待屏障 —— 冲刷失败/未解决
+      // 恢复 fork 时释放被拒绝，保持挂载并记录原因（未落盘内容仍可恢复），
+      // 绝不「假装已卸载」丢弃内容
+      const outcome = await handleRef.current?.close();
+      if (outcome && !outcome.ok) {
+        appendLog(`卸载被拒绝：${outcome.message ?? '运行时释放失败'} —— Studio 保持挂载，请先解决未保存内容`);
+        return;
+      }
       appendLog(`卸载 Studio：释放前事件订阅数 ${subscriptionCount} —— 运行时已释放`);
       setMounted(false);
     } else {
