@@ -575,11 +575,57 @@ const CREDENTIAL_COLLAPSED_FORMS: ReadonlySet<string> = (() => {
   return forms;
 })();
 
+/** Unicode Default Ignorable 码点区间（UAX #44 PropList）：零宽字符（U+200B
+ *  ZWSP/U+200C ZWNJ/U+200D ZWJ 等）、变体选择符（U+FE00-U+FE0F，含 U+FE0F
+ *  VS16）、连字/不可见格式符等 —— 视觉上无痕迹，可插入任意文本而不被察觉。
+ *  第三十四轮阻断 2：CJK 凭据根匹配前必须剥除 —— '密\u200b码' 含 ZWSP 时
+ *  NFKC 后不包含 '密码'，零宽字符注入即绕过根检查（配合折叠值 BENIGN 豁免
+ *  碰撞可让凭据值进包）。按区间表逐码点过滤（不依赖控制字符正则） */
+const DEFAULT_IGNORABLE_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x00ad, 0x00ad],
+  [0x034f, 0x034f],
+  [0x061c, 0x061c],
+  [0x115f, 0x1160],
+  [0x17b4, 0x17b5],
+  [0x180b, 0x180f],
+  [0x200b, 0x200f],
+  [0x202a, 0x202e],
+  [0x2060, 0x206f],
+  [0x3164, 0x3164],
+  [0xfe00, 0xfe0f],
+  [0xfeff, 0xfeff],
+  [0xffa0, 0xffa0],
+  [0xfff0, 0xfff8],
+  [0x1bca0, 0x1bca3],
+  [0x1d173, 0x1d17a],
+  [0xe0000, 0xe0fff],
+];
+
+function isDefaultIgnorable(code: number): boolean {
+  for (const [lo, hi] of DEFAULT_IGNORABLE_RANGES) {
+    if (code < lo) return false;
+    if (code <= hi) return true;
+  }
+  return false;
+}
+
+/** 剥除 Unicode Default Ignorable 字符（第三十四轮阻断 2）：逐码点过滤 */
+function stripDefaultIgnorables(key: string): string {
+  let out = '';
+  for (const ch of key) {
+    const code = ch.codePointAt(0)!;
+    if (!isDefaultIgnorable(code)) out += ch;
+  }
+  return out;
+}
+
 /** CJK/日文凭据根词包含判定：仅 NFKC（不 NFKD）—— 日文清浊音（パ/バ/ド 等）
  *  是独立码点，NFKD 会把パ分解为ハ+浊点（U+3099），破坏与预组合词
- *  （パスワード 等）的包含匹配；Latin 变音符号才需要 NFKD+剥离管道 */
+ *  （パスワード 等）的包含匹配；Latin 变音符号才需要 NFKD+剥离管道。
+ *  第三十四轮阻断 2：NFKC 后先剥 Default Ignorable 再匹配 —— 零宽字符
+ *  （U+200B/U+FE0F）注入的 '密\u200b码' 恢复为 '密码' 后命中，注入无法绕过 */
 function containsCredentialCjkRoot(key: string): boolean {
-  const nfkc = key.normalize('NFKC');
+  const nfkc = stripDefaultIgnorables(key.normalize('NFKC'));
   for (const word of CREDENTIAL_CJK_ROOTS) {
     if (nfkc.includes(word)) return true;
   }
@@ -758,7 +804,11 @@ function isBenignCredentialKey(key: string): boolean {
  *  matchesCredentialWord 归一（clientsecrets → client|secrets）。长度上限超限
  *  即拒（fail-closed）。 */
 function hasCredentialSegmentation(collapsed: string): boolean {
-  if (isBenignCredentialKey(collapsed)) return false;
+  // 第三十四轮阻断 2：折叠值（collapsedCredentialForm 已剥除全部非 ASCII）不
+  // 得再做 BENIGN 豁免 —— 传入本函数的键已经历规范化折叠，原文丢失：'密\u200b码
+  // tokenizerConfig' 折叠为 'tokenizerconfig' 后命中白名单而放行（修复前
+  // 正是此短路让零宽字符注入的凭据根键绕过；白名单精确豁免只在仍持有原始
+  // 字符串的入口执行 —— isCredentialShapeKey / buildExportTrie 的原始段拼接）
   if (collapsed.length > CREDENTIAL_SEGMENT_MAX_LENGTH) return true;
   if (collapsed.length === 0) return false;
   const isDictWord = (w: string): boolean =>

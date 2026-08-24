@@ -164,15 +164,18 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
           return { ok: false, message: error instanceof Error ? error.message : String(error) };
         }
         if (!outcome.ok) return { ok: false, message: outcome.message };
-        // commit（终态 best-effort 收敛，第三十三轮阻断 2）：persistence 已终态
-        // 释放（autosaver 停止、订阅已拆、store 已关）—— 运行态不可恢复，宿主
-        // 不得继续编辑（「可编辑但不可保存」死壳是数据丢失面）。host/事件订阅/
-        // 编辑器逐项尽力释放，任何失败不中断收敛（修复前 host.dispose() 失败
-        // 即返回 {ok:false}，但 persistence 已永久释放：宿主保持挂载面对死壳，
-        // 重试时新编辑随编辑器销毁丢失）；完成标记（disposed）在全部步骤尝试
-        // 后置位，失败原因并入 message —— ok 仍为 true（终态已收敛、可安全
-        // 卸载），不再以 {ok:false} 冒充运行态完整
+        // commit（终态 best-effort 收敛，第三十三轮阻断 2 + 第三十四轮严重 5）：
+        // persistence 已终态释放（autosaver 停止、订阅已拆、store 已关）——
+        // 运行态不可恢复，宿主不得继续编辑（「可编辑但不可保存」死壳是数据
+        // 丢失面）。host/事件订阅/编辑器逐项尽力释放，任何失败不中断收敛
+        // （修复前 host.dispose() 失败即返回 {ok:false}，但 persistence 已永久
+        // 释放：宿主保持挂载面对死壳，重试时新编辑随编辑器销毁丢失）；完成
+        // 标记（disposed）在全部步骤尝试后置位，失败原因并入 message —— ok
+        // 仍为 true（终态已收敛、可安全卸载）。第三十四轮严重 5：persistence
+        // 的 {ok:true, message}（其 commit 段部分失败明细）同样并入 failures ——
+        // 修复前被直接丢弃，store 层终态失败无法传到公开 close() 调用方
         const failures: string[] = [];
+        if (outcome.message) failures.push(outcome.message);
         try {
           await host.dispose();
         } catch (error) {

@@ -72,9 +72,18 @@ export class ProjectPersistence {
   private initPromise: Promise<void> | null = null;
   // 第三十三轮严重 4：待关闭的晚到 store —— 存储创建挂起期间 dispose 已开始，
   // init 重查发现已释放时不再吞掉关闭失败：store 转入此字段，dispose 的 commit
-  // 收敛点负责真实关闭并传播失败（失败时 dispose 返回 {ok:false} 可重试，关闭
-  // 成功后置 null；修复前空 catch 丢弃唯一引用、dispose 永久缓存成功，连接泄漏）
+  // 段负责真实关闭（失败并入终态 message，见下）；关闭成功后置 null。
+  // 第三十四轮严重 4 明确分流边界：只有 dispose 已进入不可回退 commit 阶段
+  // （disposePhase === 'committing'）才转入 lateStore —— 修复前凭 disposePromise
+  // 存在即转入：dispose 的 preflight 失败时直接返回，晚到 store 既不挂载也不
+  // 关闭（连接悬挂、编辑静默退化内存模式）；preflighting/idle 阶段的晚到 store
+  // 正常挂载（preflight 可失败可重试，运行态保持完整可落盘）
   private lateStore: ProjectStorage | null = null;
+  // 第三十四轮严重 4：dispose 阶段机 —— 'idle'（未开始）→ 'preflighting'
+  // （可恢复 preflight：flush/recovery 检查，失败回 'idle' 可重试）→
+  // 'committing'（不可回退终态收敛，任何失败并入 message、ok 仍 true）→
+  // 'disposed'（完成）。init 的晚到 store 分流据此判定
+  private disposePhase: 'idle' | 'preflighting' | 'committing' | 'disposed' = 'idle';
   readonly events = new TypedEventEmitter<PersistenceEventMap>();
 
   constructor(private readonly editor: SceneEditor) {
@@ -130,14 +139,27 @@ export class ProjectPersistence {
           : await ProjectStore.create(options.dbName));
       if (!store) return; // 存储不可用：静默降级（仅内存编辑），与旧语义一致
       // await 挂起期间 dispose() 已开始/完成：晚到 store 不得挂到已销毁的
-      // persistence —— 转入 lateStore 待关闭（第三十三轮严重 4），由 dispose
-      // 的 commit 收敛点真实关闭并传播失败（修复前此处空 catch 丢弃唯一引用，
-      // dispose 已永久缓存成功、无重试入口，连接泄漏不可恢复）。第三十三轮
-      // 严重 4 明确：判定必须包含「dispose 在途」（disposePromise 非空，正等待
-      // 收敛点）—— 修复前只看 disposed，dispose 等待期间的晚到 store 走正常
-      // 挂载，close 失败被 commit best-effort 归档进 message 假报「终态已达成」；
-      // 待关闭 store 是独立步骤状态，close 失败必须 {ok:false} 可重试
-      if (this.disposed || this.disposePromise) {
+      // persistence —— 第三十四轮严重 4 按阶段分流（修复前凭 disposePromise
+      // 存在即转入 lateStore：preflight 失败时 store 既不挂载也不关闭）：
+      // - disposed（dispose 已完成、收敛点已过）：立即关闭丢弃（best-effort，
+      //   终态后清理失败无处可报，但不残留连接）；
+      // - committing（dispose 已进入不可回退 commit）：转入 lateStore，由
+      //   dispose 的 commit 段真实关闭（第三十三轮严重 4；关闭失败并入终态
+      //   message —— commit 已开始，不再返回可恢复 {ok:false}，第三十四轮
+      //   阻断 3）；
+      // - idle/preflighting（preflight 可失败可重试，运行态保持完整）：正常
+      //   挂载 —— preflight 失败后 store 已就位，编辑可真实落盘（修复前
+      //   「init pending → dispose/preflight pending → init 返回 store →
+      //   preflight 失败」导致连接悬挂、编辑静默退化内存模式）
+      if (this.disposed) {
+        try {
+          store.close();
+        } catch {
+          // 终态后晚到 store 的清理失败无人接收：不残留连接即可
+        }
+        return;
+      }
+      if (this.disposePhase === 'committing') {
         this.lateStore = store;
         return;
       }
@@ -575,29 +597,57 @@ export class ProjectPersistence {
     // dispose() 同型）
     if (this.disposePromise) return this.disposePromise;
     this.disposePromise = (async (): Promise<SaveOutcome> => {
-      // preflight（第三十二轮阻断 2 拆分 + 第三十三轮阻断 2 明确语义）：flush/
-      // recovery 检查无任何 teardown —— 失败即返回 {ok:false}，autosaver/订阅/
-      // store 全部保留，运行时恢复普通可编辑状态（编辑仍进 autosave、可落盘）。
-      // 意外拒绝同样归一为可恢复失败（autosaver 内部无部分 teardown 泄漏）
-      let preflight: SaveOutcome;
-      try {
-        preflight = await this.autosaver.dispose();
-      } catch (error) {
-        return { ok: false, code: 'storage-error', message: failureMessage(error) };
-      }
-      if (!preflight.ok) return preflight;
-      // commit 前置收敛点（第三十三轮严重 4）：等待在途 init settle —— 存储创建
-      // 挂起时 dispose 已开始，晚到的 store 经 init 的 disposed 重查转入 lateStore；
-      // 在此真实关闭并传播失败（失败时 dispose 返回 {ok:false}、未置终态标记，
-      // 重试补做关闭；修复前 close 抛错被 init 空 catch 吞掉，唯一引用丢失、
-      // dispose 永久缓存成功无重试入口）
+      // commit 前置收敛点（第三十三轮严重 4 + 第三十四轮严重 4 前移）：先等
+      // 在途 init settle —— init 成功则 store 已挂载（preflighting 阶段正常
+      // 挂载），之后才做 preflight。修复前 preflight 先跑：失败时晚到 store
+      // 既不挂载也不关闭（连接悬挂、编辑静默退化内存模式），且 runtime 仍标
+      // initialized、后续 init 不补做
       const inFlightInit = this.initPromise;
       if (inFlightInit) {
         try {
           await inFlightInit;
         } catch {
-          // init 自身失败：已 settle 清理（第三十三轮一般 5），lateStore 检查接管
+          // init 自身失败：已 settle 清理（第三十三轮一般 5），无 store 需处理
         }
+      }
+      // preflight（第三十二轮阻断 2 拆分 + 第三十三轮阻断 2 + 第三十四轮阻断 3
+      // 明确语义）：autosaver 无 teardown 检查（flush + recovery）—— 失败即
+      // 返回 {ok:false}，autosaver/订阅/store 全部保留，运行时恢复普通可编辑
+      // 状态（编辑仍进 autosave、可落盘）。修复前 preflight 调 autosaver.dispose()
+      // （flush 成功即置 disposed 并移除监听）：后续 late close 失败返回
+      // {ok:false} 时宿主保持 UI 但 changed() 已 no-op —— 失败与重试间编辑
+      // 不落盘（死壳）。意外拒绝同样归一为可恢复失败
+      this.disposePhase = 'preflighting';
+      let preflight: SaveOutcome;
+      try {
+        preflight = await this.autosaver.preflightDispose();
+      } catch (error) {
+        this.disposePhase = 'idle';
+        return { ok: false, code: 'storage-error', message: failureMessage(error) };
+      }
+      if (!preflight.ok) {
+        this.disposePhase = 'idle';
+        return preflight;
+      }
+      // commit（终态 best-effort 收敛，第三十三轮阻断 2 + 第三十四轮阻断 3）：
+      // 进入不可回退 commit —— 自此任何失败不再返回可恢复 {ok:false}（宿主
+      // 不得再面对「可编辑但不可保存」死壳），逐项尽力收敛，失败并入 message、
+      // ok 仍为 true。lateStore 关闭也在此段：close 失败归档进 message（修复前
+      // 在 commit 前返回 {ok:false} 可重试 —— 但 autosaver 已终态化，重试没有
+      // 意义且失败与重试间的新编辑不落盘）
+      this.disposePhase = 'committing';
+      const failures: string[] = [];
+      try {
+        const autosaverOutcome = await this.autosaver.dispose();
+        if (!autosaverOutcome.ok) {
+          // preflight 通过后二次冲刷失败（preflight 与 commit 之间出现新编辑且
+          // 落盘失败）：内容已进恢复快照，commit 不可回退 —— 归档失败并强制
+          // 终态化（绝不残留窗口级监听）
+          failures.push(`自动保存释放失败：${autosaverOutcome.message}`);
+          this.autosaver.forceTeardown();
+        }
+      } catch (error) {
+        failures.push(`自动保存释放失败：${failureMessage(error)}`);
       }
       if (this.lateStore) {
         const late = this.lateStore;
@@ -605,18 +655,9 @@ export class ProjectPersistence {
           late.close();
           this.lateStore = null;
         } catch (error) {
-          return { ok: false, code: 'storage-error', message: `晚到存储关闭失败：${failureMessage(error)}` };
+          failures.push(`晚到存储关闭失败：${failureMessage(error)}`);
         }
       }
-      // commit（终态 best-effort 收敛，第三十三轮阻断 2）：autosaver 已释放、
-      // 订阅即将拆除 —— 运行态不可恢复，宿主不得继续编辑（「可编辑但不可保存」
-      // 死壳是数据丢失面）。剩余步骤逐项尽力执行，任何失败不中断收敛（宿主
-      // 卸载不因单个资源失败卡死），完成标记（disposed）在全部步骤尝试后置位；
-      // 失败原因并入 message，ok 仍为 true —— 终态已达成、可安全卸载，不再以
-      // {ok:false} 冒充「运行态完整」（修复前 store.close() 抛错返回 {ok:false}
-      // 但 autosaver 已永久释放：宿主保持挂载重试，新编辑不再进 autosave、
-      // 随重试的编辑器销毁丢失）
-      const failures: string[] = [];
       try {
         this.unsubscribeEditor?.dispose();
       } catch (error) {
@@ -636,6 +677,7 @@ export class ProjectPersistence {
         failures.push(failureMessage(error));
       }
       this.disposed = true;
+      this.disposePhase = 'disposed';
       return failures.length === 0 ? { ok: true } : { ok: true, message: `终态释放部分失败：${failures.join('；')}` };
     })();
     const inFlight = this.disposePromise;

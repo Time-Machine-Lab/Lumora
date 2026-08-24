@@ -1890,6 +1890,127 @@ describe('第三十三轮阻断 1：CJK/日/韩凭据根不得经 BENIGN 规范�
   });
 });
 
+describe('第三十四轮阻断 2：零宽字符（U+200B/U+FE0F）注入不得绕过凭据根与 BENIGN', () => {
+  // 修复前：containsCredentialCjkRoot 的 NFKC 包含匹配对 '密'+U+200B+'码'（ZWSP
+  // 插入）不命中；hasCredentialSegmentation 内对已折叠值（collapsedCredentialForm
+  // 剥掉全部非 ASCII）再做 BENIGN 短路 —— '密'+U+200B+'码tokenizerConfig' 折叠
+  // 为 'tokenizerconfig' 命中白名单放行，凭据值进包
+  const zwsp = '\u200b';
+  const vs16 = '\ufe0f';
+  const topLevel = [
+    `密${zwsp}码tokenizerConfig`,
+    `密${vs16}码tokenizerConfig`,
+    `密碼${zwsp}tokenizerConfig`,
+    `パスワード${zwsp}authMode`,
+    `비밀번호${zwsp}tokenizerConfig`,
+  ];
+  const nestedLeaves = [
+    ['profile', `密${zwsp}码tokenizerConfig`],
+    ['profile', `密${vs16}码tokenizerConfig`],
+    ['profile', `密碼${zwsp}tokenBudget`],
+  ];
+  const splitPaths = [
+    ['profile', `密${zwsp}码`, 'tokenizer', 'config'],
+    ['profile', `密${vs16}码`, 'tokenizer', 'config'],
+    ['profile', 'tokenizer', 'config', `密${zwsp}码`],
+  ];
+  const benignInjections = [`tokenizer${zwsp}Config`, `tokenizer${vs16}Config`];
+
+  it('顶层整键：ZWSP/VS16 注入的 CJK/日/韩凭据根键全部拒绝，值不进包', async () => {
+    const project = await buildFixtureProject();
+    for (const key of topLevel) {
+      const error = expectCredentialDeclarationRejected(() =>
+        buildProjectPackage(
+          { ...project, pluginData: { 'com.example': { [key]: 'leak-r34' } } },
+          { includePrivate: true, publicKeysByPlugin: { 'com.example': [key] } },
+        ),
+      );
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(key) });
+    }
+  });
+
+  it('嵌套叶键：零宽注入落叶键一律拒绝', async () => {
+    const project = await buildFixtureProject();
+    for (const path of nestedLeaves) {
+      const error = expectCredentialDeclarationRejected(() =>
+        buildProjectPackage(
+          { ...project, pluginData: { 'com.example': { profile: { [path[1]!]: 'leak-r34' } } } },
+          { includePrivate: true, publicKeysByPlugin: { 'com.example': [path] } },
+        ),
+      );
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(path) });
+    }
+  });
+
+  it('拆分路径：零宽注入的凭据根落任意段均拒绝（良性后缀识别不再吞掉注入前缀）', async () => {
+    const project = await buildFixtureProject();
+    for (const path of splitPaths) {
+      const error = expectCredentialDeclarationRejected(() =>
+        buildProjectPackage(
+          { ...project, pluginData: {} },
+          { includePrivate: true, publicKeysByPlugin: { 'com.example': [path] } },
+        ),
+      );
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(path) });
+    }
+  });
+
+  it('良性键的零宽变体拒绝（fail-closed）：白名单是精确豁免，零宽写法不入表', async () => {
+    const project = await buildFixtureProject();
+    for (const key of benignInjections) {
+      const error = expectCredentialDeclarationRejected(() =>
+        buildProjectPackage(
+          { ...project, pluginData: { 'com.example': { [key]: 'leak-r34' } } },
+          { includePrivate: true, publicKeysByPlugin: { 'com.example': [key] } },
+        ),
+      );
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(key) });
+    }
+  });
+
+  it('BENIGN 正向往返不受影响（回归）：纯 ASCII 良性键与嵌套拆分仍无损往返', async () => {
+    const project = await buildFixtureProject();
+    const pluginData: Record<string, unknown> = {
+      'com.example': {
+        tokenizerConfig: 'keep-1',
+        tokenBudget: 'keep-2',
+        authMode: 'keep-3',
+        profile: {
+          tokenizerConfig: 'keep-4',
+          tokenizer: { config: 'keep-5' },
+          cookie: { consent: 'keep-6' },
+        },
+      },
+    };
+    const declarations: Array<string | readonly string[]> = [
+      'tokenizerConfig',
+      'tokenBudget',
+      'authMode',
+      ['profile', 'tokenizerConfig'],
+      ['profile', 'tokenizer', 'config'],
+      ['profile', 'cookie', 'consent'],
+    ];
+    const pkg = buildProjectPackage({ ...project, pluginData }, {
+      includePrivate: true,
+      publicKeysByPlugin: { 'com.example': declarations },
+    });
+    const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, unknown>)['com.example'];
+    expect(plugin).toEqual({
+      tokenizerConfig: 'keep-1',
+      tokenBudget: 'keep-2',
+      authMode: 'keep-3',
+      profile: {
+        tokenizerConfig: 'keep-4',
+        tokenizer: { config: 'keep-5' },
+        cookie: { consent: 'keep-6' },
+      },
+    });
+  });
+});
+
 describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻断 1 / 一般 8 / 一般 9）', () => {
   it('嵌套凭据不进包：objects/scenes/tracks/资产元数据中的契约外字段默认导出与 includePrivate 一律排除', async () => {
     const project = await buildFixtureProject();

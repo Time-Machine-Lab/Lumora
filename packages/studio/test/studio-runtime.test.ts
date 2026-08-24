@@ -329,3 +329,82 @@ describe('StudioRuntime：init 拒绝不污染 single-flight（第三十三轮�
     await ProjectStore.drop(db);
   });
 });
+
+describe('StudioRuntime：init pending × dispose preflight 延迟失败（第三十四轮严重 4）', () => {
+  it('deferred init + delayed preflight failure：晚到 store 已挂载、编辑可真实落盘（修复前连接悬挂、编辑静默退化内存模式且 initialized 误标）', async () => {
+    const runtime = createStudioRuntime();
+    const db = 'lumora-test-runtime-r34-preflight';
+    await ProjectStore.drop(db);
+    const lateStore = await ProjectStore.create(db);
+    expect(lateStore).not.toBeNull();
+
+    // preflight 延迟失败：dispose 的收敛点先等 init settle（store 挂载），
+    // 再跑 preflight 并失败 —— 失败后运行态完整（修复前晚到 store 被转
+    // lateStore 且 preflight 失败直接返回：连接悬挂、编辑静默内存模式）
+    const autosaver = (
+      runtime.persistence as unknown as {
+        autosaver: {
+          preflightDispose: () => Promise<{ ok: boolean; code?: string; message?: string }>;
+        };
+      }
+    ).autosaver;
+    const preflightSpy = vi.spyOn(autosaver, 'preflightDispose');
+    preflightSpy.mockResolvedValueOnce({ ok: false, code: 'storage-error', message: '模拟冲刷失败' });
+
+    let releaseCreate!: (s: ProjectStore | null) => void;
+    const createSpy = vi.spyOn(ProjectStore, 'create').mockImplementationOnce(
+      () => new Promise<ProjectStore | null>((resolve) => {
+        releaseCreate = resolve;
+      }),
+    );
+
+    const initPromise = runtime.init({ dbName: db, debounceMs: 20 });
+    const disposePromise = runtime.dispose();
+    releaseCreate(lateStore);
+    await initPromise;
+    const disposeOutcome = await disposePromise;
+    expect(disposeOutcome).toEqual({ ok: false, message: '模拟冲刷失败' });
+    // preflight 失败：runtime 不 teardown，persistence 的 store 已挂载（可用）
+    expect(runtime.persistence.available).toBe(true);
+    // 编辑可真实落盘（修复前编辑静默退化内存模式）
+    runtime.openProject(createSampleProject('lumora://project/r34-runtime', '严重4'));
+    runtime.editor.addObject(createGroupObject());
+    await new Promise((r) => setTimeout(r, 60)); // 自动保存落盘
+    const loaded = await runtime.persistence.loadProject('lumora://project/r34-runtime');
+    expect(loaded.ok).toBe(true);
+    if (loaded.ok) {
+      expect(loaded.project.objects.length).toBe(createSampleProject().objects.length + 1);
+    }
+    preflightSpy.mockRestore();
+    createSpy.mockRestore();
+    const retried = await runtime.dispose();
+    expect(retried).toEqual({ ok: true });
+    await ProjectStore.drop(db);
+  });
+});
+
+describe('StudioRuntime：终态失败 message 透传（第三十四轮严重 5）', () => {
+  it('persistence.dispose 的 {ok:true, message} 合入 runtime 结果并透传（修复前被直接丢弃）', async () => {
+    const runtime = createStudioRuntime();
+    const db = 'lumora-test-runtime-r34-msg';
+    await ProjectStore.drop(db);
+    const store = await ProjectStore.create(db);
+    expect(store).not.toBeNull();
+    await runtime.init({ store: store!, debounceMs: 60_000 });
+    await runtime.openProject(createSampleProject('lumora://project/r34-msg', '透传'));
+
+    const disposeSpy = vi.spyOn(runtime.persistence, 'dispose');
+    disposeSpy.mockResolvedValueOnce({ ok: true, message: '终态释放部分失败：store 关闭失败' });
+
+    const outcome = await runtime.dispose();
+    // store 层终态失败明细经 runtime 聚合透传（ok 仍 true —— 终态已收敛）
+    expect(outcome.ok).toBe(true);
+    expect(outcome.message).toContain('store 关闭失败');
+    expect(outcome.message).toContain('终态释放部分失败');
+    // 终态收敛：编辑器已销毁、宿主可安全卸载
+    expect(() => runtime.editor.openProject(createSampleProject())).toThrow('编辑器已释放');
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+    disposeSpy.mockRestore();
+    await ProjectStore.drop(db);
+  });
+});

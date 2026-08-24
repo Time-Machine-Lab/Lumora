@@ -314,6 +314,43 @@ describe('LumoraStudio', () => {
     expect(runtimeDisposeSpy).toHaveBeenCalledTimes(1);
   });
 
+  it('严重 5（第三十四轮）：cache.dispose 顶层异常并入 close() 结果 —— ok 仍 true 且 message 含明细（修复前无条件裸 {ok:true} 吞掉诊断）', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const cacheDisposeSpy = vi.spyOn(ContentCache.prototype, 'dispose');
+    cacheDisposeSpy.mockImplementationOnce(() => {
+      throw new Error('模拟缓存释放崩溃');
+    });
+    render(<LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" />);
+    await screen.findByTestId('test-panel');
+    const { close } = handle.current!;
+
+    const outcome = await close();
+    expect(outcome.ok).toBe(true);
+    expect(outcome.message).toContain('缓存资源释放失败');
+    expect(outcome.message).toContain('模拟缓存释放崩溃');
+    expect(cacheDisposeSpy).toHaveBeenCalledTimes(1);
+    // 成功后幂等：重复 close 复用同一裁决（失败明细归档保留）
+    expect(await close()).toEqual(outcome);
+    expect(cacheDisposeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('严重 5（第三十四轮）：runtime 终态 message 经 close() 透传 —— store/host 层失败明细不丢失', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    render(<LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" />);
+    await screen.findByTestId('test-panel');
+    const { runtime, close } = handle.current!;
+    const disposeSpy = vi.spyOn(runtime, 'dispose');
+    disposeSpy.mockResolvedValueOnce({ ok: true, message: '终态释放部分失败：host 停用失败' });
+
+    const outcome = await close();
+    expect(outcome.ok).toBe(true);
+    expect(outcome.message).toContain('host 停用失败');
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+    // 成功后幂等：重复 close 不再触碰 runtime
+    expect(await close()).toEqual(outcome);
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+  });
+
   it('StrictMode 下 effect 卸载重放不破坏运行时：插件只启动一次，命令可用，真实卸载仍释放', async () => {
     const handle = createRef<LumoraStudioHandle>();
     const onError = vi.fn();

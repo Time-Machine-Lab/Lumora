@@ -104,16 +104,21 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       // cache.dispose 契约为 best-effort 不抛错（内部逐资源清理，第三十三轮
       // 阻断 3）—— 意外拒绝归一后仍返回成功：运行态已收敛，卸载不受阻。
       // 修复前 cache 抛错返回 {ok:false}，但 runtime 已销毁：宿主保持挂载
-      // 面对「可编辑但不可保存」死壳，重试时跳过缓存释放假报成功
+      // 面对「可编辑但不可保存」死壳，重试时跳过缓存释放假报成功。
+      // 第三十四轮严重 5：逐层聚合 —— runtime 的 {ok:true, message}（store/
+      // host 终态失败明细）与 cache 顶层异常全部并入 message 透传，修复前
+      // 无条件返回裸 {ok:true} 连续丢弃诊断
+      const messages: string[] = [];
+      if (outcome.message) messages.push(outcome.message);
       if (!cacheDisposedRef.current) {
         try {
           cache.dispose();
-        } catch {
-          // best-effort：缓存资源释放失败不阻断卸载语义（终态已达成）
+        } catch (error) {
+          messages.push(`缓存资源释放失败：${error instanceof Error ? error.message : String(error)}`);
         }
         cacheDisposedRef.current = true;
       }
-      return { ok: true };
+      return messages.length === 0 ? { ok: true } : { ok: true, message: messages.join('；') };
     })();
     const inFlight = closeInFlightRef.current;
     // 失败：清空缓存允许重试 —— 仅当 ref 仍指向本次结果（并发调用共享同一

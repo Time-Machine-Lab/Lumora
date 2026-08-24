@@ -543,13 +543,20 @@ describe('resolveFormat：显式格式 > 扩展名 > mime', () => {
 });
 
 describe('第三十三轮阻断 3：内部 GPU disposer 抛错不中断收敛（真实资源故障注入）', () => {
-  /** 带真实纹理的 gltf：geometry + material(map) + texture 三层 GPU 资源 */
+  /** 带真实纹理的 gltf：geometry + material(map) + texture 三层 GPU 资源。
+   *  第三十四轮阻断 1：mesh.material 类型为 Material | Material[]（three 允许
+   *  多材质），必须先处理数组分支再收窄/断言为 MeshStandardMaterial —— 修复前
+   *  直接 mesh.material.map 赋值触发根级 typecheck TS2339/TS2322（门禁假绿） */
   function makeTexturedGltf(): { gltf: GLTF; geometry: THREE.BufferGeometry; material: THREE.Material; texture: THREE.Texture } {
     const gltf = makeGltf();
     const mesh = gltf.scene.children[0] as THREE.Mesh;
+    const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+    if (!(material instanceof THREE.MeshStandardMaterial)) {
+      throw new Error('测试夹具要求 MeshStandardMaterial');
+    }
     const texture = new THREE.Texture();
-    mesh.material.map = texture;
-    return { gltf, geometry: mesh.geometry, material: mesh.material, texture };
+    material.map = texture;
+    return { gltf, geometry: mesh.geometry, material, texture };
   }
 
   it('geometry.dispose 抛错：dispose 不抛错、material/texture 仍释放、完成标记真实置位（修复前遍历中断假报成功）', async () => {

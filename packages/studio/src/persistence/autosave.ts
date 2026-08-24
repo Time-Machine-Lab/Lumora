@@ -909,13 +909,18 @@ export class ProjectAutosaver {
     }
   }
 
-  async dispose(): Promise<SaveOutcome> {
-    if (this.disposed) return { ok: true };
-    this.cancelTimer();
-    // 第二十八轮阻断 4：冲刷失败如实返回 —— 失败后不得继续置 disposed/移除
-    // 监听/清 stateListeners，调用方（ProjectPersistence/StudioRuntime）据此
-    // 保留编辑器与存储供重试，绝不「假装已关闭」丢弃未落盘内容。先冲刷
-    // （flush 需在 disposed 置位前读取编辑器项目），再移除监听
+  /**
+   * 卸载前检查（第三十四轮阻断 3 拆分）：flush + recovery 检查 —— **无任何
+   * teardown**（不置 disposed、不移除监听、不清 stateListeners）。失败时
+   * autosaver 保持完整活跃（编辑仍进 autosave、可落盘），调用方（ProjectPersistence
+   * 的 dispose preflight）据此返回可恢复失败；成功也不改变任何状态 —— 终态化
+   * 只发生在 dispose()/forceTeardown()。
+   * 修复前 preflight 直接调 dispose()：flush 成功即置 disposed 并移除监听，
+   * 后续（late store close 等）失败返回 {ok:false} 时宿主保持 UI 但
+   * changed() 已 no-op —— 失败与重试间的新编辑不落盘（死壳）。
+   */
+  async preflightDispose(): Promise<SaveOutcome> {
+    // 冲刷（flush 需在 disposed 置位前读取编辑器项目）
     const outcome = await this.flush();
     if (!outcome.ok) return outcome;
     // 第二十九轮阻断 5：冲刷成功后仍有恢复 fork（任一 uri 的保存失败内容仅存
@@ -930,6 +935,20 @@ export class ProjectAutosaver {
       if (uri === this.currentUri) this.emit({ status: 'error', code: 'recovery-available', message });
       return { ok: false, code: 'recovery-available', message };
     }
+    return { ok: true };
+  }
+
+  /**
+   * 强制终态清理（第三十四轮阻断 3）：仅由 ProjectPersistence 的 commit 段在
+   * preflight 通过后调用 —— preflight 与 commit 之间出现的新编辑若二次冲刷
+   * 失败，dispose() 会返回 {ok:false} 拒绝终态化；但 commit 已不可回退（宿主
+   * 将卸载、运行态已收敛），此时强制移除监听/清理状态，绝不残留窗口级监听
+   * （未落盘内容在 flush 失败路径已进入恢复快照；极端竞态下的瞬时内容随
+   * 运行时整体回收，卸载语义下尽力而为）。
+   */
+  forceTeardown(): void {
+    this.cancelTimer();
+    if (this.disposed) return;
     this.disposed = true;
     if (typeof window !== 'undefined') {
       window.removeEventListener('pagehide', this.handlePageHide);
@@ -938,6 +957,17 @@ export class ProjectAutosaver {
       document.removeEventListener('visibilitychange', this.handleVisibility);
     }
     this.stateListeners.clear();
+  }
+
+  async dispose(): Promise<SaveOutcome> {
+    if (this.disposed) return { ok: true };
+    this.cancelTimer();
+    // 第二十八轮阻断 4：冲刷失败如实返回 —— 失败后不得继续置 disposed/移除
+    // 监听/清 stateListeners，调用方（ProjectPersistence/StudioRuntime）据此
+    // 保留编辑器与存储供重试，绝不「假装已关闭」丢弃未落盘内容
+    const outcome = await this.preflightDispose();
+    if (!outcome.ok) return outcome;
+    this.forceTeardown();
     return { ok: true };
   }
 
