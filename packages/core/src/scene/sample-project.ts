@@ -1,13 +1,13 @@
 import { focalLengthToFovDeg } from './camera-math';
 import type { Project } from './types';
 
-/** 内置示例项目：演示层级、基础几何体、灯光与 50mm 摄像机（16:9 画幅）。 */
+/** 内置示例项目：演示层级、基础几何体、灯光、50mm 摄像机与动画轨道（16:9 画幅）。 */
 export function createSampleProject(uri = 'lumora://sample-project', name = '示例项目'): Project {
   const now = new Date().toISOString();
   return {
     uri,
     name,
-    schemaVersion: 2,
+    schemaVersion: 3,
     createdAt: now,
     revision: 0,
     settings: { fps: 24, aspect: [16, 9] },
@@ -95,6 +95,29 @@ export function createSampleProject(uri = 'lumora://sample-project', name = '示
           far: 200,
           aspect: null,
         },
+      },
+    ],
+    tracks: [
+      {
+        id: 'sample-track-camera-dolly',
+        name: '主摄像机推镜',
+        objectId: 'sample-camera',
+        targetPath: 'position',
+        keyframes: [
+          { time: 0, value: [0, 2.6, 7] },
+          { time: 4, value: [0, 2.6, 3], interpolation: 'step' },
+        ],
+      },
+      {
+        id: 'sample-track-cube-spin',
+        name: '立方体旋转',
+        objectId: 'sample-cube',
+        targetPath: 'rotation',
+        keyframes: [
+          { time: 0, value: [0, 0, 0] },
+          { time: 2, value: [0, Math.PI, 0] },
+          { time: 4, value: [0, Math.PI * 2, 0] },
+        ],
       },
     ],
     assets: [],

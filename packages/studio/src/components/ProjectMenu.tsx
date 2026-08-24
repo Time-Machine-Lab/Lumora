@@ -1,0 +1,704 @@
+import { useEffect, useId, useRef, useState } from 'react';
+import type { CSSProperties } from 'react';
+import { MAX_PACKAGE_TEXT_BYTES, genId } from '@lumora/core';
+import type { Project } from '@lumora/core';
+import type { StudioRuntime } from '../runtime/studio-runtime';
+import type { AutosaveState } from '../persistence/autosave';
+import type { ProjectSummary } from '../persistence/project-storage';
+import { showToast } from './editor/toasts';
+
+interface ProjectMenuProps {
+  runtime: StudioRuntime;
+  project: Project | null;
+}
+
+type ModalState = { kind: 'create' } | { kind: 'rename'; uri: string; initial: string };
+
+/** 保存状态 → 状态徽标文案 */
+function saveBadge(state: AutosaveState): { text: string; tone: 'clean' | 'dirty' | 'error' | 'memory' } | null {
+  switch (state.status) {
+    case 'idle':
+      return null;
+    case 'clean':
+      return { text: '已保存', tone: 'clean' };
+    case 'dirty':
+      return { text: '未保存更改', tone: 'dirty' };
+    case 'saving':
+      return { text: '保存中…', tone: 'dirty' };
+    case 'error':
+      return { text: '保存失败', tone: 'error' };
+    case 'memory':
+      return { text: '仅内存（未持久化）', tone: 'memory' };
+  }
+}
+
+/** Tab 焦点圈闭（模态对话框）：焦点在首/末元素时循环，不逃逸到背景 */
+function trapTabFocus(event: React.KeyboardEvent, container: HTMLElement | null): void {
+  if (event.key !== 'Tab' || !container) return;
+  const items = Array.from(
+    container.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'),
+  ).filter(
+    (element) => !('disabled' in element && (element as HTMLInputElement).disabled) && element.offsetParent !== null,
+  );
+  if (items.length === 0) return;
+  const first = items[0]!;
+  const last = items[items.length - 1]!;
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+/** 读取文件为文本：jsdom/部分 WebView 无 Blob.text()，统一走 FileReader */
+function readFileText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ''));
+    reader.onerror = () => reject(reader.error ?? new Error('无法读取文件内容'));
+    reader.readAsText(file);
+  });
+}
+
+function downloadText(text: string, filename: string): void {
+  const blob = new Blob([text], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export function ProjectMenu({ runtime, project }: ProjectMenuProps) {
+  const persistence = runtime.persistence;
+  const [open, setOpen] = useState(false);
+  const [recent, setRecent] = useState<ProjectSummary[]>([]);
+  const [saveState, setSaveState] = useState<AutosaveState>({ status: 'idle' });
+  const [modal, setModal] = useState<ModalState | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<ProjectSummary | null>(null);
+  const [busy, setBusy] = useState(false);
+  // 导出是否显式包含插件私有设置（pluginData）；凭据族字段任何情况下都不导出（NFR-008）
+  const [includePrivate, setIncludePrivate] = useState(false);
+  const importInputRef = useRef<HTMLInputElement>(null);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  // 窄屏下面板为 fixed 定位，垂直位置按按钮实测（视口坐标系）设置
+  const [dropdownTop, setDropdownTop] = useState<number | null>(null);
+
+  useEffect(() => {
+    const unsubscribe = persistence.events.on('save-state', ({ state }) => setSaveState(state));
+    return () => {
+      unsubscribe.dispose();
+    };
+  }, [persistence]);
+
+  const refreshRecent = async () => {
+    try {
+      setRecent(await persistence.listRecent());
+    } catch (error) {
+      // 第十七轮严重 4：列表加载失败（存储/锁故障）toast 呈现 —— 刷新经
+      // void 触发（toggleMenu），不 catch 即未处理 Promise 且无任何提示
+      showToast(error instanceof Error ? error.message : String(error), 'error');
+    }
+  };
+
+  const toggleMenu = () => {
+    const next = !open;
+    if (next) {
+      void refreshRecent();
+      const button = menuButtonRef.current;
+      if (button) setDropdownTop(button.getBoundingClientRect().bottom + 6);
+    }
+    setOpen(next);
+  };
+
+  const openRecent = async (summary: ProjectSummary) => {
+    setBusy(true);
+    try {
+      const loaded = await persistence.loadProject(summary.uri);
+      if (!loaded.ok) {
+        showToast(loaded.message, 'error');
+        void refreshRecent();
+        return;
+      }
+      // 切换屏障：旧项目未保存变更排空失败时保持旧项目打开，切换被阻止
+      const opened = await runtime.openProject(loaded.project);
+      if (!opened.ok) {
+        showToast(`无法打开「${summary.name}」：${opened.message}`, 'error');
+        return;
+      }
+      setOpen(false);
+    } catch (error) {
+      // 第十七轮严重 4：打开链路（loadProject/切换）意外 reject 兜底 toast，
+      // 不产生未处理 Promise
+      showToast(`无法打开「${summary.name}」：${error instanceof Error ? error.message : String(error)}`, 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const createProject = async (name: string) => {
+    setBusy(true);
+    try {
+      // 切换屏障：旧项目未保存变更排空失败时不新建（旧项目保持打开）
+      const opened = await runtime.openProject(persistence.createProject(name));
+      if (!opened.ok) {
+        showToast(`无法新建：${opened.message}`, 'error');
+        return;
+      }
+      setModal(null);
+      setOpen(false);
+      menuButtonRef.current?.focus();
+      showToast(`已新建项目「${name}」`, 'success');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const renameProject = async (uri: string, name: string) => {
+    setModal(null);
+    setBusy(true);
+    try {
+      const result = await persistence.renameProject(uri, name);
+      if (result.ok) {
+        showToast(`已重命名为「${name.trim()}」`, 'success');
+        void refreshRecent();
+      } else {
+        showToast(result.message, 'error');
+      }
+    } catch (error) {
+      // 第十七轮严重 4：存储/锁故障（rename 类型化失败之外）兜底 toast
+      showToast(`重命名失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const duplicateProject = async (uri: string) => {
+    setBusy(true);
+    try {
+      const result = await persistence.duplicateProject(uri);
+      if (!result.ok) {
+        showToast(result.message, 'error');
+        return;
+      }
+      // 副本二次加载统一边界（第十四轮严重 5）：load 的 reject 与校验失败都归一
+      // 为类型化失败并 CAS 清理副本（清理状态如实报告），绝不产生未处理的 reject
+      const loaded = await persistence.loadCopyForOpen(result.summary.uri, result.fingerprint);
+      if (!loaded.ok) {
+        showToast(loaded.message, 'error');
+        return;
+      }
+      // 复制打开中的项目时内容已以副本落盘：跳过切换排空屏障（flush:false），
+      // 旧项目的未保存快照随后由排空任务尽力保存或转为恢复快照
+      const opened = await runtime.openProject(loaded.project, {
+        flush: uri === project?.uri ? false : undefined,
+      });
+      if (!opened.ok) {
+        showToast(`无法打开副本：${opened.message}`, 'error');
+        return;
+      }
+      showToast(`已复制为「${result.summary.name}」`, 'success');
+      void refreshRecent();
+    } catch (error) {
+      // 兜底 catch（第十五轮严重 5）：facade/loadCopyForOpen 均已归一为类型化
+      // 失败，此处仅防御未覆盖的意外 reject（UI 不产生未处理的 Promise）
+      showToast(`复制失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteProject = async (summary: ProjectSummary) => {
+    setPendingDelete(null);
+    setBusy(true);
+    try {
+      if (project?.uri === summary.uri) {
+        // 关闭即丢弃未保存内容：落盘失败时必须中止删除（内容仍在编辑器/恢复快照中）
+        const closed = await runtime.closeProject();
+        if (!closed.ok) {
+          showToast(`无法删除：${closed.message ?? '未保存更改落盘失败'}`, 'error');
+          return;
+        }
+      }
+      await persistence.deleteProject(summary.uri);
+      showToast(`已删除「${summary.name}」`, 'success');
+      void refreshRecent();
+    } catch (error) {
+      // 第十七轮严重 4：删除失败（facade 归一化后抛错）toast 呈现
+      showToast(`删除失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+    } finally {
+      setBusy(false);
+      // 删除后焦点回到常驻「项目」按钮（被删行的删除按钮已随列表移除，不落 BODY）
+      menuButtonRef.current?.focus();
+    }
+  };
+
+  const exportCurrent = async () => {
+    // 命名空间 + 路径 schema 显式公开导出契约（第十四轮阻断 1/2 + 第十五轮阻断
+    // 1 加固）：core 端只保留插件显式声明可导出的字段/路径，缺失或空声明一律
+    // 整段排除（fail-closed）；宿主直读 manifest.exportableSettings 与
+    // manifest.privateSettings 原样传入 —— 声明与 privateSettings/凭据形态键
+    // 重叠（含整对象声明）由 core 逐条拒绝，不依赖插件自觉声明 privateSettings
+    const publicKeysByPlugin: Record<string, readonly (string | readonly string[])[]> = {};
+    const privateKeysByPlugin: Record<string, readonly string[]> = {};
+    for (const info of runtime.host.listPlugins()) {
+      const manifest = runtime.host.getPluginManifest(info.instanceId);
+      const declarations = manifest?.exportableSettings;
+      publicKeysByPlugin[info.instanceId] = Array.isArray(declarations) ? declarations : [];
+      const privateSettings = manifest?.privateSettings;
+      privateKeysByPlugin[info.instanceId] = Array.isArray(privateSettings) ? privateSettings : [];
+    }
+    const exported = persistence.exportCurrent({ includePrivate, publicKeysByPlugin, privateKeysByPlugin });
+    if (!exported.ok) {
+      showToast(exported.message, 'error');
+      return;
+    }
+    const estimate = await persistence.estimateQuota();
+    if (estimate && exported.bytes > estimate.quota - estimate.usage) {
+      showToast('导出大小接近本地存储配额上限，建议尽快迁移备份', 'error');
+    }
+    downloadText(exported.text, exported.filename);
+    showToast(`已导出工程包「${exported.filename}」`, 'success');
+  };
+
+  const importPackage = async (file: File) => {
+    if (importInputRef.current) importInputRef.current.value = '';
+    // 先于读取的字节量预检（与解析端的文本长度上限一致，拒绝超长文件解码攻击）
+    if (file.size > MAX_PACKAGE_TEXT_BYTES) {
+      showToast(`文件过大（${Math.ceil(file.size / 1024 / 1024)} MB），无法导入`, 'error');
+      return;
+    }
+    setBusy(true);
+    try {
+      const text = await readFileText(file);
+      const imported = await persistence.importPackage(text);
+      if (!imported.ok) {
+        // 可操作错误明细：损坏原因 + 处理建议（AC3）
+        showToast(`导入失败：${imported.error.message}`, 'error');
+        return;
+      }
+      let restored = imported.project;
+      // 本地已存在同 uri 项目：视为副本导入，避免后续自动保存覆盖本地记录
+      if (await persistence.hasLocal(restored.uri)) {
+        restored = { ...restored, uri: `lumora://project/${genId('p')}`, name: `${restored.name}（导入）` };
+      }
+      // 切换屏障：旧项目未保存变更排空失败时保持旧项目打开，导入被阻止
+      const opened = await runtime.openProject(restored);
+      if (!opened.ok) {
+        showToast(`导入失败：${opened.message}`, 'error');
+        return;
+      }
+      setOpen(false);
+      menuButtonRef.current?.focus();
+      if (imported.warnings.length > 0) {
+        const names = imported.warnings.map((w) => w.name).join('、');
+        showToast(`已导入；${imported.warnings.length} 个资产内容缺失（${names}）`, 'error');
+      } else {
+        showToast(`已导入项目「${restored.name}」`, 'success');
+      }
+    } catch (error) {
+      showToast(`读取文件失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** 冲突解决「加载较新版本」：以本地保存内容为基线重开（显式丢弃未保存更改） */
+  const resolveConflict = async () => {
+    setBusy(true);
+    try {
+      const result = await persistence.reloadOpenProject();
+      if (!result.ok) {
+        showToast(result.message, 'error');
+        return;
+      }
+      showToast('已加载本地较新版本', 'success');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** 冲突/恢复解决「另存副本」：未保存内容另存为新项目并打开 */
+  const saveAsCopy = async () => {
+    if (!project) return;
+    setBusy(true);
+    try {
+      // 源内容决策（第八轮 #2 + 第二十九轮阻断 3）：当前项目有未保存编辑时以
+      // 编辑器现场为准（generation = null）—— 慢速保存/重试落盘期间的新编辑
+      // 不得被旧恢复快照覆盖丢弃；否则取该 uri 最新代恢复 fork（绑定代数）
+      const source = persistence.resolveSaveAsCopySource(project.uri);
+      if (source) {
+        const saved = await persistence.saveSnapshotAsNew(source.source);
+        if (!saved.ok) {
+          showToast(saved.message, 'error');
+          return;
+        }
+        // 第二十九轮阻断 3：只清除「被消费的那一代」恢复 fork —— 源为编辑器
+        // 现场（复制当前内容）时不清除任何历史 fork：旧 fork 内容仅存于恢复区，
+        // 保全当前副本绝不沉没旧内容；其余 fork 保留并继续锁存 recovery-available
+        if (source.generation !== null) {
+          persistence.clearRecoveryGeneration(project.uri, source.generation, source.fingerprint);
+        }
+        // 未保存内容已保全：跳过切换排空屏障（flush:false）
+        const opened = await runtime.openProject(saved.project, { flush: false });
+        if (!opened.ok) {
+          showToast(`无法打开副本：${opened.message}`, 'error');
+          return;
+        }
+        setOpen(false);
+        showToast(`未保存更改已另存为「${saved.project.name}」`, 'success');
+        void refreshRecent();
+        return;
+      }
+      const dup = await persistence.duplicateProject(project.uri);
+      if (!dup.ok) {
+        showToast(dup.message, 'error');
+        return;
+      }
+      // 存储复制分支与最近复制同一统一边界（第十四轮严重 5）：load 的 reject
+      // （修复前为未处理的 Promise）与校验失败都归一为类型化失败并 CAS 清理
+      // 副本（清理状态如实报告），ok:false 分支绝不静默报成功
+      const loaded = await persistence.loadCopyForOpen(dup.summary.uri, dup.fingerprint);
+      if (!loaded.ok) {
+        showToast(loaded.message, 'error');
+        return;
+      }
+      const opened = await runtime.openProject(loaded.project, { flush: false });
+      if (!opened.ok) {
+        showToast(`无法打开副本：${opened.message}`, 'error');
+        return;
+      }
+      setOpen(false);
+      showToast(`未保存更改已另存为「${dup.summary.name}」`, 'success');
+      void refreshRecent();
+    } catch (error) {
+      // 兜底 catch（第十五轮严重 5）：saveSnapshotAsNew/duplicateProject 均已
+      // 归一为类型化失败，此处仅防御未覆盖的意外 reject（UI 不产生未处理 Promise）
+      showToast(`另存副本失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const badge = saveBadge(saveState);
+  const currentUri = project?.uri ?? null;
+
+  return (
+    // Escape 在包含 trigger + dropdown 的根容器上处理：刚点击「项目」后焦点仍在
+    // trigger 上，事件不经过 dropdown，只有根容器能覆盖两种焦点位置
+    <div
+      className="lumora-project-menu"
+      onKeyDown={(e) => {
+        if (e.key === 'Escape' && open && !modal && !pendingDelete) {
+          e.stopPropagation();
+          e.preventDefault();
+          setOpen(false);
+          menuButtonRef.current?.focus();
+        }
+      }}
+    >
+      <button
+        ref={menuButtonRef}
+        type="button"
+        className="lumora-button"
+        data-testid="project-menu"
+        aria-expanded={open}
+        onClick={toggleMenu}
+      >
+        项目
+      </button>
+      {badge && (
+        <span className={`lumora-project-menu__badge lumora-project-menu__badge--${badge.tone}`} data-testid="save-state-badge">
+          {badge.text}
+          {saveState.status === 'error' && (
+            <span className="lumora-project-menu__error-actions">
+              <button
+                type="button"
+                className="lumora-project-menu__retry"
+                data-testid="save-reload"
+                title="以本地较新保存内容为准，丢弃未保存更改"
+                onClick={() => void resolveConflict()}
+              >
+                加载较新版本
+              </button>
+              <button
+                type="button"
+                className="lumora-project-menu__retry"
+                data-testid="save-saveas"
+                title="将当前未保存内容另存为新项目"
+                onClick={() => void saveAsCopy()}
+              >
+                另存副本
+              </button>
+              <button
+                type="button"
+                className="lumora-project-menu__retry"
+                data-testid="save-retry"
+                onClick={() => {
+                  if (saveState.status === 'error' && saveState.code === 'recovery-available' && project) {
+                    void persistence.retryRecovery(project.uri).then((result) => {
+                      showToast(result.ok ? '恢复快照已重新保存' : `重试失败：${result.message}`, result.ok ? 'success' : 'error');
+                    });
+                  } else {
+                    void persistence.flushPending().then((result) => {
+                      if (!result.ok) showToast(`保存失败：${result.message}`, 'error');
+                    });
+                  }
+                }}
+              >
+                重试
+              </button>
+            </span>
+          )}
+        </span>
+      )}
+      {open && (
+        <div
+          className="lumora-project-menu__dropdown"
+          data-testid="project-menu-dropdown"
+          style={dropdownTop !== null ? ({ '--lumora-menu-top': `${dropdownTop}px` } as CSSProperties) : undefined}
+        >
+          <div className="lumora-project-menu__actions">
+            <button type="button" className="lumora-button" data-testid="project-new" onClick={() => setModal({ kind: 'create' })}>
+              新建项目
+            </button>
+            <button
+              type="button"
+              className="lumora-button"
+              data-testid="project-import"
+              disabled={busy}
+              onClick={() => importInputRef.current?.click()}
+            >
+              导入工程包…
+            </button>
+            <button
+              type="button"
+              className="lumora-button"
+              data-testid="project-export"
+              disabled={!project}
+              onClick={() => void exportCurrent()}
+            >
+              导出工程包…
+            </button>
+            <input
+              ref={importInputRef}
+              type="file"
+              accept=".lumora,application/json"
+              style={{ display: 'none' }}
+              data-testid="project-import-input"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) void importPackage(file);
+              }}
+            />
+          </div>
+          <label className="lumora-project-menu__export-private">
+            <input
+              type="checkbox"
+              data-testid="project-export-include-private"
+              checked={includePrivate}
+              disabled={!project}
+              onChange={(e) => setIncludePrivate(e.target.checked)}
+            />
+            <span>导出包含插件私有设置（凭据永不导出）</span>
+          </label>
+          <div className="lumora-project-menu__recent">
+            <div className="lumora-project-menu__recent-title">最近项目</div>
+            {recent.length === 0 && <div className="lumora-project-menu__recent-empty">暂无本地项目</div>}
+            {recent.map((summary) => (
+              <div key={summary.uri} className="lumora-project-menu__recent-item" data-testid="recent-project">
+                <button
+                  type="button"
+                  className="lumora-project-menu__recent-open"
+                  disabled={busy || summary.uri === currentUri}
+                  title={summary.uri === currentUri ? '当前打开中' : undefined}
+                  onClick={() => void openRecent(summary)}
+                >
+                  <span className="lumora-project-menu__recent-name">{summary.name}</span>
+                  <span className="lumora-project-menu__recent-meta">
+                    {new Date(summary.savedAt).toLocaleString()} · r{summary.revision}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className="lumora-project-menu__recent-rename"
+                  data-testid="recent-rename"
+                  title="重命名"
+                  onClick={() => setModal({ kind: 'rename', uri: summary.uri, initial: summary.name })}
+                >
+                  重命名
+                </button>
+                <button
+                  type="button"
+                  className="lumora-project-menu__recent-dup"
+                  data-testid="recent-duplicate"
+                  title="复制"
+                  onClick={() => void duplicateProject(summary.uri)}
+                >
+                  复制
+                </button>
+                <button
+                  type="button"
+                  className="lumora-project-menu__recent-del"
+                  data-testid="recent-delete"
+                  title="删除"
+                  onClick={() => setPendingDelete(summary)}
+                >
+                  删除
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {modal && (
+        <ProjectNameModal
+          title={modal.kind === 'create' ? '新建项目' : '重命名项目'}
+          initial={modal.kind === 'rename' ? modal.initial : '未命名项目'}
+          confirmLabel={modal.kind === 'create' ? '新建' : '重命名'}
+          busy={busy}
+          onCancel={() => setModal(null)}
+          onConfirm={(name) => {
+            if (modal.kind === 'create') void createProject(name);
+            else void renameProject(modal.uri, name);
+          }}
+        />
+      )}
+      {pendingDelete && (
+        <ConfirmDeleteDialog
+          name={pendingDelete.name}
+          busy={busy}
+          onCancel={() => setPendingDelete(null)}
+          onConfirm={() => void deleteProject(pendingDelete)}
+        />
+      )}
+    </div>
+  );
+}
+
+interface ProjectNameModalProps {
+  title: string;
+  initial: string;
+  confirmLabel: string;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: (name: string) => void;
+}
+
+function ProjectNameModal({ title, initial, confirmLabel, busy, onCancel, onConfirm }: ProjectNameModalProps) {
+  const titleId = useId();
+  const inputId = useId();
+  const boxRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [name, setName] = useState(initial);
+  useEffect(() => {
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    inputRef.current?.focus();
+    inputRef.current?.select();
+    return () => {
+      previouslyFocused?.focus();
+    };
+  }, []);
+  const trimmed = name.trim();
+  return (
+    <div className="lumora-project-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} data-testid="project-dialog">
+      <div className="lumora-project-dialog__box" ref={boxRef} onKeyDown={(e) => {
+        if (e.key === 'Escape') {
+          // 对话框内 Escape 自行消化：不得冒泡到全局键处理（会误清编辑器选择）
+          e.stopPropagation();
+          e.preventDefault();
+          onCancel();
+          return;
+        }
+        trapTabFocus(e, boxRef.current);
+      }}>
+        <div className="lumora-project-dialog__title" id={titleId}>{title}</div>
+        <label className="lumora-project-dialog__label" htmlFor={inputId}>项目名称</label>
+        <input
+          ref={inputRef}
+          id={inputId}
+          className="lumora-project-dialog__input"
+          data-testid="project-name-input"
+          value={name}
+          maxLength={60}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && trimmed) onConfirm(name);
+          }}
+        />
+        <div className="lumora-project-dialog__actions">
+          <button type="button" className="lumora-button" onClick={onCancel}>
+            取消
+          </button>
+          <button
+            type="button"
+            className="lumora-button"
+            data-testid="project-name-confirm"
+            disabled={!trimmed || busy}
+            onClick={() => onConfirm(name)}
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface ConfirmDeleteDialogProps {
+  name: string;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}
+
+function ConfirmDeleteDialog({ name, busy, onCancel, onConfirm }: ConfirmDeleteDialogProps) {
+  const titleId = useId();
+  const boxRef = useRef<HTMLDivElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    cancelRef.current?.focus();
+    return () => {
+      previouslyFocused?.focus();
+    };
+  }, []);
+  return (
+    <div className="lumora-project-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} data-testid="delete-dialog">
+      <div className="lumora-project-dialog__box" ref={boxRef} onKeyDown={(e) => {
+        if (e.key === 'Escape') {
+          // 对话框内 Escape 自行消化：不得冒泡到全局键处理（会误清编辑器选择）
+          e.stopPropagation();
+          e.preventDefault();
+          onCancel();
+          return;
+        }
+        trapTabFocus(e, boxRef.current);
+      }}>
+        <div className="lumora-project-dialog__title" id={titleId}>删除项目</div>
+        <p className="lumora-project-dialog__body">
+          确定删除「{name}」吗？本地保存的数据将被移除，此操作不可撤销。
+        </p>
+        <div className="lumora-project-dialog__actions">
+          <button ref={cancelRef} type="button" className="lumora-button" onClick={onCancel}>
+            取消
+          </button>
+          <button
+            type="button"
+            className="lumora-button lumora-button--danger"
+            data-testid="confirm-delete"
+            disabled={busy}
+            onClick={onConfirm}
+          >
+            删除
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

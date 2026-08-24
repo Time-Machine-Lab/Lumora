@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { PluginDescriptor } from '@lumora/core';
+import type { Manifest, PluginDescriptor } from '@lumora/core';
 import { LumoraStudio } from '@lumora/studio';
 import type { LumoraStudioHandle } from '@lumora/studio';
 import mockManifest from '@lumora/mock-plugin/lumora.plugin.json';
@@ -61,13 +61,116 @@ const explodingPlugin: PluginDescriptor = {
   }),
 };
 
-const PLUGINS: PluginDescriptor[] = [mockPlugin, brokenManifestPlugin, brokenEnginePlugin, explodingPlugin];
+/** e2e 覆盖：真实 manifest 声明 exportableSettings（含 BENIGN 歧义键）→
+ *  includePrivate 导出经 ProjectMenu 下载链路按声明投影，com.example.settings
+ *  命名空间随包携带声明的公开键，其余字段（含凭据形态键）绝不进包 */
+const settingsPlugin: PluginDescriptor = {
+  manifest: {
+    schemaVersion: '1',
+    id: 'com.example.settings',
+    name: '设置导出插件',
+    version: '0.1.0',
+    entry: './dist/index.js',
+    exportableSettings: [
+      'theme',
+      'model',
+      'tokenBudget',
+      'authMode',
+      'cookieConsent',
+      'cookieSettings',
+      'sessionMode',
+    ],
+    privateSettings: ['serverUrl'],
+  } satisfies Manifest,
+  entry: async () => ({
+    default: {
+      activate: (context) => context.contribute({}),
+    },
+  }),
+};
+
+/** e2e 覆盖：manifest 缺失 → 注册即失败（fail-closed），其 pluginData 命名空间
+ *  无任何声明依据，includePrivate 导出整段排除 */
+const noManifestPlugin: PluginDescriptor = {
+  manifest: undefined as unknown as Manifest,
+  entry: async () => ({
+    default: {
+      activate: (context) => context.contribute({}),
+    },
+  }),
+};
+
+/** e2e 覆盖：真实 manifest 声明凭据形态键（exportableSettings 含 apiKey）→
+ *  构建期整包拒绝，includePrivate 导出不产生下载。仅 ?plugins=leaky 时注册，
+ *  避免污染常规宿主的导出路径 */
+const leakySettingsPlugin: PluginDescriptor = {
+  manifest: {
+    schemaVersion: '1',
+    id: 'com.example.leaky',
+    name: '泄漏声明插件',
+    version: '0.1.0',
+    entry: './dist/index.js',
+    exportableSettings: ['apiKey', 'theme'],
+  } satisfies Manifest,
+  entry: async () => ({
+    default: {
+      activate: (context) => context.contribute({}),
+    },
+  }),
+};
+
+/** 第三十轮一般 4：逐类真实 manifest 显式声明凭据键 —— B1 无边界全小写复合
+ *  （sessionid）、S7 session/cookie 系列（cookieHeader）、CJK 敏感词（访问令牌）
+ *  各注册独立命名空间插件；仅 ?plugins=leaky-<类别> 时注册对应类别，
+ *  includePrivate 导出逐类断言整包拒绝且不产生下载。
+ *  id 必须为反向域名风格（validateManifest ID_PATTERN 不允许连字符），
+ *  否则 manifest 校验失败、声明不生效、导出静默剥离而非整包拒绝 */
+const leakyCategoryPlugin = (id: string, name: string, credentialKey: string): PluginDescriptor => ({
+  manifest: {
+    schemaVersion: '1',
+    id,
+    name,
+    version: '0.1.0',
+    entry: './dist/index.js',
+    exportableSettings: [credentialKey, 'theme'],
+  } satisfies Manifest,
+  entry: async () => ({
+    default: {
+      activate: (context) => context.contribute({}),
+    },
+  }),
+});
+const LEAKY_B1 = leakyCategoryPlugin('com.example.leaky.b1', '泄漏声明插件 B1', 'sessionid');
+const LEAKY_S7 = leakyCategoryPlugin('com.example.leaky.s7', '泄漏声明插件 S7', 'cookieHeader');
+const LEAKY_CJK = leakyCategoryPlugin('com.example.leaky.cjk', '泄漏声明插件 CJK', '访问令牌');
+
+const LEAKY_PLUGINS = new URLSearchParams(window.location.search).get('plugins');
+
+const PLUGINS: PluginDescriptor[] = [
+  mockPlugin,
+  brokenManifestPlugin,
+  brokenEnginePlugin,
+  explodingPlugin,
+  settingsPlugin,
+  noManifestPlugin,
+  ...(LEAKY_PLUGINS === 'leaky' ? [leakySettingsPlugin] : []),
+  ...(LEAKY_PLUGINS === 'leaky-b1' ? [LEAKY_B1] : []),
+  ...(LEAKY_PLUGINS === 'leaky-s7' ? [LEAKY_S7] : []),
+  ...(LEAKY_PLUGINS === 'leaky-cjk' ? [LEAKY_CJK] : []),
+];
 
 /** 默认只记录事件摘要；?debug=full 时输出完整 payload（大数据量下会产生 GB 级字符串，仅限调试） */
 const DEBUG_FULL = new URLSearchParams(window.location.search).get('debug') === 'full';
 
+/** 本地存储后端选择：?storage=opfs 使用 OPFS，缺省 IndexedDB（持久化门面可切换，TML-53 范围项） */
+const STORAGE = new URLSearchParams(window.location.search).get('storage') === 'opfs' ? 'opfs' : 'indexeddb';
+
 export default function App() {
   const [mounted, setMounted] = useState(true);
+  // 第三十一轮严重 3：卸载进行中（close() 未 settle）时禁用触发按钮 ——
+  // 双击/连点不再并发进入卸载流程；close() 本身是 single-flight（重复调用
+  // 共享同一 in-flight 裁决），此处是 UI 层对同一问题的第一道防线
+  const [closing, setClosing] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const handleRef = useRef<LumoraStudioHandle | null>(null);
 
@@ -92,11 +195,26 @@ export default function App() {
     };
   }, [mounted]);
 
-  const toggleMount = () => {
+  const toggleMount = async () => {
     if (mounted) {
-      const subscriptionCount = handleRef.current?.runtime.events.handlerCount ?? 0;
-      appendLog(`卸载 Studio：释放前事件订阅数 ${subscriptionCount} —— 运行时已释放`);
-      setMounted(false);
+      // 第三十一轮严重 3：卸载进行中禁止再次进入（双击/连点防护）
+      if (closing) return;
+      setClosing(true);
+      try {
+        const subscriptionCount = handleRef.current?.runtime.events.handlerCount ?? 0;
+        // 第三十轮严重 6：卸载走 handle.close() 可等待屏障 —— 冲刷失败/未解决
+        // 恢复 fork 时释放被拒绝，保持挂载并记录原因（未落盘内容仍可恢复），
+        // 绝不「假装已卸载」丢弃内容
+        const outcome = await handleRef.current?.close();
+        if (outcome && !outcome.ok) {
+          appendLog(`卸载被拒绝：${outcome.message ?? '运行时释放失败'} —— Studio 保持挂载，请先解决未保存内容`);
+          return;
+        }
+        appendLog(`卸载 Studio：释放前事件订阅数 ${subscriptionCount} —— 运行时已释放`);
+        setMounted(false);
+      } finally {
+        setClosing(false);
+      }
     } else {
       setMounted(true);
     }
@@ -110,6 +228,7 @@ export default function App() {
           <button
             type="button"
             data-testid="reopen-last-export"
+            disabled={closing}
             onClick={() => {
               const raw = localStorage.getItem('lumora.demo.last-export');
               if (!raw) {
@@ -126,14 +245,14 @@ export default function App() {
           >
             重开上次导出（新运行时）
           </button>
-          <button type="button" data-testid="studio-mount-toggle" onClick={toggleMount}>
-            {mounted ? '卸载 Studio（释放资源）' : '重新挂载 Studio'}
+          <button type="button" data-testid="studio-mount-toggle" disabled={closing} onClick={toggleMount}>
+            {closing ? '正在释放资源…' : mounted ? '卸载 Studio（释放资源）' : '重新挂载 Studio'}
           </button>
         </div>
       </header>
       <div className="host__layout">
         {mounted ? (
-          <LumoraStudio ref={handleRef} plugins={PLUGINS} hostVersion="0.1.0" className="host__studio" />
+          <LumoraStudio ref={handleRef} plugins={PLUGINS} hostVersion="0.1.0" storage={STORAGE} className="host__studio" />
         ) : (
           <div className="host__placeholder" data-testid="studio-placeholder">
             Studio 已卸载 —— WebGL 场景、插件贡献项与事件订阅均已释放

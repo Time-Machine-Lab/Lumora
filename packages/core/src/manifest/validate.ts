@@ -21,6 +21,16 @@ export const manifestSchema = z
       .optional(),
     contributes: z.array(z.enum(['panel', 'command', 'toolbar', 'assetLoader', 'aiProvider', 'exporter'])).optional(),
     enabled: z.boolean().optional(),
+    /** 插件显式声明 pluginData[instanceId] 下这些顶层键为私有（导出含私有设置时
+     *  剥离，不进工程包）。仅声明才剥离 —— 凭据隔离是结构化契约（第十一轮）。 */
+    privateSettings: z.array(z.string()).optional(),
+    /** 插件显式公开导出契约（第十四轮阻断 1）：声明 pluginData[instanceId] 下哪些
+     *  字段/路径可随工程包导出。元素为顶层键字符串（整值导出）或路径数组
+     *  （['profile', 'username'] 逐层递归投影）；缺失或空声明 = 无可导出内容 =
+     *  整个命名空间不导出（fail-closed，凭据永不导出不依赖插件自觉声明）。
+     *  宿主读取后原样传入 buildProjectPackage 的 publicKeysByPlugin，不做减法
+     *  过滤。 */
+    exportableSettings: z.array(z.union([z.string(), z.array(z.string())])).optional(),
   })
   .strict();
 

@@ -16,7 +16,7 @@ import {
   updateObject,
 } from '../scene/scene-graph';
 import { deepFreeze } from '../scene/immutable';
-import { validateProjectSchema, validateSceneObjectData } from '../scene/validate';
+import { validateProjectSchema, validateProjectStructure, validateSceneObjectData } from '../scene/validate';
 import { isSceneObject } from '../scene/types';
 import type { AssetData, Project, SceneObjectData, TransformData } from '../scene/types';
 import { TypedEventEmitter } from '../events/typed-event-emitter';
@@ -164,6 +164,12 @@ export class SceneEditor {
   private sessionToken = 0;
   /** 已释放（runtime dispose）：任何写入/提交一律拒绝 */
   private disposed = false;
+  /** 写准入已关闭（第三十八轮阻断 1）：持久化 seal 裁决成功的同一同步线性化段
+   *  置位 —— 此后一切写操作明确失败，读与最终资源清理（dispose）不受影响。
+   *  与 disposed 分离：disposed 后读也终态（状态置空、事件总线关闭），
+   *  admissionClosed 仅关闭写入准入，供 seal 到终态清理之间的真实异步窗口
+   *  （插件 async deactivate 挂起等）使用 */
+  private admissionClosed = false;
   /** 每次应用状态的单调序号（openProject/提交/撤销/重做各取新值） */
   private revisionCounter = 0;
   /** 状态变迁版本（R10-M1）：project/selection/view 三类状态任何一次实际写入
@@ -246,9 +252,29 @@ export class SceneEditor {
     return this.sessionToken;
   }
 
+  /**
+   * 状态变迁代数（mutationVersion）：任何状态写（提交/撤销/重做/openProject/
+   * 选择/视图写/dispose）都递增；异步流程（自动保存重试等）以此复验
+   * 「期间无编辑」—— 严格操作代数，不以内容比较替代（编辑→撤销可产生内容
+   * 相等的新引用，指纹比较会漏判，第八轮 #6）。
+   */
+  getMutationVersion(): number {
+    return this.mutationVersion;
+  }
+
   /** token 是否仍为当前会话 */
   isCurrentSession(token: number): boolean {
     return token === this.sessionToken;
+  }
+
+  /**
+   * 关闭写准入（第三十八轮阻断 1）：autosaver 密封裁决成功的同一同步线性化段
+   * 调用 —— 此后所有写操作明确失败（addObject 等返回「未打开项目」），读不受
+   * 影响，最终资源清理仍由 dispose() 完成。幂等；preflight 失败路径不调用它
+   * （编辑保持可落盘、可重试）。与 disposed 分离，保证终态清理不被跳过早退。
+   */
+  closeAdmission(): void {
+    this.admissionClosed = true;
   }
 
   /**
@@ -278,7 +304,7 @@ export class SceneEditor {
     // 选择严格限定在活动场景可达集内：跨场景对象不可选中；重复 ID 首次出现去重（R8-8）。
     // 读取 ids 期间可能触发 getter 副作用（dispose/嵌套写），读取后必须复验版本（R10-M1）
     const next = project ? this.filterSelection(project, ids) : [];
-    if (this.disposed || this.mutationVersion !== version) return;
+    if (this.disposed || this.admissionClosed || this.mutationVersion !== version) return;
     if (next.length === this.selection.length && next.every((id, i) => id === this.selection[i])) return;
     this.selection = next;
     this.mutationVersion += 1;
@@ -323,6 +349,17 @@ export class SceneEditor {
     );
     // 机位视图按活动场景隔离：transition 从下一个项目推导（机位不可达 → 导演视图）
     return result;
+  }
+
+  /** 重命名项目（FR-001）：作为一步历史，名称变化同样递增 revision 触发自动保存 */
+  setProjectName(name: string): Result {
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
+    const trimmed = name.trim();
+    if (!trimmed) return failure('项目名称不能为空');
+    if (project.name === trimmed) return { ok: true };
+    return this.commit(baseline, { ...project, name: trimmed }, `重命名项目为「${trimmed}」`);
   }
 
   setActiveCamera(objectId: string | null): Result {
@@ -389,6 +426,9 @@ export class SceneEditor {
     }
     const removed = ids.size;
     let next = removeObjects(project, ids);
+    // 轨道归属其驱动对象（TML-88）：对象被删除后，绑定该对象的轨道一并移除，
+    // 保证轨道引用不悬空（undo 时随历史快照整体恢复）
+    next = { ...next, tracks: next.tracks.filter((track) => !ids.has(track.objectId)) };
     const unreferenced = new Set(collectUnreferencedAssets(next).map((a) => a.id));
     next = removeAssets(next, unreferenced);
     const parentId = baseline.selection
@@ -552,8 +592,11 @@ export class SceneEditor {
    * 项目为 owned immutable（每次变更产生新 Project，旧引用递归冻结、永不改变），
    * 因此直接持有冻结引用即可作为拖动前状态——不做结构化克隆，
    * 避免复制/序列化完整二进制 payload（大模型历史步骤与撤销无重负担）。
+   * 第三十九轮阻断 1：disposed/admissionClosed 后 no-op —— seal 后不得写入
+   * dragSnapshot（拖动事务基准同样是编辑器写状态）。
    */
   beginTransform(): void {
+    if (this.disposed || this.admissionClosed) return;
     const project = this.project;
     if (project) this.dragSnapshot = { project, selection: [...this.selection] };
   }
@@ -797,7 +840,7 @@ export class SceneEditor {
    * {project, epoch, session}，外部窗口（克隆/回调/getter）后 guardReentry 复验。
    */
   private beginIngress(): Baseline | null {
-    if (this.disposed || !this.project) return null;
+    if (this.disposed || this.admissionClosed || !this.project) return null;
     return {
       project: this.project,
       selection: [...this.selection],
@@ -813,7 +856,7 @@ export class SceneEditor {
    * 不得移动历史、不得覆盖内层结果、不得复活已释放编辑器。
    */
   private guardReentry(baseline: Baseline): { ok: false; error: Error } | null {
-    if (this.disposed) return { ok: false, error: new Error('编辑器已释放') };
+    if (this.disposed || this.admissionClosed) return { ok: false, error: new Error('编辑器已释放') };
     if (
       this.sessionToken !== baseline.session ||
       this.mutationVersion !== baseline.version ||
@@ -830,12 +873,13 @@ export class SceneEditor {
   }
 
   /**
-   * 视图基线复验（R10-M1，幂等）：dispose 或任何状态写（嵌套视图写/嵌套提交/
-   * openProject/undo/redo）都使本次视图写失效——不得覆盖内层写入结果。
+   * 视图基线复验（R10-M1，幂等）：dispose、写准入关闭（第三十九轮阻断 1）或
+   * 任何状态写（嵌套视图写/嵌套提交/openProject/undo/redo）都使本次视图写
+   * 失效——不得覆盖内层写入结果、不得跨过刚建立的线性化点提交。
    * 视图快照按值比较兜底：即使某处视图写漏递增版本，也能被捕获。
    */
   private guardViewReentry(baseline: ViewBaseline): boolean {
-    if (this.disposed) return true;
+    if (this.disposed || this.admissionClosed) return true;
     if (this.mutationVersion !== baseline.version) return true;
     return !sameViewState(this.view, baseline.view);
   }
@@ -1006,106 +1050,20 @@ export class SceneEditor {
 
   /**
    * 项目校验（O(n)：对象索引 + 三色 parent 链检测 + 归属根索引，不做整项目扫描）：
-   * 完整 schema 与有限数值校验（validateProjectSchema）→ 父引用存在 →
-   * 父子循环 → 根列表一致性（parentId === null ⇔ 恰好出现在一个场景根列表）→
-   * 活动场景与活动机位可达性（归属索引单次构建，C 个活动机位场景各 O(1)）。
+   * 完整 schema 与有限数值校验（validateProjectSchema）→ 共享纯函数
+   * validateProjectStructure（父引用存在、父子循环、根列表一致性、活动场景与
+   * 活动机位可达性 —— 与加载边界/工程包导入同一套完整校验，第六轮 #2）。
    * 不合法即抛错（openProject 同步失败；提交路径为编辑器自身不变量的防御性校验）。
    */
   private validateProject(project: Project): void {
     const schemaProblem = validateProjectSchema(project);
     if (schemaProblem) throw new Error(schemaProblem);
-    const byId = new Map<string, SceneObjectData>();
-    for (const object of project.objects) {
-      if (byId.has(object.id)) throw new Error(`对象数据不合法：${object.id}`);
-      byId.set(object.id, object);
-    }
-    for (const object of project.objects) {
-      if (object.parentId !== null && !byId.has(object.parentId)) {
-        throw new Error(`对象缺少父级：${object.id}`);
-      }
-    }
-    // 三色循环检测（O(n) 摊还）：顺序遍历 parent 链，路径内重复即循环；
-    // 已确认无环（'ok'）的链直接复用，不重复走
-    const status = new Map<string, 'in-progress' | 'ok'>();
-    for (const object of project.objects) {
-      const path: string[] = [];
-      let cursor: SceneObjectData | undefined = object;
-      while (cursor && cursor.parentId !== null) {
-        const s = status.get(cursor.id);
-        if (s === 'ok') break;
-        if (s === 'in-progress') throw new Error(`父子关系存在循环：${cursor.id}`);
-        status.set(cursor.id, 'in-progress');
-        path.push(cursor.id);
-        cursor = byId.get(cursor.parentId);
-      }
-      for (const id of path) status.set(id, 'ok');
-    }
-    // 根列表一致性：rootObjectIds 引用合法根对象；每个根对象恰好出现一次
-    const rootCount = new Map<string, number>();
-    for (const scene of project.scenes) {
-      for (const rootId of scene.rootObjectIds) {
-        const root = byId.get(rootId);
-        if (!root || root.parentId !== null) throw new Error(`场景根列表引用非法：${rootId}`);
-        rootCount.set(rootId, (rootCount.get(rootId) ?? 0) + 1);
-      }
-    }
-    for (const object of project.objects) {
-      if (object.parentId === null && !rootCount.has(object.id)) {
-        throw new Error(`孤立根对象：${object.id}`);
-      }
-    }
-    for (const [rootId, count] of rootCount) {
-      if (count > 1) throw new Error(`根对象重复挂载：${rootId}`);
-    }
-    const scene = project.scenes.find((s) => s.id === project.activeSceneId);
-    if (!scene) throw new Error('活动场景不存在');
-    // 所有场景的 activeCameraId 都必须指向本场景可达的相机（R6：非活动场景
-    // 同样校验）。根一致性 ⇒ 无环单父森林中每对象沿父链上溯唯一根、场景子树
-    // 不相交 → 单次构建归属根索引（O(N) 摊还路径压缩）+ 场景根集合，机位校验
-    // 收敛 O(1)（替代每场景 isReachableFrom 全量重建 childrenOf 的 O(C·N)，R13-1）。
-    // 无任何活动机位场景时校验空转，跳过索引构建（R11-1-T1 的 Map#set 24n
-    // 契约：零活动机位项目不得因新增构建引入任何额外 set）
-    if (project.scenes.some((s) => s.activeCameraId !== null)) {
-      const rootOf = new Map<string, string>();
-      const resolvedRoot = new Map<string, string>();
-      for (const object of project.objects) {
-        if (object.parentId === null) {
-          rootOf.set(object.id, object.id);
-          continue;
-        }
-        const path: string[] = [];
-        let cursor: SceneObjectData | undefined = object;
-        let rootId: string | null = null;
-        while (cursor && cursor.parentId !== null) {
-          const cached = resolvedRoot.get(cursor.id);
-          if (cached !== undefined) {
-            rootId = cached;
-            break;
-          }
-          path.push(cursor.id);
-          cursor = byId.get(cursor.parentId);
-        }
-        if (rootId === null && cursor) rootId = cursor.id;
-        for (const id of path) resolvedRoot.set(id, rootId!);
-        rootOf.set(object.id, rootId!);
-      }
-      const sceneRoots = new Map<string, Set<string>>();
-      for (const s of project.scenes) sceneRoots.set(s.id, new Set(s.rootObjectIds));
-      for (const s of project.scenes) {
-        if (s.activeCameraId === null) continue;
-        const camera = byId.get(s.activeCameraId);
-        if (!camera || camera.type !== 'camera') {
-          throw new Error(`场景「${s.name}」的机位不存在或不是相机`);
-        }
-        if (!sceneRoots.get(s.id)!.has(rootOf.get(s.activeCameraId)!)) {
-          throw new Error(`场景「${s.name}」的机位不属于该场景`);
-        }
-      }
-    }
+    const structureProblem = validateProjectStructure(project);
+    if (structureProblem) throw new Error(structureProblem);
   }
 
   private assertAlive(): void {
-    if (this.disposed) throw new Error('编辑器已释放');
+    if (this.disposed || this.admissionClosed) throw new Error('编辑器已释放');
   }
 
   /** 拖动前后是否等价：仅比较目标对象三向量（局部比较，不序列化项目） */

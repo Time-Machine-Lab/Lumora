@@ -1,11 +1,13 @@
 import { SCENE_OBJECT_TYPES } from './types';
-import type { AssetData, Project, SceneObjectData, TransformData, Vec3 } from './types';
+import type { AssetData, Project, SceneObjectData, TrackData, TransformData, Vec3 } from './types';
 
 /** 完整 schema + 有限数值校验：候选状态在提交/打开前必须通过（M1，TML-57 第五轮）。 */
 
 export const PRIMITIVE_KINDS = ['box', 'sphere', 'cone', 'torus', 'plane'] as const;
 export const LIGHT_KINDS = ['directional', 'point', 'spot'] as const;
 export const CAMERA_PROJECTIONS = ['perspective'] as const;
+export const TRACK_TARGET_PATHS = ['position', 'rotation', 'scale'] as const;
+export const TRACK_INTERPOLATIONS = ['linear', 'step'] as const;
 
 // ---------- 非 JSON 结构拒绝（R8-6）：Map/Set/Date 冻结壳封堵 ----------
 // deepFreeze 只遍历自有属性：Map/Set 内部槽位（[[MapData]]）与 Date 时间槽位
@@ -161,7 +163,7 @@ export function validateProjectSchema(project: unknown): string | null {
   if (jsonProblem) return jsonProblem;
   const p = project as Partial<Project>;
   if (!isString(p.uri) || !isString(p.name)) return 'uri/name 非法';
-  if (p.schemaVersion !== 2) return 'schemaVersion 非法';
+  if (p.schemaVersion !== 3) return 'schemaVersion 非法';
   if (!isString(p.createdAt)) return 'createdAt 非法';
   if (typeof p.revision !== 'number' || !Number.isFinite(p.revision) || p.revision < 0) {
     return 'revision 非法';
@@ -197,6 +199,39 @@ export function validateProjectSchema(project: unknown): string | null {
     const problem = validateSceneObjectData(object);
     if (problem) return `对象数据不合法（${problem}）`;
   }
+  if (!Array.isArray(p.tracks)) return 'tracks 缺失或非数组';
+  const trackIds = new Set<string>();
+  for (const track of p.tracks) {
+    if (!track || typeof track !== 'object') return '轨道条目非法';
+    const t = track as Partial<TrackData>;
+    if (!isString(t.id) || t.id.length === 0 || trackIds.has(t.id)) return '轨道 id 非法或重复';
+    trackIds.add(t.id);
+    if (!isString(t.name)) return '轨道 name 非法';
+    if (!isString(t.objectId) || t.objectId.length === 0) return '轨道 objectId 非法';
+    if (!isString(t.targetPath) || !(TRACK_TARGET_PATHS as readonly string[]).includes(t.targetPath)) {
+      return '轨道 targetPath 非法';
+    }
+    if (!Array.isArray(t.keyframes)) return '轨道 keyframes 非法';
+    let lastTime = -Infinity;
+    for (const keyframe of t.keyframes) {
+      if (!keyframe || typeof keyframe !== 'object') return '轨道关键帧条目非法';
+      const k = keyframe as { time?: unknown; value?: unknown; interpolation?: unknown };
+      if (typeof k.time !== 'number' || !Number.isFinite(k.time) || k.time < 0) {
+        return '轨道关键帧 time 非法（需为非负有限数）';
+      }
+      // 关键帧按 time 严格升序（重复时刻的插值语义未定义，拒绝猜测）
+      if (k.time <= lastTime) return '轨道关键帧 time 未按升序排列';
+      lastTime = k.time;
+      if (!isFiniteVec3(k.value)) return '轨道关键帧 value 非法（不允许 NaN/Infinity）';
+      if (
+        k.interpolation !== undefined &&
+        (typeof k.interpolation !== 'string' ||
+          !(TRACK_INTERPOLATIONS as readonly string[]).includes(k.interpolation))
+      ) {
+        return '轨道关键帧 interpolation 非法';
+      }
+    }
+  }
   if (!Array.isArray(p.assets)) return 'assets 缺失';
   const assetIds = new Set<string>();
   for (const asset of p.assets) {
@@ -205,7 +240,18 @@ export function validateProjectSchema(project: unknown): string | null {
     if (!isString(a.id) || assetIds.has(a.id)) return '资源 id 非法或重复';
     assetIds.add(a.id);
     if (a.kind !== 'gltf') return '资源 kind 非法';
-    if (!isString(a.name) || !isString(a.mime) || !isString(a.hash)) return '资源名称/MIME/hash 非法';
+    if (!isString(a.name) || !isString(a.mime)) return '资源名称/MIME 非法';
+    // 有载荷（主载荷或分件）的资产必须携带格式明确的哈希（SHA-256 64 位十六进制），
+    // 内容完整性依赖它做无条件校验；无载荷（URL 来源）资产允许空哈希（去重键缺省）
+    const hasPayload =
+      a.payload !== undefined || (Array.isArray(a.parts) && a.parts.length > 0);
+    if (hasPayload) {
+      if (typeof a.hash !== 'string' || !/^[0-9a-fA-F]{64}$/.test(a.hash)) {
+        return '资源 hash 非法（载荷存在时必须为 64 位十六进制 SHA-256）';
+      }
+    } else if (!isString(a.hash)) {
+      return '资源 hash 非法';
+    }
     if (typeof a.size !== 'number' || !Number.isFinite(a.size) || a.size < 0) return '资源 size 非法';
     if (a.source !== 'file' && a.source !== 'url') return '资源 source 非法';
     if (!isString(a.storageRef) || !isString(a.createdAt)) return '资源 storageRef/createdAt 非法';
@@ -226,6 +272,113 @@ export function validateProjectSchema(project: unknown): string | null {
   for (const object of p.objects) {
     if (object.type === 'model' && !assetIds.has(object.assetId as string)) {
       return `模型对象引用不存在的资源（${(object.assetId as string | undefined) ?? '缺失'}）`;
+    }
+  }
+  // 交叉引用（TML-88）：轨道 objectId 必须指向项目内已注册对象
+  const objectIds = new Set<string>(p.objects.map((object) => object.id));
+  for (const track of p.tracks) {
+    if (!objectIds.has(track.objectId)) {
+      return `轨道引用不存在的对象（${track.objectId}）`;
+    }
+  }
+  return null;
+}
+
+/**
+ * 完整图结构校验（第六轮 #2：从 SceneEditor 私有校验抽取为共享纯函数，
+ * 加载边界与工程包导入在状态变更前复用）：父引用存在 → 父子循环 →
+ * 根列表一致性（parentId === null ⇔ 恰好出现在一个场景根列表）→
+ * 活动场景存在 → 机位归属（activeCameraId 指向本场景可达的相机）。
+ * 调用方必须先通过 validateProjectSchema（本函数信任其基本类型保证）。
+ * 返回首个问题描述；null 表示结构合法。
+ */
+export function validateProjectStructure(project: Project): string | null {
+  if (!project || typeof project !== 'object') return '项目不是对象';
+  if (!Array.isArray(project.objects)) return 'objects 缺失';
+  if (!Array.isArray(project.scenes)) return 'scenes 缺失';
+  const byId = new Map<string, SceneObjectData>();
+  for (const object of project.objects) {
+    if (byId.has(object.id)) return `对象数据不合法：${object.id}`;
+    byId.set(object.id, object);
+  }
+  for (const object of project.objects) {
+    if (object.parentId !== null && !byId.has(object.parentId)) {
+      return `对象缺少父级：${object.id}`;
+    }
+  }
+  // 三色循环检测（O(n) 摊还）：顺序遍历 parent 链，路径内重复即循环；
+  // 已确认无环（'ok'）的链直接复用，不重复走
+  const status = new Map<string, 'in-progress' | 'ok'>();
+  for (const object of project.objects) {
+    const path: string[] = [];
+    let cursor: SceneObjectData | undefined = object;
+    while (cursor && cursor.parentId !== null) {
+      const s = status.get(cursor.id);
+      if (s === 'ok') break;
+      if (s === 'in-progress') return `父子关系存在循环：${cursor.id}`;
+      status.set(cursor.id, 'in-progress');
+      path.push(cursor.id);
+      cursor = byId.get(cursor.parentId);
+    }
+    for (const id of path) status.set(id, 'ok');
+  }
+  // 根列表一致性：rootObjectIds 引用合法根对象；每个根对象恰好出现一次
+  const rootCount = new Map<string, number>();
+  for (const scene of project.scenes) {
+    for (const rootId of scene.rootObjectIds) {
+      const root = byId.get(rootId);
+      if (!root || root.parentId !== null) return `场景根列表引用非法：${rootId}`;
+      rootCount.set(rootId, (rootCount.get(rootId) ?? 0) + 1);
+    }
+  }
+  for (const object of project.objects) {
+    if (object.parentId === null && !rootCount.has(object.id)) {
+      return `孤立根对象：${object.id}`;
+    }
+  }
+  for (const [rootId, count] of rootCount) {
+    if (count > 1) return `根对象重复挂载：${rootId}`;
+  }
+  const scene = project.scenes.find((s) => s.id === project.activeSceneId);
+  if (!scene) return '活动场景不存在';
+  // 所有场景的 activeCameraId 都必须指向本场景可达的相机（非活动场景同样校验）。
+  // 根一致性 ⇒ 无环单父森林中每对象沿父链上溯唯一根、场景子树不相交 → 单次
+  // 构建归属根索引（O(N) 摊还路径压缩）+ 场景根集合，机位校验收敛 O(1)。
+  if (project.scenes.some((s) => s.activeCameraId !== null)) {
+    const rootOf = new Map<string, string>();
+    const resolvedRoot = new Map<string, string>();
+    for (const object of project.objects) {
+      if (object.parentId === null) {
+        rootOf.set(object.id, object.id);
+        continue;
+      }
+      const path: string[] = [];
+      let cursor: SceneObjectData | undefined = object;
+      let rootId: string | null = null;
+      while (cursor && cursor.parentId !== null) {
+        const cached = resolvedRoot.get(cursor.id);
+        if (cached !== undefined) {
+          rootId = cached;
+          break;
+        }
+        path.push(cursor.id);
+        cursor = byId.get(cursor.parentId);
+      }
+      if (rootId === null && cursor) rootId = cursor.id;
+      for (const id of path) resolvedRoot.set(id, rootId!);
+      rootOf.set(object.id, rootId!);
+    }
+    const sceneRoots = new Map<string, Set<string>>();
+    for (const s of project.scenes) sceneRoots.set(s.id, new Set(s.rootObjectIds));
+    for (const s of project.scenes) {
+      if (s.activeCameraId === null) continue;
+      const camera = byId.get(s.activeCameraId);
+      if (!camera || camera.type !== 'camera') {
+        return `场景「${s.name}」的机位不存在或不是相机`;
+      }
+      if (!sceneRoots.get(s.id)!.has(rootOf.get(s.activeCameraId)!)) {
+        return `场景「${s.name}」的机位不属于该场景`;
+      }
     }
   }
   return null;

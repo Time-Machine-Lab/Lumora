@@ -41,6 +41,42 @@ test('卸载组件释放运行时，重新挂载后一切恢复可用', async ({
   await expect(page.getByTestId('event-log')).toContainText('项目已打开: 示例项目');
 });
 
+test('卸载前失败屏障：冲突未解决时 close() 拒绝且保持挂载，解决后可真正卸载（第三十一轮一般 4）', async ({
+  context,
+}) => {
+  // 同一 context 的两个页面共享 IndexedDB：模拟另一标签页已保存较新内容
+  const pageA = await context.newPage();
+  await pageA.goto('/');
+  await pageA.getByTestId('open-sample-project').click();
+  await expect(pageA.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
+
+  await pageA.getByTestId('add-object').click();
+  await pageA.getByTestId('add-摄像机').click();
+  await expect(pageA.locator('.lumora-tree-row__type--camera')).toHaveCount(2);
+  await expect(pageA.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
+
+  // B 打开同 uri 示例项目：对账冲突锁存，保存失败
+  const pageB = await context.newPage();
+  await pageB.goto('/');
+  await pageB.getByTestId('open-sample-project').click();
+  await expect(pageB.getByTestId('save-state-badge')).toHaveText(/保存失败/, { timeout: 6000 });
+
+  // 卸载屏障被拒绝：close() 返回 {ok:false}，Studio 保持挂载（未落盘内容仍可恢复），
+  // 占位符不出现，事件日志记录拒绝原因 —— 绝不「假装已卸载」丢弃内容
+  await pageB.getByTestId('studio-mount-toggle').click();
+  await expect(pageB.getByTestId('lumora-studio')).toBeVisible();
+  await expect(pageB.getByTestId('studio-placeholder')).not.toBeVisible();
+  await expect(pageB.getByTestId('event-log')).toContainText('卸载被拒绝');
+
+  // 显式解决冲突（加载较新版本）后重试卸载：屏障放行，真正卸载并释放
+  await pageB.getByTestId('save-reload').click();
+  await expect(pageB.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
+  await pageB.getByTestId('studio-mount-toggle').click();
+  await expect(pageB.getByTestId('lumora-studio')).not.toBeVisible();
+  await expect(pageB.getByTestId('studio-placeholder')).toBeVisible();
+  await expect(pageB.getByTestId('event-log')).toContainText('运行时已释放');
+});
+
 test('导入模型后立即卸载：dispose 清理已加载内容，重新挂载后一切可用（P4）', async ({ page }) => {
   await page.getByTestId('open-sample-project').click();
   await expect(page.getByTestId('tree-row-sample-group')).toBeVisible();

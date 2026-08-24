@@ -58,6 +58,23 @@ describe('validateManifest', () => {
     const result = validateManifest({ ...VALID, contributes: ['panel', 'hacker'] });
     expect(result.ok).toBe(false);
   });
+
+  it('privateSettings 接受字符串数组（第十一轮：声明制剥离）', () => {
+    const result = validateManifest({ ...VALID, privateSettings: ['apiKey', 'clientSecret'] });
+    expect(result.ok).toBe(true);
+    expect(result.manifest?.privateSettings).toEqual(['apiKey', 'clientSecret']);
+  });
+
+  it('privateSettings 缺省为 undefined（不声明即不剥离）', () => {
+    const result = validateManifest(VALID);
+    expect(result.ok).toBe(true);
+    expect(result.manifest?.privateSettings).toBeUndefined();
+  });
+
+  it('privateSettings 非字符串数组时拒绝', () => {
+    expect(validateManifest({ ...VALID, privateSettings: ['ok', 42] }).ok).toBe(false);
+    expect(validateManifest({ ...VALID, privateSettings: 'apiKey' }).ok).toBe(false);
+  });
 });
 
 describe('checkEngineCompatibility', () => {

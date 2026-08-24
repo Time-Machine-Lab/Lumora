@@ -7,6 +7,7 @@ import { useEventRefresh } from '../hooks/use-event-refresh';
 import type { ContentCache } from './editor/content-cache';
 import { importModelFile } from './editor/model-import';
 import { showToast } from './editor/toasts';
+import { ProjectMenu } from './ProjectMenu';
 
 interface ToolbarProps {
   runtime: StudioRuntime;
@@ -48,11 +49,17 @@ export function Toolbar({
     <header className="lumora-toolbar" data-testid="lumora-toolbar">
       <span className="lumora-toolbar__brand">Lumora Studio</span>
       <div className="lumora-toolbar__actions">
+        <ProjectMenu runtime={runtime} project={project} />
         <button
           type="button"
           className="lumora-button"
           data-testid="open-sample-project"
-          onClick={() => runtime.openProject(createSampleProject())}
+          onClick={() => {
+            // 切换屏障：旧项目未保存变更排空失败时保持旧项目打开
+            void runtime.openProject(createSampleProject()).then((result) => {
+              if (!result.ok) showToast(`无法打开示例项目：${result.message}`, 'error');
+            });
+          }}
         >
           打开示例项目
         </button>

@@ -7,7 +7,7 @@ export { TypedEventEmitter } from './events/typed-event-emitter';
 export type { EventHandler, TypedEventEmitterOptions } from './events/typed-event-emitter';
 export type { EventMap } from './events/event-map';
 
-// 场景数据模型（Project v2）
+// 场景数据模型（Project v3）
 export { createSampleProject } from './scene/sample-project';
 export type {
   AssetData,
@@ -24,6 +24,9 @@ export type {
   SceneObjectData,
   SceneObjectKind,
   SceneObjectType,
+  TrackData,
+  TrackKeyframeData,
+  TrackTargetPath,
   TransformData,
   Vec3,
 } from './scene/types';
@@ -63,7 +66,10 @@ export {
   defaultTransform,
   genId,
 } from './scene/create';
-export { fnv1aHex, hashBytes } from './scene/assets';
+export { hashBytes, sha256Hex, compositeContentHash } from './scene/assets';
+export { validateProjectSchema, validateProjectStructure, validateSceneObjectData } from './scene/validate';
+export { findJsonEncodingProblem } from './scene/json-encoding';
+export type { JsonEncodingProblem } from './scene/json-encoding';
 export { fovDegToFocalLength, focalLengthToFovDeg, fitRect, FULL_FRAME_SENSOR } from './scene/camera-math';
 
 // 历史与场景编辑器
@@ -78,6 +84,51 @@ export type {
   ViewMode,
   ViewState,
 } from './editor/scene-editor';
+
+// 项目持久化与工程包（MVP-3）
+export {
+  CURRENT_PROJECT_SCHEMA_VERSION,
+  LUMORA_PACKAGE_EXTENSION,
+  PACKAGE_FORMAT_VERSION,
+  PRIVATE_PROJECT_FIELDS,
+  PROJECT_PACKAGE_FORMAT,
+} from './project/schema';
+export type {
+  PackageAppInfo,
+  PrivateProjectField,
+  ProjectAssetPayload,
+  ProjectPackage,
+  ProjectPackageManifest,
+} from './project/schema';
+export { createBlankProject } from './project/create-project';
+export type { BlankProjectOptions } from './project/create-project';
+export { migrateProjectSchema, readSchemaVersion } from './project/migrate';
+export type {
+  MigrateResult,
+  ProjectMigration,
+  ProjectMigrationError,
+  ProjectMigrationErrorKind,
+} from './project/migrate';
+export {
+  PUBLIC_PROJECT_FIELDS,
+  buildProjectPackage,
+  estimatePackageBytes,
+  MAX_PACKAGE_TEXT_BYTES,
+  parseProjectPackage,
+  serializeProjectPackage,
+} from './project/package';
+export {
+  PackageBuildError,
+  type PackageBuildErrorCode,
+} from './project/package';
+export type {
+  MissingAssetWarning,
+  PackageBuildOptions,
+  PackageImportError,
+  PackageImportErrorCode,
+  PackageParseLimits,
+  PackageParseResult,
+} from './project/package';
 
 // Manifest v1
 export { manifestSchema, validateManifest } from './manifest/validate';

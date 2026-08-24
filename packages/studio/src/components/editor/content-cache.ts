@@ -168,12 +168,52 @@ function collectMaterialTextures(material: THREE.Material): THREE.Texture[] {
  * 以全局 identity Set 遍历完整资源图：GLTF 内同一 geometry/material/texture 可能被
  * 多个节点乃至多个场景（gltf.scene 与 gltf.scenes，R6 补全）共享（DAG），
  * 每个 GPU 资源 exactly-once。
+ * 第三十三轮阻断 3：逐资源 best-effort —— 每个 GPU disposer 独立 try/catch，
+ * 单个资源释放失败不中断其余资源（修复前 geometry.dispose() 抛错中断整个遍历，
+ * 后续 material/texture 未释放；外层随后置完成标记假报成功，遗留资源无重试入口）。
  */
 function disposeGltf(gltf: GLTF): void {
   const disposedGeometries = new Set<THREE.BufferGeometry>();
   const disposedMaterials = new Set<THREE.Material>();
   const disposedTextures = new Set<THREE.Texture>();
   const visited = new Set<THREE.Object3D>();
+  const disposeGeometry = (geometry: THREE.BufferGeometry): void => {
+    if (disposedGeometries.has(geometry)) return;
+    disposedGeometries.add(geometry);
+    try {
+      geometry.dispose();
+    } catch {
+      // best-effort：该资源释放失败，继续释放其余资源（尽力收敛）
+    }
+  };
+  const disposeMaterial = (material: THREE.Material): void => {
+    if (disposedMaterials.has(material)) return;
+    disposedMaterials.add(material);
+    try {
+      material.dispose();
+    } catch {
+      // best-effort
+    }
+    for (const texture of collectMaterialTextures(material)) {
+      if (!disposedTextures.has(texture)) {
+        disposedTextures.add(texture);
+        try {
+          texture.dispose();
+        } catch {
+          // best-effort
+        }
+      }
+    }
+  };
+  const disposeTexture = (texture: THREE.Texture): void => {
+    if (disposedTextures.has(texture)) return;
+    disposedTextures.add(texture);
+    try {
+      texture.dispose();
+    } catch {
+      // best-effort
+    }
+  };
   const visit = (root: THREE.Object3D) => {
     root.traverse((child) => {
       if (visited.has(child)) return; // 多场景共享同一节点：只访问一次
@@ -182,29 +222,13 @@ function disposeGltf(gltf: GLTF): void {
         geometry?: THREE.BufferGeometry;
         material?: THREE.Material | THREE.Material[];
       };
-      if (renderable.geometry && !disposedGeometries.has(renderable.geometry)) {
-        disposedGeometries.add(renderable.geometry);
-        renderable.geometry.dispose();
-      }
+      if (renderable.geometry) disposeGeometry(renderable.geometry);
       if (renderable.material) {
         const materials = Array.isArray(renderable.material) ? renderable.material : [renderable.material];
-        for (const material of materials) {
-          if (disposedMaterials.has(material)) continue;
-          disposedMaterials.add(material);
-          material.dispose();
-          for (const texture of collectMaterialTextures(material)) {
-            if (!disposedTextures.has(texture)) {
-              disposedTextures.add(texture);
-              texture.dispose();
-            }
-          }
-        }
+        for (const material of materials) disposeMaterial(material);
       }
       const skeleton = (child as { skeleton?: THREE.Skeleton }).skeleton;
-      if (skeleton?.boneTexture && !disposedTextures.has(skeleton.boneTexture)) {
-        disposedTextures.add(skeleton.boneTexture);
-        skeleton.boneTexture.dispose();
-      }
+      if (skeleton?.boneTexture) disposeTexture(skeleton.boneTexture);
     });
   };
   for (const scene of gltf.scenes ?? []) visit(scene);
@@ -508,16 +532,22 @@ export class ContentCache {
    * 整体释放（终态）：原子撤销并清空全部 lease token——不依赖消费者配合
    * （卸载后的 consumer 可能不执行 finally）。已就绪条目立即 teardown；
    * loader 在途条目保留到 settle，由 settle 处理器独立完成唯一 teardown。
+   * 第三十三轮阻断 3：完成标记（disposed）在全部条目真实执行 teardown 之后
+   * 置位 —— 修复前先置 disposed，内部 GPU disposer 抛错中断 dispose 后标记已
+   * 置位，外层（LumoraStudio.close）捕获返回 {ok:false}、重试时 dispose 直接
+   * no-op 假报成功，未完成资源从清理路径消失。现在 disposeGltf 内部逐资源
+   * best-effort 不抛错，dispose 本身恒完整执行 ——「disposed=true」恒等于
+   * 「所有已就绪条目都真实执行过清理」，外层无需再为 cache 失败兜底。
    */
   dispose(): void {
     if (this.disposed) return;
-    this.disposed = true;
     for (const entry of [...this.entries.values()]) {
       entry.condemned = true;
       for (const lease of [...entry.leases]) lease.revoke();
       entry.leases.clear();
       if (entry.gltf) this.teardown(entry);
     }
+    this.disposed = true;
   }
 
   // ---------- 内部 ----------
@@ -607,13 +637,17 @@ export class ContentCache {
     if (entry.condemned && entry.leases.size === 0) this.teardown(entry);
   }
 
-  /** 唯一清理点：幂等；只删除自身 identity；revoke 全部 URL + 释放 GPU */
+  /** 唯一清理点：幂等；只删除自身 identity；revoke 全部 URL + 释放 GPU。
+   *  第三十三轮阻断 3：收尾标记（torn）在全部释放步骤完成后置位 —— 修复前
+   *  torn 在 disposeGltf 前置位，GPU disposer 抛错后条目标记「已收尾」并从
+   *  清理路径消失（外层随后假报成功）。disposeGltf 内部逐资源 best-effort
+   *  不抛错，此处 torn 后置保证「torn=true」恒等于「该条目的清理真实完成」 */
   private teardown(entry: Entry): void {
     if (entry.torn) return;
     if (this.entries.get(entry.hash) === entry) this.entries.delete(entry.hash);
-    entry.torn = true;
     this.revoke(entry);
     if (entry.gltf) disposeGltf(entry.gltf);
+    entry.torn = true;
   }
 
   private revoke(entry: Entry): void {
