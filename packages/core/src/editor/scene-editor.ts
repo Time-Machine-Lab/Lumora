@@ -770,7 +770,9 @@ export class SceneEditor {
 
   // ---------- 动画轨道（历史可撤销） ----------
 
-  /** 新建轨道：绑定对象 + 属性通道；对象须存在（跨场景对象允许——轨道是项目级数据） */
+  /** 新建轨道：绑定对象 + 属性通道；对象须存在（跨场景对象允许——轨道是项目级数据）。
+   *  (objectId, targetPath) 复合键唯一：回放与录制都按复合键寻址，重复轨道
+   *  会隐式覆盖/遮蔽（TML-52 审查第 6 项）。 */
   addTrack(track: TrackData): Result<string> {
     const baseline = this.beginIngress();
     if (!baseline) return failure('未打开项目');
@@ -780,6 +782,17 @@ export class SceneEditor {
     if (reentered) return reentered;
     if (!owned.objectId || !findObject(project, owned.objectId)) return failure('轨道绑定对象不存在');
     if (project.tracks.some((t) => t.id === owned.id)) return failure('轨道 id 重复');
+    if (
+      project.tracks.some(
+        (t) => t.objectId === owned.objectId && t.targetPath === owned.targetPath,
+      )
+    ) {
+      return failure('同对象同通道已有轨道');
+    }
+    if (owned.targetPath === 'focalLength') {
+      const object = findObject(project, owned.objectId);
+      if (!object || object.type !== 'camera') return failure('焦距轨道只能绑定相机对象');
+    }
     const result = this.commit(
       baseline,
       { ...project, tracks: [...project.tracks, owned] },
@@ -787,6 +800,50 @@ export class SceneEditor {
     );
     if (!result.ok) return result;
     return { ok: true, value: owned.id };
+  }
+
+  /**
+   * 原子批量 upsert 录制轨道：一次历史提交内按 (objectId, targetPath) 覆盖
+   * 既有轨道（整体替换关键帧并明确重新启用）或追加新轨道。录制三通道必须
+   * 同生共死 —— 分三次提交会在中途失败时留下半成品（TML-52 审查第 7 项）。
+   */
+  commitRecordingTracks(tracks: TrackData[], label = '录制关键帧'): Result {
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
+    const owned = tracks.map((t) => this.own(t)); // 克隆后再复验（getter 副作用窗口）
+    const reentered = this.guardReentry(baseline);
+    if (reentered) return reentered;
+    const incomingKeys = new Set<string>();
+    for (const track of owned) {
+      if (!track.objectId || !findObject(project, track.objectId)) return failure('轨道绑定对象不存在');
+      if (track.targetPath === 'focalLength') {
+        const object = findObject(project, track.objectId);
+        if (!object || object.type !== 'camera') return failure('焦距轨道只能绑定相机对象');
+        for (const k of track.keyframes) {
+          if (typeof k.value === 'number' && k.value <= 0) return failure('焦距关键帧需为正');
+        }
+      }
+      const key = `${track.objectId}\u0000${track.targetPath}`;
+      if (incomingKeys.has(key)) return failure('录制轨道包含重复通道');
+      incomingKeys.add(key);
+      for (let i = 0; i < track.keyframes.length; i += 1) {
+        const k = track.keyframes[i]!;
+        if (!Number.isFinite(k.time) || k.time < 0) return failure('关键帧时刻非法（需为非负有限数）');
+        if (i > 0 && k.time <= track.keyframes[i - 1]!.time) return failure('关键帧时刻未按升序排列');
+      }
+    }
+    const byKey = new Map(owned.map((t) => [`${t.objectId}\u0000${t.targetPath}`, t]));
+    const nextTracks = project.tracks.map((t) => {
+      const incoming = byKey.get(`${t.objectId}\u0000${t.targetPath}`);
+      // 录制覆盖：整体替换关键帧并重新启用（禁用轨道录制后必须可回放）
+      return incoming ? { ...t, keyframes: incoming.keyframes, disabled: false } : t;
+    });
+    const existingKeys = new Set(project.tracks.map((t) => `${t.objectId}\u0000${t.targetPath}`));
+    for (const track of owned) {
+      if (!existingKeys.has(`${track.objectId}\u0000${track.targetPath}`)) nextTracks.push(track);
+    }
+    return this.commit(baseline, { ...project, tracks: nextTracks }, label);
   }
 
   /** 更新轨道（改名/禁用开关等），可撤销；updater 收到结构化克隆工作副本 */
@@ -832,7 +889,9 @@ export class SceneEditor {
   }
 
   /** 整体替换轨道关键帧（录制提交/关键帧批量编辑），作为一步历史；
-   *  校验升序、非负有限时间与值类型（标量通道 vs Vec3 通道） */
+   *  校验升序、非负有限时间与值类型（标量通道 vs Vec3 通道）。
+   *  写入同时明确重新启用轨道（disabled: false）——录制结果必须可回放，
+   *  被覆盖的禁用轨道不得继续遮蔽录制内容（TML-52 审查第 6 项）。 */
   setTrackKeyframes(trackId: string, keyframes: TrackKeyframeData[], label = '更新关键帧'): Result {
     const baseline = this.beginIngress();
     if (!baseline) return failure('未打开项目');
@@ -851,12 +910,15 @@ export class SceneEditor {
         ? typeof k.value === 'number' && Number.isFinite(k.value)
         : Array.isArray(k.value) && k.value.length === 3 && k.value.every((n) => Number.isFinite(n));
       if (!okValue) return failure(scalarPath ? '关键帧值非法（标量通道需为有限数值）' : '关键帧值非法（需为三元有限向量）');
+      if (scalarPath && (k.value as number) <= 0) return failure('焦距关键帧需为正');
     }
     return this.commit(
       baseline,
       {
         ...project,
-        tracks: project.tracks.map((t) => (t.id === trackId ? { ...t, keyframes: owned.keyframes } : t)),
+        tracks: project.tracks.map((t) =>
+          t.id === trackId ? { ...t, keyframes: owned.keyframes, disabled: false } : t,
+        ),
       },
       label,
     );
@@ -922,7 +984,10 @@ export class SceneEditor {
     );
   }
 
-  /** 重排分镜：orderedIds 必须是当前全部分镜 id 的一个排列（顺序 = 分镜顺序） */
+  /** 重排分镜：orderedIds 必须是当前全部分镜 id 的一个排列（顺序 = 分镜顺序）。
+   *  原子重算区段时间：每个分镜保持自身时长与机位绑定，按新数组顺序连续
+   *  占槽 —— 视觉顺序、数组顺序与时间顺序三者一致（TML-52 审查第 3 项：
+   *  仅重排数组而区块仍按原 startTime 绝对定位，可见顺序不变）。 */
   reorderShots(orderedIds: string[]): Result {
     const baseline = this.beginIngress();
     if (!baseline) return failure('未打开项目');
@@ -939,7 +1004,14 @@ export class SceneEditor {
     if (!valid) return failure('分镜重排列表必须是全部分镜 id 的排列');
     if (orderedIds.every((id, i) => id === current[i])) return { ok: true };
     const byId = new Map(project.shots.map((s) => [s.id, s]));
-    const shots = orderedIds.map((id) => byId.get(id)!);
+    let cursor = 0;
+    const shots = orderedIds.map((id) => {
+      const shot = byId.get(id)!;
+      const duration = shot.endTime - shot.startTime;
+      const startTime = cursor;
+      cursor += duration;
+      return { ...shot, startTime, endTime: startTime + duration };
+    });
     return this.commit(baseline, { ...project, shots }, '重排分镜');
   }
 

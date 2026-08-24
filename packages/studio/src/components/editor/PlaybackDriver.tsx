@@ -1,7 +1,9 @@
 /**
  * 回放驱动（TML-52）：订阅时间引擎事件，把启用轨道的求值结果应用到场景节点。
  * - time:changed → 对当前播放头时间求值并写入节点（跳过录制机位与 gizmo 拖拽中的对象）
- * - state:changed(false)（暂停/停止）→ 还原全部节点到项目静态位姿
+ * - state:changed(false)（暂停/停止）→ 保持/重求值当前帧（apply）：暂停画面
+ *   与播放头时间一致，恢复播放无首帧跳变；静态位姿只在显式退出时间线
+ *   （组件卸载）时还原（TML-52 审查第 2 项）
  * - project:changed（提交）→ 下一帧重放求值（同步场景已把节点还原为项目位姿，
  *   驱动须在其后把轨道值重新盖回，避免提交后视图与播放头脱节）
  * - 录制机位（recorder.active 期间）完全由驱动接管，既不应用也不还原 ——
@@ -100,8 +102,10 @@ export function PlaybackDriver({ session, editor, rootRef, skipIdsRef }: Playbac
 
     const subs = [
       timeline.events.on('time:changed', apply),
+      // 暂停 = 画面停在当前播放头时刻（重求值一次，确保与 seek 后静态位姿一致）；
+      // 播放到末尾自停同理（tick 已先发 time:changed 到终点值）
       timeline.events.on('state:changed', ({ playing }) => {
-        if (!playing) restore();
+        if (!playing) apply();
       }),
       editor.events.on('project:changed', () => {
         // 提交后 scene sync 先把节点还原为项目位姿，驱动在下一帧把轨道值盖回
@@ -112,6 +116,8 @@ export function PlaybackDriver({ session, editor, rootRef, skipIdsRef }: Playbac
     return () => {
       cancelAnimationFrame(pendingRaf);
       for (const sub of subs) sub.dispose();
+      // 显式退出时间线（组件卸载）→ 还原全部节点到项目静态位姿
+      restore();
     };
   }, [timeline, recorder, editor]);
 

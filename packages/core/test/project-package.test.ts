@@ -187,8 +187,10 @@ describe('buildProjectPackage：私有数据默认排除（FR-011 / NFR-008）',
         {
           id: disabledTrackId,
           name: '禁用轨道',
+          // rotation 通道：sample-camera 的 position/focalLength 已被示例轨道占用，
+          // 复合键唯一约束（TML-52 审查第 6 项）不允许再建同键轨道
           objectId: 'sample-camera',
-          targetPath: 'position' as const,
+          targetPath: 'rotation' as const,
           disabled: true,
           keyframes: [
             { time: 0, value: [0, 0, 0] as [number, number, number] },

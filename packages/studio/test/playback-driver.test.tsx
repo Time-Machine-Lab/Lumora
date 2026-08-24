@@ -97,9 +97,11 @@ function harness(project: Project) {
   const rootRef = { current: root } as RefObject<THREE.Group | null>;
   const skipIdsRef = { current: null } as RefObject<Set<string> | null>;
   const session = makeSession(timeline, recorder);
-  render(<PlaybackDriver session={session} editor={editor} rootRef={rootRef} skipIdsRef={skipIdsRef} />);
+  const rendered = render(
+    <PlaybackDriver session={session} editor={editor} rootRef={rootRef} skipIdsRef={skipIdsRef} />,
+  );
   const node = findNode(root, 'cam')!;
-  return { editor, timeline, recorder, session, node };
+  return { editor, timeline, recorder, session, node, unmount: rendered.unmount };
 }
 
 describe('PlaybackDriver：时间引擎驱动的场景回放', () => {
@@ -115,13 +117,34 @@ describe('PlaybackDriver：时间引擎驱动的场景回放', () => {
     expect(node.position.x).toBeCloseTo(0);
   });
 
-  it('暂停（state:changed false）把节点还原到项目静态位姿', () => {
+  it('暂停（state:changed false）保留当前帧画面，与播放头时间一致', () => {
     const { timeline, node } = harness(makeProject());
     act(() => timeline.seek(1));
     expect(node.position.x).toBeCloseTo(2);
     timeline.setDuration(2);
     act(() => timeline.play());
     act(() => timeline.pause());
+    // 暂停不还原静态位姿：画面停在播放头时刻的求值结果（审查第 2 项）
+    expect(timeline.getTime()).toBe(1);
+    expect(node.position.x).toBeCloseTo(2);
+    expect(node.position.y).toBeCloseTo(1);
+    expect(node.position.z).toBeCloseTo(2);
+  });
+
+  it('非循环到末尾自停：画面停在末尾求值而非静态位姿', () => {
+    const { timeline, node } = harness(makeProject());
+    timeline.setLoop(false);
+    act(() => timeline.play());
+    act(() => timeline.tick(5)); // 越过 3s 时长 → 停在 3s 并自停
+    expect(timeline.getTime()).toBe(3);
+    expect(node.position.x).toBeCloseTo(4); // 3s 越界收敛到末关键帧值，非静态位姿 0
+  });
+
+  it('显式退出时间线（驱动卸载）才还原静态位姿', () => {
+    const { timeline, node, unmount } = harness(makeProject());
+    act(() => timeline.seek(1));
+    expect(node.position.x).toBeCloseTo(2);
+    act(() => unmount());
     expect(node.position.x).toBeCloseTo(0);
     expect(node.position.y).toBeCloseTo(1.6);
     expect(node.position.z).toBeCloseTo(6);
@@ -140,7 +163,7 @@ describe('PlaybackDriver：时间引擎驱动的场景回放', () => {
     const { timeline, recorder, node } = harness(makeProject());
     act(() => timeline.seek(1));
     expect(node.position.x).toBeCloseTo(2);
-    recorder.start('cam');
+    recorder.start('cam', 'lumora://playback');
     act(() => timeline.seek(2));
     expect(node.position.x).toBeCloseTo(2); // 跳过轨道值，保留驾驶位姿
     act(() => timeline.pause());

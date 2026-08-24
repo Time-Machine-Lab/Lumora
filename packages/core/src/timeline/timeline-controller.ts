@@ -106,12 +106,17 @@ export class TimelineController {
     this.emitSettings();
   }
 
-  /** 项目有效时长接入；播放中时长缩短到时点之后 → 收敛到新时长 */
+  /** 项目有效时长接入；播放中时长缩短到时点之后 → 收敛到新时长；
+   *  播放中把时长设为 0（空时间线）→ 一并暂停，避免悬空 playing 态 */
   setDuration(duration: number): void {
     const next = Number.isFinite(duration) && duration > 0 ? duration : 0;
     if (next === this.duration) return;
     this.duration = next;
     if (this.time > next) this.seek(next);
+    if (next === 0 && this.playing) {
+      this.playing = false;
+      this.events.emit('state:changed', { playing: false });
+    }
     this.emitSettings();
   }
 
@@ -153,7 +158,7 @@ export class TimelineController {
   play(): void {
     if (this.playing) return;
     if (this.duration <= 0) return; // 空时间线无可播放内容
-    if (this.time >= this.duration) this.time = 0; // 末尾重播从头开始
+    if (this.time >= this.duration) this.seek(0); // 末尾重播：经 seek 发 time:changed
     this.playing = true;
     this.events.emit('state:changed', { playing: true });
   }

@@ -203,6 +203,9 @@ export function validateProjectSchema(project: unknown): string | null {
   }
   if (!Array.isArray(p.tracks)) return 'tracks 缺失或非数组';
   const trackIds = new Set<string>();
+  // (objectId, targetPath) 复合键唯一：回放按复合键寻址，重复轨道的后一条
+  // 会隐式覆盖前一条，录制/更新却按数组中的第一条寻址 —— 语义不可用
+  const trackKeys = new Set<string>();
   for (const track of p.tracks) {
     if (!track || typeof track !== 'object') return '轨道条目非法';
     const t = track as Partial<TrackData>;
@@ -213,6 +216,11 @@ export function validateProjectSchema(project: unknown): string | null {
     if (!isString(t.targetPath) || !(TRACK_TARGET_PATHS as readonly string[]).includes(t.targetPath)) {
       return '轨道 targetPath 非法';
     }
+    const compositeKey = `${t.objectId}\u0000${t.targetPath}`;
+    if (trackKeys.has(compositeKey)) {
+      return `轨道绑定对象与通道重复（${t.objectId} · ${t.targetPath}）`;
+    }
+    trackKeys.add(compositeKey);
     if (t.disabled !== undefined && typeof t.disabled !== 'boolean') return '轨道 disabled 非法';
     const scalarPath = (SCALAR_TRACK_PATHS as readonly string[]).includes(t.targetPath);
     if (!Array.isArray(t.keyframes)) return '轨道 keyframes 非法';
@@ -231,6 +239,8 @@ export function validateProjectSchema(project: unknown): string | null {
         if (typeof k.value !== 'number' || !Number.isFinite(k.value)) {
           return '轨道关键帧 value 非法（标量通道需为有限数值）';
         }
+        // 焦距正值域：≤0 让投影矩阵失效，保形插值同样要求正值端点
+        if (k.value <= 0) return '轨道关键帧 value 非法（焦距需为正）';
       } else if (!isFiniteVec3(k.value)) {
         return '轨道关键帧 value 非法（不允许 NaN/Infinity）';
       }
@@ -306,6 +316,13 @@ export function validateProjectSchema(project: unknown): string | null {
   for (const track of p.tracks) {
     if (!objectIds.has(track.objectId)) {
       return `轨道引用不存在的对象（${track.objectId}）`;
+    }
+    // 焦距通道只能绑定相机对象（TML-52 审查第 8 项：fov 推导需要相机载荷）
+    if (track.targetPath === 'focalLength') {
+      const object = p.objects.find((o) => o.id === track.objectId);
+      if (!object || object.type !== 'camera') {
+        return `焦距轨道绑定非相机对象（${track.objectId}）`;
+      }
     }
   }
   // 交叉引用（TML-52）：分镜 cameraObjectId 必须指向项目内已注册的相机对象

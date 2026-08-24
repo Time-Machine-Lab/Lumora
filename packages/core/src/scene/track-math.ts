@@ -66,7 +66,10 @@ function lerpVec3(a: Vec3, b: Vec3, t: number): Vec3 {
 }
 
 /** Catmull-Rom 段求值（时间均匀参数化）：四个控制点 P0..P3 对应时刻 t0..t3，
- *  段 [t1, t2] 内插值；端点处用单侧切线（钳制端）。确定性纯函数。 */
+ *  段 [t1, t2] 内插值；端点处用单侧切线（钳制端）。确定性纯函数。
+ *  切线尺度修正：导数项乘当前段时长 (t2 - t1) —— 否则时间缩放 2 倍后
+ *  相对中点值漂移（Hermite 基 h10/h11 中的 u 是无量纲参数，切线须换算回
+ *  时间单位）。 */
 function catmullRomAt(
   p0: number[], p1: number[], p2: number[], p3: number[],
   t0: number, t1: number, t2: number, t3: number,
@@ -79,16 +82,120 @@ function catmullRomAt(
   const h10 = u3 - 2 * u2 + u;
   const h01 = -2 * u3 + 3 * u2;
   const h11 = u3 - u2;
-  const m1 = p0.map((v, i) => (p2[i]! - v) / (t2 - t0));
-  const m2 = p2.map((v, i) => (p3[i]! - p1[i]!) / (t3 - t1));
+  const seg = t2 - t1;
+  const m1 = p0.map((v, i) => ((p2[i]! - v) * seg) / (t2 - t0));
+  const m2 = p2.map((v, i) => ((p3[i]! - p1[i]!) * seg) / (t3 - t1));
   return p1.map((v, i) => h00 * v + h10 * m1[i]! + h01 * p2[i]! + h11 * m2[i]!);
+}
+
+/**
+ * 保形（单调）三次插值段求值（Fritsch-Carlson）：控制点 P0..P3 对应时刻
+ * t0..t3，段 [t1, t2] 内插值。端斜率取相邻分段差商的调和均值，符号反转时
+ * 置 0（局部极值变平）；端点缺失侧用单侧差商（钳制端）。保证值不出段两端
+ * 范围 —— 焦距等正值通道不会因过冲产生负值。确定性纯函数。
+ */
+function monotoneHermiteAt(
+  p0: number, p1: number, p2: number, p3: number,
+  t0: number, t1: number, t2: number, t3: number,
+  t: number,
+): number {
+  const dLeft = t1 > t0 ? (p1 - p0) / (t1 - t0) : null;
+  const dMid = (p2 - p1) / (t2 - t1);
+  const dRight = t3 > t2 ? (p3 - p2) / (t3 - t2) : null;
+  const slope = (dA: number | null, dB: number): number => {
+    if (dA === null) return dB;
+    if (dA * dB <= 0) return 0;
+    return 2 / (1 / dA + 1 / dB);
+  };
+  const m1 = slope(dLeft, dMid);
+  const m2 = slope(dRight, dMid);
+  const u = (t - t1) / (t2 - t1);
+  const u2 = u * u;
+  const u3 = u2 * u;
+  const h00 = 2 * u3 - 3 * u2 + 1;
+  const h10 = u3 - 2 * u2 + u;
+  const h01 = -2 * u3 + 3 * u2;
+  const h11 = u3 - u2;
+  const seg = t2 - t1;
+  return h00 * p1 + h10 * seg * m1 + h01 * p2 + h11 * seg * m2;
+}
+
+// ---------- 旋转通道：四元数 slerp（TML-52 回放一致性） ----------
+// Euler 三分量逐分量插值在表示边界（THREE 由四元数导出欧拉时把 yaw 规范到
+// [-π, π]，纯 yaw 连续推进会在 π 处把 x/z 一并翻转）产生物理位姿几乎不变、
+// 数值却跳变 π 的相邻采样，逐分量 lerp 会插出一条完全错误的路径。旋转通道
+// 统一走最短弧 slerp：录制采样与回放求值同一语义，跨边界不再跳变。
+// 约定与 three.js 默认一致：Euler order 'XYZ'（内在 X→Y→Z，q = qx·qy·qz）。
+
+type Quat = [number, number, number, number]; // [x, y, z, w]
+
+function eulerToQuat(x: number, y: number, z: number): Quat {
+  const cx = Math.cos(x / 2);
+  const sx = Math.sin(x / 2);
+  const cy = Math.cos(y / 2);
+  const sy = Math.sin(y / 2);
+  const cz = Math.cos(z / 2);
+  const sz = Math.sin(z / 2);
+  return [
+    sx * cy * cz + cx * sy * sz,
+    cx * sy * cz - sx * cy * sz,
+    cx * cy * sz + sx * sy * cz,
+    cx * cy * cz - sx * sy * sz,
+  ];
+}
+
+/** 四元数 → Euler（three.js Euler.setFromQuaternion 的 'XYZ' 提取） */
+function quatToEuler(q: Quat): Vec3 {
+  const [x, y, z, w] = q;
+  const m13 = 2 * (x * z + y * w);
+  const eulerY = Math.asin(Math.min(1, Math.max(-1, m13)));
+  if (Math.abs(m13) < 0.9999999) {
+    const m23 = 2 * (y * z - x * w);
+    const m33 = 1 - 2 * (x * x + y * y);
+    const m12 = 2 * (x * y - z * w);
+    const m11 = 1 - 2 * (y * y + z * z);
+    return [Math.atan2(-m23, m33), eulerY, Math.atan2(-m12, m11)];
+  }
+  const m32 = 2 * (y * z + x * w);
+  const m22 = 1 - 2 * (x * x + z * z);
+  return [Math.atan2(m32, m22), eulerY, 0];
+}
+
+/** 最短弧球面插值（标准 slerp，含共线/同向退化处理） */
+function slerpQuat(a: Quat, b: Quat, t: number): Quat {
+  const [ax, ay, az, aw] = a;
+  let [bx, by, bz, bw] = b;
+  let dot = ax * bx + ay * by + az * bz + aw * bw;
+  if (dot < 0) {
+    bx = -bx; by = -by; bz = -bz; bw = -bw;
+    dot = -dot;
+  }
+  if (dot > 0.9995) {
+    // 近似同向：线性插值 + 归一化（避免 acos(≈1) 数值病态）
+    const k = t;
+    const inv = 1 - t;
+    const len = Math.hypot(ax * inv + bx * k, ay * inv + by * k, az * inv + bz * k, aw * inv + bw * k);
+    return [(ax * inv + bx * k) / len, (ay * inv + by * k) / len, (az * inv + bz * k) / len, (aw * inv + bw * k) / len];
+  }
+  const omega = Math.acos(dot);
+  const sinOmega = Math.sin(omega);
+  const ka = Math.sin((1 - t) * omega) / sinOmega;
+  const kb = Math.sin(t * omega) / sinOmega;
+  return [ax * ka + bx * kb, ay * ka + by * kb, az * ka + bz * kb, aw * ka + bw * kb];
+}
+
+function rotationEulerAt(left: Vec3, right: Vec3, t: number): Vec3 {
+  return quatToEuler(slerpQuat(eulerToQuat(left[0], left[1], left[2]), eulerToQuat(right[0], right[1], right[2]), t));
 }
 
 /**
  * 轨道确定性求值：时刻 t 处的目标值。
  * - 无关键帧（或禁用轨道）→ null；
  * - t 落在首/末关键帧之外 → 保持端点值；
- * - 段内：step 保持左值；linear 线性插值；smooth 经 Catmull-Rom 平滑（端点钳制）。
+ * - 段内：step 保持左值；linear 线性插值；smooth 平滑插值；
+ *   旋转通道（linear/smooth 一致）走最短弧四元数 slerp，跨表示边界不翻转；
+ *   标量通道 smooth 走保形三次（正值域不越界）；其余 Vec3 smooth 经
+ *   Catmull-Rom 平滑（端点钳制）。
  */
 export function evaluateTrack(track: TrackData, time: number): TrackEvaluation | null {
   if (track.disabled || track.keyframes.length === 0) return null;
@@ -122,13 +229,33 @@ export function evaluateTrack(track: TrackData, time: number): TrackEvaluation |
     return { time, value: left.value, span: [lo, hi] };
   }
   const t = (time - left.time) / (right.time - left.time);
+  const isRotation = track.targetPath === 'rotation';
   if (mode === 'linear') {
+    if (isRotation) {
+      return { time, value: rotationEulerAt(left.value as Vec3, right.value as Vec3, t), span: [lo, hi] };
+    }
     const value = scalar
       ? lerpNumber(left.value as number, right.value as number, t)
       : lerpVec3(left.value as Vec3, right.value as Vec3, t);
     return { time, value, span: [lo, hi] };
   }
-  // smooth：Catmull-Rom，端点钳制（单侧切线）
+  // smooth：Vec3 走 Catmull-Rom（端点钳制单侧切线）；旋转统一走最短弧 slerp
+  // （跨表示边界逐分量 Hermite 同样会翻转）；标量走保形三次（焦距正值域）。
+  if (isRotation) {
+    return { time, value: rotationEulerAt(left.value as Vec3, right.value as Vec3, t), span: [lo, hi] };
+  }
+  if (scalar) {
+    const p0 = lo > 0 ? (keyframes[lo - 1]!.value as number) : (left.value as number);
+    const p1 = left.value as number;
+    const p2 = right.value as number;
+    const p3 = hi < keyframes.length - 1 ? (keyframes[hi + 1]!.value as number) : (right.value as number);
+    const t0 = lo > 0 ? keyframes[lo - 1]!.time : left.time;
+    const t1 = left.time;
+    const t2 = right.time;
+    const t3 = hi < keyframes.length - 1 ? keyframes[hi + 1]!.time : right.time;
+    const value = monotoneHermiteAt(p0, p1, p2, p3, t0, t1, t2, t3, time);
+    return { time, value, span: [lo, hi] };
+  }
   const p0 = lo > 0 ? asArray(keyframes[lo - 1]!.value) : asArray(left.value);
   const p1 = asArray(left.value);
   const p2 = asArray(right.value);
@@ -138,7 +265,7 @@ export function evaluateTrack(track: TrackData, time: number): TrackEvaluation |
   const t2 = right.time;
   const t3 = hi < keyframes.length - 1 ? keyframes[hi + 1]!.time : right.time;
   const result = catmullRomAt(p0, p1, p2, p3, t0, t1, t2, t3, time);
-  return { time, value: scalar ? result[0]! : [result[0]!, result[1]!, result[2]!], span: [lo, hi] };
+  return { time, value: [result[0]!, result[1]!, result[2]!], span: [lo, hi] };
 }
 
 /** 录制采样：时刻 + 该时刻的目标值（与关键帧同型） */

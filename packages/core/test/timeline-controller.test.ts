@@ -131,7 +131,24 @@ describe('TimelineController：播放/暂停与 tick 推进', () => {
     timeline.tick(0.5);
     timeline.tick(0.5);
     expect(timeline.getTime()).toBeCloseTo(1);
-    expect(times).toHaveLength(2);
+    // 末尾重播经带事件的 seek(0) 收敛（审查一般项：重播不得静默改时间），
+    // 事件序列 = [重播 0, tick 0.5, tick 1]
+    expect(times).toHaveLength(3);
+    expect(times[0]).toBe(0);
+    expect(times[1]).toBeCloseTo(0.5);
+    expect(times[2]).toBeCloseTo(1);
+  });
+
+  it('播放中把时长设为 0（空时间线）：一并暂停并发出 state:changed(false)', () => {
+    const timeline = new TimelineController({ duration: 10 });
+    timeline.seek(3);
+    const states: boolean[] = [];
+    timeline.events.on('state:changed', (p) => states.push(p.playing));
+    timeline.play();
+    timeline.setDuration(0);
+    expect(timeline.isPlaying()).toBe(false);
+    expect(timeline.getTime()).toBe(0);
+    expect(states).toEqual([true, false]);
   });
 
   it('loop 开启：越过末尾按 duration 取模绕回', () => {

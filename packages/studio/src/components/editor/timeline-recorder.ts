@@ -19,6 +19,8 @@ export interface RecorderChannels {
 
 export class TimelineRecorder {
   private cameraId: string | null = null;
+  /** 录制绑定项目身份：提交前须与当前项目 uri 一致，否则样本作废（TML-52 审查第 7 项） */
+  private projectUri: string | null = null;
   private paused = true;
   private source: CaptureSource | null = null;
   private positionSamples: TrackSample[] = [];
@@ -38,13 +40,18 @@ export class TimelineRecorder {
     return this.cameraId;
   }
 
+  get boundProjectUri(): string | null {
+    return this.projectUri;
+  }
+
   get isPaused(): boolean {
     return this.paused;
   }
 
-  /** 开始录制：绑定机位并清空上一轮样本 */
-  start(cameraObjectId: string): void {
+  /** 开始录制：绑定机位（及所属项目）并清空上一轮样本 */
+  start(cameraObjectId: string, projectUri: string | null): void {
     this.cameraId = cameraObjectId;
+    this.projectUri = projectUri;
     this.paused = false;
     this.positionSamples = [];
     this.rotationSamples = [];
@@ -85,6 +92,7 @@ export class TimelineRecorder {
       focalLength: this.focalSeen ? this.focalSamples : null,
     };
     this.cameraId = null;
+    this.projectUri = null;
     this.paused = true;
     this.positionSamples = [];
     this.rotationSamples = [];

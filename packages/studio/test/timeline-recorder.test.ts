@@ -14,10 +14,11 @@ describe('TimelineRecorder：采样采集器', () => {
     const recorder = new TimelineRecorder();
     const source = fixedSource(FIXED);
     recorder.setCaptureSource(source);
-    recorder.start('cam');
+    recorder.start('cam', 'lumora://test');
     expect(recorder.active).toBe(true);
     expect(recorder.isPaused).toBe(false);
     expect(recorder.recordingCameraId).toBe('cam');
+    expect(recorder.boundProjectUri).toBe('lumora://test');
 
     expect(recorder.sample(0)).toBe(true);
     expect(recorder.sample(1.5)).toBe(true);
@@ -38,13 +39,13 @@ describe('TimelineRecorder：采样采集器', () => {
 
   it('无采集源时不产生采样，stop 返回空通道；无焦距采样时焦距通道为 null（相机节点缺失保护）', () => {
     const recorder = new TimelineRecorder();
-    recorder.start('cam');
+    recorder.start('cam', 'lumora://test');
     expect(recorder.sample(0)).toBe(false); // 无源 → 不采集
     const empty = recorder.stop();
     expect(empty).not.toBeNull();
     expect(empty!.position).toHaveLength(0);
 
-    recorder.start('cam');
+    recorder.start('cam', 'lumora://test');
     recorder.setCaptureSource(
       vi.fn((): CaptureNodeSample => ({ position: [0, 0, 0], rotation: [0, 0, 0], focalLength: null })),
     );
@@ -58,7 +59,7 @@ describe('TimelineRecorder：采样采集器', () => {
     const recorder = new TimelineRecorder();
     const source = fixedSource(FIXED);
     recorder.setCaptureSource(source);
-    recorder.start('cam');
+    recorder.start('cam', 'lumora://test');
     recorder.sample(0);
     recorder.pause();
     expect(recorder.isPaused).toBe(true);
@@ -75,7 +76,7 @@ describe('TimelineRecorder：采样采集器', () => {
   it('stop 返回通道后清空状态（再次 stop 为 null）', () => {
     const recorder = new TimelineRecorder();
     recorder.setCaptureSource(fixedSource(FIXED));
-    recorder.start('cam');
+    recorder.start('cam', 'lumora://test');
     recorder.sample(0);
     const first = recorder.stop();
     expect(first).not.toBeNull();

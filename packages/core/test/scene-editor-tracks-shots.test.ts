@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { SceneEditor } from '../src/editor/scene-editor';
 import type { Result } from '../src/editor/scene-editor';
 import { createSampleProject } from '../src/scene/sample-project';
-import { createCameraObject, createGroupObject, createShotClip, createTrack } from '../src/scene/create';
-import type { ShotClipData, TrackData, TrackKeyframeData, TrackKeyframeValue } from '../src/scene/types';
+import { createCameraObject, createShotClip, createTrack } from '../src/scene/create';
+import type { TrackData, TrackKeyframeData, TrackKeyframeValue } from '../src/scene/types';
 
 function makeEditor(): SceneEditor {
   const editor = new SceneEditor();
@@ -23,10 +23,16 @@ function positionTrack(objectId = 'sample-camera'): TrackData {
   ]);
 }
 
+/** 新建一个未绑定任何轨道的机位（示例项目自带轨道占用 sample-camera 的
+ *  position/focalLength 复合键，无法再添加同键轨道） */
+function freshCamera(editor: SceneEditor, name = '测试机位'): string {
+  return ok(editor.addObject(createCameraObject(name)));
+}
+
 describe('SceneEditor 轨道写入口', () => {
   it('addTrack：绑定对象必须存在；track id 重复拒绝', () => {
     const editor = makeEditor();
-    const id = ok(editor.addTrack(positionTrack()));
+    const id = ok(editor.addTrack(positionTrack(freshCamera(editor))));
     expect(editor.getProject()!.tracks.some((t) => t.id === id)).toBe(true);
     expect(editor.addTrack({ ...positionTrack(), objectId: 'ghost' }).ok).toBe(false);
     const existing = editor.getProject()!.tracks.find((t) => t.id === id)!;
@@ -35,7 +41,7 @@ describe('SceneEditor 轨道写入口', () => {
 
   it('updateTrack：id/绑定对象/通道不可修改，其余可撤销更新', () => {
     const editor = makeEditor();
-    const id = ok(editor.addTrack(positionTrack()));
+    const id = ok(editor.addTrack(positionTrack(freshCamera(editor))));
     expect(editor.updateTrack(id, (t) => ({ ...t, id: 'renamed' }), 'x').ok).toBe(false);
     expect(editor.updateTrack(id, (t) => ({ ...t, objectId: 'sample-cube' }), 'x').ok).toBe(false);
     expect(editor.updateTrack(id, (t) => ({ ...t, targetPath: 'rotation' }), 'x').ok).toBe(false);
@@ -49,7 +55,7 @@ describe('SceneEditor 轨道写入口', () => {
 
   it('deleteTrack：删除轨道不删绑定对象；可撤销', () => {
     const editor = makeEditor();
-    const id = ok(editor.addTrack(positionTrack()));
+    const id = ok(editor.addTrack(positionTrack(freshCamera(editor))));
     const objectCount = editor.getProject()!.objects.length;
     ok(editor.deleteTrack(id));
     expect(editor.getProject()!.tracks.some((t) => t.id === id)).toBe(false);
@@ -61,7 +67,7 @@ describe('SceneEditor 轨道写入口', () => {
 
   it('setTrackKeyframes：整体替换关键帧；校验升序/非负有限时间/值类型', () => {
     const editor = makeEditor();
-    const id = ok(editor.addTrack(positionTrack()));
+    const id = ok(editor.addTrack(positionTrack(freshCamera(editor))));
     ok(editor.setTrackKeyframes(id, [
       { time: 0.5, value: [1, 2, 3], interpolation: 'smooth' },
       { time: 3, value: [4, 5, 6] },
@@ -80,13 +86,96 @@ describe('SceneEditor 轨道写入口', () => {
 
   it('setTrackKeyframes：标量通道（focalLength）只接受有限 number', () => {
     const editor = makeEditor();
-    const id = ok(editor.addTrack(createTrack('sample-camera', 'focalLength', '变焦')));
+    const id = ok(editor.addTrack(createTrack(freshCamera(editor), 'focalLength', '变焦')));
     ok(editor.setTrackKeyframes(id, [
       { time: 0, value: 50 },
       { time: 2, value: 35 },
     ]));
     expect(editor.setTrackKeyframes(id, [{ time: 0, value: [1, 2, 3] }]).ok).toBe(false);
     expect(editor.setTrackKeyframes(id, [{ time: 0, value: Infinity }]).ok).toBe(false);
+  });
+
+  it('addTrack：复合键 (objectId, targetPath) 唯一；焦距轨道只能绑定相机（审查第 6/8 项）', () => {
+    const editor = makeEditor();
+    const camA = freshCamera(editor);
+    const camB = freshCamera(editor);
+    const camC = freshCamera(editor);
+    ok(editor.addTrack(positionTrack(camA)));
+    // 同对象同通道重复 → 拒绝（回放按复合键寻址，重复轨道会隐式遮蔽）
+    expect(editor.addTrack(positionTrack(camA)).ok).toBe(false);
+    // 同通道换对象 → 允许
+    ok(editor.addTrack(positionTrack(camB)));
+    // 焦距轨道绑定非相机对象 → 拒绝
+    expect(editor.addTrack(createTrack('sample-cube', 'focalLength', '坏变焦')).ok).toBe(false);
+    ok(editor.addTrack(createTrack(camC, 'focalLength', '变焦')));
+    // 焦距关键帧非正 → 拒绝（正值域，审查第 8 项）
+    const focal = editor.getProject()!.tracks.find((t) => t.targetPath === 'focalLength')!;
+    expect(editor.setTrackKeyframes(focal.id, [{ time: 0, value: -5 }]).ok).toBe(false);
+  });
+
+  it('commitRecordingTracks：原子批量 upsert —— 覆盖既有（重新启用）、追加新轨道、一步历史', () => {
+    const editor = makeEditor();
+    // 项目自带 sample-camera·position 轨道（复合键唯一，无法再 addTrack 同键）；
+    // 先禁用，录制提交应整体替换并重新启用（审查第 6 项）
+    const existing = editor
+      .getProject()!
+      .tracks.find((t) => t.objectId === 'sample-camera' && t.targetPath === 'position')!;
+    const id = existing.id;
+    ok(editor.updateTrack(id, (t) => ({ ...t, disabled: true }), '禁用'));
+    const historyBefore = editor.getHistoryState();
+    const batch: TrackData[] = [
+      createTrack('sample-camera', 'position', '录制主相机·位置', [
+        { time: 0, value: [1, 1, 1] },
+        { time: 2, value: [2, 1, 1] },
+      ]),
+      createTrack('sample-camera', 'rotation', '录制主相机·旋转', [
+        { time: 0, value: [0, 0, 0] },
+        { time: 2, value: [0, 0.5, 0] },
+      ]),
+    ];
+    ok(editor.commitRecordingTracks(batch));
+    const tracks = editor.getProject()!.tracks;
+    const position = tracks.find((t) => t.id === id)!;
+    expect(position.keyframes[0]!.value).toEqual([1, 1, 1]);
+    expect(position.disabled).toBe(false); // 覆盖即重新启用
+    expect(tracks.some((t) => t.targetPath === 'rotation')).toBe(true);
+    // 一次批量提交 = 一步历史（撤销一步即整体回退）
+    ok(editor.undo());
+    // 示例项目自带 sample-cube·rotation；断言的是本次提交新增的 sample-camera·rotation
+    expect(
+      editor.getProject()!.tracks.some((t) => t.objectId === 'sample-camera' && t.targetPath === 'rotation'),
+    ).toBe(false);
+    expect(editor.getProject()!.tracks.find((t) => t.id === id)!.disabled).toBe(true);
+    expect(historyBefore.canUndo).toBe(editor.getHistoryState().canUndo);
+  });
+
+  it('commitRecordingTracks：入参校验（对象存在/焦距约束/重复通道/关键帧升序）且失败不产生历史', () => {
+    const editor = makeEditor();
+    const before = editor.getHistoryState();
+    const badCamera = createTrack('ghost', 'position', '悬空', [
+      { time: 0, value: [0, 0, 0] },
+    ]);
+    expect(editor.commitRecordingTracks([badCamera]).ok).toBe(false);
+    const badFocal = createTrack('sample-cube', 'focalLength', '非相机焦距', [
+      { time: 0, value: 50 },
+    ]);
+    expect(editor.commitRecordingTracks([badFocal]).ok).toBe(false);
+    const negativeFocal = createTrack('sample-camera', 'focalLength', '负焦距', [
+      { time: 0, value: -1 },
+    ]);
+    expect(editor.commitRecordingTracks([negativeFocal]).ok).toBe(false);
+    const dupChannel = [
+      createTrack('sample-camera', 'position', '位置 1', [{ time: 0, value: [0, 0, 0] }]),
+      createTrack('sample-camera', 'position', '位置 2', [{ time: 1, value: [1, 1, 1] }]),
+    ];
+    expect(editor.commitRecordingTracks(dupChannel).ok).toBe(false);
+    const unsorted = createTrack('sample-camera', 'scale', '乱序', [
+      { time: 2, value: [1, 1, 1] },
+      { time: 1, value: [1, 1, 1] },
+    ]);
+    expect(editor.commitRecordingTracks([unsorted]).ok).toBe(false);
+    // 全部拒绝 → 无任何历史写入
+    expect(editor.getHistoryState().canUndo).toBe(before.canUndo);
   });
 
   it('删除绑定对象：绑定轨道级联删除（TML-88 语义延续）', () => {
@@ -147,13 +236,19 @@ describe('SceneEditor 分镜写入口', () => {
     expect(shot.name).toBe('临时分镜');
   });
 
-  it('reorderShots：排列重排持久化；非排列拒绝；同序 no-op', () => {
+  it('reorderShots：排列重排持久化；非排列拒绝；同序 no-op；区段时间原子重算', () => {
     const editor = makeEditor();
     const shots = editor.getProject()!.shots.map((s) => s.id);
     expect(shots).toHaveLength(3);
     const reversed = [...shots].reverse();
     ok(editor.reorderShots(reversed));
     expect(editor.getProject()!.shots.map((s) => s.id)).toEqual(reversed);
+    // 审查第 3 项：重排必须改变时间顺序 —— 每分镜保持自身时长与机位绑定，
+    // 按新数组顺序连续占槽（示例项目三分镜各 1.5s）
+    const stored = editor.getProject()!.shots;
+    expect(stored.map((s) => s.startTime)).toEqual([0, 1.5, 3]);
+    expect(stored.map((s) => s.endTime)).toEqual([1.5, 3, 4.5]);
+    expect(stored.map((s) => s.cameraObjectId)).toEqual(['sample-camera', 'sample-camera', 'sample-camera']);
     expect(editor.reorderShots([shots[0]!, shots[0]!, shots[1]!]).ok).toBe(false);
     expect(editor.reorderShots([shots[0]!]).ok).toBe(false);
     expect(editor.reorderShots(['ghost', ...shots.slice(1)]).ok).toBe(false);
@@ -165,9 +260,10 @@ describe('SceneEditor 分镜写入口', () => {
     expect(historyAfter.canRedo).toBe(historyBefore.canRedo);
     ok(editor.undo());
     expect(editor.getProject()!.shots.map((s) => s.id)).toEqual(shots);
+    expect(editor.getProject()!.shots.map((s) => s.startTime)).toEqual([0, 1.5, 3]);
   });
 
-  it('分镜排序在 openProject 往返后保持一致（AC4：重排并保存 → 重开一致）', () => {
+  it('分镜排序在 openProject 往返后保持一致（AC4：重排并保存 → 重开一致，区段坐标/机位绑定同存）', () => {
     const editor = makeEditor();
     const shots = editor.getProject()!.shots.map((s) => s.id);
     const reordered = [shots[2]!, shots[0]!, shots[1]!];
@@ -177,6 +273,9 @@ describe('SceneEditor 分镜写入口', () => {
     reopened.openProject(structuredClone(persisted));
     expect(reopened.getProject()!.shots.map((s) => s.id)).toEqual(reordered);
     expect(reopened.getProject()!.shots).toEqual(persisted.shots);
+    // AC4：重开后区段坐标与机位绑定一致
+    expect(reopened.getProject()!.shots.map((s) => s.startTime)).toEqual([0, 1.5, 3]);
+    expect(reopened.getProject()!.shots[0]!.cameraObjectId).toBe('sample-camera');
   });
 });
 

@@ -111,6 +111,71 @@ describe('evaluateTrack：确定性时间插值（AC3）', () => {
     expect(evaluateTrack(track, 2)!.value).toBe(40);
   });
 
+  it('smooth 插值时间缩放不变：同一曲线时间轴 2 倍缩放后相对中点值不变（审查第 8 项切线尺度）', () => {
+    const track = createTrack('sample-camera', 'position', 'smooth', [
+      { time: 0, value: [0, 0, 0], interpolation: 'smooth' },
+      { time: 1, value: [0, 10, 0], interpolation: 'smooth' },
+      { time: 2, value: [10, 10, 0], interpolation: 'smooth' },
+      { time: 3, value: [10, 0, 0], interpolation: 'smooth' },
+    ]);
+    const scaled = createTrack('sample-camera', 'position', 'smooth', [
+      { time: 0, value: [0, 0, 0], interpolation: 'smooth' },
+      { time: 2, value: [0, 10, 0], interpolation: 'smooth' },
+      { time: 4, value: [10, 10, 0], interpolation: 'smooth' },
+      { time: 6, value: [10, 0, 0], interpolation: 'smooth' },
+    ]);
+    const a = evaluateTrack(track, 1.5)!.value as number[];
+    const b = evaluateTrack(scaled, 3)!.value as number[];
+    // 修复前：切线缺段长因子，缩放后相对中点漂移（6.25 → 5.625）
+    expect(a[0]).toBeCloseTo(b[0], 9);
+    expect(a[1]).toBeCloseTo(b[1], 9);
+  });
+
+  it('smooth 标量（焦距）：保形插值保证值不出段两端范围（审查第 8 项，修复前 1.5s 得 -11.375）', () => {
+    const track = createTrack('sample-camera', 'focalLength', '变焦', [
+      { time: 0, value: 100, interpolation: 'smooth' },
+      { time: 1, value: 1, interpolation: 'smooth' },
+      { time: 2, value: 1, interpolation: 'smooth' },
+      { time: 3, value: 100, interpolation: 'smooth' },
+    ]);
+    expect(evaluateTrack(track, 1.5)!.value).toBeCloseTo(1);
+    // 全程非负（正值域），单调段不越界
+    for (let i = 0; i <= 30; i += 1) {
+      const v = evaluateTrack(track, i / 10)!.value as number;
+      expect(v).toBeGreaterThan(0);
+      expect(v).toBeGreaterThanOrEqual(1 - 1e-9);
+    }
+  });
+
+  it('slerp 旋转：Euler 表示边界（π 翻转）处插值走最短弧，不逐分量翻转（审查第 9 项）', () => {
+    // THREE 导出纯 yaw 越过 π/2 时把剩余旋转翻进 x/z：[−π, π−θ, −π] 表示 yaw θ
+    // （R = Rx(−π)·Ry(π−θ)·Rz(−π) = Ry(θ)）。物理姿态只前进 0.0016 rad，
+    // 表示却跳变 π —— 逐分量 lerp 会插出 [-π/2, …, -π/2] 的完全错误路径；
+    // slerp 得小弧：中点 yaw 1.5608，x/z 保持 ~0
+    const track = createTrack('sample-camera', 'rotation', 'yaw', [
+      { time: 0, value: [0, 1.56, 0] },
+      { time: 1, value: [-Math.PI, Math.PI - 1.5616, -Math.PI] },
+    ]);
+    const mid = evaluateTrack(track, 0.5)!.value as number[];
+    expect(Math.abs(mid[0])).toBeLessThan(0.01);
+    expect(Math.abs(mid[2])).toBeLessThan(0.01);
+    expect(mid[1]).toBeCloseTo(1.5608, 3);
+  });
+
+  it('slerp 旋转：跨边界连续推进路径正确（第二段起于翻转表示，仍沿 yaw 前进）', () => {
+    const track = createTrack('sample-camera', 'rotation', 'yaw', [
+      { time: 0, value: [0, 0, 0] },
+      { time: 1, value: [0, 1.5, 0] },
+      { time: 2, value: [-Math.PI, Math.PI - 1.5616, -Math.PI] },
+    ]);
+    // 段 2 中点：物理上只比 1.5 前进 ~0.03，x/z 保持 ~0
+    const mid = evaluateTrack(track, 1.5)!.value as number[];
+    expect(Math.abs(mid[0])).toBeLessThan(0.02);
+    expect(Math.abs(mid[2])).toBeLessThan(0.02);
+    expect(mid[1]).toBeGreaterThan(1.5);
+    expect(mid[1]).toBeLessThan(1.5616);
+  });
+
   it('禁用轨道/空轨道/乱序轨道：求值为 null', () => {
     const disabled = { ...linearPositionTrack(), disabled: true };
     expect(evaluateTrack(disabled, 1)).toBeNull();

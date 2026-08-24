@@ -1,21 +1,25 @@
 /**
  * 统一时间引擎会话（TML-52）：每实例一个 TimelineController + TimelineRecorder。
- * - rAF 驱动：播放时 tick 推进；录制时先保证时间容量（时长随播放头增长，
- *   避免 loop 绕回/到点自停），再采样机位节点
+ * - rAF 驱动：播放时 tick 推进；录制时先保证时间容量（1 秒分块扩容，约 1Hz
+ *   节流 —— 而非每帧 setDuration，避免时长/会话高频变化），再采样机位节点
  * - 失焦保护（AC2）：window blur / 页面隐藏 → 录制与播放一并暂停，不自动恢复
- * - 停止录制：各通道样本 RDP 抽稀 → 覆盖写入/新建轨道 → 恢复时长并回到 0s
+ * - 停止录制：各通道样本 RDP 抽稀 → 一次原子批量提交（commitRecordingTracks）
+ * - 会话对象稳定：实例持有 useRef 对象，仅 state 字段随渲染原地更新 ——
+ *   下游 effect（相机驾驶/回放订阅）不因状态变化重建，录制中按键输入不被
+ *   会话重建打断（TML-52 审查第 1 项）
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   TimelineController,
   createTrack,
   getProjectDuration,
   simplifySamples,
 } from '@lumora/core';
-import type { SceneEditor, TrackKeyframeData, TrackTargetPath } from '@lumora/core';
+import type { SceneEditor, TrackData, TrackKeyframeData, TrackTargetPath } from '@lumora/core';
 import { TimelineRecorder } from '../components/editor/timeline-recorder';
 import type { CaptureSource } from '../components/editor/timeline-recorder';
+import { showToast } from '../components/editor/toasts';
 
 export type RecorderChannel = 'position' | 'rotation' | 'focalLength';
 
@@ -58,7 +62,7 @@ export interface TimelineSession {
   cancelOverwrite(): void;
   /** 恢复暂停中的录制（同时恢复播放） */
   resumeRecording(): void;
-  /** 结束录制：抽稀并提交各通道轨道 */
+  /** 结束录制：抽稀并原子提交各通道轨道 */
   stopRecording(): void;
 }
 
@@ -84,8 +88,12 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
 
   const pendingCameraRef = useRef<string | null>(null);
   const wasNullRef = useRef(true);
+  /** 录制绑定身份：项目 uri + 机位 id（TML-52 审查第 7 项） */
+  const recordedProjectUriRef = useRef<string | null>(null);
 
-  /** 项目变更：新开/关闭项目重置播放头；时长随轨道/分镜变化收敛（录制中除外） */
+  /** 项目变更：新开/关闭项目重置播放头；时长随轨道/分镜变化收敛（录制中除外）。
+   *  录制中的项目身份变化（直接切换项目/重开）或绑定机位被删除 → 取消录制并
+   *  丢弃本轮样本（避免旧采样写入新项目或静默悬空） */
   useEffect(() => {
     // 挂载时已有项目（会话重建/测试）：事件订阅晚于 openProject，直接补齐时长与 fps。
     // 镜像订阅在此 effect 之后才注册，settings:changed 事件无人接收，须同步写 state
@@ -98,13 +106,16 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       setState((s) => ({ ...s, duration, fps: typeof fps === 'number' && fps > 0 ? fps : s.fps }));
       wasNullRef.current = false;
     }
+    const cancelRecording = () => {
+      if (!recorder.active) return;
+      recorder.stop();
+      recordedProjectUriRef.current = null;
+      setState((s) => ({ ...s, recording: false, recordingPaused: false }));
+    };
     const subs = [
       editor.events.on('project:changed', ({ project }) => {
         if (project === null) {
-          if (recorder.active) {
-            recorder.stop();
-            setState((s) => ({ ...s, recording: false, recordingPaused: false }));
-          }
+          cancelRecording();
           timeline.pause();
           timeline.setDuration(0);
           timeline.seek(0);
@@ -114,6 +125,16 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
         const fps = project.settings?.fps;
         if (typeof fps === 'number' && fps > 0) timeline.setFps(fps);
         if (!recorder.active) timeline.setDuration(getProjectDuration(project));
+        else if (project.uri !== recordedProjectUriRef.current) {
+          // 切换/重开到另一项目：旧录制立即取消（样本不得进入新项目）
+          cancelRecording();
+          timeline.pause();
+          timeline.setDuration(getProjectDuration(project));
+        } else if (!project.objects.some((o) => o.id === recorder.recordingCameraId)) {
+          // 录制中绑定机位被删除/撤销：采样源已失效，取消录制
+          cancelRecording();
+          timeline.pause();
+        }
         if (wasNullRef.current) {
           timeline.seek(0);
           wasNullRef.current = false;
@@ -138,7 +159,10 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     };
   }, [timeline]);
 
-  /** 主循环：播放推进 + 录制采样（采样仅发生在时间前进且录制未暂停时） */
+  /** 主循环：播放推进 + 录制采样（采样仅发生在时间前进且录制未暂停时）。
+   *  时间容量保证：录制中播放头领先时长时按整秒分块扩容（ceil(time+1)，
+   *  ~1Hz 一次，非每帧），loop 不会绕回、loop 关闭不会到点自停；起始
+   *  duration=0 时先扩容再强制播放（审查第 1 项：分块扩容/节流） */
   useEffect(() => {
     let raf = 0;
     let last = performance.now();
@@ -148,9 +172,7 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       const t = timelineRef.current!;
       const r = recorderRef.current!;
       if (r.active && !r.isPaused) {
-        // 时间容量保证：播放头始终领先时长至少 1 秒，loop 不会绕回、loop 关闭
-        // 不会到点自停；起始 duration=0 时 play 被阻塞，先扩容再强制播放
-        if (t.getTime() + 1 > t.getDuration()) t.setDuration(t.getTime() + 1);
+        if (t.getTime() + 1 > t.getDuration()) t.setDuration(Math.ceil(t.getTime() + 1));
         if (!t.isPlaying()) t.play();
       }
       if (t.isPlaying()) t.tick(dt);
@@ -226,12 +248,31 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
 
   const beginRecording = useCallback(
     (cameraObjectId: string) => {
-      recorder.start(cameraObjectId);
+      const project = editor.getProject();
+      const projectUri = project?.uri ?? null;
+      // 绑定身份后再采样：项目切换/相机删除时按身份取消（审查第 7 项）
+      recorder.start(cameraObjectId, projectUri);
+      recordedProjectUriRef.current = projectUri;
       timeline.play();
       setState((s) => ({ ...s, recording: true, recordingPaused: false }));
     },
-    [recorder, timeline],
+    [editor, recorder, timeline],
   );
+
+  /** 覆盖确认时重验：等待期间目标可能已被删除（审查第 7 项） */
+  const confirmOverwrite = useCallback(() => {
+    const cameraId = pendingCameraRef.current;
+    pendingCameraRef.current = null;
+    setState((s) => ({ ...s, overwritePending: false }));
+    if (!cameraId) return;
+    const project = editor.getProject();
+    const camera = project?.objects.find((o) => o.id === cameraId);
+    if (!camera || camera.type !== 'camera') {
+      showToast('目标机位已不存在，无法录制', 'error');
+      return;
+    }
+    beginRecording(cameraId);
+  }, [beginRecording, editor]);
 
   const startRecording = useCallback(
     (cameraObjectId: string) => {
@@ -260,13 +301,6 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     [editor, recorder, timeline, beginRecording],
   );
 
-  const confirmOverwrite = useCallback(() => {
-    const cameraId = pendingCameraRef.current;
-    pendingCameraRef.current = null;
-    setState((s) => ({ ...s, overwritePending: false }));
-    if (cameraId) beginRecording(cameraId);
-  }, [beginRecording]);
-
   const cancelOverwrite = useCallback(() => {
     pendingCameraRef.current = null;
     setState((s) => ({ ...s, overwritePending: false }));
@@ -283,32 +317,32 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
   const stopRecording = useCallback(() => {
     if (!recorder.active) return;
     const cameraObjectId = recorder.recordingCameraId;
+    const projectUri = recorder.boundProjectUri;
     const channels = recorder.stop();
+    recordedProjectUriRef.current = null;
     setState((s) => ({ ...s, recording: false, recordingPaused: false }));
+    // 停止时重验绑定身份：项目已切换或相机已删除 → 丢弃样本，不提交
     const project = editor.getProject();
-    if (channels && project) {
-      const camera = project.objects.find((o) => o.id === cameraObjectId) ?? null;
-      const label = camera?.name ?? '机位';
+    const camera =
+      channels && project && project.uri === projectUri && cameraObjectId
+        ? (project.objects.find((o) => o.id === cameraObjectId) ?? null)
+        : null;
+    if (camera && channels && cameraObjectId) {
+      const label = camera.name;
+      const tracks: TrackData[] = [];
       for (const channel of ['position', 'rotation', 'focalLength'] as const) {
         const samples = channels[channel];
         if (!samples || samples.length === 0) continue;
         const keyframes = simplifySamples(samples) as TrackKeyframeData[];
         if (keyframes.length === 0) continue;
-        const existing = project.tracks.find(
-          (t) => t.objectId === cameraObjectId && t.targetPath === channel,
+        tracks.push(
+          createTrack(cameraObjectId, channel as TrackTargetPath, `录制${label}·${CHANNEL_LABELS[channel]}`, keyframes),
         );
-        const trackLabel = `录制${label}·${CHANNEL_LABELS[channel]}`;
-        if (existing) {
-          editor.setTrackKeyframes(existing.id, keyframes, trackLabel);
-        } else {
-          const track = createTrack(
-            cameraObjectId!,
-            channel as TrackTargetPath,
-            trackLabel,
-            keyframes,
-          );
-          editor.addTrack(track);
-        }
+      }
+      if (tracks.length > 0) {
+        // 一次原子批量提交：三通道同生共死，失败不留下半提交（审查第 7 项）
+        const result = editor.commitRecordingTracks(tracks, '录制关键帧');
+        if (!result.ok) showToast(result.error.message, 'error');
       }
     }
     timeline.pause();
@@ -317,8 +351,13 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     timeline.seek(0);
   }, [editor, recorder, timeline]);
 
-  const session = useMemo<TimelineSession>(
-    () => ({
+  /** 会话对象稳定：仅 state 字段随渲染原地更新。下游 effect 以整个 session 为
+   *  依赖（相机驾驶/回放订阅），身份稳定则录制期间不重建 —— 修复录制后段
+   *  每帧 drive.stop() 清空按键输入（TML-52 审查第 1 项）。回调均以稳定引用
+   *  持有（useCallback deps 只含 ref 实例），首次创建后无需重建。 */
+  const sessionRef = useRef<TimelineSession | null>(null);
+  if (!sessionRef.current) {
+    sessionRef.current = {
       timeline,
       recorder,
       state,
@@ -335,26 +374,9 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       cancelOverwrite,
       resumeRecording,
       stopRecording,
-    }),
-    [
-      timeline,
-      recorder,
-      state,
-      togglePlay,
-      pause,
-      seek,
-      zoomBy,
-      setZoom,
-      setSnap,
-      setLoop,
-      setCaptureSource,
-      startRecording,
-      confirmOverwrite,
-      cancelOverwrite,
-      resumeRecording,
-      stopRecording,
-    ],
-  );
+    };
+  }
+  sessionRef.current.state = state;
 
-  return session;
+  return sessionRef.current;
 }

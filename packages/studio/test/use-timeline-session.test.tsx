@@ -26,7 +26,8 @@ afterEach(() => {
 });
 
 type HookRef = RenderHookResult<TimelineSession, unknown>;
-/** result.current 是活动渲染的实时引用；会话对象每次状态变更都会重建，必须实时读取 */
+/** result.current 是活动渲染的实时引用；会话对象身份稳定（仅 state 字段原地
+ *  更新 —— 修复审查第 1 项后不再随状态变更重建），必须实时读取 state */
 let hook: HookRef;
 function live(): TimelineSession {
   return hook.result.current;
@@ -76,7 +77,7 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     expect(live().recorder.recordingCameraId).toBe('sample-camera');
   });
 
-  it('AC1：模拟 5 秒量级录制 → 各通道样本抽稀为升序关键帧写入轨道，停止后时长收敛并回到 0s', () => {
+  it('AC1：真实约 5s 持续输入录制 → 各通道样本抽稀为升序关键帧写入轨道，停止后时长收敛并回到 0s', () => {
     mount();
     let tick = 0;
     const source = vi.fn((): CaptureNodeSample => {
@@ -86,8 +87,8 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     act(() => live().setCaptureSource(source));
     act(() => live().startRecording('sample-camera'));
     act(() => live().confirmOverwrite());
-    act(() => vi.advanceTimersByTime(2000));
-    expect(source.mock.calls.length).toBeGreaterThan(100); // 采样器实时采样
+    act(() => vi.advanceTimersByTime(5000));
+    expect(source.mock.calls.length).toBeGreaterThan(250); // ~312 帧持续采样（60Hz）
 
     act(() => live().stopRecording());
     const project = editor.getProject()!;
@@ -99,15 +100,32 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
       for (let i = 1; i < track.keyframes.length; i += 1) {
         expect(track.keyframes[i]!.time).toBeGreaterThan(track.keyframes[i - 1]!.time);
       }
-      // 直线样本抽稀到首尾两端：首帧落在 0s 附近（首个 rAF 帧 dt=0），末帧约 2s；
+      // 直线样本抽稀到首尾两端：首帧落在 0s 附近（首个 rAF 帧 dt=0），末帧约 5s；
       // 关键帧数 ≤3 同时证明旧轨道（项目自带的 4+ 帧）确实被录制结果覆盖
       expect(track.keyframes[0]!.time).toBeLessThan(0.05);
-      expect(track.keyframes[track.keyframes.length - 1]!.time).toBeCloseTo(2, 1);
+      expect(track.keyframes[track.keyframes.length - 1]!.time).toBeCloseTo(5, 1);
     }
     expect(live().state.recording).toBe(false);
     // 时长收敛到项目时长（含示例项目其它轨道）
     expect(live().state.duration).toBeCloseTo(getProjectDuration(editor.getProject()!), 6);
     expect(live().timeline.getTime()).toBe(0); // 播放头回到起点
+  });
+
+  it('B1 回归：约 5s 持续录制中会话对象身份稳定 —— 驾驶输入不再被会话重建清空', () => {
+    mount();
+    const session = live();
+    const source = vi.fn((): CaptureNodeSample => ({ position: [1, 0, 0], rotation: [0, 0, 0], focalLength: 35 }));
+    act(() => live().setCaptureSource(source));
+    act(() => live().startRecording('sample-camera'));
+    act(() => live().confirmOverwrite());
+    act(() => vi.advanceTimersByTime(5000));
+    // 时长随录制分块扩容（1 秒块、约 1Hz），播放头持续推进不绕回
+    expect(live().state.recording).toBe(true);
+    expect(live().timeline.getTime()).toBeGreaterThan(4.5);
+    // 审查第 1 项根因：每帧 setDuration → 状态更新 → 会话重建 → 驾驶 effect
+    // cleanup 调 drive.stop()。修复后身份全程不变，下游 effect 不重建
+    expect(live()).toBe(session);
+    act(() => live().stopRecording());
   });
 
   it('AC2：录制中页面失焦 → 录制与播放暂停且不再采样；恢复后继续', () => {
@@ -135,6 +153,68 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     act(() => vi.advanceTimersByTime(200));
     expect(source.mock.calls.length).toBeGreaterThan(beforeBlur); // 恢复采样
     act(() => live().stopRecording());
+  });
+
+  it('录制绑定项目身份：录制中切换到另一项目 → 立即取消，样本不写入新项目（审查第 7 项）', () => {
+    mount();
+    act(() => live().startRecording('sample-camera'));
+    act(() => live().confirmOverwrite());
+    act(() => vi.advanceTimersByTime(300));
+    expect(live().recorder.active).toBe(true);
+    const other = { ...createSampleProject(), uri: 'lumora://other-project' };
+    act(() => editor.openProject(other));
+    expect(live().recorder.active).toBe(false);
+    expect(live().state.recording).toBe(false);
+    expect(live().timeline.isPlaying()).toBe(false);
+    // 新项目未混入旧项目的录制轨道（示例项目自带轨道无「录制」标签）
+    expect(editor.getProject()!.tracks.every((t) => !t.name.startsWith('录制'))).toBe(true);
+  });
+
+  it('录制中绑定机位被删除 → 自动取消录制并丢弃样本（审查第 7 项）', () => {
+    mount();
+    act(() => live().startRecording('sample-camera'));
+    act(() => live().confirmOverwrite());
+    act(() => vi.advanceTimersByTime(300));
+    expect(live().recorder.active).toBe(true);
+    act(() => {
+      editor.setSelection(['sample-camera']);
+      editor.deleteSelection();
+    });
+    expect(live().recorder.active).toBe(false);
+    expect(live().state.recording).toBe(false);
+    expect(live().timeline.isPlaying()).toBe(false);
+  });
+
+  it('覆盖确认期间目标机位被删除 → 确认不再开始录制（审查第 7 项重验）', () => {
+    mount();
+    act(() => live().startRecording('sample-camera'));
+    expect(live().state.overwritePending).toBe(true);
+    act(() => {
+      editor.setSelection(['sample-camera']);
+      editor.deleteSelection();
+    });
+    act(() => live().confirmOverwrite());
+    expect(live().state.overwritePending).toBe(false);
+    expect(live().recorder.active).toBe(false);
+    expect(live().state.recording).toBe(false);
+  });
+
+  it('停止录制时重验身份：相机已删除 → 丢弃样本不提交（审查第 7 项）', () => {
+    mount();
+    const source = vi.fn((): CaptureNodeSample => ({ position: [1, 0, 0], rotation: [0, 0, 0], focalLength: 35 }));
+    act(() => live().setCaptureSource(source));
+    act(() => live().startRecording('sample-camera'));
+    act(() => live().confirmOverwrite());
+    act(() => vi.advanceTimersByTime(300));
+    act(() => {
+      editor.setSelection(['sample-camera']);
+      editor.deleteSelection(); // 级联删除绑定轨道（本身即一步历史）
+    });
+    const historyBefore = editor.getHistoryState();
+    act(() => live().stopRecording());
+    expect(live().recorder.active).toBe(false);
+    // 相机与轨道已整体删除；停止录制不再尝试提交（无新增历史）
+    expect(editor.getHistoryState().canUndo).toBe(historyBefore.canUndo);
   });
 
   it('录制中播放键 = 暂停/恢复录制；关闭项目重置会话', () => {

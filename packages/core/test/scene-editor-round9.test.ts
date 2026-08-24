@@ -53,6 +53,7 @@ const PUBLIC_API_LIST = [
   'beginTransform',
   'clearSelection',
   'closeAdmission',
+  'commitRecordingTracks',
   'commitTransform',
   'deleteSelection',
   'deleteShot',

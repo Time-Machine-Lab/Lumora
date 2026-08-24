@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { SceneEditor, TimelineController, createCameraObject, createTrack } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import type { RefObject } from 'react';
-import { TimelinePanel } from '../src/components/editor/TimelinePanel';
+import { TIMELINE_LABEL_WIDTH, TimelinePanel } from '../src/components/editor/TimelinePanel';
 import { TimelineRecorder } from '../src/components/editor/timeline-recorder';
 import type { TimelineSession, TimelineSessionState } from '../src/hooks/use-timeline-session';
 
@@ -132,11 +132,22 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     expect(session.seek).toHaveBeenCalledTimes(2); // 抬起后不再跟手
   });
 
-  it('播放头随真实 seek 移动并更新时间显示', () => {
+  it('播放头随真实 seek 移动并更新时间显示（共享坐标系：标签列右侧定位）', () => {
     const { timeline } = mountPanel();
     act(() => timeline.seek(0.5));
-    expect(screen.getByTestId('timeline-playhead').style.left).toBe(`${0.5 * timeline.getZoom()}px`);
+    // 播放头在共享时间坐标系中定位：标签列 + time * zoom（审查第 5 项）
+    expect(screen.getByTestId('timeline-playhead').style.left).toBe(
+      `${TIMELINE_LABEL_WIDTH + 0.5 * timeline.getZoom()}px`,
+    );
     expect(screen.getByTestId('timeline-time').textContent).toBe('00:00.50');
+  });
+
+  it('关键帧与标尺刻度位于同一时间坐标系（时间画布内 time * zoom）', () => {
+    const { timeline, project } = mountPanel();
+    const zoom = timeline.getZoom();
+    const trackId = project.tracks[0]!.id;
+    expect(screen.getByTestId(`keyframe-${trackId}-1`).style.left).toBe(`${zoom}px`);
+    expect(screen.getByTestId(`shot-block-s2`).style.left).toBe(`${zoom}px`);
   });
 
   it('关键帧菱形点击定位到该帧时间', () => {
@@ -146,14 +157,30 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     expect(session.seek).toHaveBeenCalledWith(1);
   });
 
-  it('分镜：点击区块定位起点；‹› 重排提交 reorderShots（AC4）', () => {
-    const { session, editor } = mountPanel();
+  it('分镜：点击区块定位起点；‹› 重排提交 reorderShots（AC4：视觉/时间顺序同变）', () => {
+    const view = mountPanel();
     fireEvent.click(screen.getByTestId('shot-block-s2'));
-    expect(session.seek).toHaveBeenCalledWith(1);
+    expect(view.session.seek).toHaveBeenCalledWith(1);
 
     expect(screen.getByTestId('shot-move-left-s1')).toBeDisabled();
     fireEvent.click(screen.getByTestId('shot-move-right-s1'));
-    expect(editor.getProject()!.shots.map((s) => s.id)).toEqual(['s2', 's1', 's3']); // AC4 顺序持久
+    const shots = view.editor.getProject()!.shots;
+    expect(shots.map((s) => s.id)).toEqual(['s2', 's1', 's3']); // 数组顺序
+    // 原子重算区段时间：重排后按新顺序连续占槽（审查第 3 项 —— 仅改数组顺序
+    // 而区块仍按旧 startTime 绝对定位，视觉顺序不变）
+    expect(shots.map((s) => s.startTime)).toEqual([0, 1, 2]);
+    expect(shots.map((s) => s.endTime)).toEqual([1, 2, 3]);
+    // 面板以 project 属性渲染；重排提交后父级（LumoraStudio 同款行为）携新项目重渲染
+    view.rerender(
+      <TimelinePanel
+        session={view.session}
+        editor={view.editor}
+        project={view.editor.getProject()!}
+        selection={[]}
+        captureRef={view.captureRef}
+      />,
+    );
+    expect(screen.getByTestId('shot-block-s2').style.left).toBe('0px'); // s2 移到最前
     expect(screen.getByTestId('shot-move-right-s3')).toBeDisabled();
   });
 
@@ -176,6 +203,36 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     const cancel = mountPanel({ state: { ...baseState(), overwritePending: true } });
     fireEvent.click(screen.getByText('取消'));
     expect(cancel.session.cancelOverwrite).toHaveBeenCalledTimes(1);
+  });
+
+  it('覆盖确认模态：真模态语义（role/aria、焦点圈、Escape、Delete 拦截）', () => {
+    const first = mountPanel({ state: { ...baseState(), overwritePending: true } });
+    const dialog = screen.getByTestId('overwrite-confirm');
+    expect(dialog).toHaveAttribute('role', 'dialog');
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    // 打开后焦点进入对话框（焦点圈起点）
+    expect(first.container.querySelector('.lumora-timeline__modal')).toHaveFocus();
+    // Escape → 取消覆盖
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(first.session.cancelOverwrite).toHaveBeenCalledTimes(1);
+    first.unmount();
+
+    // Delete 被模态 capture 拦截：模拟 LumoraStudio 全局删除处理器（bubble 层）
+    // 注册在模态监听之后 —— stopImmediatePropagation 使其不触发（审查一般项：
+    // 底层全局 Delete 不得穿透模态）
+    const second = mountPanel({ state: { ...baseState(), overwritePending: true } });
+    let globalSeen = false;
+    const onGlobalKeyDown = () => {
+      globalSeen = true;
+    };
+    window.addEventListener('keydown', onGlobalKeyDown);
+    fireEvent.keyDown(window, { key: 'Delete' });
+    fireEvent.keyDown(window, { key: 'Backspace' });
+    fireEvent.keyDown(window, { key: ' ' });
+    window.removeEventListener('keydown', onGlobalKeyDown);
+    expect(globalSeen).toBe(false);
+    expect(second.session.cancelOverwrite).not.toHaveBeenCalled();
+    second.unmount();
   });
 
   it('无截图通道时缩略图安全降级：显示机位名而非 img', () => {

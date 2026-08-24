@@ -182,7 +182,11 @@ export function EditorViewport({
       data-testid="lumora-viewport"
       onPointerDown={handlePointerDown}
     >
-      <Canvas dpr={[1, 2]} camera={{ position: [7, 5, 7], fov: 45 }}>
+      <Canvas
+        dpr={[1, 2]}
+        camera={{ position: [7, 5, 7], fov: 45 }}
+        onCreated={() => undefined}
+      >
         <color attach="background" args={['#14161f']} />
         <ambientLight intensity={0.35} />
         <gridHelper args={[20, 20, '#3a3f52', '#2a2e3d']} />
@@ -220,8 +224,11 @@ export function EditorViewport({
 /**
  * 键鼠机位驾驶（TML-52）：选中机位且非播放态时启用（录制中强制可驾驶），
  * rAF 每帧把按键意图积分到节点。脱离驾驶（取消选中/开始回放/录制暂停）时
- * 还原静态位姿 —— 回放中与录制采样中除外（分别由回放驱动与录制接管）。
+ * 还原静态位姿 —— 回放中与录制采样中除外（分别由回放驱动与录制接管）；
+ * 绑定机位已有启用轨道时也跳过还原（轨道求值已接管节点，见 restoreIfNeeded）。
  * window blur → 硬停（速度立即归零，无失控位移）。
+ * 会话对象稳定（useTimelineSession 内部 useRef 持有），本 effect 录制期间
+ * 不重建 —— 按键输入不再被每帧 drive.stop() 清空（TML-52 审查第 1 项）。
  */
 function useCameraDrive(
   session: TimelineSession | null,
@@ -267,10 +274,19 @@ function useCameraDrive(
     const restoreIfNeeded = () => {
       if (attachedId === null || !attachedNode) return;
       const st = sessionRef.current?.state;
-      // 回放中/录制采样中不还原（分别由回放驱动与录制接管）
-      if (st && (st.playing && !st.recording)) return;
-      if (st?.recording) return;
-      const object = editor.getProject()?.objects.find((o) => o.id === attachedId);
+      // 回放中/录制中不还原（分别由回放驱动与录制接管）
+      if (st && (st.playing || st.recording)) return;
+      const project = editor.getProject();
+      // 绑定机位已有启用轨道：节点由轨道求值接管（回放驱动最后一次 apply
+      // 已把播放头时刻的值写到节点），还原静态位姿会让画面与播放头脱节
+      if (
+        project?.tracks.some(
+          (t) => t.objectId === attachedId && t.keyframes.length > 0 && !t.disabled,
+        )
+      ) {
+        return;
+      }
+      const object = project?.objects.find((o) => o.id === attachedId);
       if (object) restoreObjectOnNode(attachedNode, object);
     };
 
@@ -279,11 +295,12 @@ function useCameraDrive(
       last = now;
       const st = sessionRef.current?.state;
       const cameraId = cameraIdRef.current;
-      // 可驾驶：选中机位 && 录制未暂停 && （暂停 || 录制中）&& 无轨道（录制中无视轨道）
+      // 可驾驶：选中机位 && 录制未暂停 && （暂停 || 录制中）&& 无启用轨道（录制中无视轨道；
+      // 禁用轨道不阻止驾驶 —— 禁用 = 该通道暂不参与回放）
       const hasTracks =
         !!st &&
         !!editor.getProject()?.tracks.some(
-          (t) => t.objectId === cameraId && t.keyframes.length > 0,
+          (t) => t.objectId === cameraId && t.keyframes.length > 0 && !t.disabled,
         );
       const canDrive =
         !!st &&
