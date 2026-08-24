@@ -307,12 +307,14 @@ describe('rotation 通道 RDP 与回放求值同源（TML-52 复审阻断 1）',
     const kept = evaluateTrack(threeFrame, 0.5)!;
     // slerp 求值经四元数往返（slerp → 欧拉），与原始关键帧存在 1e-15 量级浮点差，
     // 而非语义偏差 —— 按分量 1e-12 精度断言
+    if (!Array.isArray(kept.value)) throw new Error('rotation 求值应为 Vec3');
     for (let i = 0; i < 3; i += 1) {
       expect(kept.value[i]).toBeCloseTo([Math.PI / 4, Math.PI / 4, 0][i]!, 12);
     }
     // 回归钉：2 帧版本（旧行为）在同一求值点产生 0.46 rad 量级的分量误差
     const twoFrame = createTrack('sample-camera', 'rotation', 'r', simplifySamples(counterExample()));
     const bad = evaluateTrack(twoFrame, 0.5)!;
+    if (!Array.isArray(bad.value)) throw new Error('rotation 求值应为 Vec3');
     const error = Math.max(
       Math.abs(bad.value[0] - Math.PI / 4),
       Math.abs(bad.value[1] - Math.PI / 4),

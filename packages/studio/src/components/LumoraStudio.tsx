@@ -1,4 +1,5 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { ReactNode } from 'react';
 import type { PluginDescriptor, Project } from '@lumora/core';
 import { createStudioRuntime } from '../runtime/studio-runtime';
@@ -97,8 +98,102 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   const session = useTimelineSession(runtime.editor);
   const sessionRef = useRef(session);
   sessionRef.current = session;
+  // 覆盖确认模态（复审阻断 4）：提升到壳层根级，打开时整壳 inert（工具栏/对象树/
+  // 视口/时间线整体不可达），模态经 portal 挂到 body 脱离 inert 子树
+  const overwriteModalRef = useRef<HTMLDivElement>(null);
+  const overwriteTriggerRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!session.state.overwritePending) return;
+    const dialog = overwriteModalRef.current;
+    if (!dialog) return;
+    overwriteTriggerRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusables = () =>
+      Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+    focusables()[0]?.focus();
+    // 捕获阶段处理先于全局冒泡处理器，stopImmediatePropagation 使其不可达。
+    // 应用快捷键统一小写匹配：Ctrl+Shift+K 的 key 为大写 K，未小写化时泄漏到
+    // 命令面板开关（复审阻断 4）
+    const isAppShortcut = (event: KeyboardEvent) => {
+      const key = event.key.toLowerCase();
+      return (
+        key === 'delete' ||
+        key === 'backspace' ||
+        key === '1' ||
+        key === '2' ||
+        key === '3' ||
+        ((event.ctrlKey || event.metaKey) &&
+          (key === 'k' || key === 'z' || key === 'y' || key === 'd'))
+      );
+    };
+    const onKeyDownCapture = (event: KeyboardEvent) => {
+      // Escape 无条件取消，先于「模态外」分支判定：焦点逃逸到对话框外后
+      // Escape 不得被 outside 分支吞掉（复审阻断 4）
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        session.cancelOverwrite();
+        return;
+      }
+      const inside = event.target instanceof Node && dialog.contains(event.target);
+      if (!inside) {
+        // 模态外（含 window/document 上的按键）：一律拦截，不再穿透到全局处理器；
+        // 焦点若已逃逸到对话框外（程序性 blur 等），Tab 把它拉回首项（焦点陷阱闭环）
+        if (event.key === 'Tab') {
+          focusables()[0]?.focus();
+        }
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
+      if (event.key === 'Tab') {
+        const list = focusables();
+        if (list.length === 0) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          return;
+        }
+        const first = list[0]!;
+        const last = list[list.length - 1]!;
+        if (!dialog.contains(document.activeElement)) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          first.focus();
+        } else if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          first.focus();
+        }
+        return;
+      }
+      if (isAppShortcut(event)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
+      if (event.key === ' ') {
+        // 对话框按钮的空格激活走原生行为，只阻断冒泡到全局播放切换
+        event.stopImmediatePropagation();
+        return;
+      }
+    };
+    window.addEventListener('keydown', onKeyDownCapture, true);
+    return () => {
+      window.removeEventListener('keydown', onKeyDownCapture, true);
+      const trigger = overwriteTriggerRef.current;
+      if (trigger && trigger.isConnected) trigger.focus();
+    };
+  }, [session.state.overwritePending, session]);
   // 分镜缩略图截图通道：EditorViewport 的 FrameCaptureBridge 挂载后可用
-  const captureRef = useRef<(() => string | null) | null>(null);
+  const captureRef = useRef<((cameraObjectId?: string | null) => string | null) | null>(null);
   // 通道就绪状态：仅写 ref 不触发渲染，缩略图链依赖该状态在通道就绪后重跑
   // （复审阻断 2：初载时 effect 早于 FrameCaptureBridge 挂载而空转）
   const [captureReady, setCaptureReady] = useState(false);
@@ -317,71 +412,107 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   }, [runtime]);
 
   return (
-    <div ref={rootRef} className={`lumora-studio${className ? ` ${className}` : ''}`} data-testid="lumora-studio">
-      <Toolbar
-        runtime={runtime}
-        project={project}
-        editorState={editorState}
-        cache={cache}
-        onTogglePlugins={() => setPluginManagerOpen((open) => !open)}
-        onTogglePalette={() => setPaletteOpen((open) => !open)}
-      />
-      <div className="lumora-studio__body">
-        <div className="lumora-studio__sidebar">
-          <ObjectTree
-            editor={runtime.editor}
-            project={project}
-            selection={editorState.selection}
-            cache={cache}
-          />
-          <PanelHost
-            runtime={runtime}
-            project={project}
-            onDisablePlugin={(pluginId) => void runtime.host.disable(pluginId)}
-          />
-        </div>
-        <main className="lumora-studio__viewport">
-          <div className="lumora-studio__scene-slot">
-            {scene ? (
-              scene(project)
-            ) : (
-              <EditorViewport
-                editor={runtime.editor}
-                project={project}
-                selection={editorState.selection}
-                view={editorState.view}
-                cache={cache}
-                session={session}
-                captureRef={captureRef}
-                onCaptureReady={handleCaptureReady}
-              />
-            )}
-            {!project && (
-              <div className="lumora-studio__empty" data-testid="studio-empty-hint">
-                尚未打开项目 —— 点击工具栏「打开示例项目」
-              </div>
-            )}
-          </div>
-          {project && !scene && (
-            <TimelinePanel
-              session={session}
+    <>
+      <div
+        ref={rootRef}
+        className={`lumora-studio${className ? ` ${className}` : ''}`}
+        data-testid="lumora-studio"
+        // 覆盖确认模态打开时整壳 inert：工具栏/对象树/视口/时间线整体不可达
+        // （复审阻断 4：仅时间线内容 inert 时其余应用仍可交互）
+        inert={session.state.overwritePending || undefined}
+      >
+        <Toolbar
+          runtime={runtime}
+          project={project}
+          editorState={editorState}
+          cache={cache}
+          onTogglePlugins={() => setPluginManagerOpen((open) => !open)}
+          onTogglePalette={() => setPaletteOpen((open) => !open)}
+        />
+        <div className="lumora-studio__body">
+          <div className="lumora-studio__sidebar">
+            <ObjectTree
               editor={runtime.editor}
               project={project}
               selection={editorState.selection}
-              captureRef={captureRef}
-              captureReady={captureReady}
+              cache={cache}
             />
-          )}
-        </main>
-        <PropertiesPanel
-          editor={runtime.editor}
-          project={project}
-          selection={editorState.selection}
-        />
+            <PanelHost
+              runtime={runtime}
+              project={project}
+              onDisablePlugin={(pluginId) => void runtime.host.disable(pluginId)}
+            />
+          </div>
+          <main className="lumora-studio__viewport">
+            <div className="lumora-studio__scene-slot">
+              {scene ? (
+                scene(project)
+              ) : (
+                <EditorViewport
+                  editor={runtime.editor}
+                  project={project}
+                  selection={editorState.selection}
+                  view={editorState.view}
+                  cache={cache}
+                  session={session}
+                  captureRef={captureRef}
+                  onCaptureReady={handleCaptureReady}
+                />
+              )}
+              {!project && (
+                <div className="lumora-studio__empty" data-testid="studio-empty-hint">
+                  尚未打开项目 —— 点击工具栏「打开示例项目」
+                </div>
+              )}
+            </div>
+            {project && !scene && (
+              <TimelinePanel
+                session={session}
+                editor={runtime.editor}
+                project={project}
+                selection={editorState.selection}
+                captureRef={captureRef}
+                captureReady={captureReady}
+              />
+            )}
+          </main>
+          <PropertiesPanel
+            editor={runtime.editor}
+            project={project}
+            selection={editorState.selection}
+          />
+        </div>
+        <ToastHost />
+        {pluginManagerOpen && <PluginManager runtime={runtime} onClose={() => setPluginManagerOpen(false)} />}
+        {paletteOpen && <CommandPalette runtime={runtime} onClose={() => setPaletteOpen(false)} />}
       </div>
-      <ToastHost />
-      {pluginManagerOpen && <PluginManager runtime={runtime} onClose={() => setPluginManagerOpen(false)} />}
-      {paletteOpen && <CommandPalette runtime={runtime} onClose={() => setPaletteOpen(false)} />}
-    </div>
+      {session.state.overwritePending &&
+        createPortal(
+          <div
+            className="lumora-timeline__overlay"
+            data-testid="overwrite-confirm"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="overwrite-confirm-title"
+          >
+            <div className="lumora-timeline__modal" ref={overwriteModalRef} tabIndex={-1}>
+              <p id="overwrite-confirm-title">该机位已有录制轨道，覆盖现有关键帧？</p>
+              <div className="lumora-timeline__modal-actions">
+                <button
+                  type="button"
+                  className="lumora-button lumora-button--danger"
+                  onClick={session.confirmOverwrite}
+                >
+                  覆盖录制
+                </button>
+                <button type="button" className="lumora-button" onClick={session.cancelOverwrite}>
+                  取消
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
+    </>
   );
 });

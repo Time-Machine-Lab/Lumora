@@ -131,7 +131,7 @@ async function expectShotLeft(page: Page, shotId: string, expectedPx: number): P
   expect(Math.abs(actual - expectedPx)).toBeLessThan(1);
 }
 
-test('AC1 浏览器级：真实约 5s 持续驾驶录制 → 抽稀覆盖轨道 → 两次回放暂停点位姿/画面一致', async ({ page }) => {
+test('AC1 浏览器级：真实约 5s 持续驾驶录制 → 抽稀覆盖轨道 → 晚段位姿 late delta + 两次回放同一确定终点严格一致', async ({ page }) => {
   await page.getByTestId('view-mode-select').selectOption('sample-camera'); // 主摄像机 POV
   await startRecording(page);
   await hideViewportOverlays(page);
@@ -177,7 +177,23 @@ test('AC1 浏览器级：真实约 5s 持续驾驶录制 → 抽稀覆盖轨道 
   const s0 = await canvasShot(page);
   const pose0 = await cameraPose(page);
 
+  // 晚于故障阈值（~3.5s）的两个时点直接读 camera pose 断言 late delta：
+  // 示例 cube 自身 0-4s 有旋转轨道，仅画面变化无法证明相机在动（复审阻断 5
+  // 反例：相机自 3.5s 起停住，2.5→4.5 画面仍变）；相机位姿是直接证据 ——
+  // 后段关键帧错位/平台化时 4.0 与 4.5 的插值位姿相同或滞留。驾驶约 2.5m/s
+  // 持续后移 → 0.5s 理论位移 ~1.25m，阈值 0.25m 留 5 倍余量
+  await seekByRuler(page, 4.0, zoom);
+  const pose40 = await cameraPose(page);
+  const p40 = await canvasShot(page);
+  await seekByRuler(page, 4.5, zoom);
+  const pose45 = await cameraPose(page);
+  const p45 = await canvasShot(page);
+  expect(Math.abs(pose45.position[2]! - pose40.position[2]!)).toBeGreaterThan(0.25);
+  expect(Math.abs(pose45.rotation[0]! - pose40.rotation[0]!)).toBeLessThan(0.05); // 驾驶仅平移
+  expect(p45.equals(p40)).toBe(false);
+
   // 第一次回放：播放推进 → 暂停 → 立即读取位姿/画面（勿先 seek 回精确时刻）
+  await seekByRuler(page, 0.02, zoom);
   await page.getByTestId('timeline-play').click();
   await page.waitForTimeout(800);
   await page.getByTestId('timeline-play').click(); // 暂停
@@ -207,6 +223,22 @@ test('AC1 浏览器级：真实约 5s 持续驾驶录制 → 抽稀覆盖轨道 
   // 两次暂停的画面一致（像素差异比例小，而非逐像素相等 —— 两帧相隔 ≤0.3s）
   const diff = await pixelDiffRatio(page, pA, pB);
   expect(diff).toBeLessThan(0.15);
+
+  // 收紧（复审阻断 5）：两次回放都驱动到同一确定终点（4.0s）后严格比较 ——
+  // 同一 seek 输入（吸附关闭坐标精确、滚动位置确定性设置）→ 两次落点逐位
+  // 一致，位姿必须完全相等、画面近乎逐像素一致。修复前容差式断言
+  // （|Δt|<0.3s、位置<0.9m、像素<15%）可放过明显不同的停帧
+  await seekByRuler(page, 4.0, zoom);
+  const poseA4 = await cameraPose(page);
+  const pA4 = await canvasShot(page);
+  await seekByRuler(page, 4.0, zoom);
+  const poseB4 = await cameraPose(page);
+  const pB4 = await canvasShot(page);
+  expect(poseB4.position).toEqual(poseA4.position);
+  expect(poseB4.rotation).toEqual(poseA4.rotation);
+  expect(poseB4.focalLength).toEqual(poseA4.focalLength);
+  const diffEnd = await pixelDiffRatio(page, pA4, pB4);
+  expect(diffEnd).toBeLessThan(0.01);
 });
 
 test('AC2 浏览器级：按住驾驶键时页面失焦 → 相机 transform 冻结（录制暂停、画面逐像素不变）', async ({ page }) => {

@@ -905,7 +905,8 @@
 }
 
 .lumora-timeline__overlay {
-  position: absolute;
+  /* 模态提升到壳层根级并经 portal 挂 body：fixed 覆盖整个视口（复审阻断 4） */
+  position: fixed;
   inset: 0;
   display: flex;
   align-items: center;

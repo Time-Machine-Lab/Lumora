@@ -30,8 +30,9 @@ interface EditorViewportProps {
   cache: ContentCache;
   /** 时间线会话：提供后启用回放驱动与键鼠机位驾驶（TML-52） */
   session?: TimelineSession | null;
-  /** 帧截图通道：FrameCaptureBridge 在 Canvas 内注册（分镜缩略图用） */
-  captureRef?: React.RefObject<(() => string | null) | null>;
+  /** 帧截图通道：FrameCaptureBridge 在 Canvas 内注册（分镜缩略图用）；
+   *  可选参数 = 分镜绑定机位 id，传参时按该机位渲染 */
+  captureRef?: React.RefObject<((cameraObjectId?: string | null) => string | null) | null>;
   /** 截图通道就绪通知（FrameCaptureBridge 挂载/卸载时回调；缩略图链据此
    *  启动，复审阻断 2） */
   onCaptureReady?: (ready: boolean) => void;
@@ -73,7 +74,7 @@ export function EditorViewport({
   // 回放驱动跳过集：gizmo 拖拽中的对象不被轨道求值覆盖
   const skipIdsRef = useRef<Set<string> | null>(null);
   // 分镜缩略图截图通道（FrameCaptureBridge 在 Canvas 内挂载后可用）
-  const localCaptureRef = useRef<(() => string | null) | null>(null);
+  const localCaptureRef = useRef<((cameraObjectId?: string | null) => string | null) | null>(null);
   const captureRef = captureRefProp ?? localCaptureRef;
 
   // 驾驶目标：单选机位；已有轨道机位在暂停态不驾驶（时间线接管），录制中始终可驾驶
@@ -212,12 +213,15 @@ export function EditorViewport({
         />
         {!cameraView && <OrbitControls makeDefault enableDamping enabled={!dragging} />}
         <CameraProxy cameraRef={cameraRef} />
-        <FrameCaptureBridge captureRef={captureRef} onCaptureReady={onCaptureReady} />
+        <FrameCaptureBridge captureRef={captureRef} onCaptureReady={onCaptureReady} rootRef={rootRef} aspect={aspect} />
       </Canvas>
       {session && (
         <>
           <PlaybackDriver session={session} editor={editor} rootRef={rootRef} skipIdsRef={skipIdsRef} />
-          <CameraPoseReadout session={session} editor={editor} rootRef={rootRef} />
+          {/* 数值位姿读取钩子仅供 e2e 数值断言（复审一般 7）：dev 服务（e2e 即
+              dev server）挂载，生产构建 tree-shake —— 60Hz JSON stringify 不进
+              生产树 */}
+          {import.meta.env.DEV && <CameraPoseReadout session={session} editor={editor} rootRef={rootRef} />}
         </>
       )}
       {cameraView && containerSize && project && (
@@ -418,23 +422,39 @@ function CameraPoseReadout({
 function FrameCaptureBridge({
   captureRef,
   onCaptureReady,
+  rootRef,
+  aspect,
 }: {
-  captureRef: React.RefObject<(() => string | null) | null>;
+  captureRef: React.RefObject<((cameraObjectId?: string | null) => string | null) | null>;
   /** 通道就绪通知：挂载置 true、卸载置 false。仅写 ref 不触发 React 渲染，
    *  缩略图链依赖该回调启动（复审阻断 2） */
   onCaptureReady?: (ready: boolean) => void;
+  /** 场景根：分镜机位截图时经 findNode 解析绑定相机节点 */
+  rootRef: React.RefObject<THREE.Group | null>;
+  /** 项目画幅比例：机位截图前同步 aspect（与 CameraRig 同源模式） */
+  aspect: number;
 }) {
   const gl = useThree((s) => s.gl);
   const scene = useThree((s) => s.scene);
   const camera = useThree((s) => s.camera);
   const size = useThree((s) => s.size);
   useEffect(() => {
-    captureRef.current = () => {
+    captureRef.current = (cameraObjectId?: string | null) => {
       if (typeof gl.render !== 'function') return null;
       try {
+        // 分镜机位截图：解析绑定相机并按项目画幅校正投影；绑定缺失时返回 null
+        // 让缩略图保持占位，而不是用当前相机渲染出错误画面（复审阻断 2）
+        let viewCamera = camera;
+        if (cameraObjectId) {
+          const node = rootRef.current ? findNode(rootRef.current, cameraObjectId) : null;
+          if (!node || !(node instanceof THREE.PerspectiveCamera)) return null;
+          node.aspect = aspect;
+          node.updateProjectionMatrix();
+          viewCamera = node;
+        }
         gl.setScissorTest(false);
         gl.setViewport(0, 0, size.width, size.height);
-        gl.render(scene, camera);
+        gl.render(scene, viewCamera);
         return gl.domElement.toDataURL('image/png');
       } catch {
         return null;
@@ -445,7 +465,7 @@ function FrameCaptureBridge({
       captureRef.current = null;
       onCaptureReady?.(false);
     };
-  }, [gl, scene, camera, size, captureRef, onCaptureReady]);
+  }, [gl, scene, camera, size, captureRef, onCaptureReady, rootRef, aspect]);
   return null;
 }
 

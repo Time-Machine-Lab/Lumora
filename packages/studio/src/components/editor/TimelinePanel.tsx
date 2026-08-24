@@ -24,8 +24,9 @@ export interface TimelinePanelProps {
   editor: SceneEditor;
   project: Project;
   selection: string[];
-  /** 视口截图通道（FrameCaptureBridge 注册）；null = 不可截图（测试/无 Canvas） */
-  captureRef: React.RefObject<(() => string | null) | null>;
+  /** 视口截图通道（FrameCaptureBridge 注册）；null = 不可截图（测试/无 Canvas）。
+   *  可选参数 = 分镜绑定机位 id：传参时按该机位渲染，缺省渲染当前相机 */
+  captureRef: React.RefObject<((cameraObjectId?: string | null) => string | null) | null>;
   /** 截图通道就绪信号：FrameCaptureBridge 挂载后才置 true。仅改稳定 ref 的
    *  .current 不触发 effect 重跑，初载缩略图链须经此状态启动（复审阻断 2） */
   captureReady?: boolean;
@@ -37,6 +38,37 @@ const CHANNEL_LABELS: Record<string, string> = {
   scale: '缩放',
   focalLength: '焦距',
 };
+
+/**
+ * 项目内容指纹（缩略图失效代）：稳定投影 settings/scenes/objects/tracks/shots/
+ * 资源元数据（不含 payload/parts 字节与运行期 storageRef）后取 djb2 哈希。
+ * 任何影响画面的编辑（对象变换、轨道关键帧、分镜绑定、画幅、资源替换）都会
+ * 改变指纹 → 缩略图键换代 → 旧代键淘汰重截（复审阻断 2）。
+ */
+export function projectContentFingerprint(project: Project): string {
+  const projection = {
+    settings: project.settings,
+    scenes: project.scenes,
+    objects: project.objects,
+    tracks: project.tracks,
+    shots: project.shots,
+    assets: project.assets.map((a) => ({
+      id: a.id,
+      kind: a.kind,
+      name: a.name,
+      format: a.format,
+      mime: a.mime,
+      hash: a.hash,
+      size: a.size,
+      source: a.source,
+    })),
+  };
+  let hash = 5381;
+  for (const char of JSON.stringify(projection)) {
+    hash = ((hash << 5) + hash + char.charCodeAt(0)) >>> 0;
+  }
+  return hash.toString(36);
+}
 
 /** 面板本地播放头订阅：tick 频率的时间镜像，不经过全局状态 */
 function usePlayheadTime(session: TimelineSession): number {
@@ -121,8 +153,25 @@ export function TimelinePanel({ session, editor, project, selection, captureRef,
   // 不再有陈旧 previous 互踩（TML-52 审查第 4 项）。
   const [thumbs, setThumbs] = useState<Record<string, string | null>>({});
   const thumbChainRef = useRef<{ cancelled: boolean; seeking: boolean } | null>(null);
+  // 失效代 = 会话令牌 + 项目内容指纹：任何影响画面的编辑或重开都会换代，旧代键
+  // 不再命中且被淘汰（仅按 shot.id 键控时编辑后旧键永不过期，复审阻断 2）。
+  // effect 与渲染共用同一派生，保证写入键与展示键一致
+  const thumbGeneration = useMemo(
+    () => `${editor.getSessionToken()}:${projectContentFingerprint(project)}`,
+    [editor, project],
+  );
 
   useEffect(() => {
+    const prefix = `${thumbGeneration}:`;
+    const staleKeys = Object.keys(thumbs).filter((key) => !key.startsWith(prefix));
+    if (staleKeys.length > 0) {
+      // 换代后首跑一次性淘汰旧代键，避免缩略图 Map 随每次编辑膨胀
+      setThumbs((m) => {
+        const next = { ...m };
+        for (const key of staleKeys) delete next[key];
+        return next;
+      });
+    }
     const capture = captureRef.current;
     // captureReady 参与门控：FrameCaptureBridge 在 effect 首跑之后才写入
     // captureRef.current，早跑早退会留下永远缺失的缩略图；就绪翻转后本链重跑
@@ -134,11 +183,8 @@ export function TimelinePanel({ session, editor, project, selection, captureRef,
       lastSeek: null,
     };
     thumbChainRef.current = chain;
-    // 缓存键 = 会话令牌 + 分镜内容身份（时间/绑定/名称）：项目切换、重开或
-    // 分镜编辑后不再命中上一项目的旧缩略图（复审阻断 2：仅按 shot.id 键控）
-    const sessionToken = editor.getSessionToken();
-    const thumbKey = (shot: (typeof project.shots)[number]) =>
-      `${sessionToken}:${shot.id}:${shot.startTime}:${shot.endTime}:${shot.cameraObjectId}:${shot.name}`;
+    // 缓存键 = 失效代 + 分镜 id（分镜内容身份已含在指纹中）
+    const thumbKey = (shot: (typeof project.shots)[number]) => `${prefix}${shot.id}`;
     const missing = project.shots.filter((shot) => thumbs[thumbKey(shot)] === undefined);
     if (missing.length === 0) return;
     const previous = timeline.getTime();
@@ -174,7 +220,7 @@ export function TimelinePanel({ session, editor, project, selection, captureRef,
           requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
         });
         if (chain.cancelled) break;
-        setThumbs((m) => ({ ...m, [thumbKey(shot)]: capture() }));
+        setThumbs((m) => ({ ...m, [thumbKey(shot)]: capture(shot.cameraObjectId) }));
       }
       // 链未被外部打断且确实移动过播放头 → 统一恢复一次（审查第 4 项）
       if (!chain.cancelled && moved) timeline.seek(previous, false);
@@ -198,9 +244,10 @@ export function TimelinePanel({ session, editor, project, selection, captureRef,
       for (const sub of subs) sub.dispose();
       void cancelled;
     };
-    // 播放态翻转后重新补缺（暂停时截图、播放中跳过）；thumbs 增量触发补齐剩余
+    // 播放态翻转后重新补缺（暂停时截图、播放中跳过）；thumbs 增量触发补齐剩余；
+    // project 整体入 deps：对象变换等不触及 shots 的编辑也须换代重截（复审阻断 2）
     // eslint-disable-next-line react-hooks/exhaustive-deps -- missing 由 deps 覆盖推导
-  }, [project.shots, thumbs, timeline, captureRef, captureReady, state.playing, state.recording, editor]);
+  }, [project, thumbs, timeline, captureRef, captureReady, state.playing, state.recording, editor, thumbGeneration]);
 
   const moveShot = useCallback(
     (index: number, direction: -1 | 1) => {
@@ -232,94 +279,6 @@ export function TimelinePanel({ session, editor, project, selection, captureRef,
 
   // 覆盖确认模态：真模态语义 —— 初始聚焦首个可聚焦项（容器不再拿焦点，消除
   // Shift+Tab 逃逸）、Tab/Shift+Tab 环内循环（焦点逃逸到对话框外也拉回）、
-  // 模态外按键一律拦截（全局快捷键不穿透）、关闭后焦点还原到触发按钮、背景
-  // inert（TML-52 复审一般项 6）。捕获阶段处理先于 LumoraStudio 冒泡阶段
-  // 全局处理器，stopImmediatePropagation 使其不可达；对话框内空格保留原生
-  // 按钮激活（仅停传播、不 preventDefault）。
-  const overwriteModalRef = useRef<HTMLDivElement>(null);
-  const overwriteTriggerRef = useRef<HTMLElement | null>(null);
-  useEffect(() => {
-    if (!state.overwritePending) return;
-    const dialog = overwriteModalRef.current;
-    if (!dialog) return;
-    overwriteTriggerRef.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const focusables = () =>
-      Array.from(
-        dialog.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-        ),
-      );
-    focusables()[0]?.focus();
-    const isAppShortcut = (event: KeyboardEvent) =>
-      event.key === 'Delete' ||
-      event.key === 'Backspace' ||
-      event.key === '1' ||
-      event.key === '2' ||
-      event.key === '3' ||
-      ((event.ctrlKey || event.metaKey) &&
-        (event.key === 'k' || event.key === 'z' || event.key === 'y' || event.key === 'd'));
-    const onKeyDownCapture = (event: KeyboardEvent) => {
-      const inside = event.target instanceof Node && dialog.contains(event.target);
-      if (!inside) {
-        // 模态外（含 window/document 上的按键）：一律拦截，不再穿透到全局处理器；
-        // 焦点若已逃逸到对话框外（程序性 blur 等），Tab 把它拉回首项（焦点陷阱闭环）
-        if (event.key === 'Tab') {
-          focusables()[0]?.focus();
-        }
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        return;
-      }
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        session.cancelOverwrite();
-        return;
-      }
-      if (event.key === 'Tab') {
-        const list = focusables();
-        if (list.length === 0) {
-          event.preventDefault();
-          event.stopImmediatePropagation();
-          return;
-        }
-        const first = list[0]!;
-        const last = list[list.length - 1]!;
-        if (!dialog.contains(document.activeElement)) {
-          event.preventDefault();
-          event.stopImmediatePropagation();
-          first.focus();
-        } else if (event.shiftKey && document.activeElement === first) {
-          event.preventDefault();
-          event.stopImmediatePropagation();
-          last.focus();
-        } else if (!event.shiftKey && document.activeElement === last) {
-          event.preventDefault();
-          event.stopImmediatePropagation();
-          first.focus();
-        }
-        return;
-      }
-      if (isAppShortcut(event)) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        return;
-      }
-      if (event.key === ' ') {
-        // 对话框按钮的空格激活走原生行为，只阻断冒泡到全局播放切换
-        event.stopImmediatePropagation();
-        return;
-      }
-    };
-    window.addEventListener('keydown', onKeyDownCapture, true);
-    return () => {
-      window.removeEventListener('keydown', onKeyDownCapture, true);
-      const trigger = overwriteTriggerRef.current;
-      if (trigger && trigger.isConnected) trigger.focus();
-    };
-  }, [state.overwritePending, session]);
-
   const ticks = useMemo(() => {
     const minorStep = zoom >= 600 ? 0.25 : zoom >= 300 ? 0.5 : 1;
     const total = Math.max(0.1, state.duration);
@@ -334,8 +293,8 @@ export function TimelinePanel({ session, editor, project, selection, captureRef,
 
   return (
     <div className="lumora-timeline" data-testid="lumora-timeline">
-      {/* 覆盖确认模态打开时背景 inert（键盘/鼠标/辅助技术全部不可达，复审一般项 6） */}
-      <div className="lumora-timeline__content" inert={state.overwritePending || undefined}>
+      {/* 覆盖确认模态已提升至 Studio 根层（整壳 inert，见 LumoraStudio） */}
+      <div className="lumora-timeline__content">
       <div className="lumora-timeline__transport">
         <button
           type="button"
@@ -480,7 +439,7 @@ export function TimelinePanel({ session, editor, project, selection, captureRef,
                 {project.shots.map((shot, index) => {
                   const camera = shot.cameraObjectId ? findObject(project, shot.cameraObjectId) : null;
                   const width = Math.max(3, (shot.endTime - shot.startTime) * zoom);
-                  const thumbKey = `${editor.getSessionToken()}:${shot.id}:${shot.startTime}:${shot.endTime}:${shot.cameraObjectId}:${shot.name}`;
+                  const thumbKey = `${thumbGeneration}:${shot.id}`;
                   return (
                     <div
                       key={shot.id}
@@ -530,27 +489,6 @@ export function TimelinePanel({ session, editor, project, selection, captureRef,
         </div>
       </div>
       </div>
-      {state.overwritePending && (
-        <div
-          className="lumora-timeline__overlay"
-          data-testid="overwrite-confirm"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="overwrite-confirm-title"
-        >
-          <div className="lumora-timeline__modal" ref={overwriteModalRef} tabIndex={-1}>
-            <p id="overwrite-confirm-title">该机位已有录制轨道，覆盖现有关键帧？</p>
-            <div className="lumora-timeline__modal-actions">
-              <button type="button" className="lumora-button lumora-button--danger" onClick={session.confirmOverwrite}>
-                覆盖录制
-              </button>
-              <button type="button" className="lumora-button" onClick={session.cancelOverwrite}>
-                取消
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

@@ -211,6 +211,58 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     expect(live().state.recording).toBe(false);
   });
 
+  it('A→B 直接打开 / 同 URI 重开：无条件暂停并回零（复审阻断 3，不再只在项目从 null 打开时回零）', () => {
+    mount();
+    // 播放推进到中间时刻
+    act(() => live().togglePlay());
+    act(() => vi.advanceTimersByTime(1500));
+    expect(live().timeline.getTime()).toBeGreaterThan(1);
+    // A→B 直接打开：播放头必须暂停并回零，不得带着旧项目的时刻进入新项目
+    act(() => editor.openProject({ ...createSampleProject(), uri: 'lumora://other-project' }));
+    expect(live().timeline.isPlaying()).toBe(false);
+    expect(live().timeline.getTime()).toBe(0);
+    // 同 URI 重开：同样无条件暂停并回零
+    act(() => live().togglePlay());
+    act(() => vi.advanceTimersByTime(800));
+    expect(live().timeline.getTime()).toBeGreaterThan(0.5);
+    act(() => editor.openProject(createSampleProject()));
+    expect(live().timeline.isPlaying()).toBe(false);
+    expect(live().timeline.getTime()).toBe(0);
+  });
+
+  it('更早注册的 project:changed listener 同步执行旧 confirm/stop → 入口自检拒绝，样本不写入新项目（复审阻断 3）', () => {
+    // 先于 hook 内部 listener 注册：openProject 同步分发 project:changed 时本
+    // listener 先执行，hook 的取消分支尚未运行 —— 只能靠 confirm/stop 入口的
+    // isCurrentSession 自检兜底旧会话动作
+    const staleCalls: string[] = [];
+    const earlySub = editor.events.on('project:changed', () => {
+      if (live().state.recording) staleCalls.push('stop');
+      if (live().state.overwritePending) staleCalls.push('confirm');
+      live().stopRecording();
+      live().confirmOverwrite();
+    });
+    mount();
+    // 覆盖确认挂起 → 同 URI 重开：旧 confirm 不得在新会话启动录制
+    act(() => live().startRecording('sample-camera'));
+    expect(live().state.overwritePending).toBe(true);
+    act(() => editor.openProject(createSampleProject()));
+    expect(live().state.overwritePending).toBe(false);
+    expect(live().recorder.active).toBe(false);
+    expect(live().state.recording).toBe(false);
+    // 录制中 → 同 URI 重开：旧 stop 不得把样本提交进新项目
+    act(() => live().startRecording('sample-camera'));
+    act(() => live().confirmOverwrite());
+    act(() => vi.advanceTimersByTime(300));
+    expect(live().recorder.active).toBe(true);
+    act(() => editor.openProject(createSampleProject()));
+    expect(live().recorder.active).toBe(false);
+    expect(live().state.recording).toBe(false);
+    expect(live().timeline.isPlaying()).toBe(false);
+    expect(editor.getProject()!.tracks.every((t) => !t.name.startsWith('录制'))).toBe(true);
+    expect(staleCalls).toEqual(['confirm', 'stop']);
+    earlySub.dispose();
+  });
+
   it('录制扩容后绑定机位被删除 → 取消录制并把时长收敛回项目时长（复审阻断 3）', () => {
     mount();
     act(() => live().startRecording('sample-camera'));

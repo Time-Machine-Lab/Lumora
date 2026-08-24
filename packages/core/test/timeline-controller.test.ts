@@ -122,6 +122,25 @@ describe('TimelineController：播放/暂停与 tick 推进', () => {
     expect(states).toEqual([true, false]);
   });
 
+  it('state:changed 双监听器：首个监听器同步 pause 时，剩余监听器不得收到陈旧 [false,true] 镜像（复审一般 6）', () => {
+    // 反例：play() 分发中首个监听器同步重入 pause() → 嵌套 emit 已把最新
+    // {playing:false} 送达剩余监听器；修复前外层分发继续，陈旧 {playing:true}
+    // 又在 false 之后送达 → 第二个监听器收到 [false,true] 镜像。latest-wins
+    // 使嵌套发生即终止外层分发，只交付最新状态
+    const timeline = new TimelineController({ duration: 10 });
+    const firstSeen: boolean[] = [];
+    const secondSeen: boolean[] = [];
+    timeline.events.on('state:changed', (p) => {
+      firstSeen.push(p.playing);
+      if (p.playing) timeline.pause(); // 同步重入
+    });
+    timeline.events.on('state:changed', (p) => secondSeen.push(p.playing));
+    timeline.play();
+    expect(timeline.isPlaying()).toBe(false);
+    expect(firstSeen).toEqual([true, false]);
+    expect(secondSeen).toEqual([false]);
+  });
+
   it('tick 推进：dt 累加、每帧发 time:changed；播放头从末尾重播', () => {
     const timeline = new TimelineController({ fps: 24, duration: 4 });
     timeline.seek(4);

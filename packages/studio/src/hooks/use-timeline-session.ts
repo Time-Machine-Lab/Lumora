@@ -87,7 +87,10 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
   }));
 
   const pendingRecordingRef = useRef<{ sessionToken: number; cameraId: string } | null>(null);
-  const wasNullRef = useRef(true);
+  /** 本 hook 观察中的项目会话令牌：project:changed 里据此判定「会话切换」
+   *  （打开/重开/重置）。与 recordedSessionTokenRef 分离 —— 后者仅录制时非空，
+   *  不能作为会话变化依据（从未录制时不得把每次编辑误判为切换） */
+  const currentSessionTokenRef = useRef<number | null>(null);
   /** 录制绑定身份：项目会话令牌 + uri + 机位 id。会话令牌随项目打开/重开/重置
    *  递增 —— 同 URI 重开被判定为不同会话，录制与覆盖确认一并作废，不得把
    *  旧会话状态带到新项目（TML-52 复审阻断 3：仅绑定 uri 会把同 URI 重开
@@ -101,6 +104,7 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
   useEffect(() => {
     // 挂载时已有项目（会话重建/测试）：事件订阅晚于 openProject，直接补齐时长与 fps。
     // 镜像订阅在此 effect 之后才注册，settings:changed 事件无人接收，须同步写 state
+    currentSessionTokenRef.current = editor.getSessionToken();
     const open = editor.getProject();
     if (open) {
       const fps = open.settings?.fps;
@@ -108,7 +112,6 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       if (typeof fps === 'number' && fps > 0) timeline.setFps(fps);
       timeline.setDuration(duration);
       setState((s) => ({ ...s, duration, fps: typeof fps === 'number' && fps > 0 ? fps : s.fps }));
-      wasNullRef.current = false;
     }
     const cancelRecording = () => {
       if (!recorder.active) return;
@@ -134,31 +137,30 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
           timeline.pause();
           timeline.setDuration(0);
           timeline.seek(0);
-          wasNullRef.current = true;
           return;
         }
         const fps = project.settings?.fps;
         if (typeof fps === 'number' && fps > 0) timeline.setFps(fps);
-        if (!recorder.active) timeline.setDuration(getProjectDuration(project));
-        else if (
-          sessionToken !== recordedSessionTokenRef.current ||
-          project.uri !== recordedProjectUriRef.current
-        ) {
-          // 切换/重开到另一项目（含同 URI 重开：会话令牌已变）：旧录制立即
-          // 取消，样本不得进入新项目
-          cancelRecording();
+        // 会话切换（A→B 直接打开 / 同 URI 重开 / 关闭后重开）：无条件停止录制、
+        // 暂停并回零 —— 不得只在「上一项目为 null」时回零，否则播放头带着旧
+        // 项目的时刻直接进入新项目（复审阻断 3）
+        const sessionChanged =
+          currentSessionTokenRef.current !== null && sessionToken !== currentSessionTokenRef.current;
+        currentSessionTokenRef.current = sessionToken;
+        if (sessionChanged) {
+          if (recorder.active) cancelRecording();
           timeline.pause();
+          timeline.seek(0);
           timeline.setDuration(getProjectDuration(project));
-        } else if (!project.objects.some((o) => o.id === recorder.recordingCameraId)) {
+          return;
+        }
+        if (!recorder.active) timeline.setDuration(getProjectDuration(project));
+        else if (!project.objects.some((o) => o.id === recorder.recordingCameraId)) {
           // 录制中绑定机位被删除/撤销：采样源已失效，取消录制并把时长收敛回
           // 项目时长（录制扩容出的时长不得残留，复审阻断 3）
           cancelRecording();
           timeline.pause();
           timeline.setDuration(getProjectDuration(project));
-        }
-        if (wasNullRef.current) {
-          timeline.seek(0);
-          wasNullRef.current = false;
         }
       }),
     ];
@@ -284,12 +286,15 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
   );
 
   /** 覆盖确认时重验：等待期间目标可能已被删除或会话已切换（审查第 7 项；
-   *  复审阻断 3：pending 携带会话令牌，切换后已被 project:changed 作废） */
+   *  复审阻断 3：pending 携带会话令牌，切换后已被 project:changed 作废）。
+   *  isCurrentSession 兜底更早注册的 listener 在 project:changed 同步阶段调用
+   *  confirmOverwrite 的竞态 —— 彼时令牌已递增，旧 pending 不得在新会话启动录制 */
   const confirmOverwrite = useCallback(() => {
     const pending = pendingRecordingRef.current;
     pendingRecordingRef.current = null;
     setState((s) => ({ ...s, overwritePending: false }));
     if (!pending) return;
+    if (!editor.isCurrentSession(pending.sessionToken)) return;
     const project = editor.getProject();
     const camera = project?.objects.find((o) => o.id === pending.cameraId);
     if (!camera || camera.type !== 'camera') {
@@ -344,9 +349,23 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
 
   const stopRecording = useCallback(() => {
     if (!recorder.active) return;
+    // 录制绑定会话令牌已过期（项目切换/重开，含同 URI 重开）→ 仅停止并丢弃
+    // 样本：更早注册的 listener 在 project:changed 同步阶段触达 stopRecording
+    // 时，本 hook 的取消分支尚未执行，此检查兜底旧会话样本不进入新项目
+    // （复审阻断 3）
+    const recordedToken = recordedSessionTokenRef.current;
+    if (recordedToken === null || !editor.isCurrentSession(recordedToken)) {
+      recorder.stop();
+      recordedSessionTokenRef.current = null;
+      recordedProjectUriRef.current = null;
+      setState((s) => ({ ...s, recording: false, recordingPaused: false }));
+      timeline.pause();
+      return;
+    }
     const cameraObjectId = recorder.recordingCameraId;
     const projectUri = recorder.boundProjectUri;
     const channels = recorder.stop();
+    recordedSessionTokenRef.current = null;
     recordedProjectUriRef.current = null;
     setState((s) => ({ ...s, recording: false, recordingPaused: false }));
     // 停止时重验绑定身份：项目已切换或相机已删除 → 丢弃样本，不提交

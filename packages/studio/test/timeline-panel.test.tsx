@@ -4,7 +4,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { SceneEditor, TimelineController, createCameraObject, createTrack } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import type { RefObject } from 'react';
-import { TIMELINE_LABEL_WIDTH, TimelinePanel } from '../src/components/editor/TimelinePanel';
+import {
+  TIMELINE_LABEL_WIDTH,
+  TimelinePanel,
+  projectContentFingerprint,
+} from '../src/components/editor/TimelinePanel';
 import { TimelineRecorder } from '../src/components/editor/timeline-recorder';
 import type { TimelineSession, TimelineSessionState } from '../src/hooks/use-timeline-session';
 
@@ -75,7 +79,7 @@ function mountPanel(overrides: Partial<TimelineSession> = {}, selection: string[
     stopRecording: vi.fn(),
     ...overrides,
   };
-  const captureRef = { current: null } as RefObject<(() => string | null) | null>;
+  const captureRef = { current: null } as RefObject<((cameraObjectId?: string | null) => string | null) | null>;
   const view = render(
     <TimelinePanel
       session={session}
@@ -200,122 +204,6 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     expect(editor.getSelection()).toEqual(['cam']);
   });
 
-  it('覆盖确认模态：确认/取消分别回调', () => {
-    const confirm = mountPanel({ state: { ...baseState(), overwritePending: true } });
-    expect(screen.getByTestId('overwrite-confirm')).toBeInTheDocument();
-    fireEvent.click(screen.getByText('覆盖录制'));
-    expect(confirm.session.confirmOverwrite).toHaveBeenCalledTimes(1);
-    confirm.unmount();
-
-    const cancel = mountPanel({ state: { ...baseState(), overwritePending: true } });
-    fireEvent.click(screen.getByText('取消'));
-    expect(cancel.session.cancelOverwrite).toHaveBeenCalledTimes(1);
-  });
-
-  it('覆盖确认模态：真模态语义（role/aria、焦点圈、Escape、Delete 拦截）', () => {
-    const first = mountPanel({ state: { ...baseState(), overwritePending: true } });
-    const dialog = screen.getByTestId('overwrite-confirm');
-    expect(dialog).toHaveAttribute('role', 'dialog');
-    expect(dialog).toHaveAttribute('aria-modal', 'true');
-    // 打开后焦点进入对话框内的首个可聚焦项（焦点圈起点，不再聚焦容器 ——
-    // 容器持焦点时 Shift+Tab 直接逃出对话框，复审一般项 6）
-    expect(screen.getByText('覆盖录制')).toHaveFocus();
-    // 对话框内 Escape → 取消覆盖
-    fireEvent.keyDown(screen.getByText('覆盖录制'), { key: 'Escape' });
-    expect(first.session.cancelOverwrite).toHaveBeenCalledTimes(1);
-    first.unmount();
-
-    // 模态外按键被模态 capture 拦截：模拟 LumoraStudio 全局删除处理器（bubble
-    // 层）注册在模态监听之后 —— stopImmediatePropagation 使其不触发（审查一般
-    // 项：底层全局 Delete 不得穿透模态）
-    const second = mountPanel({ state: { ...baseState(), overwritePending: true } });
-    let globalSeen = false;
-    const onGlobalKeyDown = () => {
-      globalSeen = true;
-    };
-    window.addEventListener('keydown', onGlobalKeyDown);
-    fireEvent.keyDown(window, { key: 'Delete' });
-    fireEvent.keyDown(window, { key: 'Backspace' });
-    fireEvent.keyDown(window, { key: ' ' });
-    fireEvent.keyDown(window, { key: 'd', ctrlKey: true });
-    window.removeEventListener('keydown', onGlobalKeyDown);
-    expect(globalSeen).toBe(false);
-    expect(second.session.cancelOverwrite).not.toHaveBeenCalled();
-    second.unmount();
-  });
-
-  it('覆盖确认模态：Tab/Shift+Tab 焦点圈闭环，焦点逃逸到对话框外也拉回（复审一般项 6）', () => {
-    mountPanel({ state: { ...baseState(), overwritePending: true } });
-    const confirm = screen.getByText('覆盖录制');
-    const cancel = screen.getByText('取消');
-    expect(confirm).toHaveFocus();
-    // 首个可聚焦项上 Shift+Tab：回环到末项（修复前逃逸出对话框）
-    fireEvent.keyDown(confirm, { key: 'Tab', shiftKey: true });
-    expect(cancel).toHaveFocus();
-    // 末项上 Tab：回环到首项
-    fireEvent.keyDown(cancel, { key: 'Tab' });
-    expect(confirm).toHaveFocus();
-    // 焦点已在对话框外（模拟浏览器默认移动）→ Tab 拉回首项
-    (document.activeElement as HTMLElement).blur();
-    fireEvent.keyDown(document.body, { key: 'Tab' });
-    expect(confirm).toHaveFocus();
-  });
-
-  it('覆盖确认模态：对话框内应用快捷键被拦、空格放行原生激活；背景 inert（复审一般项 6）', () => {
-    const view = mountPanel({ state: { ...baseState(), overwritePending: true } });
-    const confirm = screen.getByText('覆盖录制');
-    let globalSeen = false;
-    const onGlobal = () => {
-      globalSeen = true;
-    };
-    window.addEventListener('keydown', onGlobal);
-    // 对话框内：应用快捷键拦截（Delete/Backspace/1/2/3、Ctrl/Cmd+K/Z/Y/D）
-    fireEvent.keyDown(confirm, { key: 'Delete' });
-    fireEvent.keyDown(confirm, { key: '1' });
-    fireEvent.keyDown(confirm, { key: 'd', ctrlKey: true });
-    fireEvent.keyDown(confirm, { key: 'k', metaKey: true });
-    expect(globalSeen).toBe(false);
-    // 对话框内空格：只阻断全局冒泡、不 preventDefault（保留按钮原生激活）
-    fireEvent.keyDown(confirm, { key: ' ' });
-    expect(globalSeen).toBe(false);
-    expect(view.session.cancelOverwrite).not.toHaveBeenCalled();
-    expect(view.session.confirmOverwrite).not.toHaveBeenCalled();
-    window.removeEventListener('keydown', onGlobal);
-    // 背景 inert：模态打开时运输栏整体不可达（aria 语义）
-    expect(screen.getByTestId('lumora-timeline').querySelector('.lumora-timeline__content')).toHaveAttribute('inert');
-  });
-
-  it('覆盖确认模态：关闭后焦点还原到触发按钮（复审一般项 6）', () => {
-    // 选中机位使录制按钮可用 —— jsdom 对 disabled 元素调用 focus() 是空操作
-    const view = mountPanel({}, ['cam']);
-    const record = screen.getByTestId('timeline-record');
-    record.focus();
-    view.session.state = { ...baseState(), overwritePending: true };
-    view.rerender(
-      <TimelinePanel
-        session={view.session}
-        editor={view.editor}
-        project={view.project}
-        selection={['cam']}
-        captureRef={view.captureRef}
-      />,
-    );
-    expect(screen.getByText('覆盖录制')).toHaveFocus();
-    fireEvent.keyDown(screen.getByText('覆盖录制'), { key: 'Escape' });
-    expect(view.session.cancelOverwrite).toHaveBeenCalledTimes(1);
-    view.session.state = { ...baseState(), overwritePending: false };
-    view.rerender(
-      <TimelinePanel
-        session={view.session}
-        editor={view.editor}
-        project={view.project}
-        selection={['cam']}
-        captureRef={view.captureRef}
-      />,
-    );
-    expect(record).toHaveFocus();
-  });
-
   it('无截图通道时缩略图安全降级：显示机位名而非 img', () => {
     mountPanel();
     const shot = screen.getByTestId('shot-block-s1');
@@ -402,7 +290,8 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
       'data:image/png;base64,img-4',
     );
 
-    // 分镜绑定变化（cameraObjectId 改空）→ 该分镜键失效，单独重截
+    // 分镜绑定变化（cameraObjectId 改空）→ 内容指纹换代 → 全量重截（旧代键淘汰，
+    // 不残留上代 data URI；复审阻断 2：编辑后必须重截而非复用旧键）
     view.rerender(
       <TimelinePanel
         session={view.session}
@@ -417,10 +306,111 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
       />,
     );
     await act(async () => {});
-    expect(counter).toBe(7); // 仅 s2 重截
+    expect(counter).toBe(9); // 指纹换代：3 个分镜全部重截
     expect(screen.getByTestId('shot-block-s2').querySelector('img')?.getAttribute('src')).toBe(
+      'data:image/png;base64,img-8',
+    );
+    expect(screen.getByTestId('shot-block-s1').querySelector('img')?.getAttribute('src')).toBe(
       'data:image/png;base64,img-7',
     );
     raf.mockRestore();
+  });
+
+  it('对象变换编辑换代：全量重截且 capture 携带分镜绑定机位（复审阻断 2 反例）', async () => {
+    // 反例：仅改对象位移（不触及 shots/tracks 结构）后，旧实现键不变 → 3 张
+    // data URI 逐字节保留、编辑不生效；修复后指纹换代 → 旧键淘汰、全部重截
+    const raf = vi
+      .spyOn(globalThis, 'requestAnimationFrame')
+      .mockImplementation((cb: FrameRequestCallback) => {
+        cb(0);
+        return 1;
+      });
+    const seen: Array<string | null | undefined> = [];
+    const capture = vi.fn((cameraObjectId?: string | null) => {
+      seen.push(cameraObjectId);
+      return `data:image/png;base64,img-${seen.length}`;
+    });
+    const view = mountPanel({}, [], false);
+    view.captureRef.current = capture;
+    view.rerender(
+      <TimelinePanel
+        session={view.session}
+        editor={view.editor}
+        project={view.project}
+        selection={[]}
+        captureRef={view.captureRef}
+        captureReady
+      />,
+    );
+    await act(async () => {});
+    expect(capture).toHaveBeenCalledTimes(3);
+    // 每次截图显式携带分镜绑定机位（s3 未绑定 → null = 当前相机）
+    expect(seen).toEqual(['cam', 'cam', null]);
+    expect(screen.getByTestId('shot-block-s1').querySelector('img')?.getAttribute('src')).toBe(
+      'data:image/png;base64,img-1',
+    );
+
+    act(() =>
+      view.editor.commitTransform('cam', { position: [2.5, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] }),
+    );
+    view.rerender(
+      <TimelinePanel
+        session={view.session}
+        editor={view.editor}
+        project={view.editor.getProject()!}
+        selection={[]}
+        captureRef={view.captureRef}
+        captureReady
+      />,
+    );
+    await act(async () => {});
+    expect(capture).toHaveBeenCalledTimes(6);
+    expect(seen.slice(3)).toEqual(['cam', 'cam', null]);
+    expect(screen.getByTestId('shot-block-s1').querySelector('img')?.getAttribute('src')).toBe(
+      'data:image/png;base64,img-4',
+    );
+    raf.mockRestore();
+  });
+});
+
+describe('projectContentFingerprint：缩略图失效代', () => {
+  it('影响画面的编辑改变指纹；资源载荷字节与运行期 storageRef 不计入', () => {
+    const project = makeProject();
+    const edited = {
+      ...project,
+      objects: project.objects.map((o, i) =>
+        i === 0 ? { ...o, transform: { ...o.transform, position: [2.5, 0, 0] as [number, number, number] } } : o,
+      ),
+    };
+    const trackEdited = { ...project, tracks: project.tracks.map((t) => ({ ...t, keyframes: [...t.keyframes] })) };
+    const shotEdited = { ...project, shots: project.shots.map((s, i) => (i === 1 ? { ...s, endTime: 2.5 } : s)) };
+    const assetPayload = {
+      ...project,
+      assets: [
+        {
+          id: 'a1',
+          kind: 'gltf' as const,
+          name: '车',
+          mime: 'model/gltf+json',
+          hash: 'h',
+          size: 1,
+          source: 'file' as const,
+          storageRef: 'blob:tmp',
+          payload: 'AAAA',
+          createdAt: '2026-08-20T00:00:00.000Z',
+        },
+      ],
+    };
+    const storageRefOnly = {
+      ...assetPayload,
+      assets: [{ ...assetPayload.assets[0]!, payload: 'BBBB', storageRef: 'blob:other' }],
+    };
+    expect(projectContentFingerprint(edited)).not.toBe(projectContentFingerprint(project));
+    // 仅 keyframes 数组引用变化、内容未变 → 指纹稳定
+    expect(projectContentFingerprint(trackEdited)).toBe(projectContentFingerprint(project));
+    expect(projectContentFingerprint(shotEdited)).not.toBe(projectContentFingerprint(project));
+    expect(projectContentFingerprint(assetPayload)).not.toBe(projectContentFingerprint(project));
+    // payload/storageRef 不计入 → 同内容不同载荷/引用指纹一致
+    expect(projectContentFingerprint(storageRefOnly)).toBe(projectContentFingerprint(assetPayload));
   });
 });
