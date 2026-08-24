@@ -2370,3 +2370,51 @@ describe('ProjectPersistence：第三十六轮修复回归（审查员 8/24 07:1
     removeDocSpy.mockRestore();
   });
 });
+
+describe('ProjectPersistence：第三十七轮修复回归（审查员 8/24 08:17 复审）', () => {
+  it('阻断 1：task-turn 密封屏障 —— 四层嵌套 queueMicrotask 编辑在 close settle 前被接受并真实落盘，线性化点后写入被 editor 拒绝（修复前 await null 只让出一个微任务位置：深度 3-8 的编辑在复查 + forceTeardown 之后才执行 —— addObject().ok === true、closing {ok:true}、编辑器对象数 +1，但重开真实 IndexedDB 仍为初始值，内容静默丢失）', async () => {
+    const runtime = createStudioRuntime();
+    openRuntimes.push(runtime);
+    await runtime.init({ debounceMs: 60_000, dbName: 'r37-task-turn' });
+    await runtime.openProject(createSampleProject('lumora://project/r37-task-turn', '任务边界封存'));
+    // 先落盘到 clean：dispose 的 preflight flush 判净，随后进入密封裁决窗口
+    const initial = await runtime.persistence.flushPending();
+    expect(initial.ok).toBe(true);
+    const order: string[] = [];
+    let editAccepted: boolean | null = null;
+    const closing = runtime.dispose();
+    // 审查员复现时序：四次连续嵌套 queueMicrotask 提交编辑。修复前该编辑在
+    // 复查（epoch 未变）→ forceTeardown（autosaver disposed）之后才执行 ——
+    // 编辑被 autosaver 丢弃，但 runtime 未完成关闭、editor 仍接受写入
+    queueMicrotask(() => {
+      queueMicrotask(() => {
+        queueMicrotask(() => {
+          queueMicrotask(() => {
+            editAccepted = runtime.editor.addObject(createGroupObject()).ok;
+            order.push('edit');
+          });
+        });
+      });
+    });
+    const outcome = await closing;
+    order.push('closed');
+    expect(outcome.ok).toBe(true);
+    // 编辑发生在 close settle 前（线性化点前）且写入被接受
+    expect(order).toEqual(['edit', 'closed']);
+    expect(editAccepted).toBe(true);
+    // 线性化点后：runtime 终态已释放 editor —— 写入不再被接受（修复前 editor
+    // 未释放，静默丢失；现在显式拒绝，宿主可感知）
+    const rejected = runtime.editor.addObject(createGroupObject());
+    expect(rejected.ok).toBe(false);
+    // 重开真实 IndexedDB：窗口内编辑已真实落盘（修复前对象数仍为初始值）
+    const reopened = await ProjectStore.create('r37-task-turn');
+    expect(reopened).not.toBeNull();
+    const stored = await reopened!.load('lumora://project/r37-task-turn');
+    expect(stored.ok).toBe(true);
+    if (stored.ok && stored.project) {
+      expect(stored.project.objects.length).toBe(createSampleProject().objects.length + 1);
+    }
+    reopened!.close();
+    await ProjectStore.drop('r37-task-turn');
+  });
+});

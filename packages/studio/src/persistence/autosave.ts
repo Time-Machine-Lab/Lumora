@@ -92,6 +92,21 @@ function contentFingerprint(project: Project): string | null {
   return stableStringify(content);
 }
 
+/**
+ * 任务边界排水（第三十七轮阻断 1）：返回在下一个 task 边界解析的 promise。
+ * setTimeout 回调作为新任务，必然排在整条微任务队列之后 —— 事件循环只有在
+ * 微任务队列彻底排空（含递归追加的任意深度 queueMicrotask）后才会开始下一个
+ * 任务，因此复查前的所有微任务链编辑都已执行（pending 已置 / epoch 已递增）。
+ * 修复前用 await null 只让出一个 FIFO 微任务位置：审查员四层嵌套
+ * queueMicrotask 的编辑在复查 + forceTeardown 之后才执行 —— autosaver 已
+ * disposed 不再接收、编辑器未释放仍接受写入，内容静默丢失（深度 0-2 通过、
+ * 3-8 稳定失败）。深度扫描确认线性化点前编辑全部落盘、点后编辑被已释放的
+ * 编辑器显式拒绝（runtime 终态在同一任务边界 drain 内释放 editor）。
+ */
+function taskTurn(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 export class ProjectAutosaver {
   private store: ProjectStorage | null;
   private currentUri: string | null = null;
@@ -1005,11 +1020,13 @@ export class ProjectAutosaver {
     // 归一为可恢复失败 —— 修复前 reject 向上传播，ProjectPersistence 的 catch
     // 只收集 message 未确保 autosaver 终态（disposed 恒 false、pagehide 等窗口
     // 监听残留），宿主却已置 disposed=true 假完成
-    // 第三十六轮阻断 1：flush 判 clean 与 seal 原子化 —— preflight 通过后先
-    // await null 让与本次 dispose 同一事件循环轮排入的微任务（含宿主探针的
-    // queueMicrotask 编辑）先执行，再于同一同步段复查 pending/epoch 未变化
-    // 才封存，否则继续冲刷追平。修复前 flush 先判 clean、编辑随后进 pending
-    // 启 timer、forceTeardown 取消 timer 置 disposed 返回 {ok:true} —— 内容丢失
+    // 第三十六轮阻断 1 + 第三十七轮阻断 1：flush 判 clean 与 seal 原子化 ——
+    // preflight 通过后先让出一个完整 task turn（taskTurn：排空整条微任务队列，
+    // 含递归追加的任意深度 queueMicrotask；修复前 await null 只让出一个微任务
+    // 位置，四层嵌套微任务编辑仍可在封存后执行而丢失），再于同一同步段复查
+    // 变更代未变化才封存，否则继续冲刷追平。修复前 flush 先判 clean、编辑随后
+    // 进 pending 启 timer、forceTeardown 取消 timer 置 disposed 返回 {ok:true}
+    // —— 内容丢失
     for (;;) {
       const epochAtFlushStart = this.changeEpoch;
       let outcome: SaveOutcome;
@@ -1023,10 +1040,12 @@ export class ProjectAutosaver {
         };
       }
       if (!outcome.ok) return outcome;
-      // 排水一拍：本同步段之前排入的微任务编辑此刻已执行（pending 已置 /
-      // epoch 已递增）—— 该排水点本身不产生间隙，复查在完全同步的同一段
-      // 完成，编辑不可能插在复查与封存之间
-      await null;
+      // 任务边界排水（第三十七轮阻断 1）：复查前让出一个完整 task turn ——
+      // 排空整条微任务队列（含递归追加的任意深度 queueMicrotask），而非像
+      // 修复前的 await null 只让出一个 FIFO 微任务位置（更深层微任务编辑在
+      // 复查 + forceTeardown 之后才执行，内容静默丢失）。复查在完全同步的
+      // 同一段完成，编辑不可能插在复查与封存之间
+      await taskTurn();
       // 密封裁决只看变更代：未保存内容只能经 changed() 进入（pending 置位
       // 必伴随 epoch 递增），flush 返回 ok 已保证无未保存内容 —— pending 仍
       // 非空只可能是仅内存模式（store 为 null 时 flush 直接 ok 不清 pending）
