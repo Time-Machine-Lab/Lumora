@@ -6,6 +6,7 @@ import { createGroupObject, createSampleProject } from '@lumora/core';
 import type { Manifest, PanelContextProps, PluginDescriptor } from '@lumora/core';
 import { LumoraStudio } from '../src/components/LumoraStudio';
 import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
+import type { ProjectStorage } from '../src/persistence/project-storage';
 import { CommandPalette } from '../src/components/CommandPalette';
 
 vi.mock('@react-three/fiber', () => ({
