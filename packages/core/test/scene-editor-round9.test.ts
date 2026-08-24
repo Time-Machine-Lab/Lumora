@@ -50,6 +50,7 @@ const PUBLIC_API_LIST = [
   'addScene',
   'beginTransform',
   'clearSelection',
+  'closeAdmission',
   'commitTransform',
   'deleteSelection',
   'dispose',

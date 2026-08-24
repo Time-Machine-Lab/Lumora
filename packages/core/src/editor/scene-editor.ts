@@ -164,6 +164,12 @@ export class SceneEditor {
   private sessionToken = 0;
   /** 已释放（runtime dispose）：任何写入/提交一律拒绝 */
   private disposed = false;
+  /** 写准入已关闭（第三十八轮阻断 1）：持久化 seal 裁决成功的同一同步线性化段
+   *  置位 —— 此后一切写操作明确失败，读与最终资源清理（dispose）不受影响。
+   *  与 disposed 分离：disposed 后读也终态（状态置空、事件总线关闭），
+   *  admissionClosed 仅关闭写入准入，供 seal 到终态清理之间的真实异步窗口
+   *  （插件 async deactivate 挂起等）使用 */
+  private admissionClosed = false;
   /** 每次应用状态的单调序号（openProject/提交/撤销/重做各取新值） */
   private revisionCounter = 0;
   /** 状态变迁版本（R10-M1）：project/selection/view 三类状态任何一次实际写入
@@ -262,6 +268,16 @@ export class SceneEditor {
   }
 
   /**
+   * 关闭写准入（第三十八轮阻断 1）：autosaver 密封裁决成功的同一同步线性化段
+   * 调用 —— 此后所有写操作明确失败（addObject 等返回「未打开项目」），读不受
+   * 影响，最终资源清理仍由 dispose() 完成。幂等；preflight 失败路径不调用它
+   * （编辑保持可落盘、可重试）。与 disposed 分离，保证终态清理不被跳过早退。
+   */
+  closeAdmission(): void {
+    this.admissionClosed = true;
+  }
+
+  /**
    * 释放编辑器（不可逆终态）：runtime 卸载（组件 unmount）时调用。
    * 在任何同步事件发出前进入不可重入终态：置终态标记、递增会话令牌（在途异步导入
    * 校验失败、取消提交）、清空历史与拖动事务、置空状态，最后永久关闭事件总线
@@ -288,7 +304,7 @@ export class SceneEditor {
     // 选择严格限定在活动场景可达集内：跨场景对象不可选中；重复 ID 首次出现去重（R8-8）。
     // 读取 ids 期间可能触发 getter 副作用（dispose/嵌套写），读取后必须复验版本（R10-M1）
     const next = project ? this.filterSelection(project, ids) : [];
-    if (this.disposed || this.mutationVersion !== version) return;
+    if (this.disposed || this.admissionClosed || this.mutationVersion !== version) return;
     if (next.length === this.selection.length && next.every((id, i) => id === this.selection[i])) return;
     this.selection = next;
     this.mutationVersion += 1;
@@ -821,7 +837,7 @@ export class SceneEditor {
    * {project, epoch, session}，外部窗口（克隆/回调/getter）后 guardReentry 复验。
    */
   private beginIngress(): Baseline | null {
-    if (this.disposed || !this.project) return null;
+    if (this.disposed || this.admissionClosed || !this.project) return null;
     return {
       project: this.project,
       selection: [...this.selection],
@@ -837,7 +853,7 @@ export class SceneEditor {
    * 不得移动历史、不得覆盖内层结果、不得复活已释放编辑器。
    */
   private guardReentry(baseline: Baseline): { ok: false; error: Error } | null {
-    if (this.disposed) return { ok: false, error: new Error('编辑器已释放') };
+    if (this.disposed || this.admissionClosed) return { ok: false, error: new Error('编辑器已释放') };
     if (
       this.sessionToken !== baseline.session ||
       this.mutationVersion !== baseline.version ||
@@ -1043,7 +1059,7 @@ export class SceneEditor {
   }
 
   private assertAlive(): void {
-    if (this.disposed) throw new Error('编辑器已释放');
+    if (this.disposed || this.admissionClosed) throw new Error('编辑器已释放');
   }
 
   /** 拖动前后是否等价：仅比较目标对象三向量（局部比较，不序列化项目） */

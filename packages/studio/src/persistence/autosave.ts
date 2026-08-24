@@ -1053,6 +1053,15 @@ export class ProjectAutosaver {
       // 这些场景死循环
       if (this.changeEpoch === epochAtFlushStart) break;
     }
+    // 第三十八轮阻断 1：seal 裁决成功的同一同步线性化段关闭编辑器写准入 ——
+    // 此后任何写操作（插件 async deactivate 挂起 host.dispose 期间的调用、
+    // commitDispose 内 unsubscribe/store.close 的同步重入）都明确失败，不再
+    // 出现「被接受却已无 autosave/store 承接」的静默丢盘。修复前 runtime 在
+    // editor.dispose() 前先 await host.dispose()：真实插件的 async deactivate()
+    // 可挂起该 await，期间 addObject().ok === true 但内容永不落盘。准入关闭与
+    // forceTeardown 之间无任何 await（与裁决同一同步段）；preflight 失败路径
+    // 在循环前返回，编辑保持可落盘、可重试。
+    this.editor.closeAdmission();
     // 第三十六轮严重 3：开始终态化 —— 此后任何异常都归档为终态 {ok:true,
     // message}，绝不解释为可恢复失败（修复前 forceTeardown 内 removeEventListener
     // 抛错越过 autosaver 使 ProjectPersistence 误判可恢复 {ok:false} 重开准入：

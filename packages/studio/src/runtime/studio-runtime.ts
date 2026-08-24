@@ -167,7 +167,11 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
         // commit（终态 best-effort 收敛，第三十三轮阻断 2 + 第三十四轮严重 5）：
         // persistence 已终态释放（autosaver 停止、订阅已拆、store 已关）——
         // 运行态不可恢复，宿主不得继续编辑（「可编辑但不可保存」死壳是数据
-        // 丢失面）。host/事件订阅/编辑器逐项尽力释放，任何失败不中断收敛
+        // 丢失面）。host/事件订阅/编辑器逐项尽力释放，任何失败不中断收敛。
+        // 第三十八轮阻断 1：editor 写准入已在 autosaver seal 裁决成功的同一
+        // 同步段关闭（persistence 内）—— 此处 await host.dispose() 的真实异步
+        // 窗口（插件 async deactivate 挂起）内，写入同样被 editor 明确拒绝，
+        // 不再有「seal 后仍接受写入却无人承接」的静默丢盘
         // （修复前 host.dispose() 失败即返回 {ok:false}，但 persistence 已永久
         // 释放：宿主保持挂载面对死壳，重试时新编辑随编辑器销毁丢失）；完成
         // 标记（disposed）在全部步骤尝试后置位，失败原因并入 message —— ok

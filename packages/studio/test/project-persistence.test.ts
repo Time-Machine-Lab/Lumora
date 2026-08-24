@@ -2418,3 +2418,100 @@ describe('ProjectPersistence：第三十七轮修复回归（审查员 8/24 08:1
     await ProjectStore.drop('r37-task-turn');
   });
 });
+
+describe('ProjectPersistence：第三十八轮修复回归（审查员 8/24 08:43 复审）', () => {
+  it('阻断 1a：seal 后 editor 拒写 —— 真实 deferred 插件 deactivate 挂起期间写入被明确拒绝，放行后关闭成功、磁盘无假成功（修复前 host.dispose 的 async deactivate 挂起窗口内 addObject().ok === true、内存对象数 +1，但 autosave/store 已封存 —— 重开真实 IndexedDB 仍为初始值，产品可达的静默丢盘）', async () => {
+    const runtime = createStudioRuntime();
+    openRuntimes.push(runtime);
+    await runtime.init({ debounceMs: 60_000, dbName: 'r38-deferred-plugin' });
+    await runtime.openProject(createSampleProject('lumora://project/r38-plugin', '延迟停用插件'));
+    const initial = await runtime.persistence.flushPending();
+    expect(initial.ok).toBe(true);
+    let releaseDeactivate!: () => void;
+    let markDeactivateStarted!: () => void;
+    const deactivateEntered = new Promise<void>((resolve) => {
+      markDeactivateStarted = resolve;
+    });
+    // 真实插件：deactivate 返回 deferred —— 挂起 host.dispose() 的等待
+    await runtime.host.register({
+      manifest: {
+        schemaVersion: '1',
+        id: 'com.lumora.r38deferred',
+        name: '延迟停用插件',
+        version: '0.1.0',
+        entry: './dist/index.js',
+      },
+      entry: async () => ({
+        activate: async () => undefined,
+        deactivate: () =>
+          new Promise<void>((resolve) => {
+            markDeactivateStarted();
+            releaseDeactivate = resolve;
+          }),
+      }),
+    });
+    const closing = runtime.dispose();
+    // host.dispose 已进入插件停用：persistence 已 seal、editor 写准入已关闭
+    await deactivateEntered;
+    const accepted = runtime.editor.addObject(createGroupObject());
+    // 停用挂起期间写入被明确拒绝（修复前 ok === true 但内容永不落盘）
+    expect(accepted.ok).toBe(false);
+    releaseDeactivate();
+    const outcome = await closing;
+    expect(outcome.ok).toBe(true);
+    // 重开真实 IndexedDB：无假成功 —— 拒绝的编辑未落盘，对象数仍为初始值
+    const reopened = await ProjectStore.create('r38-deferred-plugin');
+    expect(reopened).not.toBeNull();
+    const stored = await reopened!.load('lumora://project/r38-plugin');
+    expect(stored.ok).toBe(true);
+    if (stored.ok && stored.project) {
+      expect(stored.project.objects.length).toBe(createSampleProject().objects.length);
+    }
+    reopened!.close();
+    await ProjectStore.drop('r38-deferred-plugin');
+  });
+
+  it('阻断 1b：seal 后 teardown 回调（注入式 store.close）同步重入写入被明确拒绝 —— 重开真实 IndexedDB 内容不变（修复前 commitDispose 的 store.close 与 editor 拒写之间存在窗口，teardown 回调可同步重入提交 mutation）', async () => {
+    const runtime = createStudioRuntime();
+    openRuntimes.push(runtime);
+    const created = await ProjectStore.create('r38-reentry');
+    expect(created).not.toBeNull();
+    const real: ProjectStore = created!;
+    openStores.push(real);
+    let reentryOutcome: { ok: boolean } | null = null;
+    const reentrantStore: ProjectStorage = {
+      kind: 'indexeddb',
+      list: () => real.list(),
+      load: (uri) => real.load(uri),
+      save: (project, expected) => real.save(project, expected),
+      remove: (uri) => real.remove(uri),
+      removeIfUnchanged: (uri, fingerprint) => real.removeIfUnchanged(uri, fingerprint),
+      rename: (uri, name) => real.rename(uri, name),
+      duplicate: (uri, name) => real.duplicate(uri, name),
+      close: () => {
+        // seal 后的 teardown 回调同步重入写入：必须被 editor 明确拒绝
+        reentryOutcome = runtime.editor.addObject(createGroupObject());
+        real.close();
+      },
+    };
+    await runtime.init({ debounceMs: 60_000, store: reentrantStore });
+    await runtime.openProject(createSampleProject('lumora://project/r38-reentry', '关闭重入'));
+    const initial = await runtime.persistence.flushPending();
+    expect(initial.ok).toBe(true);
+    const closing = runtime.dispose();
+    const outcome = await closing;
+    expect(outcome.ok).toBe(true);
+    expect(reentryOutcome).not.toBeNull();
+    expect(reentryOutcome!.ok).toBe(false);
+    // 重开真实 IndexedDB：重入写入未提交，对象数仍为初始值
+    const reopened = await ProjectStore.create('r38-reentry');
+    expect(reopened).not.toBeNull();
+    const stored = await reopened!.load('lumora://project/r38-reentry');
+    expect(stored.ok).toBe(true);
+    if (stored.ok && stored.project) {
+      expect(stored.project.objects.length).toBe(createSampleProject().objects.length);
+    }
+    reopened!.close();
+    await ProjectStore.drop('r38-reentry');
+  });
+});
