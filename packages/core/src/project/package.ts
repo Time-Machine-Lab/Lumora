@@ -328,10 +328,27 @@ function projectAssetPartArray(value: unknown): AssetPartData[] | undefined {
   return value.map((part) => projectDto(part, PUBLIC_ASSET_PART_FIELDS)) as AssetPartData[];
 }
 
-/** 原型污染防护：显式公开声明中的这些键一律不作为导出路径（赋值到普通对象
- *  会触发原型 setter / 污染）。 */
+/** C0/C1/DEL 控制字符（第三十五轮阻断 2）：NUL/TAB 等不可打印字符在旧规范化
+ *  管道中被当分隔符剥除（'token<NUL>izerConfig' → 'tokenizerconfig'）命中
+ *  BENIGN 精确豁免而放行、凭据值进包。统一拒绝 —— 声明与数据投影两侧都不
+ *  接受（声明侧另有显式拒绝带路径明细） */
+// eslint-disable-next-line no-control-regex -- 本正则的全部用途就是拒绝控制字符
+const CONTROL_CHARACTER_RE = /[\u0000-\u001f\u007f-\u009f]/;
+
+function hasControlCharacter(key: string): boolean {
+  return CONTROL_CHARACTER_RE.test(key);
+}
+
+/** 原型污染防护 + 控制字符拒绝：显式公开声明中的这些键一律不作为导出路径
+ * （赋值到普通对象会触发原型 setter / 污染）；含 C0/C1/DEL 控制字符的键一律
+ * 拒绝（第三十五轮阻断 2 —— trie 构建与数据投影的兜底防线）。 */
 function isSafeExportKey(key: string): boolean {
-  return key !== '__proto__' && key !== 'constructor' && key !== 'prototype';
+  return (
+    key !== '__proto__' &&
+    key !== 'constructor' &&
+    key !== 'prototype' &&
+    !hasControlCharacter(key)
+  );
 }
 
 /** 凭据形态判定（第二十三轮范式反转重写，阻断 2/3 + 严重 5；历轮演进见
@@ -643,9 +660,19 @@ function normalizeCredentialKey(key: string): string {
 }
 
 /** 无边界规范化：归一化 + 去分隔符 —— 全小写/全大写/全角/分隔符变体收敛到
- *  同一无边界形态，供派生候选精确相等匹配 */
+ *  同一无边界形态，供派生候选精确相等匹配。第三十五轮阻断 2：只剥可打印分隔符，
+ *  C0/C1/DEL 控制字符保留（含控制字符的形态无法命中纯 ASCII 白名单精确项，
+ *  fail-closed，不再有 'token<NUL>izerConfig' → 'tokenizerconfig' 的收敛） */
 function collapsedCredentialForm(key: string): string {
-  return normalizeCredentialKey(key).replace(/[^a-z0-9]/g, '');
+  const normalized = normalizeCredentialKey(key);
+  let out = '';
+  for (const ch of normalized) {
+    const code = ch.codePointAt(0)!;
+    const isAlnum = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
+    const isControl = code < 0x20 || (code >= 0x7f && code <= 0x9f);
+    if (isAlnum || isControl) out += ch;
+  }
+  return out;
 }
 
 /** BENIGN 白名单判定专用规范化（第三十三轮阻断 1）：NFKC（全角/兼容字符归
@@ -657,13 +684,15 @@ function collapsedCredentialForm(key: string): string {
  *  ASCII 白名单条目相等；全角『；』等 NFKC 转 ASCII 的兼容分隔符仍正确剥除 */
 function benignCredentialForm(key: string): string {
   const nfkc = key.normalize('NFKC').toLowerCase();
-  // 剥除 ASCII 非字母数字与 NBSP（NFKC 不转 NBSP；全角空格经 NFKC 已转 ASCII
-  // 空格后一并剥除），保留全部非 ASCII 内容（逐码点过滤，避免控制字符正则）
+  // 只剥可打印 ASCII 分隔符与 NBSP（NFKC 不转 NBSP；全角空格经 NFKC 已转
+  // ASCII 空格后一并剥除）。C0/C1/DEL 控制字符与全部非 ASCII 内容保留 ——
+  // 第三十五轮阻断 2：'token<NUL>izerConfig' 保留控制字符后无法与纯 ASCII
+  // 白名单精确相等，fail-closed（逐码点过滤，避免控制字符正则）
   let out = '';
   for (const ch of nfkc) {
     const code = ch.codePointAt(0)!;
     if (code === 0xa0) continue;
-    if (code < 0x80 && !(ch >= 'a' && ch <= 'z') && !(ch >= '0' && ch <= '9')) continue;
+    if (code >= 0x20 && code < 0x7f && !(ch >= 'a' && ch <= 'z') && !(ch >= '0' && ch <= '9')) continue;
     out += ch;
   }
   return out;
@@ -1024,6 +1053,13 @@ function buildExportTrie(
   const root: ExportTrie = new Map();
   for (const declaration of declarations) {
     if (typeof declaration === 'string') {
+      // 第三十五轮阻断 2：含 C0/C1/DEL 控制字符的声明一律显式拒绝（带路径明细）
+      // —— 旧规范化管道把 NUL/TAB 当分隔符剥除，'token<NUL>izerConfig' 收敛后
+      // 命中 BENIGN 白名单放行、凭据值进包；控制字符键在声明入口统一拒绝
+      if (hasControlCharacter(declaration)) {
+        rejections.push({ plugin, path: JSON.stringify(declaration) });
+        continue;
+      }
       if (isCredentialShapeKey(declaration)) {
         rejections.push({ plugin, path: JSON.stringify(declaration) });
         continue;
@@ -1033,6 +1069,12 @@ function buildExportTrie(
       continue;
     }
     if (!Array.isArray(declaration) || declaration.length === 0) continue; // 畸形/空路径：忽略
+    // 第三十五轮阻断 2：任一段含控制字符即整条路径显式拒绝（覆盖拆分路径
+    // ['profile','token<NUL>izerConfig'] 与 ['profile','token<NUL>izer','config']）
+    if (declaration.some((segment) => typeof segment === 'string' && hasControlCharacter(segment))) {
+      rejections.push({ plugin, path: JSON.stringify(declaration) });
+      continue;
+    }
     const joinedPath = declaration.join('');
     // 第三十二轮严重 3：良性豁免统一为「末尾段序列（规范化 joined）命中良性
     // 集合」的最长后缀识别 —— 整键（['tokenizer','config'] ≡ tokenizerConfig）、

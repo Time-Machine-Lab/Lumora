@@ -1833,10 +1833,10 @@ describe('ProjectPersistence：dispose 幂等合并 single-flight（第三十一
         };
       }
     ).autosaver;
-    // 第三十四轮阻断 3：preflight 走无 teardown 的 preflightDispose（修复前
-    // 调 autosaver.dispose()，flush 成功即置 disposed —— 失败后 autosaver
-    // 已终态化，「可重试」名存实亡）
-    const disposeSpy = vi.spyOn(autosaver, 'preflightDispose');
+    // 第三十五轮阻断 1：preflight = autosaver.dispose() 原子封存（flush 失败即
+    // 未 teardown、autosaver 完整保留 —— 修复前 commit 段二次调用 dispose()
+    // 失败仍强制 teardown 返回 {ok:true}，「可重试」名存实亡）
+    const disposeSpy = vi.spyOn(autosaver, 'dispose');
     disposeSpy.mockResolvedValueOnce({ ok: false, code: 'storage-error', message: '模拟冲刷失败' });
 
     const first = persistence.dispose();
@@ -1858,7 +1858,7 @@ describe('ProjectPersistence：dispose 幂等合并 single-flight（第三十一
     expect((persistence as unknown as { currentUri: unknown }).currentUri).toBeNull();
 
     // 成功后永久复用成功结果：重复调用幂等，不再触碰 autosaver
-    const retrySpy = vi.spyOn(autosaver, 'preflightDispose');
+    const retrySpy = vi.spyOn(autosaver, 'dispose');
     const again = persistence.dispose();
     const again2 = persistence.dispose();
     expect(again2).toBe(again);
@@ -1978,15 +1978,16 @@ describe('ProjectPersistence：init/dispose 竞态 —— 晚到 store 收敛关
     const closeSpy = vi.spyOn(lateStore, 'close');
 
     // preflight 延迟失败：dispose 的收敛点先等 init settle（store 挂载），
-    // 再跑 preflight 并失败 —— 失败后运行态完整（store 已挂载、autosaver 活跃）
+    // 再跑 preflight（autosaver.dispose 原子封存）并失败 —— 失败后运行态完整
+    // （store 已挂载、autosaver 活跃）
     const autosaver = (
       persistence as unknown as {
         autosaver: {
-          preflightDispose: () => Promise<{ ok: boolean; code?: string; message?: string }>;
+          dispose: () => Promise<{ ok: boolean; code?: string; message?: string }>;
         };
       }
     ).autosaver;
-    const preflightSpy = vi.spyOn(autosaver, 'preflightDispose');
+    const preflightSpy = vi.spyOn(autosaver, 'dispose');
     preflightSpy.mockResolvedValueOnce({ ok: false, code: 'storage-error', message: '模拟冲刷失败' });
 
     let releaseCreate!: (store: ProjectStore | null) => void;
@@ -2046,6 +2047,47 @@ describe('ProjectPersistence：init/dispose 竞态 —— 晚到 store 收敛关
     expect(outcome).toEqual({ ok: true });
     createSpy.mockRestore();
   });
+
+  it('严重 3（第三十五轮）：dispose-first/init-second —— dispose 开始后晚到 init 不再穿过屏障（修复前 init 在 preflight/commit 期间仍被允许：dispose 返回 {ok:true} 后 store 才到达、close() 抛错在 init 内部被吞、公开 close 永久成功但连接泄漏）', async () => {
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    const createSpy = vi.spyOn(ProjectStore, 'create');
+    // dispose 先开始：同步关闭新 init 准入（返回 promise 之前生效）
+    const disposePromise = persistence.dispose();
+    // dispose 开始后启动 init：准入已关 → no-op，不启动任何创建任务
+    await persistence.init({ dbName: 'r35-dispose-first' });
+    expect(createSpy).not.toHaveBeenCalled();
+    const outcome = await disposePromise;
+    expect(outcome).toEqual({ ok: true });
+    expect((persistence as unknown as { disposed: boolean }).disposed).toBe(true);
+    expect(persistence.available).toBe(false);
+    createSpy.mockRestore();
+  });
+
+  it('严重 3（第三十五轮）：preflight 失败后准入重新开放 —— 晚到 init 恢复可用、编辑可真实落盘（修复前 dispose 后 init 永久 no-op，运行态无法恢复持久化）', async () => {
+    const editor = new SceneEditor();
+    const persistence = new ProjectPersistence(editor);
+    const store = await openStandaloneStore();
+    const autosaver = (
+      persistence as unknown as {
+        autosaver: { dispose: () => Promise<{ ok: boolean; code?: string; message?: string }> };
+      }
+    ).autosaver;
+    const disposeSpy = vi.spyOn(autosaver, 'dispose');
+    disposeSpy.mockResolvedValueOnce({ ok: false, code: 'storage-error', message: '模拟冲刷失败' });
+    const failed = await persistence.dispose();
+    expect(failed.ok).toBe(false);
+    // 准入已重新开放：init 恢复可用
+    await persistence.init({ debounceMs: 60_000, store });
+    expect(persistence.available).toBe(true);
+    editor.openProject(createSampleProject('lumora://project/r35-reopen', '准入重开'));
+    editor.addObject(createGroupObject());
+    const flush = await persistence.flushPending();
+    expect(flush.ok).toBe(true);
+    disposeSpy.mockRestore();
+    const retried = await persistence.dispose();
+    expect(retried).toEqual({ ok: true });
+  });
 });
 
 describe('ProjectPersistence：init 拒绝不污染 single-flight（第三十三轮一般 5）', () => {
@@ -2081,12 +2123,13 @@ describe('ProjectPersistence：preflight 失败后运行态完整可落盘（第
     const autosaver = (
       persistence as unknown as {
         autosaver: {
-          preflightDispose: () => Promise<{ ok: boolean; code?: string; message?: string }>;
           dispose: () => Promise<{ ok: boolean; code?: string; message?: string }>;
         };
       }
     ).autosaver;
-    const preflightSpy = vi.spyOn(autosaver, 'preflightDispose');
+    // 第三十五轮阻断 1：preflight = autosaver.dispose()（封存失败即原样返回、
+    // 无 teardown —— 修复前 commit 段二次冲刷失败被强制 teardown 改写成成功）
+    const preflightSpy = vi.spyOn(autosaver, 'dispose');
     preflightSpy.mockResolvedValueOnce({ ok: false, code: 'recovery-available', message: '存在未解决恢复 fork' });
 
     const outcome = await persistence.dispose();
@@ -2120,12 +2163,11 @@ describe('ProjectPersistence：preflight 失败后运行态完整可落盘（第
     const autosaver = (
       persistence as unknown as {
         autosaver: {
-          preflightDispose: () => Promise<{ ok: boolean; code?: string; message?: string }>;
           dispose: () => Promise<{ ok: boolean; code?: string; message?: string }>;
         };
       }
     ).autosaver;
-    const preflightSpy = vi.spyOn(autosaver, 'preflightDispose');
+    const preflightSpy = vi.spyOn(autosaver, 'dispose');
     preflightSpy.mockResolvedValueOnce({ ok: false, code: 'storage-error', message: '磁盘瞬时错误' });
 
     const outcome = await persistence.dispose();
@@ -2142,5 +2184,86 @@ describe('ProjectPersistence：preflight 失败后运行态完整可落盘（第
     preflightSpy.mockRestore();
     const retried = await persistence.dispose();
     expect(retried).toEqual({ ok: true });
+  });
+
+  it('第三十五轮阻断 1：最终冲刷失败原样返回 {ok:false}、无任何 teardown —— 首轮成功→间隙编辑→二次保存失败→仍可编辑→重试后真实验盘（修复前 commit 段二次冲刷失败被归档 message、强制 forceTeardown、改写成 {ok:true} —— 内存 recovery 中的新编辑随 runtime 销毁丢失）', async () => {
+    const editor = new SceneEditor();
+    const store = await openStandaloneStore();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, store });
+    editor.openProject(createSampleProject('lumora://project/r35-seal', '封存失败'));
+    // 首轮成功：内容真实落盘
+    const initial = await persistence.flushPending();
+    expect(initial.ok).toBe(true);
+    // 间隙编辑：出现 preflight 与最终冲刷之间的新内容
+    editor.addObject(createGroupObject());
+    // 二次保存失败：最终冲刷（autosaver.dispose 内 flush）落盘失败
+    const saveSpy = vi.spyOn(store, 'save');
+    saveSpy.mockRejectedValueOnce(new Error('磁盘瞬时错误'));
+    const outcome = await persistence.dispose();
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe('storage-error');
+      expect(outcome.message).toBe('磁盘瞬时错误');
+    }
+    // 原样失败：persistence 与 autosaver 两层都未进入终态（修复前 persistence
+    // disposed=true、autosaver 被强制 forceTeardown —— 假完成）
+    expect((persistence as unknown as { disposed: boolean }).disposed).toBe(false);
+    const autosaver = (persistence as unknown as { autosaver: { disposed: boolean } }).autosaver;
+    expect(autosaver.disposed).toBe(false);
+    // 仍可编辑：运行态完整
+    editor.addObject(createGroupObject());
+    // 重试后真实验盘（存储恢复）：两轮编辑都落盘
+    saveSpy.mockRestore();
+    const flush = await persistence.flushPending();
+    expect(flush.ok).toBe(true);
+    const loaded = await persistence.loadProject('lumora://project/r35-seal');
+    expect(loaded.ok).toBe(true);
+    if (loaded.ok) {
+      expect(loaded.project.objects.length).toBe(createSampleProject().objects.length + 2);
+    }
+    const retried = await persistence.dispose();
+    expect(retried).toEqual({ ok: true });
+    expect((persistence as unknown as { disposed: boolean }).disposed).toBe(true);
+  });
+
+  it('严重 4（第三十五轮）：autosaver.dispose() reject 归一为可恢复失败 —— 两层 disposed 一致、重试终态后窗口监听完整移除（修复前 persistence 置 disposed=true 假完成、autosaver 仍 disposed=false、pagehide/visibilitychange 监听残留）', async () => {
+    const editor = new SceneEditor();
+    const store = await openStandaloneStore();
+    const persistence = new ProjectPersistence(editor);
+    await persistence.init({ debounceMs: 60_000, store });
+    editor.openProject(createSampleProject('lumora://project/r35-reject', 'reject 归一'));
+
+    const autosaver = (
+      persistence as unknown as {
+        autosaver: { disposed: boolean; dispose: () => Promise<{ ok: boolean; code?: string; message?: string }> };
+      }
+    ).autosaver;
+    const removeSpy = vi.spyOn(window, 'removeEventListener');
+    const removeDocSpy = vi.spyOn(document, 'removeEventListener');
+    const rejectSpy = vi.spyOn(autosaver, 'dispose');
+    rejectSpy.mockRejectedValueOnce(new Error('模拟释放崩溃'));
+
+    const outcome = await persistence.dispose();
+    expect(outcome).toMatchObject({ ok: false, code: 'storage-error', message: '模拟释放崩溃' });
+    expect((persistence as unknown as { disposed: boolean }).disposed).toBe(false);
+    expect(autosaver.disposed).toBe(false);
+    // 运行态保留：编辑仍可落盘（修复后 autosaver 未终态化）
+    editor.addObject(createGroupObject());
+    const flush = await persistence.flushPending();
+    expect(flush.ok).toBe(true);
+
+    rejectSpy.mockRestore();
+    const retried = await persistence.dispose();
+    expect(retried).toEqual({ ok: true });
+    expect((persistence as unknown as { disposed: boolean }).disposed).toBe(true);
+    expect(autosaver.disposed).toBe(true);
+    // 终态清理逐项完成：pagehide（window）/visibilitychange（document）监听已移除
+    const removed = removeSpy.mock.calls.map((call) => call[0]);
+    expect(removed).toContain('pagehide');
+    const removedDoc = removeDocSpy.mock.calls.map((call) => call[0]);
+    expect(removedDoc).toContain('visibilitychange');
+    removeSpy.mockRestore();
+    removeDocSpy.mockRestore();
   });
 });

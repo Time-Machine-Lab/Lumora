@@ -965,7 +965,20 @@ export class ProjectAutosaver {
     // 第二十八轮阻断 4：冲刷失败如实返回 —— 失败后不得继续置 disposed/移除
     // 监听/清 stateListeners，调用方（ProjectPersistence/StudioRuntime）据此
     // 保留编辑器与存储供重试，绝不「假装已关闭」丢弃未落盘内容
-    const outcome = await this.preflightDispose();
+    // 第三十五轮严重 4：preflightDispose/flush 的意外异常（storage 层 reject）
+    // 归一为可恢复失败 —— 修复前 reject 向上传播，ProjectPersistence 的 catch
+    // 只收集 message 未确保 autosaver 终态（disposed 恒 false、pagehide 等窗口
+    // 监听残留），宿主却已置 disposed=true 假完成
+    let outcome: SaveOutcome;
+    try {
+      outcome = await this.preflightDispose();
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'storage-error',
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
     if (!outcome.ok) return outcome;
     this.forceTeardown();
     return { ok: true };

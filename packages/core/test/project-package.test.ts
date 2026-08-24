@@ -2011,6 +2011,88 @@ describe('第三十四轮阻断 2：零宽字符（U+200B/U+FE0F）注入不得�
   });
 });
 
+describe('第三十五轮阻断 2：C0/C1/DEL 控制字符（NUL/TAB）不得经 BENIGN 规范化收敛放行', () => {
+  // 修复前：collapsed/benign 规范化把全部 ASCII 非字母数字（含 NUL/TAB）当分隔符
+  // 剥除 —— 'token<NUL>izerConfig' → 'tokenizerconfig' 命中 BENIGN 精确豁免而放行、
+  // 凭据值进包。修复后控制字符保留（含控制字符的形态无法与纯 ASCII 白名单精确
+  // 相等），且声明入口对控制字符显式拒绝（带路径明细）
+  const nul = '\u0000';
+  const tab = '\t';
+  const del = '\u007f';
+  const topLevel = [`token${nul}izerConfig`, `token${tab}izerConfig`, `password${nul}less`, `config${del}prod`];
+  const nestedLeaves = [
+    ['profile', `token${nul}izerConfig`],
+    ['profile', `password${nul}less`],
+    ['profile', `config${tab}prod`],
+  ];
+  const splitPaths = [
+    ['profile', `token${nul}izer`, 'config'],
+    ['profile', `token${tab}izer`, 'config'],
+    ['profile', `config${nul}prod`],
+  ];
+
+  it('顶层整键：NUL/TAB/DEL 注入的敏感键与任意控制字符键一律拒绝', async () => {
+    const project = await buildFixtureProject();
+    for (const key of topLevel) {
+      const error = expectCredentialDeclarationRejected(() =>
+        buildProjectPackage(
+          { ...project, pluginData: { 'com.example': { [key]: 'leak-r35' } } },
+          { includePrivate: true, publicKeysByPlugin: { 'com.example': [key] } },
+        ),
+      );
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(key) });
+    }
+  });
+
+  it('嵌套叶键：控制字符注入落叶键一律拒绝，值不进包', async () => {
+    const project = await buildFixtureProject();
+    for (const path of nestedLeaves) {
+      const error = expectCredentialDeclarationRejected(() =>
+        buildProjectPackage(
+          { ...project, pluginData: { 'com.example': { profile: { [path[1]!]: 'leak-r35' } } } },
+          { includePrivate: true, publicKeysByPlugin: { 'com.example': [path] } },
+        ),
+      );
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(path) });
+    }
+  });
+
+  it('拆分路径：控制字符落任意段均拒绝（BENIGN 最长后缀识别不再吞掉控制字符注入）', async () => {
+    const project = await buildFixtureProject();
+    for (const path of splitPaths) {
+      const error = expectCredentialDeclarationRejected(() =>
+        buildProjectPackage(
+          { ...project, pluginData: {} },
+          { includePrivate: true, publicKeysByPlugin: { 'com.example': [path] } },
+        ),
+      );
+      expect(error.declarations).toContainEqual({ plugin: 'com.example', path: JSON.stringify(path) });
+    }
+  });
+
+  it('序列化值不进包：未声明的控制字符键值不随插件命名空间导出（数据投影兜底）', async () => {
+    const project = await buildFixtureProject();
+    const pkg = buildProjectPackage(
+      {
+        ...project,
+        pluginData: {
+          'com.example': {
+            tokenizerConfig: 'keep-1',
+            [`token${nul}izerConfig`]: 'leak-r35',
+            profile: { [`password${nul}less`]: 'leak-r35-2', authMode: 'keep-2' },
+          },
+        },
+      },
+      { includePrivate: true, publicKeysByPlugin: { 'com.example': ['tokenizerConfig', ['profile', 'authMode']] } },
+    );
+    const parsed = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const plugin = (parsed.project.pluginData as Record<string, unknown>)['com.example'];
+    expect(plugin).toEqual({ tokenizerConfig: 'keep-1', profile: { authMode: 'keep-2' } });
+  });
+});
+
 describe('每层公开 DTO 契约投影与声明查询加固（第十二轮阻断 1 / 一般 8 / 一般 9）', () => {
   it('嵌套凭据不进包：objects/scenes/tracks/资产元数据中的契约外字段默认导出与 includePrivate 一律排除', async () => {
     const project = await buildFixtureProject();

@@ -212,6 +212,35 @@ describe('LumoraStudio', () => {
     expect(cacheDisposeSpy).toHaveBeenCalledTimes(1);
   });
 
+  it('宿主 onCloseError 回调抛错不产生未处理拒绝（第三十五轮一般 5：修复前回调异常外溢为 unhandledrejection）', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (event: PromiseRejectionEvent) => {
+      unhandled.push(event.reason);
+    };
+    window.addEventListener('unhandledrejection', onUnhandled);
+    const onCloseError = vi.fn((_message: string) => {
+      throw new Error('宿主回调崩溃');
+    });
+    const { unmount } = render(
+      <LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" onCloseError={onCloseError} />,
+    );
+    await screen.findByTestId('test-panel');
+    const { runtime } = handle.current!;
+    // 关闭失败 → cleanup 的 close().then 回调调用宿主 onCloseError，回调抛错 ——
+    // 修复前回调在 fulfilled/rejected 回调内直接执行，派生 promise 无 catch
+    const disposeSpy = vi.spyOn(runtime, 'dispose');
+    disposeSpy.mockResolvedValueOnce({ ok: false, message: '模拟冲刷失败' });
+    unmount();
+    await waitFor(() => expect(onCloseError).toHaveBeenCalledTimes(1));
+    expect(onCloseError.mock.calls[0]![0]).toBe('模拟冲刷失败');
+    // 宿主回调异常被隔离：链尾无未处理拒绝
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(unhandled).toHaveLength(0);
+    window.removeEventListener('unhandledrejection', onUnhandled);
+    disposeSpy.mockRestore();
+  });
+
   it('严重 3：并发一败一成 —— close() 并发调用共享同一 in-flight 裁决（双击/连点不再重复 teardown），失败后清空缓存允许重试，成功释放缓存恰一次', async () => {
     const handle = createRef<LumoraStudioHandle>();
     const cacheDisposeSpy = vi.spyOn(ContentCache.prototype, 'dispose');

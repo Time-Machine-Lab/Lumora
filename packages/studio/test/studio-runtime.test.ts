@@ -339,16 +339,17 @@ describe('StudioRuntime：init pending × dispose preflight 延迟失败（第�
     expect(lateStore).not.toBeNull();
 
     // preflight 延迟失败：dispose 的收敛点先等 init settle（store 挂载），
-    // 再跑 preflight 并失败 —— 失败后运行态完整（修复前晚到 store 被转
-    // lateStore 且 preflight 失败直接返回：连接悬挂、编辑静默内存模式）
+    // 再跑 preflight（autosaver.dispose 原子封存，第三十五轮阻断 1）并失败 ——
+    // 失败后运行态完整（修复前晚到 store 被转 lateStore 且 preflight 失败直接
+    // 返回：连接悬挂、编辑静默内存模式）
     const autosaver = (
       runtime.persistence as unknown as {
         autosaver: {
-          preflightDispose: () => Promise<{ ok: boolean; code?: string; message?: string }>;
+          dispose: () => Promise<{ ok: boolean; code?: string; message?: string }>;
         };
       }
     ).autosaver;
-    const preflightSpy = vi.spyOn(autosaver, 'preflightDispose');
+    const preflightSpy = vi.spyOn(autosaver, 'dispose');
     preflightSpy.mockResolvedValueOnce({ ok: false, code: 'storage-error', message: '模拟冲刷失败' });
 
     let releaseCreate!: (s: ProjectStore | null) => void;

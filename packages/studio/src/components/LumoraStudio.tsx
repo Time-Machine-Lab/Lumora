@@ -185,12 +185,23 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
           // 仍可恢复，绝不「假装已卸载」丢弃内容；资源缓存随成功释放（恰好
           // 一次），宿主重试期间壳层仍完整可用。宿主确需放弃内容时先经
           // persistence.clearRecovery 显式丢弃后重试
+          // 第三十五轮一般 5：宿主 onCloseError 回调抛错时隔离 —— 修复前回调
+          // 直接在 fulfilled/rejected 回调内执行，宿主异常使派生 promise 无
+          // catch 处理，产生 unhandledrejection
           void close().then(
             (outcome) => {
-              if (!outcome.ok) onCloseErrorRef.current?.(outcome.message ?? '运行时释放失败');
+              try {
+                if (!outcome.ok) onCloseErrorRef.current?.(outcome.message ?? '运行时释放失败');
+              } catch {
+                // 宿主回调自身抛错不得外溢为未处理拒绝
+              }
             },
             (error) => {
-              onCloseErrorRef.current?.(error instanceof Error ? error.message : String(error));
+              try {
+                onCloseErrorRef.current?.(error instanceof Error ? error.message : String(error));
+              } catch {
+                // 宿主回调自身抛错不得外溢为未处理拒绝
+              }
             },
           );
         }

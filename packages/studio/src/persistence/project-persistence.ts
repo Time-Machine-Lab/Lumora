@@ -84,6 +84,10 @@ export class ProjectPersistence {
   // 'committing'（不可回退终态收敛，任何失败并入 message、ok 仍 true）→
   // 'disposed'（完成）。init 的晚到 store 分流据此判定
   private disposePhase: 'idle' | 'preflighting' | 'committing' | 'disposed' = 'idle';
+  // 第三十五轮严重 3：新 init 准入 —— dispose() 同步关闭（返回 promise 之前生效，
+  // dispose-first/init-second 的晚到 init 不再穿过屏障另起创建任务）；preflight
+  // 失败时重新开放（运行态保留、可继续 init/重试）
+  private initAdmissionOpen = true;
   readonly events = new TypedEventEmitter<PersistenceEventMap>();
 
   constructor(private readonly editor: SceneEditor) {
@@ -129,7 +133,10 @@ export class ProjectPersistence {
   init(
     options: { debounceMs?: number; dbName?: string; storage?: StorageBackend; store?: ProjectStorage } = {},
   ): Promise<void> {
-    if (this.disposed || this.store) return Promise.resolve();
+    // 第三十五轮严重 3：dispose() 同步关闭准入后，晚到 init 直接 no-op ——
+    // 修复前 dispose-first/init-second 仍会启动创建任务，close() 抛错被吞、
+    // 公开 close 永久成功但连接泄漏
+    if (this.disposed || !this.initAdmissionOpen || this.store) return Promise.resolve();
     if (this.initPromise) return this.initPromise;
     this.initPromise = (async (): Promise<void> => {
       const store =
@@ -583,11 +590,16 @@ export class ProjectPersistence {
     return { ok: true, project: result.project, warnings: result.warnings, migratedFrom: result.migratedFrom };
   }
 
-  /** 卸载：冲刷未保存变更、断开自动保存与存储连接。
-   *  第二十八轮阻断 4 + 第二十九轮阻断 5：autosaver 冲刷失败、或冲刷成功后仍有
-   *  未解决的恢复 fork 时如实返回失败 —— 不得继续 teardown（断开监听/关闭存储/
-   *  清 events），调用方（StudioRuntime）据此保留编辑器与存储供重试或显式解决，
-   *  绝不「假装已卸载」丢弃未落盘内容。 */
+  /** 卸载：最终冲刷 + 断开自动保存与存储连接。
+   *  第三十五轮阻断 1 重构：最终冲刷成功是进入 commit 的前置条件 —— autosaver
+   *  .dispose()（cancelTimer + flush/recovery 检查 + forceTeardown 原子化封存）
+   *  是唯一可恢复步骤，失败原样返回 {ok:false}（编辑与 autosave 完整保留、可
+   *  重试），绝不强制 teardown 改写成卸载成功；只有 autosaver 已成功封存后，
+   *  store/host/cache 剩余步骤才走 ok:true + message 终态 best-effort。
+   *  修复前 commit 内二次调用 autosaver.dispose()：外层 preflight 成功 → 间隙
+   *  出现新编辑 → 内层 flush 落盘失败 → autosaver 返回 {ok:false} 且未 teardown
+   *  （可恢复），但此处写入 message、强制 teardown、返回 {ok:true} —— runtime
+   *  销毁编辑器、内存 recovery 中的新编辑丢失。 */
   dispose(): Promise<SaveOutcome> {
     // 第三十一轮严重 3：成功后永久复用同一成功结果对象（不再触碰 autosaver/订阅）
     if (this.disposed) return this.disposePromise ?? Promise.resolve({ ok: true });
@@ -596,12 +608,16 @@ export class ProjectPersistence {
     // 非 async 直接返回缓存 promise，并发调用拿到同一对象（与 close()/runtime
     // dispose() 同型）
     if (this.disposePromise) return this.disposePromise;
+    // 第三十五轮严重 3：同步关闭新 init 准入（在返回 promise 之前生效）——
+    // dispose 开始后晚到的 init 一律 no-op（见 init 守卫）；preflight 失败时
+    // 重新开放
+    this.initAdmissionOpen = false;
     this.disposePromise = (async (): Promise<SaveOutcome> => {
-      // commit 前置收敛点（第三十三轮严重 4 + 第三十四轮严重 4 前移）：先等
-      // 在途 init settle —— init 成功则 store 已挂载（preflighting 阶段正常
-      // 挂载），之后才做 preflight。修复前 preflight 先跑：失败时晚到 store
-      // 既不挂载也不关闭（连接悬挂、编辑静默退化内存模式），且 runtime 仍标
-      // initialized、后续 init 不补做
+      // commit 前置收敛点：先等在途 init settle（single-flight + 准入已关，
+      // 此刻不存在其他未收敛创建任务）—— init 成功则 store 已挂载（disposePhase
+      // 仍为 idle，晚到 store 正常挂载而非转 lateStore），之后才做 preflight。
+      // 修复前 preflight 先跑：失败时晚到 store 既不挂载也不关闭（连接悬挂、
+      // 编辑静默退化内存模式），且 runtime 仍标 initialized、后续 init 不补做
       const inFlightInit = this.initPromise;
       if (inFlightInit) {
         try {
@@ -610,45 +626,31 @@ export class ProjectPersistence {
           // init 自身失败：已 settle 清理（第三十三轮一般 5），无 store 需处理
         }
       }
-      // preflight（第三十二轮阻断 2 拆分 + 第三十三轮阻断 2 + 第三十四轮阻断 3
-      // 明确语义）：autosaver 无 teardown 检查（flush + recovery）—— 失败即
-      // 返回 {ok:false}，autosaver/订阅/store 全部保留，运行时恢复普通可编辑
-      // 状态（编辑仍进 autosave、可落盘）。修复前 preflight 调 autosaver.dispose()
-      // （flush 成功即置 disposed 并移除监听）：后续 late close 失败返回
-      // {ok:false} 时宿主保持 UI 但 changed() 已 no-op —— 失败与重试间编辑
-      // 不落盘（死壳）。意外拒绝同样归一为可恢复失败
+      // preflight = autosaver.dispose()（第三十五轮阻断 1：最终冲刷 + 封存
+      // 原子化，唯一可恢复步骤）—— 失败即原样返回 {ok:false}，autosaver/
+      // 订阅/store 全部保留（flush 失败时 dispose() 未 teardown、仍可编辑可
+      // 落盘），运行时恢复普通可编辑状态；意外拒绝同样归一为可恢复失败
       this.disposePhase = 'preflighting';
-      let preflight: SaveOutcome;
+      let sealed: SaveOutcome;
       try {
-        preflight = await this.autosaver.preflightDispose();
+        sealed = await this.autosaver.dispose();
       } catch (error) {
         this.disposePhase = 'idle';
+        this.initAdmissionOpen = true;
         return { ok: false, code: 'storage-error', message: failureMessage(error) };
       }
-      if (!preflight.ok) {
+      if (!sealed.ok) {
         this.disposePhase = 'idle';
-        return preflight;
+        this.initAdmissionOpen = true;
+        return sealed;
       }
       // commit（终态 best-effort 收敛，第三十三轮阻断 2 + 第三十四轮阻断 3）：
-      // 进入不可回退 commit —— 自此任何失败不再返回可恢复 {ok:false}（宿主
-      // 不得再面对「可编辑但不可保存」死壳），逐项尽力收敛，失败并入 message、
-      // ok 仍为 true。lateStore 关闭也在此段：close 失败归档进 message（修复前
-      // 在 commit 前返回 {ok:false} 可重试 —— 但 autosaver 已终态化，重试没有
-      // 意义且失败与重试间的新编辑不落盘）
+      // autosaver 已成功封存（disposed=true、窗口监听已移除）—— 自此任何失败
+      // 不再返回可恢复 {ok:false}（宿主不得再面对「可编辑但不可保存」死壳），
+      // 剩余步骤（lateStore/正式 store 关闭、编辑器订阅、事件总线）逐项尽力
+      // 收敛，失败并入 message、ok 仍为 true
       this.disposePhase = 'committing';
       const failures: string[] = [];
-      try {
-        const autosaverOutcome = await this.autosaver.dispose();
-        if (!autosaverOutcome.ok) {
-          // preflight 通过后二次冲刷失败（preflight 与 commit 之间出现新编辑且
-          // 落盘失败）：内容已进恢复快照，commit 不可回退 —— 归档失败并强制
-          // 终态化（绝不残留窗口级监听）
-          failures.push(`自动保存释放失败：${autosaverOutcome.message}`);
-          this.autosaver.forceTeardown();
-        }
-      } catch (error) {
-        failures.push(`自动保存释放失败：${failureMessage(error)}`);
-      }
       if (this.lateStore) {
         const late = this.lateStore;
         try {
