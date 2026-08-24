@@ -27,6 +27,13 @@ function v2Fixture(): Record<string, unknown> {
   return { ...v2, schemaVersion: 2 };
 }
 
+/** v3 夹具（TML-52 迁移测试）：无 shots 字段（v3 schema 无分镜概念）。 */
+function v3Fixture(): Record<string, unknown> {
+  const v4 = createSampleProject('lumora://sample-project', '迁移样本');
+  const { shots: _shots, ...v3 } = v4;
+  return { ...v3, schemaVersion: 3 };
+}
+
 describe('migrateProjectSchema：版本化 schema 迁移管道（NFR-017）', () => {
   it('v1 → 当前版本：补默认字段、schemaVersion 升级、其余字段完整保留（不静默丢字段）', () => {
     const input = v1Fixture();
@@ -70,6 +77,33 @@ describe('migrateProjectSchema：版本化 schema 迁移管道（NFR-017）', ()
     expect(migrated.scenes).toEqual(original.scenes);
     expect(migrated.objects).toEqual(original.objects);
     expect(migrated.assets).toEqual(original.assets);
+  });
+
+  it('v3 → 当前版本：无 shots 的 v3 数据补默认空数组，轨道/对象原样保留', () => {
+    const input = v3Fixture();
+    const result = migrateProjectSchema(input);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.migratedFrom).toBe(3);
+    const migrated = result.project as Project;
+    expect(migrated.schemaVersion).toBe(CURRENT_PROJECT_SCHEMA_VERSION);
+    expect(migrated.shots).toEqual([]);
+    const original = input as unknown as Project;
+    expect(migrated.tracks).toEqual(original.tracks);
+    expect(migrated.objects).toEqual(original.objects);
+    expect(migrated.scenes).toEqual(original.scenes);
+  });
+
+  it('v3 数据携带 shots（手工构造）时原样透传，不覆盖不丢弃', () => {
+    const input = v3Fixture();
+    const shots = [
+      { id: 'shot-1', name: '开场', cameraObjectId: 'sample-camera', startTime: 0, endTime: 1.5 },
+    ];
+    input.shots = shots;
+    const result = migrateProjectSchema(input);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect((result.project as Project).shots).toEqual(shots);
   });
 
   it('v2 数据携带 tracks（手工构造）时原样透传，不覆盖不丢弃', () => {

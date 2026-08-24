@@ -176,6 +176,42 @@ describe('buildProjectPackage：私有数据默认排除（FR-011 / NFR-008）',
       expect(entry.parts).toBeUndefined();
     }
   });
+
+  it('分镜与轨道 disabled 随工程包往返（TML-52 包契约：shots 与 track disabled 进 PUBLIC 白名单）', async () => {
+    const project = await buildFixtureProject();
+    const disabledTrackId = genId('track');
+    const withTimeline = {
+      ...project,
+      tracks: [
+        ...project.tracks,
+        {
+          id: disabledTrackId,
+          name: '禁用轨道',
+          objectId: 'sample-camera',
+          targetPath: 'position' as const,
+          disabled: true,
+          keyframes: [
+            { time: 0, value: [0, 0, 0] as [number, number, number] },
+            { time: 1, value: [0, 0, 1] as [number, number, number] },
+          ],
+        },
+      ],
+      shots: [
+        { id: genId('shot'), name: '开场', cameraObjectId: 'sample-camera', startTime: 0, endTime: 1.5 },
+        { id: genId('shot'), name: '特写', cameraObjectId: null, startTime: 1.5, endTime: 3 },
+      ],
+    };
+    const pkg = buildProjectPackage(withTimeline, { exportedAt: '2026-08-24T00:00:00.000Z' });
+    const result = await parseProjectPackage(serializeProjectPackage(pkg));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const roundTrip = result.project as Project;
+    expect(roundTrip.shots).toEqual(withTimeline.shots);
+    const disabledTrack = roundTrip.tracks.find((t) => t.id === disabledTrackId);
+    expect(disabledTrack).toBeDefined();
+    expect(disabledTrack!.disabled).toBe(true);
+    expect(disabledTrack!.keyframes).toEqual(withTimeline.tracks[withTimeline.tracks.length - 1]!.keyframes);
+  });
 });
 
 describe('工程包私有数据契约（NFR-008：结构化隔离 + 声明制剥离，第十一轮）', () => {
@@ -2944,7 +2980,7 @@ describe('createBlankProject（FR-001：默认场景与摄像机）', () => {
   it('新项目含默认场景、活动机位与 16:9 画幅设置', () => {
     const project = createBlankProject('lumora://project/test', '新片场');
     expect(project.name).toBe('新片场');
-    expect(project.schemaVersion).toBe(3);
+    expect(project.schemaVersion).toBe(4);
     expect(project.revision).toBe(0);
     expect(project.settings).toEqual({ fps: 24, aspect: [16, 9] });
     expect(project.scenes).toHaveLength(1);

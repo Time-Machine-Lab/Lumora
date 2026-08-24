@@ -59,7 +59,7 @@ describe('ProjectStore：IndexedDB 持久化（FR-011）', () => {
     await store.save(project('lumora://project/new', '新项目', 2));
     const summaries = await listStored(store);
     expect(summaries.map((s) => s.uri)).toEqual(['lumora://project/new', 'lumora://project/old']);
-    expect(summaries[0]).toMatchObject({ name: '新项目', revision: 2, schemaVersion: 3 });
+    expect(summaries[0]).toMatchObject({ name: '新项目', revision: 2, schemaVersion: 4 });
     store.close();
   });
 
@@ -293,7 +293,7 @@ describe('ProjectStore：拒绝 schema 降级（第六轮 #6）', () => {
     if (result.ok || result.code !== 'schema-downgrade') return;
     expect(result.message).toContain('schema');
     const stored = await loadStored(store, 'lumora://project/a');
-    expect(stored!.schemaVersion).toBe(3);
+    expect(stored!.schemaVersion).toBe(4);
     expect(stored!.revision).toBe(0);
     store.close();
   });
@@ -307,7 +307,7 @@ describe('ProjectStore：拒绝 schema 降级（第六轮 #6）', () => {
     const result = await store.save(old);
     expect(result).toMatchObject({ ok: false, code: 'schema-downgrade' });
     const stored = await loadStored(store, 'lumora://project/a');
-    expect(stored!.schemaVersion).toBe(3);
+    expect(stored!.schemaVersion).toBe(4);
     store.close();
   });
 });
@@ -376,7 +376,7 @@ describe('schema 升级写回豁免 isMigrationWriteback（第七轮 #5，两个
     const result = await store.save(migrated.project as Project, 7);
     expect(result.ok).toBe(true);
     const stored = await loadStored(store, 'lumora://project/a');
-    expect(stored!.schemaVersion).toBe(3);
+    expect(stored!.schemaVersion).toBe(4);
     expect(stored!.revision).toBe(7);
     store.close();
   });
@@ -392,7 +392,7 @@ describe('schema 升级写回豁免 isMigrationWriteback（第七轮 #5，两个
     // 仅升级 schemaVersion、场景内容被改写的任意 v3/rev7 分叉：不是迁移结果 → 拒绝
     const divergent = {
       ...v3,
-      schemaVersion: 3,
+      schemaVersion: 4,
       scenes: [{ ...v3.scenes[0]!, name: '被篡改的场景' }],
     } as unknown as Project;
     const result = await store.save(divergent, 7);

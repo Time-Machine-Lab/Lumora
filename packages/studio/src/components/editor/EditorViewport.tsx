@@ -18,6 +18,9 @@ import {
   syncScene,
 } from './scene-builder';
 import { showToast } from './toasts';
+import { CameraDrive, captureCameraSample, DRIVE_KEY_CODES, restoreObjectOnNode } from './camera-drive';
+import { PlaybackDriver } from './PlaybackDriver';
+import type { TimelineSession } from '../../hooks/use-timeline-session';
 
 interface EditorViewportProps {
   editor: SceneEditor;
@@ -25,6 +28,10 @@ interface EditorViewportProps {
   selection: string[];
   view: ViewState;
   cache: ContentCache;
+  /** 时间线会话：提供后启用回放驱动与键鼠机位驾驶（TML-52） */
+  session?: TimelineSession | null;
+  /** 帧截图通道：FrameCaptureBridge 在 Canvas 内注册（分镜缩略图用） */
+  captureRef?: React.RefObject<(() => string | null) | null>;
 }
 
 /** 沿父链找到最近的对象 id（GLB 内容网格挂在模型组下，需要向上追溯）。
@@ -42,7 +49,15 @@ export function findObjectId(object: THREE.Object3D): string | null {
  *   传 CSS 像素，three 内部按 pixelRatio 换算），三分线/安全框以 DOM 覆盖层
  *   绘制在相同矩形上 —— 辅助线永不进入 canvas
  */
-export function EditorViewport({ editor, project, selection, view, cache }: EditorViewportProps) {
+export function EditorViewport({
+  editor,
+  project,
+  selection,
+  view,
+  cache,
+  session = null,
+  captureRef: captureRefProp,
+}: EditorViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<THREE.Group | null>(null);
   const cameraRef = useRef<THREE.Camera | null>(null);
@@ -51,6 +66,33 @@ export function EditorViewport({ editor, project, selection, view, cache }: Edit
   // 同步引用：Gizmo 的原生 pointerdown 监听先于容器 React 处理器执行，
   // 用 ref 而非异步的 state 判断「拖动已在 Gizmo 上开始」，避免拾取改选/清选
   const draggingRef = useRef(false);
+  // 回放驱动跳过集：gizmo 拖拽中的对象不被轨道求值覆盖
+  const skipIdsRef = useRef<Set<string> | null>(null);
+  // 分镜缩略图截图通道（FrameCaptureBridge 在 Canvas 内挂载后可用）
+  const localCaptureRef = useRef<(() => string | null) | null>(null);
+  const captureRef = captureRefProp ?? localCaptureRef;
+
+  // 驾驶目标：单选机位；已有轨道机位在暂停态不驾驶（时间线接管），录制中始终可驾驶
+  const drivenCameraId = useMemo(() => {
+    if (!project || selection.length !== 1) return null;
+    const object = findObject(project, selection[0]!);
+    return object && object.type === 'camera' ? object.id : null;
+  }, [project, selection]);
+
+  useCameraDrive(session, drivenCameraId, rootRef, editor);
+
+  // 录制采样源：视口把机位节点映射为通道样本（录制期间节点由驾驶/静止接管）
+  useEffect(() => {
+    if (!session) return;
+    session.setCaptureSource((cameraId) => {
+      const root = rootRef.current;
+      if (!root) return null;
+      const node = findNode(root, cameraId);
+      if (!node) return null;
+      return captureCameraSample(node);
+    });
+    return () => session.setCaptureSource(null);
+  }, [session]);
 
   const aspect = project ? project.settings.aspect[0] / project.settings.aspect[1] : 16 / 9;
   // 相机视图按活动场景隔离：仅当机位对象存在且属于活动场景可达集时生效
@@ -157,10 +199,16 @@ export function EditorViewport({ editor, project, selection, view, cache }: Edit
           rootRef={rootRef}
           dragging={dragging}
           setDragging={updateDragging}
+          playbackActive={!!session && session.state.playing}
+          skipIdsRef={skipIdsRef}
         />
         {!cameraView && <OrbitControls makeDefault enableDamping enabled={!dragging} />}
         <CameraProxy cameraRef={cameraRef} />
+        <FrameCaptureBridge captureRef={captureRef} />
       </Canvas>
+      {session && (
+        <PlaybackDriver session={session} editor={editor} rootRef={rootRef} skipIdsRef={skipIdsRef} />
+      )}
       {cameraView && containerSize && project && (
         <GuidesOverlay rect={fitRect(containerSize.width, containerSize.height, aspect)} view={view} />
       )}
@@ -169,12 +217,155 @@ export function EditorViewport({ editor, project, selection, view, cache }: Edit
   );
 }
 
+/**
+ * 键鼠机位驾驶（TML-52）：选中机位且非播放态时启用（录制中强制可驾驶），
+ * rAF 每帧把按键意图积分到节点。脱离驾驶（取消选中/开始回放/录制暂停）时
+ * 还原静态位姿 —— 回放中与录制采样中除外（分别由回放驱动与录制接管）。
+ * window blur → 硬停（速度立即归零，无失控位移）。
+ */
+function useCameraDrive(
+  session: TimelineSession | null,
+  drivenCameraId: string | null,
+  rootRef: React.RefObject<THREE.Group | null>,
+  editor: SceneEditor,
+) {
+  const cameraIdRef = useRef<string | null>(null);
+  cameraIdRef.current = drivenCameraId;
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+
+  useEffect(() => {
+    if (!session) return;
+    const drive = new CameraDrive();
+    let raf = 0;
+    let last = performance.now();
+    let attachedId: string | null = null;
+    let attachedNode: THREE.Object3D | null = null;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (DRIVE_KEY_CODES.has(event.code)) {
+        if (cameraIdRef.current) event.preventDefault();
+        drive.press(event.code);
+      }
+    };
+    const onKeyUp = (event: KeyboardEvent) => drive.release(event.code);
+    const onBlur = () => drive.stop();
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+
+    const restoreIfNeeded = () => {
+      if (attachedId === null || !attachedNode) return;
+      const st = sessionRef.current?.state;
+      // 回放中/录制采样中不还原（分别由回放驱动与录制接管）
+      if (st && (st.playing && !st.recording)) return;
+      if (st?.recording) return;
+      const object = editor.getProject()?.objects.find((o) => o.id === attachedId);
+      if (object) restoreObjectOnNode(attachedNode, object);
+    };
+
+    const loop = (now: number) => {
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      const st = sessionRef.current?.state;
+      const cameraId = cameraIdRef.current;
+      // 可驾驶：选中机位 && 录制未暂停 && （暂停 || 录制中）&& 无轨道（录制中无视轨道）
+      const hasTracks =
+        !!st &&
+        !!editor.getProject()?.tracks.some(
+          (t) => t.objectId === cameraId && t.keyframes.length > 0,
+        );
+      const canDrive =
+        !!st &&
+        cameraId !== null &&
+        !st.recordingPaused &&
+        (!st.playing || st.recording) &&
+        (!hasTracks || st.recording);
+      if (!canDrive) {
+        if (attachedId !== null) {
+          restoreIfNeeded();
+          drive.detach();
+          attachedId = null;
+          attachedNode = null;
+        }
+        raf = requestAnimationFrame(loop);
+        return;
+      }
+      const root = rootRef.current;
+      const node = root ? findNode(root, cameraId!) : null;
+      if (!node) {
+        raf = requestAnimationFrame(loop);
+        return;
+      }
+      if (attachedId !== cameraId) {
+        drive.attach(node);
+        attachedId = cameraId;
+        attachedNode = node;
+      }
+      drive.update(dt);
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+      drive.stop();
+      restoreIfNeeded();
+    };
+  }, [session, rootRef, editor]);
+}
+
 /** 把当前渲染相机镜像给外层（点击拾取用） */
 function CameraProxy({ cameraRef }: { cameraRef: React.MutableRefObject<THREE.Camera | null> }) {
   const camera = useThree((s) => s.camera);
   useEffect(() => {
     cameraRef.current = camera;
   }, [camera, cameraRef]);
+  return null;
+}
+
+/**
+ * 帧截图桥（分镜缩略图）：把「立即截一帧 PNG dataURL」注册给外层。测试 mock 的
+ * gl 没有 render/toDataURL，typeof guard 后返回 null（缩略图占位）。
+ */
+function FrameCaptureBridge({
+  captureRef,
+}: {
+  captureRef: React.RefObject<(() => string | null) | null>;
+}) {
+  const gl = useThree((s) => s.gl);
+  const scene = useThree((s) => s.scene);
+  const camera = useThree((s) => s.camera);
+  const size = useThree((s) => s.size);
+  useEffect(() => {
+    captureRef.current = () => {
+      if (typeof gl.render !== 'function') return null;
+      try {
+        gl.setScissorTest(false);
+        gl.setViewport(0, 0, size.width, size.height);
+        gl.render(scene, camera);
+        return gl.domElement.toDataURL('image/png');
+      } catch {
+        return null;
+      }
+    };
+    return () => {
+      captureRef.current = null;
+    };
+  }, [gl, scene, camera, size, captureRef]);
   return null;
 }
 
@@ -367,6 +558,8 @@ function EditorGizmo({
   rootRef,
   dragging,
   setDragging,
+  playbackActive,
+  skipIdsRef,
 }: {
   editor: SceneEditor;
   project: Project | null;
@@ -375,6 +568,10 @@ function EditorGizmo({
   rootRef: React.MutableRefObject<THREE.Group | null>;
   dragging: boolean;
   setDragging: (value: boolean) => void;
+  /** 回放/录制中禁用 Gizmo（时间线与驾驶接管节点） */
+  playbackActive: boolean;
+  /** 拖拽期间登记对象 id，回放驱动跳过该节点 */
+  skipIdsRef: React.RefObject<Set<string> | null>;
 }) {
   const root = rootRef.current;
   const target = selection.length === 1 && project && root ? findNode(root, selection[0]) : null;
@@ -382,6 +579,16 @@ function EditorGizmo({
   const locked = !!data?.locked;
   /** 正常提交路径标记：commit 先置位再收尾 dragging，cleanup 据此区分中断回滚 */
   const committedRef = useRef(false);
+
+  // 拖拽期间登记 skip 集：回放驱动不覆盖被 Gizmo 握住的节点
+  useEffect(() => {
+    if (!target || !dragging) return;
+    const objectId = target.userData.objectId as string;
+    skipIdsRef.current = new Set([objectId]);
+    return () => {
+      skipIdsRef.current = null;
+    };
+  }, [dragging, target, skipIdsRef]);
 
   // 拖动期间的全部中断路径（Hook 必须先于条件返回调用，保证 Hook 顺序稳定）：
   // Escape / window blur / pointercancel / 组件卸载（Delete 删除、Escape 清选、切对象）。
@@ -415,7 +622,7 @@ function EditorGizmo({
     };
   }, [dragging, target, setDragging]);
 
-  if (!target || locked || !project) return null;
+  if (!target || locked || !project || playbackActive) return null;
 
   const commit = () => {
     const objectId = target.userData.objectId as string;

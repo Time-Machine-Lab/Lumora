@@ -44,6 +44,9 @@ export type ProjectMigration = (data: unknown) => unknown;
  * 存在但为 undefined 也是现场数据，不猜测解释）；已存在的非数组值原样保留 ——
  * 迁移不静默丢数据也不猜测解释，合法性由迁移后的 v3 统一校验明确拒绝
  * （tracks 缺失或非数组）。
+ *
+ * v3 → v4：Project 新增 shots（分镜）字段（TML-52，v3 无分镜概念）。
+ * 同样只补「字段缺失」的默认空数组；已存在值原样保留，合法性由 v4 校验裁决。
  */
 const MIGRATIONS: Record<number, ProjectMigration> = {
   1: (data) => {
@@ -67,6 +70,14 @@ const MIGRATIONS: Record<number, ProjectMigration> = {
       ...raw,
       schemaVersion: 3,
       ...(Object.hasOwn(raw, 'tracks') ? {} : { tracks: [] }),
+    };
+  },
+  3: (data) => {
+    const raw = data as Record<string, unknown>;
+    return {
+      ...raw,
+      schemaVersion: 4,
+      ...(Object.hasOwn(raw, 'shots') ? {} : { shots: [] }),
     };
   },
 };

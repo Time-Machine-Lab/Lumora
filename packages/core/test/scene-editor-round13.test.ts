@@ -87,7 +87,7 @@ function multiSceneCameraProject(sceneCount: number): Project {
       activeCameraId: `camera-${i}`,
     });
   }
-  return { ...sample, objects, scenes, activeSceneId: 'scene-0', tracks: [] };
+  return { ...sample, objects, scenes, activeSceneId: 'scene-0', tracks: [], shots: [] };
 }
 
 /** 逆序深链：叶在前、根在后（路径压缩最坏情形——objects[0] 回溯整条链
@@ -112,6 +112,7 @@ function deepChainProject(nodeCount: number): Project {
     }],
     activeSceneId: 'scene-1',
     tracks: [],
+    shots: [],
   };
 }
 

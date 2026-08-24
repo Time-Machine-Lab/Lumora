@@ -80,16 +80,22 @@ export interface SceneData {
   activeCameraId: string | null;
 }
 
-/** 轨道可驱动的对象属性通道（与 TransformData 同型的 Vec3 通道） */
-export type TrackTargetPath = 'position' | 'rotation' | 'scale';
+/** 轨道可驱动的对象属性通道：Vec3 通道（position/rotation/scale）与标量通道（focalLength） */
+export type TrackTargetPath = 'position' | 'rotation' | 'scale' | 'focalLength';
+
+/** 标量通道的关键帧值（focalLength 等） */
+export type TrackKeyframeScalar = number;
+
+/** 轨道关键帧值：Vec3 通道为三元向量，标量通道为单个数值 */
+export type TrackKeyframeValue = Vec3 | TrackKeyframeScalar;
 
 export interface TrackKeyframeData {
   /** 帧时刻（秒，相对轨道起点，非负） */
   time: number;
-  /** 该时刻的目标属性值（与目标通道同型的三元向量） */
-  value: Vec3;
-  /** 插值方式：linear（默认，线性插值）/ step（阶跃，保持到下一帧） */
-  interpolation?: 'linear' | 'step';
+  /** 该时刻的目标属性值：Vec3 通道为三元向量，focalLength 等标量通道为数值 */
+  value: TrackKeyframeValue;
+  /** 插值方式：linear（默认，线性插值）/ step（阶跃，保持到下一帧）/ smooth（Catmull-Rom 平滑） */
+  interpolation?: 'linear' | 'step' | 'smooth';
 }
 
 /** 动画轨道：绑定一个场景对象的属性通道，携带按时间升序的关键帧序列 */
@@ -103,6 +109,24 @@ export interface TrackData {
   targetPath: TrackTargetPath;
   /** 关键帧（按 time 严格升序，同一轨道的帧时刻不可重复） */
   keyframes: TrackKeyframeData[];
+  /** 禁用轨道：不参与回放求值，也不计入项目有效时长（缺省 false） */
+  disabled?: boolean;
+}
+
+/**
+ * 分镜剪辑（ShotClip）：将一段时间线区段绑定到一台机位，构成「分镜 - 机位 - 区段」
+ * 的编排单元。顺序 = shots 数组下标（重排即改序）；区段可被后续编辑调整。
+ */
+export interface ShotClipData {
+  /** 稳定 ID，不随重命名变化 */
+  id: string;
+  name: string;
+  /** 绑定的机位对象 ID（null 表示未绑定） */
+  cameraObjectId: string | null;
+  /** 时间线区段起点（秒，非负，相对项目时间轴） */
+  startTime: number;
+  /** 时间线区段终点（秒，须大于 startTime） */
+  endTime: number;
 }
 
 export interface ProjectSettings {
@@ -141,7 +165,7 @@ export interface AssetData {
 export interface Project {
   uri: string;
   name: string;
-  schemaVersion: 3;
+  schemaVersion: 4;
   createdAt: string;
   /** 每次提交可撤销变更 +1，用于自动保存判断 */
   revision: number;
@@ -152,6 +176,8 @@ export interface Project {
   objects: SceneObjectData[];
   /** 动画轨道：绑定对象的属性通道 + 关键帧序列（objectId 引用 objects） */
   tracks: TrackData[];
+  /** 分镜剪辑：机位与时间线区段绑定，顺序即 shots 数组下标 */
+  shots: ShotClipData[];
   assets: AssetData[];
   /**
    * 插件私有设置（按插件 instanceId 键控）：随项目本地持久化，

@@ -59,7 +59,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     await store.save(project('lumora://project/new', '新项目', 2));
     const summaries = await listStored(store);
     expect(summaries.map((s) => s.uri)).toEqual(['lumora://project/new', 'lumora://project/old']);
-    expect(summaries[0]).toMatchObject({ name: '新项目', revision: 2, schemaVersion: 3 });
+    expect(summaries[0]).toMatchObject({ name: '新项目', revision: 2, schemaVersion: 4 });
     store.close();
   });
 
@@ -266,7 +266,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
       JSON.stringify({
         uri: 'lumora://project/mismatch',
         savedAt: 'x',
-        project: { uri: 'lumora://project/other', name: 'n', schemaVersion: 3, revision: 0 },
+        project: { uri: 'lumora://project/other', name: 'n', schemaVersion: 4, revision: 0 },
       }),
     );
     await writable2.close();
@@ -459,7 +459,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     await writeFile('lumora://project/missing-sections', {
       uri: 'lumora://project/missing-sections',
       name: '缺字段',
-      schemaVersion: 3,
+      schemaVersion: 4,
       revision: 0,
     });
     // 图关系损坏：父级不存在（孤儿对象）
@@ -567,7 +567,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     // 任意 v3/rev7 分叉（仅升级 schemaVersion + 场景内容被改写）：不得借「升级」覆盖
     const divergent = {
       ...v3,
-      schemaVersion: 3,
+      schemaVersion: 4,
       scenes: [{ ...v3.scenes[0]!, name: '被篡改的场景' }],
     } as unknown as Project;
     const forked = await store.save(divergent, 7);
@@ -581,7 +581,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     if (!migrated.ok) return;
     expect((await store.save(migrated.project as Project, 7)).ok).toBe(true);
     const stored = await loadStored(store, 'lumora://project/a');
-    expect(stored!.schemaVersion).toBe(3);
+    expect(stored!.schemaVersion).toBe(4);
     expect(stored!.revision).toBe(7);
     store.close();
   });
@@ -696,7 +696,7 @@ describe('OpfsProjectStore：OPFS 持久化（FR-011，行为与 IndexedDB 一�
     if (result.ok || result.code !== 'schema-downgrade') return;
     expect(result.message).toContain('schema');
     const stored = await loadStored(store, 'lumora://project/a');
-    expect(stored!.schemaVersion).toBe(3);
+    expect(stored!.schemaVersion).toBe(4);
     store.close();
   });
 

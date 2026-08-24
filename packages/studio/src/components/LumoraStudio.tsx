@@ -4,12 +4,14 @@ import type { PluginDescriptor, Project } from '@lumora/core';
 import { createStudioRuntime } from '../runtime/studio-runtime';
 import type { StudioRuntime } from '../runtime/studio-runtime';
 import { useSceneEditor } from '../hooks/use-scene-editor';
+import { useTimelineSession } from '../hooks/use-timeline-session';
 import type { StorageBackend } from '../persistence/project-storage';
 import { PanelHost } from './panels/PanelHost';
 import { Toolbar } from './Toolbar';
 import { CommandPalette } from './CommandPalette';
 import { PluginManager } from './PluginManager';
 import { EditorViewport } from './editor/EditorViewport';
+import { TimelinePanel } from './editor/TimelinePanel';
 import { ObjectTree } from './editor/ObjectTree';
 import { PropertiesPanel } from './editor/PropertiesPanel';
 import { ToastHost, showToast } from './editor/toasts';
@@ -91,6 +93,12 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   const runtime = runtimeRef.current;
   const editorState = useSceneEditor(runtime.editor);
   const { project } = editorState;
+  // 统一时间引擎会话（TML-52）：播放/录制/驾驶的时间权威
+  const session = useTimelineSession(runtime.editor);
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  // 分镜缩略图截图通道：EditorViewport 的 FrameCaptureBridge 挂载后可用
+  const captureRef = useRef<(() => string | null) | null>(null);
 
   const cacheRef = useRef<ContentCache | null>(null);
   if (!cacheRef.current) cacheRef.current = new ContentCache();
@@ -288,6 +296,11 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         editor.clearSelection();
         return;
       }
+      if (event.key === ' ') {
+        event.preventDefault();
+        sessionRef.current.togglePlay();
+        return;
+      }
       if (event.key === '1') editor.setTransformMode('translate');
       else if (event.key === '2') editor.setTransformMode('rotate');
       else if (event.key === '3') editor.setTransformMode('scale');
@@ -324,21 +337,34 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
           />
         </div>
         <main className="lumora-studio__viewport">
-          {scene ? (
-            scene(project)
-          ) : (
-            <EditorViewport
+          <div className="lumora-studio__scene-slot">
+            {scene ? (
+              scene(project)
+            ) : (
+              <EditorViewport
+                editor={runtime.editor}
+                project={project}
+                selection={editorState.selection}
+                view={editorState.view}
+                cache={cache}
+                session={session}
+                captureRef={captureRef}
+              />
+            )}
+            {!project && (
+              <div className="lumora-studio__empty" data-testid="studio-empty-hint">
+                尚未打开项目 —— 点击工具栏「打开示例项目」
+              </div>
+            )}
+          </div>
+          {project && !scene && (
+            <TimelinePanel
+              session={session}
               editor={runtime.editor}
               project={project}
               selection={editorState.selection}
-              view={editorState.view}
-              cache={cache}
+              captureRef={captureRef}
             />
-          )}
-          {!project && (
-            <div className="lumora-studio__empty" data-testid="studio-empty-hint">
-              尚未打开项目 —— 点击工具栏「打开示例项目」
-            </div>
           )}
         </main>
         <PropertiesPanel

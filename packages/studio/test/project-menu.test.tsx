@@ -479,7 +479,7 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
         name: '副本UI项目 副本',
         savedAt: new Date().toISOString(),
         revision: 0,
-        schemaVersion: 3,
+        schemaVersion: 4,
       },
       fingerprint: 'fp-at-create',
     });
@@ -589,7 +589,7 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
         name: '最近复制项目 副本',
         savedAt: new Date().toISOString(),
         revision: 0,
-        schemaVersion: 3,
+        schemaVersion: 4,
       },
       fingerprint: 'fp-at-create',
     });
@@ -633,7 +633,7 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
         name: '最近复制项目二 副本',
         savedAt: new Date().toISOString(),
         revision: 0,
-        schemaVersion: 3,
+        schemaVersion: 4,
       },
       fingerprint: 'fp-at-create-2',
     });
@@ -683,7 +683,7 @@ describe('ProjectMenu：保存状态徽标（AC2 可见性）', () => {
         name: '最近复制项目三 副本',
         savedAt: new Date().toISOString(),
         revision: 0,
-        schemaVersion: 3,
+        schemaVersion: 4,
       },
       fingerprint: 'fp-at-create-3',
     });

@@ -48,11 +48,15 @@ function assetData(id: string): AssetData {
 const PUBLIC_API_LIST = [
   'addObject',
   'addScene',
+  'addShot',
+  'addTrack',
   'beginTransform',
   'clearSelection',
   'closeAdmission',
   'commitTransform',
   'deleteSelection',
+  'deleteShot',
+  'deleteTrack',
   'dispose',
   'duplicateSelection',
   'getHistoryState',
@@ -67,6 +71,7 @@ const PUBLIC_API_LIST = [
   'openProject',
   'redo',
   'registerAsset',
+  'reorderShots',
   'reset',
   'setActiveCamera',
   'setActiveScene',
@@ -78,10 +83,13 @@ const PUBLIC_API_LIST = [
   'setTransform',
   'setTransformMode',
   'setTransformSpace',
+  'setTrackKeyframes',
   'setVisible',
   'setViewMode',
   'undo',
   'updateObjectProps',
+  'updateShot',
+  'updateTrack',
 ];
 
 describe('R9-M1 事务边界：外部 getter 副作用入口探针', () => {
@@ -217,6 +225,7 @@ describe('R9-M1 事务边界：外部 getter 副作用入口探针', () => {
       'stampAndFreeze',
       'swapState',
       'validateProject',
+      'validateShot',
     ];
     const expected = [...PUBLIC_API_LIST, ...PRIVATE_API_LIST].sort();
     const methods = new Set(

@@ -178,11 +178,11 @@ describe('ProjectPersistence：OPFS 后端（可配置切换，行为与 Indexed
     expect(loaded.ok).toBe(true);
     if (!loaded.ok) return;
     expect(loaded.migratedFrom).toBe(2);
-    expect(loaded.project.schemaVersion).toBe(3);
+    expect(loaded.project.schemaVersion).toBe(4);
     expect(loaded.project.tracks).toEqual([]);
-    // 写回后的存储记录已是 v3（下次加载不再迁移）
+    // 写回后的存储记录已是 v4（下次加载不再迁移）
     const after = await loadStored(store, v3.uri);
-    expect(after!.schemaVersion).toBe(3);
+    expect(after!.schemaVersion).toBe(4);
     expect(after!.revision).toBe(0);
     store.close();
   });

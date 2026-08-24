@@ -393,28 +393,30 @@ describe('ProjectPersistence：运行时集成（自动保存链路）', () => {
 });
 
 describe('ProjectPersistence：本地加载边界 schema 迁移（TML-53 第四轮 #6）', () => {
-  it('v2 项目记录（无 tracks）重开：加载边界迁移到 v3 补 tracks，并以已存 revision CAS 原子写回', async () => {
+  it('v2 项目记录（无 tracks）重开：加载边界迁移到 v4 补 tracks 与 shots，并以已存 revision CAS 原子写回', async () => {
     const runtime = await makeRuntime();
     // 直接向存储写入 v2 记录（模拟旧版本留下的本地数据，无迁移入口时的形态）
     const store = await openStandaloneStore();
-    const v3 = runtime.persistence.createProject('旧版项目');
-    const { tracks: _tracks, ...v2 } = v3;
+    const v4 = runtime.persistence.createProject('旧版项目');
+    const { tracks: _tracks, ...v2 } = v4;
     const v2Record = { ...v2, schemaVersion: 2 } as unknown as Project;
     expect((await store!.save(v2Record)).ok).toBe(true);
 
     // 重开：加载边界迁移 + 校验 + 原子写回（绝不把旧版本数据原样交给编辑器）
-    const loaded = await runtime.persistence.loadProject(v3.uri);
+    const loaded = await runtime.persistence.loadProject(v4.uri);
     expect(loaded.ok).toBe(true);
     if (!loaded.ok) return;
     expect(loaded.migratedFrom).toBe(2);
-    expect(loaded.project.schemaVersion).toBe(3);
+    expect(loaded.project.schemaVersion).toBe(4);
     expect(loaded.project.tracks).toEqual([]);
-    expect(loaded.project.objects).toEqual(v3.objects);
+    expect(loaded.project.shots).toEqual([]);
+    expect(loaded.project.objects).toEqual(v4.objects);
 
-    // 写回后的存储记录已是 v3（下次加载不再迁移）
-    const after = await loadStored(store!, v3.uri);
-    expect(after!.schemaVersion).toBe(3);
+    // 写回后的存储记录已是 v4（下次加载不再迁移）
+    const after = await loadStored(store!, v4.uri);
+    expect(after!.schemaVersion).toBe(4);
     expect(after!.tracks).toEqual([]);
+    expect(after!.shots).toEqual([]);
     await runtime.dispose();
   });
 
@@ -435,25 +437,25 @@ describe('ProjectPersistence：本地加载边界 schema 迁移（TML-53 第四�
 });
 
 describe('ProjectPersistence：本地加载边界统一「迁移 → 校验」（第五轮 #7）', () => {
-  it('当前版本（v3）损坏记录：结构校验拒绝，绝不原样交给编辑器，也不产生写回', async () => {
+  it('当前版本（v4）损坏记录：结构校验拒绝，绝不原样交给编辑器，也不产生写回', async () => {
     const runtime = await makeRuntime();
     const store = await openStandaloneStore();
-    const v3 = runtime.persistence.createProject('损坏的当前版本');
-    const bad = { ...v3, tracks: 'not-an-array' } as unknown as Project;
+    const v4 = runtime.persistence.createProject('损坏的当前版本');
+    const bad = { ...v4, tracks: 'not-an-array' } as unknown as Project;
     expect((await store!.save(bad)).ok).toBe(true);
 
-    const loaded = await runtime.persistence.loadProject(v3.uri);
+    const loaded = await runtime.persistence.loadProject(v4.uri);
     expect(loaded.ok).toBe(false);
     if (loaded.ok) return;
     expect(loaded.message).toContain('tracks');
 
     // 磁盘记录保持原样（无写回尝试），下次加载仍被拒绝
-    const after = await loadStored(store!, v3.uri);
+    const after = await loadStored(store!, v4.uri);
     expect(after!.tracks).toBe('not-an-array');
     await runtime.dispose();
   });
 
-  it('当前版本（v3）合法记录：校验通过原样返回，不做无意义写回（save 不被调用）', async () => {
+  it('当前版本（v4）合法记录：校验通过原样返回，不做无意义写回（save 不被调用）', async () => {
     const runtime = createStudioRuntime();
     openRuntimes.push(runtime);
     const injected = await ProjectStore.create(DB);
@@ -470,7 +472,7 @@ describe('ProjectPersistence：本地加载边界统一「迁移 → 校验」�
     expect(loaded.ok).toBe(true);
     if (!loaded.ok) return;
     expect(saveSpy).not.toHaveBeenCalled();
-    expect(loaded.project.schemaVersion).toBe(3);
+    expect(loaded.project.schemaVersion).toBe(4);
     await runtime.dispose();
   });
 

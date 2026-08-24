@@ -18,7 +18,7 @@ import {
 import { deepFreeze } from '../scene/immutable';
 import { validateProjectSchema, validateProjectStructure, validateSceneObjectData } from '../scene/validate';
 import { isSceneObject } from '../scene/types';
-import type { AssetData, Project, SceneObjectData, TransformData } from '../scene/types';
+import type { AssetData, Project, SceneObjectData, ShotClipData, TrackData, TrackKeyframeData, TransformData } from '../scene/types';
 import { TypedEventEmitter } from '../events/typed-event-emitter';
 
 /** 视口变换模式（FR-004） */
@@ -429,6 +429,15 @@ export class SceneEditor {
     // 轨道归属其驱动对象（TML-88）：对象被删除后，绑定该对象的轨道一并移除，
     // 保证轨道引用不悬空（undo 时随历史快照整体恢复）
     next = { ...next, tracks: next.tracks.filter((track) => !ids.has(track.objectId)) };
+    // 分镜机位解绑（TML-52）：绑定机位被删除后分镜保留但解除绑定，避免引用悬空
+    next = {
+      ...next,
+      shots: next.shots.map((shot) =>
+        shot.cameraObjectId !== null && ids.has(shot.cameraObjectId)
+          ? { ...shot, cameraObjectId: null }
+          : shot,
+      ),
+    };
     const unreferenced = new Set(collectUnreferencedAssets(next).map((a) => a.id));
     next = removeAssets(next, unreferenced);
     const parentId = baseline.selection
@@ -757,6 +766,193 @@ export class SceneEditor {
     const result = this.commit(baseline, next, `导入模型 ${normalizedObject.name}`, [normalizedObject.id]);
     if (!result.ok) return result;
     return { ok: true, value: normalizedObject.id };
+  }
+
+  // ---------- 动画轨道（历史可撤销） ----------
+
+  /** 新建轨道：绑定对象 + 属性通道；对象须存在（跨场景对象允许——轨道是项目级数据） */
+  addTrack(track: TrackData): Result<string> {
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
+    const owned = this.own(track); // 无条件克隆为编辑器自有数据（R6）
+    const reentered = this.guardReentry(baseline); // 克隆 getter 副作用（R8）
+    if (reentered) return reentered;
+    if (!owned.objectId || !findObject(project, owned.objectId)) return failure('轨道绑定对象不存在');
+    if (project.tracks.some((t) => t.id === owned.id)) return failure('轨道 id 重复');
+    const result = this.commit(
+      baseline,
+      { ...project, tracks: [...project.tracks, owned] },
+      `新建轨道「${owned.name}」`,
+    );
+    if (!result.ok) return result;
+    return { ok: true, value: owned.id };
+  }
+
+  /** 更新轨道（改名/禁用开关等），可撤销；updater 收到结构化克隆工作副本 */
+  updateTrack(trackId: string, updater: (track: TrackData) => TrackData | null, label: string): Result {
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
+    const track = project.tracks.find((t) => t.id === trackId);
+    if (!track) return failure('轨道不存在');
+    const nextTrack = updater(structuredClone(track));
+    const reentered = this.guardReentry(baseline);
+    if (reentered) return reentered;
+    if (!nextTrack) return failure('轨道数据非法');
+    if (nextTrack.id !== trackId) return failure('轨道 id 不可修改');
+    if (nextTrack.objectId !== track.objectId) return failure('轨道绑定对象不可修改');
+    // 换绑轨道请删除后重建（录制/关键帧操作按轨道 id 寻址，改绑悬空引用风险高）
+    if (nextTrack.targetPath !== track.targetPath) return failure('轨道通道不可修改');
+    const owned = this.own(nextTrack);
+    const reenteredClone = this.guardReentry(baseline);
+    if (reenteredClone) return reenteredClone;
+    return this.commit(
+      baseline,
+      {
+        ...project,
+        tracks: project.tracks.map((t) => (t.id === trackId ? owned : t)),
+      },
+      label,
+    );
+  }
+
+  /** 删除轨道（不删除绑定对象） */
+  deleteTrack(trackId: string): Result {
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
+    const track = project.tracks.find((t) => t.id === trackId);
+    if (!track) return failure('轨道不存在');
+    return this.commit(
+      baseline,
+      { ...project, tracks: project.tracks.filter((t) => t.id !== trackId) },
+      `删除轨道「${track.name}」`,
+    );
+  }
+
+  /** 整体替换轨道关键帧（录制提交/关键帧批量编辑），作为一步历史；
+   *  校验升序、非负有限时间与值类型（标量通道 vs Vec3 通道） */
+  setTrackKeyframes(trackId: string, keyframes: TrackKeyframeData[], label = '更新关键帧'): Result {
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
+    const track = project.tracks.find((t) => t.id === trackId);
+    if (!track) return failure('轨道不存在');
+    const owned = this.own({ keyframes }); // 克隆后再复验（getter 副作用窗口）
+    const reentered = this.guardReentry(baseline);
+    if (reentered) return reentered;
+    const scalarPath = track.targetPath === 'focalLength';
+    for (let i = 0; i < owned.keyframes.length; i += 1) {
+      const k = owned.keyframes[i]!;
+      if (!Number.isFinite(k.time) || k.time < 0) return failure('关键帧时刻非法（需为非负有限数）');
+      if (i > 0 && k.time <= owned.keyframes[i - 1]!.time) return failure('关键帧时刻未按升序排列');
+      const okValue = scalarPath
+        ? typeof k.value === 'number' && Number.isFinite(k.value)
+        : Array.isArray(k.value) && k.value.length === 3 && k.value.every((n) => Number.isFinite(n));
+      if (!okValue) return failure(scalarPath ? '关键帧值非法（标量通道需为有限数值）' : '关键帧值非法（需为三元有限向量）');
+    }
+    return this.commit(
+      baseline,
+      {
+        ...project,
+        tracks: project.tracks.map((t) => (t.id === trackId ? { ...t, keyframes: owned.keyframes } : t)),
+      },
+      label,
+    );
+  }
+
+  // ---------- 分镜剪辑（历史可撤销） ----------
+
+  /** 新建分镜：绑定机位（可空）+ 时间线区段；机位非空时必须为已存在的相机对象 */
+  addShot(shot: ShotClipData): Result<string> {
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
+    const owned = this.own(shot);
+    const reentered = this.guardReentry(baseline); // 克隆 getter 副作用（R8）
+    if (reentered) return reentered;
+    const problem = this.validateShot(project, owned);
+    if (problem) return failure(problem);
+    if (project.shots.some((s) => s.id === owned.id)) return failure('分镜 id 重复');
+    const result = this.commit(
+      baseline,
+      { ...project, shots: [...project.shots, owned] },
+      `新建分镜「${owned.name}」`,
+    );
+    if (!result.ok) return result;
+    return { ok: true, value: owned.id };
+  }
+
+  /** 更新分镜（改名/机位绑定/区段调整），可撤销；updater 收到结构化克隆工作副本 */
+  updateShot(shotId: string, updater: (shot: ShotClipData) => ShotClipData | null, label: string): Result {
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
+    const shot = project.shots.find((s) => s.id === shotId);
+    if (!shot) return failure('分镜不存在');
+    const nextShot = updater(structuredClone(shot));
+    const reentered = this.guardReentry(baseline);
+    if (reentered) return reentered;
+    if (!nextShot) return failure('分镜数据非法');
+    if (nextShot.id !== shotId) return failure('分镜 id 不可修改');
+    const problem = this.validateShot(project, nextShot);
+    if (problem) return failure(problem);
+    const owned = this.own(nextShot);
+    const reenteredClone = this.guardReentry(baseline);
+    if (reenteredClone) return reenteredClone;
+    return this.commit(
+      baseline,
+      { ...project, shots: project.shots.map((s) => (s.id === shotId ? owned : s)) },
+      label,
+    );
+  }
+
+  /** 删除分镜（不删除绑定机位对象） */
+  deleteShot(shotId: string): Result {
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
+    const shot = project.shots.find((s) => s.id === shotId);
+    if (!shot) return failure('分镜不存在');
+    return this.commit(
+      baseline,
+      { ...project, shots: project.shots.filter((s) => s.id !== shotId) },
+      `删除分镜「${shot.name}」`,
+    );
+  }
+
+  /** 重排分镜：orderedIds 必须是当前全部分镜 id 的一个排列（顺序 = 分镜顺序） */
+  reorderShots(orderedIds: string[]): Result {
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
+    const current = project.shots.map((s) => s.id);
+    const seen = new Set<string>();
+    const valid =
+      orderedIds.length === current.length &&
+      orderedIds.every((id) => {
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return current.includes(id);
+      });
+    if (!valid) return failure('分镜重排列表必须是全部分镜 id 的排列');
+    if (orderedIds.every((id, i) => id === current[i])) return { ok: true };
+    const byId = new Map(project.shots.map((s) => [s.id, s]));
+    const shots = orderedIds.map((id) => byId.get(id)!);
+    return this.commit(baseline, { ...project, shots }, '重排分镜');
+  }
+
+  /** 分镜字段校验（与 schema 校验同语义的入口前置校验） */
+  private validateShot(project: Project, shot: ShotClipData): string | null {
+    if (!shot.name) return '分镜名称不能为空';
+    if (!Number.isFinite(shot.startTime) || shot.startTime < 0) return '分镜 startTime 非法';
+    if (!Number.isFinite(shot.endTime) || shot.endTime <= shot.startTime) return '分镜 endTime 非法（需大于 startTime）';
+    if (shot.cameraObjectId !== null) {
+      const camera = findObject(project, shot.cameraObjectId);
+      if (!camera || camera.type !== 'camera') return '分镜绑定机位不存在或不是相机';
+    }
+    return null;
   }
 
   // ---------- 视口 UI 状态（不进历史） ----------

@@ -109,7 +109,7 @@ describe('轨道与编辑器/工程包集成（TML-88）', () => {
 
   it('空白项目默认空轨道（可迁移到 v3 的旧数据在创建端补默认值）', () => {
     const project = createBlankProject('lumora://project/blank', '空白');
-    expect(project.schemaVersion).toBe(3);
+    expect(project.schemaVersion).toBe(4);
     expect(project.tracks).toEqual([]);
     expect(validateProjectSchema(project)).toBeNull();
   });

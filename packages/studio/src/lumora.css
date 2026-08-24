@@ -160,6 +160,17 @@
   position: relative;
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* 场景区与时间线面板纵向分栏（TML-52） */
+.lumora-studio__scene-slot {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
 }
 
 /* ---------- 对象层级树 ---------- */
@@ -583,6 +594,305 @@
   width: 1px;
   height: 18px;
   background: var(--lumora-border);
+}
+
+/* ---------- 时间线面板（TML-52） ---------- */
+
+.lumora-timeline {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  border-top: 1px solid var(--lumora-border);
+  background: var(--lumora-surface);
+  font-size: 12px;
+  user-select: none;
+  min-height: 0;
+}
+
+.lumora-timeline__transport {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--lumora-border);
+}
+
+.lumora-timeline__play,
+.lumora-timeline__record,
+.lumora-timeline__zoom {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--lumora-border);
+  border-radius: 6px;
+  background: var(--lumora-surface-2);
+  color: var(--lumora-text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.lumora-timeline__play:hover:not(:disabled),
+.lumora-timeline__record:hover:not(:disabled),
+.lumora-timeline__zoom:hover:not(:disabled) {
+  border-color: var(--lumora-accent);
+}
+
+.lumora-timeline__play:disabled,
+.lumora-timeline__record:disabled,
+.lumora-timeline__zoom:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.lumora-timeline__record {
+  color: var(--lumora-danger);
+}
+
+.lumora-timeline__record--on {
+  background: rgba(255, 107, 107, 0.16);
+  border-color: var(--lumora-danger);
+}
+
+.lumora-timeline__time {
+  font-variant-numeric: tabular-nums;
+  color: var(--lumora-text);
+  min-width: 52px;
+}
+
+.lumora-timeline__frame {
+  color: var(--lumora-text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.lumora-timeline__fps {
+  color: var(--lumora-text-dim);
+  border: 1px solid var(--lumora-border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+.lumora-timeline__spacer {
+  flex: 1;
+}
+
+.lumora-timeline__check {
+  white-space: nowrap;
+}
+
+.lumora-timeline__ruler {
+  position: relative;
+  height: 24px;
+  cursor: col-resize;
+  touch-action: none;
+  overflow: hidden;
+  border-bottom: 1px solid var(--lumora-border);
+}
+
+.lumora-timeline__ticks {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+}
+
+.lumora-timeline__tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--lumora-border);
+}
+
+.lumora-timeline__tick--major {
+  background: #4a5063;
+}
+
+.lumora-timeline__playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--lumora-accent);
+  pointer-events: none;
+  z-index: 5;
+}
+
+.lumora-timeline__lanes {
+  max-height: 150px;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--lumora-border);
+}
+
+.lumora-timeline__lane {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 10px;
+  border-top: 1px solid var(--lumora-border);
+  cursor: pointer;
+  min-height: 26px;
+}
+
+.lumora-timeline__lane:hover {
+  background: rgba(77, 171, 247, 0.06);
+}
+
+.lumora-timeline__lane--disabled {
+  opacity: 0.5;
+}
+
+.lumora-timeline__lane-name {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lumora-timeline__lane-channel {
+  font-size: 11px;
+  color: var(--lumora-accent);
+  border: 1px solid var(--lumora-border);
+  border-radius: 4px;
+  padding: 0 4px;
+  flex-shrink: 0;
+}
+
+.lumora-timeline__lane-keyframes {
+  position: relative;
+  flex: 1;
+  height: 100%;
+  min-width: 60px;
+}
+
+.lumora-timeline__keyframe {
+  position: absolute;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  margin: -4px 0 0 -4px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--lumora-accent);
+  cursor: pointer;
+}
+
+.lumora-timeline__keyframe:hover {
+  outline: 2px solid rgba(77, 171, 247, 0.4);
+}
+
+.lumora-timeline__shots {
+  position: relative;
+  height: 58px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.lumora-timeline__shots-inner {
+  position: relative;
+  height: 100%;
+}
+
+.lumora-timeline__shot {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border: 1px solid var(--lumora-border);
+  border-radius: 6px;
+  background: var(--lumora-surface-2);
+  cursor: pointer;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.lumora-timeline__shot:hover {
+  border-color: var(--lumora-accent);
+}
+
+.lumora-timeline__shot-move {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--lumora-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--lumora-text);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.lumora-timeline__shot-move:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.lumora-timeline__shot-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lumora-timeline__shot-thumb {
+  height: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 4px;
+  margin-left: auto;
+}
+
+.lumora-timeline__shot-camera {
+  color: var(--lumora-text-dim);
+  font-size: 11px;
+  margin-left: auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lumora-timeline__empty {
+  padding: 8px 10px;
+  color: var(--lumora-text-dim);
+}
+
+.lumora-timeline__overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 30;
+}
+
+.lumora-timeline__modal {
+  background: var(--lumora-surface-2);
+  border: 1px solid var(--lumora-border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  max-width: 300px;
+}
+
+.lumora-timeline__modal p {
+  margin: 0;
+  color: var(--lumora-text);
+}
+
+.lumora-timeline__modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 12px;
 }
 
 .lumora-toolbutton {

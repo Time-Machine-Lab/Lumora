@@ -295,7 +295,7 @@ describe('状态机：sweep / discard / settle / seed', () => {
     const project: Project = {
       uri: 'p',
       name: 'p',
-      schemaVersion: 3,
+      schemaVersion: 4,
       createdAt: '',
       revision: 0,
       settings: { fps: 60, aspect: [16, 9] },
@@ -328,6 +328,7 @@ describe('状态机：sweep / discard / settle / seed', () => {
         },
       ],
       tracks: [],
+      shots: [],
     };
     cache.sweep(project);
     expect(cache.has('ref')).toBe(true);
