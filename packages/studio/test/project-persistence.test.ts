@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createGroupObject, createSampleProject, SceneEditor } from '@lumora/core';
-import type { Project } from '@lumora/core';
+import type { Project, ViewMode } from '@lumora/core';
 import { createStudioRuntime } from '../src/runtime/studio-runtime';
 import type { StudioRuntime } from '../src/runtime/studio-runtime';
 import { ProjectStore } from '../src/persistence/project-store';
@@ -2456,6 +2456,19 @@ describe('ProjectPersistence：第三十八轮修复回归（审查员 8/24 08:4
     const accepted = runtime.editor.addObject(createGroupObject());
     // 停用挂起期间写入被明确拒绝（修复前 ok === true 但内容永不落盘）
     expect(accepted.ok).toBe(false);
+    // 第三十九轮阻断 1：停用挂起期间公开 view 写入口同样被拒绝 ——
+    // 状态、版本、事件均不动（修复前 setTransformMode 等仍修改 view/
+    // 递增 mutationVersion/发出 view:changed）
+    const viewBefore = runtime.editor.getView();
+    const viewVersion = runtime.editor.getMutationVersion();
+    const viewEvents: unknown[] = [];
+    runtime.editor.events.on('view:changed', (e) => viewEvents.push(e));
+    runtime.editor.setTransformMode('rotate');
+    runtime.editor.setGuide('thirds', false);
+    runtime.editor.beginTransform();
+    expect(runtime.editor.getView()).toEqual(viewBefore);
+    expect(runtime.editor.getMutationVersion()).toBe(viewVersion);
+    expect(viewEvents).toHaveLength(0);
     releaseDeactivate();
     const outcome = await closing;
     expect(outcome.ok).toBe(true);
@@ -2513,5 +2526,57 @@ describe('ProjectPersistence：第三十八轮修复回归（审查员 8/24 08:4
     }
     reopened!.close();
     await ProjectStore.drop('r38-reentry');
+  });
+});
+
+describe('ProjectPersistence：第三十九轮修复回归（审查员 8/24 09:10 复审）', () => {
+  it('阻断 1：closeAdmission 后四个公开 view setter 均不改状态、不推进版本、不发事件，beginTransform no-op —— 读与最终 dispose 清理不受影响', () => {
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    // 每个 setter 的写入目标均与默认视图不同：未被拒绝即产生可观察变更
+    const before = editor.getView();
+    const version = editor.getMutationVersion();
+    const events: unknown[] = [];
+    editor.events.on('view:changed', (e) => events.push(e));
+    editor.closeAdmission();
+    editor.setTransformMode('rotate');
+    editor.setTransformSpace('world');
+    editor.setViewMode({ cameraObjectId: 'sample-camera' });
+    editor.setGuide('thirds', false);
+    editor.beginTransform();
+    // 修复前四 setter 仍修改 view、递增 mutationVersion、发出 view:changed；
+    // beginTransform 仍写入 dragSnapshot
+    expect(editor.getView()).toEqual(before);
+    expect(editor.getMutationVersion()).toBe(version);
+    expect(events).toHaveLength(0);
+    expect((editor as unknown as { dragSnapshot: unknown }).dragSnapshot).toBeNull();
+    // 既有读取能力不受影响
+    expect(editor.getProject()).not.toBeNull();
+    expect(editor.getView()).toEqual(before);
+    // 最终 dispose 清理不受影响
+    editor.dispose();
+    expect(editor.getProject()).toBeNull();
+  });
+
+  it('阻断 1 同步重入：setViewMode 的 cameraObjectId getter 内 closeAdmission —— getter 返回后外层 guardViewReentry 拒绝提交', () => {
+    const editor = new SceneEditor();
+    editor.openProject(createSampleProject());
+    const before = editor.getView();
+    const version = editor.getMutationVersion();
+    const events: unknown[] = [];
+    editor.events.on('view:changed', (e) => events.push(e));
+    // sample-camera 在活动场景内：未被拒绝时机位视图会真实提交
+    const mode: ViewMode = {
+      get cameraObjectId() {
+        editor.closeAdmission();
+        return 'sample-camera';
+      },
+    };
+    editor.setViewMode(mode);
+    // 修复前 getter 内刚建立的线性化点被外层跨过：view 已改为机位视图、
+    // 版本递增、事件发出
+    expect(editor.getView()).toEqual(before);
+    expect(editor.getMutationVersion()).toBe(version);
+    expect(events).toHaveLength(0);
   });
 });

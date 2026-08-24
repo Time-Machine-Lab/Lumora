@@ -592,8 +592,11 @@ export class SceneEditor {
    * 项目为 owned immutable（每次变更产生新 Project，旧引用递归冻结、永不改变），
    * 因此直接持有冻结引用即可作为拖动前状态——不做结构化克隆，
    * 避免复制/序列化完整二进制 payload（大模型历史步骤与撤销无重负担）。
+   * 第三十九轮阻断 1：disposed/admissionClosed 后 no-op —— seal 后不得写入
+   * dragSnapshot（拖动事务基准同样是编辑器写状态）。
    */
   beginTransform(): void {
+    if (this.disposed || this.admissionClosed) return;
     const project = this.project;
     if (project) this.dragSnapshot = { project, selection: [...this.selection] };
   }
@@ -870,12 +873,13 @@ export class SceneEditor {
   }
 
   /**
-   * 视图基线复验（R10-M1，幂等）：dispose 或任何状态写（嵌套视图写/嵌套提交/
-   * openProject/undo/redo）都使本次视图写失效——不得覆盖内层写入结果。
+   * 视图基线复验（R10-M1，幂等）：dispose、写准入关闭（第三十九轮阻断 1）或
+   * 任何状态写（嵌套视图写/嵌套提交/openProject/undo/redo）都使本次视图写
+   * 失效——不得覆盖内层写入结果、不得跨过刚建立的线性化点提交。
    * 视图快照按值比较兜底：即使某处视图写漏递增版本，也能被捕获。
    */
   private guardViewReentry(baseline: ViewBaseline): boolean {
-    if (this.disposed) return true;
+    if (this.disposed || this.admissionClosed) return true;
     if (this.mutationVersion !== baseline.version) return true;
     return !sameViewState(this.view, baseline.view);
   }
