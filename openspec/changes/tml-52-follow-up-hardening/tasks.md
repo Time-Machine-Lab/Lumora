@@ -16,4 +16,4 @@
 
 - [x] 3.1 Strict-validate OpenSpec, sync CodeGraph, and inspect the final impact surface.
 - [x] 3.2 Run focused suites, typecheck, lint, all unit tests, production build, and all browser tests.
-- [ ] 3.3 Complete independent review, commit, push a new branch, create a new follow-up PR, and verify its head.
+- [x] 3.3 Complete independent review, commit, push a new branch, create a new follow-up PR, and verify its head.
