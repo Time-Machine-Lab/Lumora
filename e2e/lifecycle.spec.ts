@@ -52,7 +52,7 @@ test('卸载前失败屏障：冲突未解决时 close() 拒绝且保持挂载�
 
   await pageA.getByTestId('add-object').click();
   await pageA.getByTestId('add-摄像机').click();
-  await expect(pageA.locator('.lumora-tree-row__type--camera')).toHaveCount(2);
+  await expect(pageA.locator('.lumora-tree-row__type--camera')).toHaveCount(3);
   await expect(pageA.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
 
   // B 打开同 uri 示例项目：对账冲突锁存，保存失败

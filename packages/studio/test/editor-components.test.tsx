@@ -257,7 +257,7 @@ describe('属性名称输入与键盘可用性（G-9/G-10）', () => {
   it('对象树键盘导航：方向键移动选择与焦点，折叠/展开，F2 重命名 Esc 取消', () => {
     const editor = makeEditor();
     render(<TreeHarness editor={editor} cache={noopCache()} />);
-    // 扁平行序：组、立方体、球体、圆锥、地面、主光、主摄像机
+    // 扁平行序：组、立方体、球体、圆锥、地面、主光、主摄像机、俯拍机位
     const cube = screen.getByTestId('tree-row-sample-cube');
     cube.focus();
     fireEvent.keyDown(cube, { key: 'ArrowDown' });
@@ -292,7 +292,7 @@ describe('属性名称输入与键盘可用性（G-9/G-10）', () => {
     fireEvent.keyDown(screen.getByTestId('tree-row-sample-cube'), { key: 'Home' });
     expect(editor.getSelection()).toEqual(['sample-group']);
     fireEvent.keyDown(screen.getByTestId('tree-row-sample-group'), { key: 'End' });
-    expect(editor.getSelection()).toEqual(['sample-camera']);
+    expect(editor.getSelection()).toEqual(['sample-camera-2']);
   });
 });
 

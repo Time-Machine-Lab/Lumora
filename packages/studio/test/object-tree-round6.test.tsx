@@ -67,7 +67,7 @@ function deepProject(): Project {
   return {
     uri: 'lumora://deep',
     name: '深树',
-    schemaVersion: 3,
+    schemaVersion: 4,
     createdAt: '2026-08-20T00:00:00.000Z',
     revision: 0,
     settings: { fps: 24, aspect: [16, 9] },
@@ -75,6 +75,7 @@ function deepProject(): Project {
     scenes: [{ id: 's1', name: '主场景', rootObjectIds: ['d0'], activeCameraId: null }],
     objects,
     tracks: [],
+    shots: [],
     assets: [],
   };
 }

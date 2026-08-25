@@ -25,13 +25,14 @@ function makeProject(objects: SceneObjectData[], roots: string[]): Project {
   return {
     uri: 'lumora://tree-order',
     name: 'T',
-    schemaVersion: 3,
+    schemaVersion: 4,
     createdAt: '2026-08-20T00:00:00.000Z',
     revision: 0,
     settings: { fps: 24, aspect: [16, 9] },
     activeSceneId: 's1',
     scenes: [{ id: 's1', name: '主场景', rootObjectIds: roots, activeCameraId: null }],
     objects,
+    shots: [],
     tracks: [],
     assets: [],
   };

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { StrictMode, createRef } from 'react';
 import * as THREE from 'three';
 import { createGroupObject, createSampleProject } from '@lumora/core';
@@ -618,5 +618,99 @@ describe('LumoraStudio', () => {
     expect(whenSpy.mock.calls[0]![0].pluginId).toBe('com.test.good');
     expect(await screen.findByTestId('palette-command-com.test.good.when')).toBeInTheDocument();
     expect(screen.queryByTestId('palette-command-com.test.good.hidden')).not.toBeInTheDocument();
+  });
+});
+
+/** 打开示例项目并选中 sample-camera（使录制可用） */
+async function openSampleWithCamera(handle: React.RefObject<LumoraStudioHandle | null>) {
+  screen.getByTestId('open-sample-project').click();
+  await waitFor(() => expect(handle.current!.runtime.editor.getProject()).not.toBeNull());
+  act(() => handle.current!.runtime.editor.setSelection(['sample-camera']));
+}
+
+describe('LumoraStudio：覆盖确认模态（复审阻断 4：全应用级模态）', () => {
+  it('覆盖确认出现在壳层根级：整壳 inert、其余应用不可达；确认/取消行为正确', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    render(<LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" />);
+    await screen.findByTestId('test-panel');
+    await openSampleWithCamera(handle);
+    // 示例项目 sample-camera 已有录制轨道 → 点击录制进入覆盖确认
+    // （fireEvent 包裹 act：native click 不 flush React 提交，模态不会出现）
+    fireEvent.click(screen.getByTestId('timeline-record'));
+    expect(screen.getByTestId('overwrite-confirm')).toBeInTheDocument();
+    expect(screen.getByTestId('overwrite-confirm')).toHaveAttribute('role', 'dialog');
+    expect(screen.getByTestId('overwrite-confirm')).toHaveClass('lumora-studio', 'lumora-studio--portal');
+    // 整壳 inert：工具栏/对象树/视口/时间线整体不可达（修复前仅时间线内容 inert）
+    expect(screen.getByTestId('lumora-studio')).toHaveAttribute('inert');
+    // 打开后焦点进入首个可聚焦项
+    expect(screen.getByText('覆盖录制')).toHaveFocus();
+
+    // 取消：模态关闭、不开始录制
+    fireEvent.click(screen.getByText('取消'));
+    expect(screen.queryByTestId('overwrite-confirm')).not.toBeInTheDocument();
+    expect(screen.getByTestId('lumora-studio')).not.toHaveAttribute('inert');
+    expect(screen.getByTestId('timeline-record').textContent).toBe('●');
+
+    // 再次进入并确认：录制开始
+    fireEvent.click(screen.getByTestId('timeline-record'));
+    expect(screen.getByTestId('overwrite-confirm')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('覆盖录制'));
+    expect(screen.queryByTestId('overwrite-confirm')).not.toBeInTheDocument();
+    expect(screen.getByTestId('timeline-record').textContent).toBe('■');
+  });
+
+  it('焦点逃逸到对话框外后 Escape 仍取消模态；关闭后焦点还原到触发按钮（复审阻断 4）', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    render(<LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" />);
+    await screen.findByTestId('test-panel');
+    await openSampleWithCamera(handle);
+    const record = screen.getByTestId('timeline-record');
+    record.focus(); // jsdom 对 disabled 元素调用 focus() 是空操作；此处已启用
+    fireEvent.click(record);
+    expect(screen.getByText('覆盖录制')).toHaveFocus();
+    // 焦点逃逸（程序性 blur / 点击其它区域）后：Escape 必须先于「模态外」分支
+    // 判定 —— 修复前 Escape 被 outside 分支吞掉，模态永不关闭
+    (document.activeElement as HTMLElement).blur();
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(screen.queryByTestId('overwrite-confirm')).not.toBeInTheDocument();
+    expect(record).toHaveFocus();
+  });
+
+  it('Ctrl+Shift+K 不泄漏到命令面板；Delete 不穿透全局处理器（应用快捷键统一小写匹配）', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    render(<LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" />);
+    await screen.findByTestId('test-panel');
+    await openSampleWithCamera(handle);
+    fireEvent.click(screen.getByTestId('timeline-record'));
+    const confirm = screen.getByText('覆盖录制');
+    // Shift 按下时 event.key 为大写 K —— 修复前小写匹配漏判，Ctrl+Shift+K 打开
+    // 命令面板（泄漏）
+    fireEvent.keyDown(confirm, { key: 'K', ctrlKey: true, shiftKey: true });
+    expect(screen.queryByTestId('command-palette')).not.toBeInTheDocument();
+    // Delete 被模态 capture 拦截：全局删除处理器不执行，选择不被清空
+    fireEvent.keyDown(confirm, { key: 'Delete' });
+    expect(handle.current!.runtime.editor.getSelection()).toEqual(['sample-camera']);
+    expect(screen.getByTestId('overwrite-confirm')).toBeInTheDocument();
+  });
+
+  it('Tab/Shift+Tab 焦点圈闭环，焦点逃逸到对话框外也拉回', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    render(<LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" />);
+    await screen.findByTestId('test-panel');
+    await openSampleWithCamera(handle);
+    fireEvent.click(screen.getByTestId('timeline-record'));
+    const confirm = screen.getByText('覆盖录制');
+    const cancel = screen.getByText('取消');
+    expect(confirm).toHaveFocus();
+    // 首个可聚焦项上 Shift+Tab：回环到末项
+    fireEvent.keyDown(confirm, { key: 'Tab', shiftKey: true });
+    expect(cancel).toHaveFocus();
+    // 末项上 Tab：回环到首项
+    fireEvent.keyDown(cancel, { key: 'Tab' });
+    expect(confirm).toHaveFocus();
+    // 焦点已在对话框外（模拟浏览器默认移动）→ Tab 拉回首项
+    (document.activeElement as HTMLElement).blur();
+    fireEvent.keyDown(document.body, { key: 'Tab' });
+    expect(confirm).toHaveFocus();
   });
 });

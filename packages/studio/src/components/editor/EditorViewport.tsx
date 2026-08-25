@@ -18,6 +18,10 @@ import {
   syncScene,
 } from './scene-builder';
 import { showToast } from './toasts';
+import { CameraDrive, captureCameraSample, DRIVE_KEY_CODES, restoreObjectOnNode } from './camera-drive';
+import { PlaybackDriver } from './PlaybackDriver';
+import { captureProjectFrame } from './frame-capture';
+import type { TimelineSession } from '../../hooks/use-timeline-session';
 
 interface EditorViewportProps {
   editor: SceneEditor;
@@ -25,6 +29,16 @@ interface EditorViewportProps {
   selection: string[];
   view: ViewState;
   cache: ContentCache;
+  /** 时间线会话：提供后启用回放驱动与键鼠机位驾驶（TML-52） */
+  session?: TimelineSession | null;
+  /** 帧截图通道：FrameCaptureBridge 在 Canvas 内注册（分镜缩略图用）；
+   *  可选参数 = 分镜绑定机位 id，传参时按该机位渲染 */
+  captureRef?: React.RefObject<((cameraObjectId?: string | null) => string | null) | null>;
+  /** 截图通道就绪通知（FrameCaptureBridge 挂载/卸载时回调；缩略图链据此
+   *  启动，复审阻断 2） */
+  onCaptureReady?: (ready: boolean) => void;
+  /** Scene tree or deferred model content changed and cached frames are stale. */
+  onRenderContentChange?: () => void;
 }
 
 /** 沿父链找到最近的对象 id（GLB 内容网格挂在模型组下，需要向上追溯）。
@@ -42,7 +56,17 @@ export function findObjectId(object: THREE.Object3D): string | null {
  *   传 CSS 像素，three 内部按 pixelRatio 换算），三分线/安全框以 DOM 覆盖层
  *   绘制在相同矩形上 —— 辅助线永不进入 canvas
  */
-export function EditorViewport({ editor, project, selection, view, cache }: EditorViewportProps) {
+export function EditorViewport({
+  editor,
+  project,
+  selection,
+  view,
+  cache,
+  session = null,
+  captureRef: captureRefProp,
+  onCaptureReady,
+  onRenderContentChange,
+}: EditorViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<THREE.Group | null>(null);
   const cameraRef = useRef<THREE.Camera | null>(null);
@@ -51,6 +75,33 @@ export function EditorViewport({ editor, project, selection, view, cache }: Edit
   // 同步引用：Gizmo 的原生 pointerdown 监听先于容器 React 处理器执行，
   // 用 ref 而非异步的 state 判断「拖动已在 Gizmo 上开始」，避免拾取改选/清选
   const draggingRef = useRef(false);
+  // 回放驱动跳过集：gizmo 拖拽中的对象不被轨道求值覆盖
+  const skipIdsRef = useRef<Set<string> | null>(null);
+  // 分镜缩略图截图通道（FrameCaptureBridge 在 Canvas 内挂载后可用）
+  const localCaptureRef = useRef<((cameraObjectId?: string | null) => string | null) | null>(null);
+  const captureRef = captureRefProp ?? localCaptureRef;
+
+  // 驾驶目标：单选机位；已有轨道机位在暂停态不驾驶（时间线接管），录制中始终可驾驶
+  const drivenCameraId = useMemo(() => {
+    if (!project || selection.length !== 1) return null;
+    const object = findObject(project, selection[0]!);
+    return object && object.type === 'camera' ? object.id : null;
+  }, [project, selection]);
+
+  useCameraDrive(session, drivenCameraId, rootRef, editor);
+
+  // 录制采样源：视口把机位节点映射为通道样本（录制期间节点由驾驶/静止接管）
+  useEffect(() => {
+    if (!session) return;
+    session.setCaptureSource((cameraId) => {
+      const root = rootRef.current;
+      if (!root) return null;
+      const node = findNode(root, cameraId);
+      if (!node) return null;
+      return captureCameraSample(node);
+    });
+    return () => session.setCaptureSource(null);
+  }, [session]);
 
   const aspect = project ? project.settings.aspect[0] / project.settings.aspect[1] : 16 / 9;
   // 相机视图按活动场景隔离：仅当机位对象存在且属于活动场景可达集时生效
@@ -140,11 +191,21 @@ export function EditorViewport({ editor, project, selection, view, cache }: Edit
       data-testid="lumora-viewport"
       onPointerDown={handlePointerDown}
     >
-      <Canvas dpr={[1, 2]} camera={{ position: [7, 5, 7], fov: 45 }}>
+      <Canvas
+        dpr={[1, 2]}
+        camera={{ position: [7, 5, 7], fov: 45 }}
+        onCreated={() => undefined}
+      >
         <color attach="background" args={['#14161f']} />
         <ambientLight intensity={0.35} />
         <gridHelper args={[20, 20, '#3a3f52', '#2a2e3d']} />
-        <SceneContent editor={editor} rootRef={rootRef} project={project} cache={cache} />
+        <SceneContent
+          editor={editor}
+          rootRef={rootRef}
+          project={project}
+          cache={cache}
+          onRenderContentChange={onRenderContentChange}
+        />
         {cameraView && project && (
           <CameraRig rootRef={rootRef} cameraObjectId={cameraView} aspect={aspect} project={project} />
         )}
@@ -157,16 +218,152 @@ export function EditorViewport({ editor, project, selection, view, cache }: Edit
           rootRef={rootRef}
           dragging={dragging}
           setDragging={updateDragging}
+          playbackActive={!!session && session.state.playing}
+          skipIdsRef={skipIdsRef}
         />
         {!cameraView && <OrbitControls makeDefault enableDamping enabled={!dragging} />}
         <CameraProxy cameraRef={cameraRef} />
+        <FrameCaptureBridge captureRef={captureRef} onCaptureReady={onCaptureReady} rootRef={rootRef} aspect={aspect} />
       </Canvas>
+      {session && (
+        <>
+          <PlaybackDriver session={session} editor={editor} rootRef={rootRef} skipIdsRef={skipIdsRef} />
+          {/* 数值位姿读取钩子仅供 e2e 数值断言（复审一般 7）：dev 服务（e2e 即
+              dev server）挂载，生产构建 tree-shake —— 60Hz JSON stringify 不进
+              生产树 */}
+          {import.meta.env.DEV && <CameraPoseReadout session={session} editor={editor} rootRef={rootRef} />}
+        </>
+      )}
       {cameraView && containerSize && project && (
         <GuidesOverlay rect={fitRect(containerSize.width, containerSize.height, aspect)} view={view} />
       )}
       <ViewportToolbar editor={editor} project={project} view={view} />
     </div>
   );
+}
+
+/**
+ * 键鼠机位驾驶（TML-52）：选中机位且非播放态时启用（录制中强制可驾驶），
+ * rAF 每帧把按键意图积分到节点。脱离驾驶（取消选中/开始回放/录制暂停）时
+ * 还原静态位姿 —— 回放中与录制采样中除外（分别由回放驱动与录制接管）；
+ * 绑定机位已有启用轨道时也跳过还原（轨道求值已接管节点，见 restoreIfNeeded）。
+ * window blur → 硬停（速度立即归零，无失控位移）。
+ * 会话对象稳定（useTimelineSession 内部 useRef 持有），本 effect 录制期间
+ * 不重建 —— 按键输入不再被每帧 drive.stop() 清空（TML-52 审查第 1 项）。
+ */
+function useCameraDrive(
+  session: TimelineSession | null,
+  drivenCameraId: string | null,
+  rootRef: React.RefObject<THREE.Group | null>,
+  editor: SceneEditor,
+) {
+  const cameraIdRef = useRef<string | null>(null);
+  cameraIdRef.current = drivenCameraId;
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+
+  useEffect(() => {
+    if (!session) return;
+    const drive = new CameraDrive();
+    let raf = 0;
+    let last = performance.now();
+    let attachedId: string | null = null;
+    let attachedNode: THREE.Object3D | null = null;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (DRIVE_KEY_CODES.has(event.code)) {
+        if (cameraIdRef.current) event.preventDefault();
+        drive.press(event.code);
+      }
+    };
+    const onKeyUp = (event: KeyboardEvent) => drive.release(event.code);
+    const onBlur = () => drive.stop();
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+
+    const restoreIfNeeded = () => {
+      if (attachedId === null || !attachedNode) return;
+      const st = sessionRef.current?.state;
+      // 回放中/录制中不还原（分别由回放驱动与录制接管）
+      if (st && (st.playing || st.recording)) return;
+      const project = editor.getProject();
+      // 绑定机位已有启用轨道：节点由轨道求值接管（回放驱动最后一次 apply
+      // 已把播放头时刻的值写到节点），还原静态位姿会让画面与播放头脱节
+      if (
+        project?.tracks.some(
+          (t) => t.objectId === attachedId && t.keyframes.length > 0 && !t.disabled,
+        )
+      ) {
+        return;
+      }
+      const object = project?.objects.find((o) => o.id === attachedId);
+      if (object) restoreObjectOnNode(attachedNode, object);
+    };
+
+    const loop = (now: number) => {
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      const st = sessionRef.current?.state;
+      const cameraId = cameraIdRef.current;
+      // 可驾驶：选中机位 && 录制未暂停 && （暂停 || 录制中）&& 无启用轨道（录制中无视轨道；
+      // 禁用轨道不阻止驾驶 —— 禁用 = 该通道暂不参与回放）
+      const hasTracks =
+        !!st &&
+        !!editor.getProject()?.tracks.some(
+          (t) => t.objectId === cameraId && t.keyframes.length > 0 && !t.disabled,
+        );
+      const canDrive =
+        !!st &&
+        cameraId !== null &&
+        !st.recordingPaused &&
+        (!st.playing || st.recording) &&
+        (!hasTracks || st.recording);
+      if (!canDrive) {
+        if (attachedId !== null) {
+          restoreIfNeeded();
+          drive.detach();
+          attachedId = null;
+          attachedNode = null;
+        }
+        raf = requestAnimationFrame(loop);
+        return;
+      }
+      const root = rootRef.current;
+      const node = root ? findNode(root, cameraId!) : null;
+      if (!node) {
+        raf = requestAnimationFrame(loop);
+        return;
+      }
+      if (attachedId !== cameraId) {
+        drive.attach(node);
+        attachedId = cameraId;
+        attachedNode = node;
+      }
+      drive.update(dt);
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+      drive.stop();
+      restoreIfNeeded();
+    };
+  }, [session, rootRef, editor]);
 }
 
 /** 把当前渲染相机镜像给外层（点击拾取用） */
@@ -178,16 +375,116 @@ function CameraProxy({ cameraRef }: { cameraRef: React.MutableRefObject<THREE.Ca
   return null;
 }
 
+/**
+ * 数值位姿读取钩子（e2e AC1/AC3 数值断言）：把各相机节点当前的 position /
+ * rotation / focalLength 序列化进隐藏 span 的 textContent，播放、暂停、项目
+ * 变更时刷新（无需 React 状态，零重渲染成本）。订阅注册在 PlaybackDriver
+ * 之后，同一次事件里读到的是已应用轨道求值的位姿。
+ */
+function CameraPoseReadout({
+  session,
+  editor,
+  rootRef,
+}: {
+  session: TimelineSession;
+  editor: SceneEditor;
+  rootRef: React.RefObject<THREE.Group | null>;
+}) {
+  const hostRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const refresh = () => {
+      const root = rootRef.current;
+      const project = editor.getProject();
+      if (!root || !project) return;
+      const poses: Record<string, unknown> = {};
+      for (const object of project.objects) {
+        if (object.type !== 'camera') continue;
+        const node = findNode(root, object.id);
+        if (!node) continue;
+        const focal = (node.userData as Record<string, unknown>).focalLength;
+        poses[object.id] = {
+          position: [node.position.x, node.position.y, node.position.z],
+          rotation: [node.rotation.x, node.rotation.y, node.rotation.z],
+          focalLength: typeof focal === 'number' && Number.isFinite(focal) ? focal : null,
+        };
+      }
+      host.textContent = JSON.stringify(poses);
+    };
+    const subs = [
+      session.timeline.events.on('time:changed', refresh),
+      session.timeline.events.on('state:changed', refresh),
+      editor.events.on('project:changed', refresh),
+    ];
+    refresh();
+    return () => {
+      for (const sub of subs) sub.dispose();
+    };
+  }, [session, editor, rootRef]);
+  return <span ref={hostRef} data-testid="camera-pose-readout" aria-hidden="true" style={{ display: 'none' }} />;
+}
+
+/**
+ * 帧截图桥（分镜缩略图）：把「立即截一帧 PNG dataURL」注册给外层。测试 mock 的
+ * gl 没有 render/toDataURL，typeof guard 后返回 null（缩略图占位）。
+ */
+function FrameCaptureBridge({
+  captureRef,
+  onCaptureReady,
+  rootRef,
+  aspect,
+}: {
+  captureRef: React.RefObject<((cameraObjectId?: string | null) => string | null) | null>;
+  /** 通道就绪通知：挂载置 true、卸载置 false。仅写 ref 不触发 React 渲染，
+   *  缩略图链依赖该回调启动（复审阻断 2） */
+  onCaptureReady?: (ready: boolean) => void;
+  /** 场景根：分镜机位截图时经 findNode 解析绑定相机节点 */
+  rootRef: React.RefObject<THREE.Group | null>;
+  /** 项目画幅比例：机位截图前同步 aspect（与 CameraRig 同源模式） */
+  aspect: number;
+}) {
+  const gl = useThree((s) => s.gl);
+  const scene = useThree((s) => s.scene);
+  const camera = useThree((s) => s.camera);
+  useEffect(() => {
+    captureRef.current = (cameraObjectId?: string | null) => {
+      if (typeof gl.render !== 'function') return null;
+      try {
+        // 分镜机位截图：解析绑定相机并按项目画幅校正投影；绑定缺失时返回 null
+        // 让缩略图保持占位，而不是用当前相机渲染出错误画面（复审阻断 2）
+        let viewCamera = camera;
+        if (cameraObjectId) {
+          const node = rootRef.current ? findNode(rootRef.current, cameraObjectId) : null;
+          if (!node || !(node instanceof THREE.PerspectiveCamera)) return null;
+          viewCamera = node;
+        }
+        return captureProjectFrame(gl, scene, viewCamera, aspect);
+      } catch {
+        return null;
+      }
+    };
+    onCaptureReady?.(true);
+    return () => {
+      captureRef.current = null;
+      onCaptureReady?.(false);
+    };
+  }, [gl, scene, camera, captureRef, onCaptureReady, rootRef, aspect]);
+  return null;
+}
+
 function SceneContent({
   editor,
   rootRef,
   project,
   cache,
+  onRenderContentChange,
 }: {
   editor: SceneEditor;
   rootRef: React.MutableRefObject<THREE.Group | null>;
   project: Project | null;
   cache: ContentCache;
+  onRenderContentChange?: () => void;
 }) {
   const scene = useThree((s) => s.scene);
   const prevProjectRef = useRef<Project | null>(null);
@@ -214,8 +511,11 @@ function SceneContent({
     const sceneSwitched = prevProjectRef.current && prevProjectRef.current.activeSceneId !== project.activeSceneId;
     const newSession = session !== sessionRef.current;
     if (current && prevProjectRef.current && !sceneSwitched && !newSession) {
-      const { rebuiltModelIds } = syncScene(current, prevProjectRef.current, project, aspect);
-      if (rebuiltModelIds.length > 0) setContentVersion((v) => v + 1);
+      const { rebuiltModelIds, structuralChange } = syncScene(current, prevProjectRef.current, project, aspect);
+      if (structuralChange || rebuiltModelIds.length > 0) {
+        setContentVersion((v) => v + 1);
+        onRenderContentChange?.();
+      }
     } else {
       // 切场景/新会话（或重建）：旧树节点整体释放，避免跨场景残留 GPU 资源
       if (current) {
@@ -226,9 +526,11 @@ function SceneContent({
       rootRef.current = root;
       scene.add(root);
       sessionRef.current = session;
+      setContentVersion((v) => v + 1);
+      onRenderContentChange?.();
     }
     prevProjectRef.current = project;
-  }, [project, scene, rootRef, editor]);
+  }, [project, scene, rootRef, editor, onRenderContentChange]);
 
   // 模型内容挂载：渲染消费者在使用期持有 lease（禁止裸资源旁路）——
   // 按「活动场景内 hash → 全部模型对象 id」映射，统一「先 retain，失败再 seed」：
@@ -264,10 +566,15 @@ function SceneContent({
         (gltf) => {
           // 失效守卫：lease 已释放（cleanup/缓存 dispose 撤销）或效应已重建后不再挂载
           if (!active || lease.isReleased) return;
+          let attached = false;
           for (const objectId of objectIds) {
             const node = findNode(root, objectId);
-            if (node) attachModelContent(node, gltf);
+            if (node) {
+              attachModelContent(node, gltf);
+              attached = true;
+            }
           }
+          if (attached) onRenderContentChange?.();
         },
         () => undefined,
       );
@@ -278,7 +585,7 @@ function SceneContent({
     };
     // contentVersion：身份分叉重建的模型（rebuiltModelIds）需要重新挂载内容；
     // attachModelContent 幂等（已有内容子树直接返回），全量重跑安全
-  }, [project, cache, rootRef, contentVersion]);
+  }, [project, cache, rootRef, contentVersion, onRenderContentChange]);
 
   // 项目变更后按 Project 全量 model→asset 关系清扫缓存（null=关闭项目，全部释放）
   useEffect(() => {
@@ -367,6 +674,8 @@ function EditorGizmo({
   rootRef,
   dragging,
   setDragging,
+  playbackActive,
+  skipIdsRef,
 }: {
   editor: SceneEditor;
   project: Project | null;
@@ -375,13 +684,34 @@ function EditorGizmo({
   rootRef: React.MutableRefObject<THREE.Group | null>;
   dragging: boolean;
   setDragging: (value: boolean) => void;
+  /** 回放/录制中禁用 Gizmo（时间线与驾驶接管节点） */
+  playbackActive: boolean;
+  /** 拖拽期间登记对象 id，回放驱动跳过该节点 */
+  skipIdsRef: React.RefObject<Set<string> | null>;
 }) {
   const root = rootRef.current;
   const target = selection.length === 1 && project && root ? findNode(root, selection[0]) : null;
   const data = target ? findObject(project!, target.userData.objectId as string) : undefined;
   const locked = !!data?.locked;
+  // 场景同步（SceneContent 的 useEffect）在渲染后执行，且只重渲染 SceneContent
+  // 子树——本组件首次渲染时选中节点可能尚未挂入场景。命中「选中但节点缺失」
+  // 时补一次重渲染，待同步提交后确定性挂载 gizmo，不再依赖无关状态更新竞速
+  const [, bumpRender] = useState(0);
+  useEffect(() => {
+    if (!target && selection.length === 1 && project) bumpRender((v) => v + 1);
+  }, [target, selection, project]);
   /** 正常提交路径标记：commit 先置位再收尾 dragging，cleanup 据此区分中断回滚 */
   const committedRef = useRef(false);
+
+  // 拖拽期间登记 skip 集：回放驱动不覆盖被 Gizmo 握住的节点
+  useEffect(() => {
+    if (!target || !dragging) return;
+    const objectId = target.userData.objectId as string;
+    skipIdsRef.current = new Set([objectId]);
+    return () => {
+      skipIdsRef.current = null;
+    };
+  }, [dragging, target, skipIdsRef]);
 
   // 拖动期间的全部中断路径（Hook 必须先于条件返回调用，保证 Hook 顺序稳定）：
   // Escape / window blur / pointercancel / 组件卸载（Delete 删除、Escape 清选、切对象）。
@@ -415,7 +745,7 @@ function EditorGizmo({
     };
   }, [dragging, target, setDragging]);
 
-  if (!target || locked || !project) return null;
+  if (!target || locked || !project || playbackActive) return null;
 
   const commit = () => {
     const objectId = target.userData.objectId as string;

@@ -185,9 +185,9 @@ test('对象树键盘导航：Arrow/Home/End/Enter 沿可见行 roving focus，�
   await expect(row('sample-cone')).toBeFocused();
   await expect(page.getByTestId('inspector-name')).toHaveValue('圆锥');
 
-  await page.keyboard.press('End'); // 最后一个可见行
-  await expect(row('sample-camera')).toBeFocused();
-  await expect(page.getByTestId('inspector-name')).toHaveValue('主摄像机');
+  await page.keyboard.press('End'); // 最后一个可见行（示例项目含两台机位）
+  await expect(row('sample-camera-2')).toBeFocused();
+  await expect(page.getByTestId('inspector-name')).toHaveValue('俯拍机位');
   await page.keyboard.press('Home');
   await expect(row('sample-group')).toBeFocused();
 
@@ -336,18 +336,13 @@ test('Gizmo 缩放连续拖动：一步历史，撤销后位置/缩放整体恢�
   await page.getByTestId('gizmo-mode-scale').click();
   await page.waitForTimeout(200);
 
-  const canvas = page.locator('.lumora-viewport canvas');
-  const box = (await canvas.boundingBox())!;
-  const cx = box.x + box.width / 2;
-  const cy = box.y + box.height / 2;
-  // 均匀缩放手柄（XYZY）在 gizmo 中心正上方约 100px（three-stdlib 的
-  // 缩放手柄烘焙在对象局部轴 +1.1 处，屏幕投影 ≈104px；中心无手柄）。
-  // 拖动时每次 pointermove 都会重算 axis，指针离开手柄范围拖动即断，
-  // 因此拖距限制在手柄 ~19px 屏幕尺寸内，最终缩放比 ≈108/100
-  await page.mouse.move(cx, cy - 100);
+  // 均匀缩放手柄（XYZY）：three-stdlib 烘焙在对象局部轴 +1.1 处（中心无手柄），
+  // 屏幕位置随布局缩放，从渲染截图定位（见 uniformScaleHandle）
+  const h = await uniformScaleHandle(page);
+  await page.mouse.move(h.x, h.y);
   await page.mouse.down();
   for (let i = 1; i <= 4; i += 1) {
-    await page.mouse.move(cx, cy - 100 - i * 2);
+    await page.mouse.move(h.x, h.y - i * 2);
   }
   await page.mouse.up();
 
@@ -537,7 +532,7 @@ test('P0-2 复制后删除原件：副本保留、资源不释放、导出仍含
   expect(models[0].assetId).toBe(exported.assets[0].id);
 });
 
-/** 立方体移到原点并切换到缩放 Gizmo（手柄居中于 canvas，正上方约 100px） */
+/** 立方体移到原点并切换到缩放 Gizmo */
 async function centerCubeAndScale(page: Page): Promise<void> {
   await page.getByTestId('tree-row-sample-cube').click();
   for (const axis of ['0', '1', '2']) {
@@ -550,13 +545,48 @@ async function centerCubeAndScale(page: Page): Promise<void> {
 }
 
 async function startDrag(page: Page): Promise<void> {
-  const canvas = page.locator('.lumora-viewport canvas');
-  const box = (await canvas.boundingBox())!;
-  const cx = box.x + box.width / 2;
-  const cy = box.y + box.height / 2;
-  await page.mouse.move(cx, cy - 100);
+  const h = await uniformScaleHandle(page);
+  await page.mouse.move(h.x, h.y);
   await page.mouse.down();
-  await page.mouse.move(cx, cy - 104);
+  await page.mouse.move(h.x, h.y - 4);
+}
+
+/**
+ * 定位均匀缩放手柄（XYZY）：截图扫描纯色轴手柄像素（红/绿/蓝，排除场景对象与
+ * 高光）→ gizmo 包围盒中心 = 选中对象投影中心；绿色像素顶边 = Y 手柄顶边
+ * （局部 0.8625），XYZY 手柄中心在局部 1.1（three-stdlib 固定几何）。
+ * 返回画布页面坐标，随布局/视口尺寸自适应。
+ */
+async function uniformScaleHandle(page: Page): Promise<{ x: number; y: number }> {
+  const canvas = page.locator('.lumora-viewport canvas');
+  const shot = await canvas.screenshot();
+  const png = decodePng(shot);
+  let minX = png.width;
+  let maxX = 0;
+  let minY = png.height;
+  let maxY = 0;
+  let greenTop = png.height;
+  for (let y = 0; y < png.height; y += 1) {
+    for (let x = 0; x < png.width; x += 1) {
+      const [r, g, b] = pngPixel(png, x, y);
+      const pureRed = r > 200 && g < 80 && b < 80;
+      const pureGreen = g > 200 && r < 80 && b < 80;
+      const pureBlue = b > 200 && r < 80 && g < 80;
+      if (pureRed || pureGreen || pureBlue) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+      if (pureGreen && y < greenTop) greenTop = y;
+    }
+  }
+  const centerY = (minY + maxY) / 2;
+  const box = await canvas.boundingBox();
+  return {
+    x: box.x + (minX + maxX) / 2,
+    y: box.y + centerY - (1.1 / 0.8625) * (centerY - greenTop),
+  };
 }
 
 /** 撤销直到按钮禁用（轴输入产生的历史步数不定：目标值可能等于当前值而无提交） */
@@ -634,9 +664,9 @@ test('P0-4 多场景相机/选择隔离：机位按场景过滤，切场景回�
   await page.getByTestId('reopen-last-export').click();
   await expect(page.getByTestId('tree-row-sample-group')).toBeVisible();
 
-  // 场景 A：机位选项只有 sample-camera
+  // 场景 A：机位选项含 sample-camera 与 sample-camera-2
   const modeSelect = page.getByTestId('view-mode-select');
-  await expect(modeSelect.locator('option')).toHaveText(['导演视图', '相机 · 主摄像机']);
+  await expect(modeSelect.locator('option')).toHaveText(['导演视图', '相机 · 主摄像机', '相机 · 俯拍机位']);
 
   // 切到场景 B：树只含 B 相机，机位选项只有 cam-b
   await page.getByTestId('scene-switcher').selectOption('scene-b');
@@ -702,9 +732,52 @@ test.describe('第三轮验收：生产路径（AC1/AC3/AC4）', () => {
     await expect(page.getByTestId('lumora-toasts')).toContainText('已导入模型');
     await expect(page.locator('.lumora-tree-row', { hasText: 'nested-mesh' })).toBeVisible();
 
-    // 内容挂载完成（占位框被 GLB 内容替换），导演视图渲染模型（原点）
-    await page.waitForTimeout(700);
+    // 内容挂载完成（占位框被 GLB 内容替换），导演视图渲染模型（原点）。
+    // GLB 解析/挂载异步，固定等待在负载下会提前采样到未替换的占位框（flake），
+    // 改为轮询紫色占位框像素归零：内容永不到挂载则轮询超时失败（回归语义不变）
     await hideOverlays(page, '.lumora-viewport-toolbar');
+    // 导入自动选中模型 → 变换控件 gizmo 确定性出现（场景同步竞态回归防护：
+    // syncScene 结构变更未触发重渲染时，gizmo 出现与否取决于无关状态更新时序；
+    // 纯红 X 轴 / 纯蓝 Z 轴是场景中唯一接近纯红/纯蓝的像素源，其余物体均为
+    // 阴影化着色，g=107+ 或 b=171+ 不满足 g<50/b<50 的硬阈值）
+    const gizmoPixels = (p: ReturnType<typeof decodePng>): number => {
+      let count = 0;
+      for (let y = 0; y < p.height; y += 2) {
+        for (let x = 0; x < p.width; x += 2) {
+          const [r, g, b] = pngPixel(p, x, y);
+          if ((r > 230 && g < 50 && b < 50) || (b > 230 && r < 50 && g < 50)) count += 1;
+        }
+      }
+      return count;
+    };
+    await expect
+      .poll(
+        async () => gizmoPixels(decodePng(await page.locator('.lumora-viewport canvas').screenshot())),
+        { timeout: 5000 },
+      )
+      .toBeGreaterThan(0);
+    // Escape 清选 → gizmo 消失：gizmo 轴色与占位框启发式同色相，不清选则
+    // 下方的紫色计数恒非零，无法表达「占位框已替换」
+    await page.keyboard.press('Escape');
+    await expect
+      .poll(
+        async () => gizmoPixels(decodePng(await page.locator('.lumora-viewport canvas').screenshot())),
+        { timeout: 5000 },
+      )
+      .toBe(0);
+    await expect
+      .poll(async () => {
+        const p = decodePng(await page.locator('.lumora-viewport canvas').screenshot());
+        let purple = 0;
+        for (let y = 0; y < p.height; y += 2) {
+          for (let x = 0; x < p.width; x += 2) {
+            const [r, g, b] = pngPixel(p, x, y);
+            if (b > 150 && g < r && g < 120) purple += 1;
+          }
+        }
+        return purple;
+      }, { timeout: 5000 })
+      .toBe(0);
     const shot = await page.locator('.lumora-viewport canvas').screenshot();
     await showOverlays(page, '.lumora-viewport-toolbar');
     const png = decodePng(shot);
@@ -736,10 +809,11 @@ test.describe('第三轮验收：生产路径（AC1/AC3/AC4）', () => {
     // 真实材质：GLB 的 MeshStandardMaterial 颜色经生产解析/挂载路径渲染成片
     expect(bodyPixels).toBeGreaterThan(100);
     expect(placeholderPixels).toBe(0);
-    // 嵌套几何：2×0.6×1 车身（45° 视角）在画面中宽显著大于高，且聚类居中
+    // 嵌套几何：2×0.6×1 车身（45° 视角）在画面中宽显著大于高，且聚类居中。
+    // 像素尺寸与画布高度成正比（投影缩放 ∝ H），阈值按画布高度等比例校准
     const clusterWidth = maxX - minX + 1;
     const clusterHeight = maxY - minY + 1;
-    expect(clusterWidth).toBeGreaterThanOrEqual(120);
+    expect(clusterWidth).toBeGreaterThanOrEqual(Math.round(png.height * 0.18));
     expect(clusterHeight).toBeGreaterThanOrEqual(20);
     expect(clusterWidth).toBeGreaterThan(1.5 * clusterHeight);
     expect((minX + maxX) / 2).toBeCloseTo(png.width / 2, -1);
@@ -748,9 +822,6 @@ test.describe('第三轮验收：生产路径（AC1/AC3/AC4）', () => {
   test('AC3 Gizmo 生产路径：拖动实时预览、撤销/重做精确恢复、中断回滚（preview→rollback）', async ({ page }) => {
     await centerCubeAndScale(page);
     const canvas = page.locator('.lumora-viewport canvas');
-    const box = (await canvas.boundingBox())!;
-    const cx = box.x + box.width / 2;
-    const cy = box.y + box.height / 2;
 
     // 基准画面 A：Escape 清选（点击画布角落可能命中地面对象）→ 无 gizmo、缩放 1
     await page.keyboard.press('Escape');
@@ -760,10 +831,11 @@ test.describe('第三轮验收：生产路径（AC1/AC3/AC4）', () => {
     // 重新选中 → 拖动开始：立方体随指针实时缩放（预览生效，画面变化）
     await page.getByTestId('tree-row-sample-cube').click();
     await page.waitForTimeout(150);
-    await page.mouse.move(cx, cy - 100);
+    const h = await uniformScaleHandle(page);
+    await page.mouse.move(h.x, h.y);
     await page.mouse.down();
     for (let i = 1; i <= 4; i += 1) {
-      await page.mouse.move(cx, cy - 100 - i * 2);
+      await page.mouse.move(h.x, h.y - i * 2);
     }
     await page.waitForTimeout(120);
     const shotB = await canvas.screenshot();
@@ -789,9 +861,10 @@ test.describe('第三轮验收：生产路径（AC1/AC3/AC4）', () => {
     await page.waitForTimeout(150);
     const shotA2 = await canvas.screenshot(); // 拖动前：gizmo、缩放 1
 
-    await page.mouse.move(cx, cy - 100);
+    const h2 = await uniformScaleHandle(page);
+    await page.mouse.move(h2.x, h2.y);
     await page.mouse.down();
-    await page.mouse.move(cx, cy - 104);
+    await page.mouse.move(h2.x, h2.y - 4);
     await page.waitForTimeout(120);
     const shotB2 = await canvas.screenshot(); // 预览中：画面已变化
     expect(shotB2.equals(shotA2)).toBe(false);
@@ -826,7 +899,7 @@ test.describe('第三轮验收：生产路径（AC1/AC3/AC4）', () => {
         const project = {
           uri: 'lumora://probe-project',
           name: '投影探针',
-          schemaVersion: 3,
+          schemaVersion: 4,
           createdAt: new Date().toISOString(),
           revision: 0,
           settings: { fps: 24, aspect: [16, 9] },
@@ -882,6 +955,7 @@ test.describe('第三轮验收：生产路径（AC1/AC3/AC4）', () => {
             },
           ],
           tracks: [],
+          shots: [],
           assets: [],
         };
         localStorage.setItem('lumora.demo.last-export', JSON.stringify(project));

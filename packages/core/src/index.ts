@@ -24,8 +24,10 @@ export type {
   SceneObjectData,
   SceneObjectKind,
   SceneObjectType,
+  ShotClipData,
   TrackData,
   TrackKeyframeData,
+  TrackKeyframeValue,
   TrackTargetPath,
   TransformData,
   Vec3,
@@ -62,12 +64,39 @@ export {
   createModelObject,
   createPrimitiveObject,
   createScene,
+  createShotClip,
+  createTrack,
   defaultName,
   defaultTransform,
   genId,
 } from './scene/create';
+export {
+  DEFAULT_TIMELINE_ZOOM,
+  MAX_TIMELINE_ZOOM,
+  MIN_TIMELINE_ZOOM,
+  TimelineController,
+  snapTimeToFrame,
+} from './timeline/timeline-controller';
+export type { TimelineControllerOptions, TimelineEventMap } from './timeline/timeline-controller';
+export {
+  evaluateTrack,
+  getProjectDuration,
+  getShotDuration,
+  getTrackDuration,
+  isSortedKeyframes,
+  segmentInterpolation,
+  simplifySamples,
+} from './scene/track-math';
+export type { SimplifyOptions, TrackEvaluation, TrackSample } from './scene/track-math';
 export { hashBytes, sha256Hex, compositeContentHash } from './scene/assets';
-export { validateProjectSchema, validateProjectStructure, validateSceneObjectData } from './scene/validate';
+export {
+  SCALAR_TRACK_PATHS,
+  TRACK_INTERPOLATIONS,
+  TRACK_TARGET_PATHS,
+  validateProjectSchema,
+  validateProjectStructure,
+  validateSceneObjectData,
+} from './scene/validate';
 export { findJsonEncodingProblem } from './scene/json-encoding';
 export type { JsonEncodingProblem } from './scene/json-encoding';
 export { fovDegToFocalLength, focalLengthToFovDeg, fitRect, FULL_FRAME_SENSOR } from './scene/camera-math';

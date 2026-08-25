@@ -111,7 +111,7 @@ function chainProject(depth: number): Project {
   return {
     uri: 'test://chain',
     name: 'chain',
-    schemaVersion: 3,
+    schemaVersion: 4,
     createdAt: '2026-01-01T00:00:00Z',
     revision: 1,
     settings: { fps: 60, aspect: [16, 9] },
@@ -119,6 +119,7 @@ function chainProject(depth: number): Project {
     scenes: [{ id: 's1', name: 'S', rootObjectIds: ['n0'], activeCameraId: null }],
     objects,
     tracks: [],
+    shots: [],
     assets: [],
   };
 }

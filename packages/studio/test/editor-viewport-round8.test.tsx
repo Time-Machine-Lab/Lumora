@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from '@testing-library/react';
 import { act } from 'react';
 import * as THREE from 'three';
-import { createSampleProject, SceneEditor } from '@lumora/core';
+import { createModelObject, createSampleProject, SceneEditor } from '@lumora/core';
 import type { Project, SceneEditor as SceneEditorType } from '@lumora/core';
 import { EditorViewport } from '../src/components/editor/EditorViewport';
 import type { CacheLease, ContentCache } from '../src/components/editor/content-cache';
@@ -125,5 +125,61 @@ describe('R8-4 视口连续 openProject：按会话代强制重建', () => {
     const after = findNode(mockScene.scene, 'sample-cube');
     expect(after).toBe(before);
     expect(after!.name).toBe('改名立方体');
+  });
+
+  it('publishes a new render-content generation after a deferred model lease attaches', async () => {
+    let resolveContent!: (value: GLTF) => void;
+    const content = new Promise<GLTF>((resolve) => {
+      resolveContent = resolve;
+    });
+    const lease = leaseWith(content);
+    const cache = noopCache();
+    vi.mocked(cache.seed).mockReturnValue(lease);
+    const base = createSampleProject();
+    const model = { ...createModelObject('asset-deferred', 'Deferred model'), id: 'model-deferred' };
+    const project: Project = {
+      ...base,
+      assets: [
+        {
+          id: 'asset-deferred',
+          kind: 'gltf',
+          name: 'deferred.glb',
+          format: 'glb',
+          mime: 'model/gltf-binary',
+          hash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          size: 4,
+          source: 'file',
+          storageRef: 'blob:deferred',
+          payload: 'AAAA',
+          createdAt: '2026-08-25T00:00:00.000Z',
+        },
+      ],
+      objects: [...base.objects, model],
+      scenes: base.scenes.map((scene) => ({
+        ...scene,
+        rootObjectIds: [...scene.rootObjectIds, model.id],
+      })),
+    };
+    const editor = new SceneEditor();
+    editor.openProject(project);
+    const onRenderContentChange = vi.fn();
+    render(
+      <EditorViewport
+        editor={editor}
+        project={editor.getProject()}
+        selection={[]}
+        view={editor.getView()}
+        cache={cache}
+        onRenderContentChange={onRenderContentChange}
+      />,
+    );
+    const beforeSettlement = onRenderContentChange.mock.calls.length;
+
+    await act(async () => {
+      resolveContent({ scene: new THREE.Group() } as GLTF);
+      await content;
+    });
+
+    expect(onRenderContentChange.mock.calls.length).toBeGreaterThan(beforeSettlement);
   });
 });

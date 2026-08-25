@@ -58,7 +58,7 @@ test.beforeEach(async ({ page }) => {
     const project = {
       uri: 'lumora://deep-tree',
       name: '深树',
-      schemaVersion: 3,
+      schemaVersion: 4,
       createdAt: new Date().toISOString(),
       revision: 0,
       settings: { fps: 24, aspect: [16, 9] },
@@ -66,6 +66,7 @@ test.beforeEach(async ({ page }) => {
       scenes: [{ id: 's1', name: '主场景', rootObjectIds: ['d0', 'cam'], activeCameraId: 'cam' }],
       objects,
       tracks: [],
+      shots: [],
       assets: [],
     };
     localStorage.setItem('lumora.demo.last-export', JSON.stringify(project));

@@ -40,6 +40,7 @@ function chainProject(depth: number): Project {
     objects,
     scenes: [{ id: 'scene-1', name: '主场景', rootObjectIds: ['chain-0'], activeCameraId: null }],
     tracks: [],
+    shots: [],
   };
 }
 

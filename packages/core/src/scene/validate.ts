@@ -6,8 +6,10 @@ import type { AssetData, Project, SceneObjectData, TrackData, TransformData, Vec
 export const PRIMITIVE_KINDS = ['box', 'sphere', 'cone', 'torus', 'plane'] as const;
 export const LIGHT_KINDS = ['directional', 'point', 'spot'] as const;
 export const CAMERA_PROJECTIONS = ['perspective'] as const;
-export const TRACK_TARGET_PATHS = ['position', 'rotation', 'scale'] as const;
-export const TRACK_INTERPOLATIONS = ['linear', 'step'] as const;
+export const TRACK_TARGET_PATHS = ['position', 'rotation', 'scale', 'focalLength'] as const;
+export const TRACK_INTERPOLATIONS = ['linear', 'step', 'smooth'] as const;
+/** 标量通道（关键帧 value 为数值而非 Vec3） */
+export const SCALAR_TRACK_PATHS = ['focalLength'] as const;
 
 // ---------- 非 JSON 结构拒绝（R8-6）：Map/Set/Date 冻结壳封堵 ----------
 // deepFreeze 只遍历自有属性：Map/Set 内部槽位（[[MapData]]）与 Date 时间槽位
@@ -163,7 +165,7 @@ export function validateProjectSchema(project: unknown): string | null {
   if (jsonProblem) return jsonProblem;
   const p = project as Partial<Project>;
   if (!isString(p.uri) || !isString(p.name)) return 'uri/name 非法';
-  if (p.schemaVersion !== 3) return 'schemaVersion 非法';
+  if (p.schemaVersion !== 4) return 'schemaVersion 非法';
   if (!isString(p.createdAt)) return 'createdAt 非法';
   if (typeof p.revision !== 'number' || !Number.isFinite(p.revision) || p.revision < 0) {
     return 'revision 非法';
@@ -201,6 +203,9 @@ export function validateProjectSchema(project: unknown): string | null {
   }
   if (!Array.isArray(p.tracks)) return 'tracks 缺失或非数组';
   const trackIds = new Set<string>();
+  // (objectId, targetPath) 复合键唯一：回放按复合键寻址，重复轨道的后一条
+  // 会隐式覆盖前一条，录制/更新却按数组中的第一条寻址 —— 语义不可用
+  const trackKeys = new Set<string>();
   for (const track of p.tracks) {
     if (!track || typeof track !== 'object') return '轨道条目非法';
     const t = track as Partial<TrackData>;
@@ -211,6 +216,13 @@ export function validateProjectSchema(project: unknown): string | null {
     if (!isString(t.targetPath) || !(TRACK_TARGET_PATHS as readonly string[]).includes(t.targetPath)) {
       return '轨道 targetPath 非法';
     }
+    const compositeKey = `${t.objectId}\u0000${t.targetPath}`;
+    if (trackKeys.has(compositeKey)) {
+      return `轨道绑定对象与通道重复（${t.objectId} · ${t.targetPath}）`;
+    }
+    trackKeys.add(compositeKey);
+    if (t.disabled !== undefined && typeof t.disabled !== 'boolean') return '轨道 disabled 非法';
+    const scalarPath = (SCALAR_TRACK_PATHS as readonly string[]).includes(t.targetPath);
     if (!Array.isArray(t.keyframes)) return '轨道 keyframes 非法';
     let lastTime = -Infinity;
     for (const keyframe of t.keyframes) {
@@ -222,7 +234,16 @@ export function validateProjectSchema(project: unknown): string | null {
       // 关键帧按 time 严格升序（重复时刻的插值语义未定义，拒绝猜测）
       if (k.time <= lastTime) return '轨道关键帧 time 未按升序排列';
       lastTime = k.time;
-      if (!isFiniteVec3(k.value)) return '轨道关键帧 value 非法（不允许 NaN/Infinity）';
+      // 值与通道类型匹配：标量通道（focalLength）为有限数值，Vec3 通道为三元向量
+      if (scalarPath) {
+        if (typeof k.value !== 'number' || !Number.isFinite(k.value)) {
+          return '轨道关键帧 value 非法（标量通道需为有限数值）';
+        }
+        // 焦距正值域：≤0 让投影矩阵失效，保形插值同样要求正值端点
+        if (k.value <= 0) return '轨道关键帧 value 非法（焦距需为正）';
+      } else if (!isFiniteVec3(k.value)) {
+        return '轨道关键帧 value 非法（不允许 NaN/Infinity）';
+      }
       if (
         k.interpolation !== undefined &&
         (typeof k.interpolation !== 'string' ||
@@ -230,6 +251,22 @@ export function validateProjectSchema(project: unknown): string | null {
       ) {
         return '轨道关键帧 interpolation 非法';
       }
+    }
+  }
+  if (!Array.isArray(p.shots)) return 'shots 缺失或非数组';
+  const shotIds = new Set<string>();
+  for (const shot of p.shots) {
+    if (!shot || typeof shot !== 'object') return '分镜条目非法';
+    const s = shot as { id?: unknown; name?: unknown; cameraObjectId?: unknown; startTime?: unknown; endTime?: unknown };
+    if (!isString(s.id) || s.id.length === 0 || shotIds.has(s.id)) return '分镜 id 非法或重复';
+    shotIds.add(s.id);
+    if (!isString(s.name)) return '分镜 name 非法';
+    if (s.cameraObjectId !== null && !isString(s.cameraObjectId)) return '分镜 cameraObjectId 非法';
+    if (typeof s.startTime !== 'number' || !Number.isFinite(s.startTime) || s.startTime < 0) {
+      return '分镜 startTime 非法（需为非负有限数）';
+    }
+    if (typeof s.endTime !== 'number' || !Number.isFinite(s.endTime) || s.endTime <= s.startTime) {
+      return '分镜 endTime 非法（需大于 startTime）';
     }
   }
   if (!Array.isArray(p.assets)) return 'assets 缺失';
@@ -279,6 +316,23 @@ export function validateProjectSchema(project: unknown): string | null {
   for (const track of p.tracks) {
     if (!objectIds.has(track.objectId)) {
       return `轨道引用不存在的对象（${track.objectId}）`;
+    }
+    // 焦距通道只能绑定相机对象（TML-52 审查第 8 项：fov 推导需要相机载荷）
+    if (track.targetPath === 'focalLength') {
+      const object = p.objects.find((o) => o.id === track.objectId);
+      if (!object || object.type !== 'camera') {
+        return `焦距轨道绑定非相机对象（${track.objectId}）`;
+      }
+    }
+  }
+  // 交叉引用（TML-52）：分镜 cameraObjectId 必须指向项目内已注册的相机对象
+  for (const shot of p.shots) {
+    if (shot.cameraObjectId === null) continue;
+    const camera = objectIds.has(shot.cameraObjectId)
+      ? p.objects.find((object) => object.id === shot.cameraObjectId)
+      : undefined;
+    if (!camera || camera.type !== 'camera') {
+      return `分镜「${shot.name}」引用不存在的机位（${shot.cameraObjectId}）`;
     }
   }
   return null;

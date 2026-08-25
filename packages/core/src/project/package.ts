@@ -169,6 +169,7 @@ export const PUBLIC_PROJECT_FIELDS = [
   'scenes',
   'objects',
   'tracks',
+  'shots',
   'assets',
 ] as const;
 
@@ -209,8 +210,9 @@ export const PUBLIC_CAMERA_FIELDS = [
   'far',
   'aspect',
 ] as const;
-export const PUBLIC_TRACK_FIELDS = ['id', 'name', 'objectId', 'targetPath', 'keyframes'] as const;
+export const PUBLIC_TRACK_FIELDS = ['id', 'name', 'objectId', 'targetPath', 'disabled', 'keyframes'] as const;
 export const PUBLIC_KEYFRAME_FIELDS = ['time', 'value', 'interpolation'] as const;
+export const PUBLIC_SHOT_FIELDS = ['id', 'name', 'cameraObjectId', 'startTime', 'endTime'] as const;
 export const PUBLIC_ASSET_FIELDS = [
   'id',
   'kind',
@@ -1345,10 +1347,11 @@ export function buildProjectPackage(project: Project, options: PackageBuildOptio
     }
     stripped.settings = settings;
   }
-  // 每层 DTO 契约投影（scenes/objects/tracks 与 settings 同一机制）
+  // 每层 DTO 契约投影（scenes/objects/tracks/shots 与 settings 同一机制）
   if (Array.isArray(stripped.scenes)) stripped.scenes = stripped.scenes.map((scene) => projectDto(scene, PUBLIC_SCENE_FIELDS));
   if (Array.isArray(stripped.objects)) stripped.objects = stripped.objects.map((object) => projectObjectDto(object));
   if (Array.isArray(stripped.tracks)) stripped.tracks = stripped.tracks.map((track) => projectTrackDto(track));
+  if (Array.isArray(stripped.shots)) stripped.shots = stripped.shots.map((shot) => projectDto(shot, PUBLIC_SHOT_FIELDS));
 
   // 无原型字典：资产 id 是导入包可携带的任意字符串（含 '__proto__'），
   // 普通 {} 的赋值会走原型 setter 丢字节/污染原型（导入→导出→导入字节丢失）

@@ -7,6 +7,10 @@ import type {
   PrimitiveKind,
   SceneObjectData,
   SceneObjectType,
+  ShotClipData,
+  TrackData,
+  TrackKeyframeData,
+  TrackTargetPath,
   TransformData,
   Vec3,
 } from './types';
@@ -129,4 +133,29 @@ export function createMaterial(color: string): MaterialData {
 
 export function createScene(name = '场景'): import('./types').SceneData {
   return { id: genId('scene'), name, rootObjectIds: [], activeCameraId: null };
+}
+
+/** 轨道工厂：空关键帧轨道（可随后 setTrackKeyframes / 录制提交） */
+export function createTrack(
+  objectId: string,
+  targetPath: TrackTargetPath,
+  name?: string,
+  keyframes: TrackKeyframeData[] = [],
+): TrackData {
+  return { id: genId('track'), name: name ?? `轨道·${targetPath}`, objectId, targetPath, keyframes };
+}
+
+/** 分镜工厂：绑定机位与时间线区段 */
+export function createShotClip(
+  cameraObjectId: string | null,
+  name?: string,
+  segment: { startTime: number; endTime: number } = { startTime: 0, endTime: 1 },
+): ShotClipData {
+  return {
+    id: genId('shot'),
+    name: name ?? '分镜',
+    cameraObjectId,
+    startTime: segment.startTime,
+    endTime: segment.endTime,
+  };
 }

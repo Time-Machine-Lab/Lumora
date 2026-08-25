@@ -23,7 +23,7 @@
 import type { AssetPartData, Project } from '../scene/types';
 
 /** 当前项目数据版本（types.ts 的 Project.schemaVersion 字面量与此保持一致） */
-export const CURRENT_PROJECT_SCHEMA_VERSION = 3;
+export const CURRENT_PROJECT_SCHEMA_VERSION = 4;
 
 /** 包容器格式标识：manifest.format 必须精确匹配 */
 export const PROJECT_PACKAGE_FORMAT = 'lumora.project';

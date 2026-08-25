@@ -160,6 +160,17 @@
   position: relative;
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* 场景区与时间线面板纵向分栏（TML-52） */
+.lumora-studio__scene-slot {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
 }
 
 /* ---------- 对象层级树 ---------- */
@@ -583,6 +594,360 @@
   width: 1px;
   height: 18px;
   background: var(--lumora-border);
+}
+
+/* ---------- 时间线面板（TML-52） ---------- */
+
+.lumora-timeline {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  border-top: 1px solid var(--lumora-border);
+  background: var(--lumora-surface);
+  font-size: 12px;
+  user-select: none;
+  min-height: 0;
+}
+
+/* 运输栏 + 时间画布容器：覆盖确认模态打开时整体 inert（复审一般项 6）。
+ * 与 .lumora-timeline 同为纵向 flex 布局，包裹后布局不变 */
+.lumora-timeline__content {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.lumora-timeline__transport {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--lumora-border);
+}
+
+.lumora-timeline__play,
+.lumora-timeline__record,
+.lumora-timeline__zoom {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--lumora-border);
+  border-radius: 6px;
+  background: var(--lumora-surface-2);
+  color: var(--lumora-text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.lumora-timeline__play:hover:not(:disabled),
+.lumora-timeline__record:hover:not(:disabled),
+.lumora-timeline__zoom:hover:not(:disabled) {
+  border-color: var(--lumora-accent);
+}
+
+.lumora-timeline__play:disabled,
+.lumora-timeline__record:disabled,
+.lumora-timeline__zoom:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.lumora-timeline__record {
+  color: var(--lumora-danger);
+}
+
+.lumora-timeline__record--on {
+  background: rgba(255, 107, 107, 0.16);
+  border-color: var(--lumora-danger);
+}
+
+.lumora-timeline__time {
+  font-variant-numeric: tabular-nums;
+  color: var(--lumora-text);
+  min-width: 52px;
+}
+
+.lumora-timeline__frame {
+  color: var(--lumora-text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.lumora-timeline__fps {
+  color: var(--lumora-text-dim);
+  border: 1px solid var(--lumora-border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+.lumora-timeline__spacer {
+  flex: 1;
+}
+
+.lumora-timeline__check {
+  white-space: nowrap;
+}
+
+/* 共享滚动容器：标尺/轨道/分镜同一横向滚动（审查第 5 项 —— 独立滚动区
+   与标签列会把标尺、关键帧、分镜推向不同坐标系，错位 186px） */
+.lumora-timeline__body {
+  overflow: auto;
+  max-height: 232px;
+  position: relative;
+}
+
+.lumora-timeline__canvas {
+  position: relative;
+  min-width: 100%;
+}
+
+.lumora-timeline__row {
+  display: flex;
+  width: 100%;
+}
+
+.lumora-timeline__row--ruler {
+  height: 24px;
+  cursor: col-resize;
+  touch-action: none;
+  border-bottom: 1px solid var(--lumora-border);
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--lumora-surface);
+}
+
+.lumora-timeline__row--shots {
+  height: 58px;
+  border-top: 1px solid var(--lumora-border);
+}
+
+/* 标签列：各行动画内容横向滚动时固定不动，宽度与播放头/时间坐标换算一致 */
+.lumora-timeline__label {
+  flex: 0 0 186px;
+  position: sticky;
+  left: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  background: var(--lumora-surface);
+  border-right: 1px solid var(--lumora-border);
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.lumora-timeline__label--ruler {
+  min-height: 0;
+}
+
+.lumora-timeline__label--shots {
+  font-weight: 600;
+  color: var(--lumora-text-dim);
+}
+
+/* 时间画布：time * zoom 的统一坐标空间 */
+.lumora-timeline__time-area {
+  position: relative;
+  flex: 1 1 0%;
+  min-width: 0;
+}
+
+.lumora-timeline__ticks {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+}
+
+.lumora-timeline__tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--lumora-border);
+}
+
+.lumora-timeline__tick--major {
+  background: #4a5063;
+}
+
+.lumora-timeline__playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--lumora-accent);
+  pointer-events: none;
+  z-index: 5;
+}
+
+.lumora-timeline__lane {
+  border-top: 1px solid var(--lumora-border);
+  cursor: pointer;
+  min-height: 26px;
+}
+
+.lumora-timeline__lane:hover {
+  background: rgba(77, 171, 247, 0.06);
+}
+
+.lumora-timeline__lane--disabled {
+  opacity: 0.5;
+}
+
+.lumora-timeline__lane-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lumora-timeline__lane-channel {
+  font-size: 11px;
+  color: var(--lumora-accent);
+  border: 1px solid var(--lumora-border);
+  border-radius: 4px;
+  padding: 0 4px;
+  flex-shrink: 0;
+}
+
+.lumora-timeline__keyframe {
+  position: absolute;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  margin: -4px 0 0 -4px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--lumora-accent);
+  cursor: pointer;
+}
+
+.lumora-timeline__keyframe:hover {
+  outline: 2px solid rgba(77, 171, 247, 0.4);
+}
+
+.lumora-timeline__shot {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border: 1px solid var(--lumora-border);
+  border-radius: 6px;
+  background: var(--lumora-surface-2);
+  cursor: pointer;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.lumora-timeline__shot:hover {
+  border-color: var(--lumora-accent);
+}
+
+.lumora-timeline__shot-move {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--lumora-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--lumora-text);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.lumora-timeline__shot-move:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.lumora-timeline__shot-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lumora-timeline__shot-thumb {
+  height: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 4px;
+  margin-left: auto;
+}
+
+.lumora-timeline__shot-camera {
+  color: var(--lumora-text-dim);
+  font-size: 11px;
+  margin-left: auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lumora-timeline__empty {
+  padding: 8px 10px;
+  color: var(--lumora-text-dim);
+}
+
+.lumora-timeline__overlay {
+  /* 模态提升到壳层根级并经 portal 挂 body：fixed 覆盖整个视口（复审阻断 4） */
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 30;
+}
+
+.lumora-studio--portal {
+  width: auto;
+  height: auto;
+  min-height: 0;
+  overflow: visible;
+}
+
+.lumora-timeline__modal {
+  background: var(--lumora-surface-2);
+  border: 1px solid var(--lumora-border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  max-width: 300px;
+}
+
+.lumora-timeline__modal p {
+  margin: 0;
+  color: var(--lumora-text);
+}
+
+.lumora-timeline__modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+/* 窄视口（320/375px）：收起非关键信息，运输栏换行不裁切 */
+@media (max-width: 520px) {
+  .lumora-timeline__frame,
+  .lumora-timeline__fps {
+    display: none;
+  }
 }
 
 .lumora-toolbutton {
