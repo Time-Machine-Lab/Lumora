@@ -67,6 +67,19 @@ describe('Mock storyboard provider', () => {
     expect(task.draft?.shots.reduce((total, shot) => total + shot.durationSeconds, 0)).toBeCloseTo(1.0051, 10);
   });
 
+  it('keeps maximum-length briefs valid across the 24-shot boundary', async () => {
+    const task = await run('mock-storyboard-success', {
+      concept: 'c'.repeat(4_000),
+      visualStyle: 'v'.repeat(500),
+      targetDurationSeconds: 2.4,
+      shotCount: 24,
+    });
+
+    expect(task.status).toBe('succeeded');
+    expect(task.draft?.shots).toHaveLength(24);
+    expect(task.draft?.shots.every((shot) => shot.prompt.length <= 4_000)).toBe(true);
+  });
+
   it.each([
     ['mock-storyboard-timeout', 'timeout'],
     ['mock-storyboard-rate-limit', 'rate_limited'],

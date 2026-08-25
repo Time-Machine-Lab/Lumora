@@ -239,7 +239,11 @@ export class PluginHost {
       // 命令回调（when/execute）收到 owner/代际绑定的命令与事件门面；停用后旧 context 彻底失效
       contextFor: (ownerId) => this.createCommandContext(ownerId),
     });
-    this.contributions = new ContributionRegistry({ events: this.events, commands: this.commands });
+    this.contributions = new ContributionRegistry({
+      events: this.events,
+      commands: this.commands,
+      onAiProviderRemoved: (providerId) => cancelStoryboardTasksForProvider(this.services, providerId),
+    });
     this.services = createPluginServices(this.contributions, () => this.project);
   }
 

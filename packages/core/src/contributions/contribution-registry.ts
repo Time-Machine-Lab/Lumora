@@ -40,6 +40,7 @@ interface ExporterEntry {
 export interface ContributionRegistryOptions {
   events?: TypedEventEmitter<EventMap>;
   commands?: CommandRegistry;
+  onAiProviderRemoved?: (providerId: string) => void;
 }
 
 /**
@@ -54,11 +55,13 @@ export class ContributionRegistry {
   private readonly exporters = new Map<string, ExporterEntry>();
   private readonly events?: TypedEventEmitter<EventMap>;
   private readonly commands?: CommandRegistry;
+  private readonly onAiProviderRemoved?: (providerId: string) => void;
   private disposedFlag = false;
 
   constructor(options: ContributionRegistryOptions = {}) {
     this.events = options.events;
     this.commands = options.commands;
+    this.onAiProviderRemoved = options.onAiProviderRemoved;
   }
 
   /**
@@ -149,10 +152,20 @@ export class ContributionRegistry {
       });
     }
     for (const item of bundle.aiProviders ?? []) {
+      const providerId = item.id;
+      const registeredItem = Object.freeze({
+        ...item,
+        id: providerId,
+        models: [...item.models],
+        ...(item.storyboard === undefined ? {} : { storyboard: parseAiStoryboardCapability(item.storyboard) }),
+      });
       plan.push(() => {
-        this.aiProviders.set(item.id, { pluginId, item });
+        const entry = { pluginId, item: registeredItem };
+        this.aiProviders.set(providerId, entry);
         return onceDisposable(() => {
-          this.aiProviders.delete(item.id);
+          if (this.aiProviders.get(providerId) !== entry) return;
+          this.aiProviders.delete(providerId);
+          this.onAiProviderRemoved?.(providerId);
           this.emitChanged(pluginId);
         });
       });

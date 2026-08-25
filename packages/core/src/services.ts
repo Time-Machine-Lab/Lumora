@@ -9,6 +9,7 @@ import {
   parseCreativeBrief,
   parseStoryboardDraftPayload,
   type AiStoryboardCapability,
+  type AiProviderErrorData,
   type GenerationTask,
   type StoryboardGenerateRequest,
   type StoryboardProviderInfo,
@@ -83,6 +84,27 @@ function validatedStoryboardCapability(provider: RegisteredAiProvider): AiStoryb
   } catch {
     return undefined;
   }
+}
+
+function schemaIssuePath(error: ZodError): string | undefined {
+  const path = error.issues[0]?.path;
+  if (!path || path.length === 0) return undefined;
+  return path.reduce<string>((result, segment) => {
+    if (typeof segment === 'number') return `${result}[${segment}]`;
+    return result ? `${result}.${segment}` : segment;
+  }, '');
+}
+
+function invalidSchemaError(costKnown: boolean, error?: ZodError): AiProviderErrorData {
+  const path = error ? schemaIssuePath(error) : undefined;
+  const code = error?.issues[0]?.code;
+  const safeDetail = path ? ` at ${path}${code ? ` (${code})` : ''}` : '';
+  return {
+    code: 'schema_invalid',
+    message: `Provider returned an invalid storyboard schema${safeDetail}.`,
+    retryable: false,
+    costKnown,
+  };
 }
 
 class StoryboardTaskService {
@@ -230,23 +252,23 @@ class StoryboardTaskService {
       let payload;
       try {
         payload = parseStoryboardDraftPayload(raw);
-        if (payload.shots.length !== running.brief.shotCount) {
-          throw new Error(`Expected ${running.brief.shotCount} shots but received ${payload.shots.length}.`);
-        }
       } catch (error) {
-        const detail = error instanceof ZodError ? error.issues[0]?.message : error instanceof Error ? error.message : undefined;
         const failed: GenerationTask = {
           ...running,
           status: 'failed',
           completedAt: new Date().toISOString(),
-          error: {
-            code: 'schema_invalid',
-            message: detail ? `Provider returned an invalid storyboard schema: ${detail}` : 'Provider returned an invalid storyboard schema.',
-            retryable: false,
-            costKnown: running.cost.kind === 'known',
-          },
+          error: invalidSchemaError(running.cost.kind === 'known', error instanceof ZodError ? error : undefined),
         };
         this.completeTask(failed);
+        return;
+      }
+      if (payload.shots.length !== running.brief.shotCount) {
+        this.completeTask({
+          ...running,
+          status: 'failed',
+          completedAt: new Date().toISOString(),
+          error: invalidSchemaError(running.cost.kind === 'known'),
+        });
         return;
       }
       const succeeded: GenerationTask = {

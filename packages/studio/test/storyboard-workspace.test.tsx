@@ -1,5 +1,5 @@
 import { createRef, StrictMode } from 'react';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AI_STORYBOARD_GENERATE_CAPABILITY,
@@ -71,6 +71,21 @@ const plugin: PluginDescriptor = {
                     cost: { kind: 'unknown', note: 'Unknown on failure' },
                   },
                   {
+                    id: 'small-usd',
+                    name: 'Small USD',
+                    cost: { kind: 'known', amount: 0.004, currency: 'USD', note: 'Sub-cent estimate' },
+                  },
+                  {
+                    id: 'zero-usd',
+                    name: 'Zero USD',
+                    cost: { kind: 'known', amount: 0, currency: 'USD', note: 'No charge' },
+                  },
+                  {
+                    id: 'jpy',
+                    name: 'JPY',
+                    cost: { kind: 'known', amount: 12, currency: 'JPY', note: 'Whole-yen estimate' },
+                  },
+                  {
                     id: 'slow',
                     name: 'Slow',
                     cost: { kind: 'unknown', note: 'Cancellable' },
@@ -110,6 +125,70 @@ beforeEach(() => {
 });
 
 describe('StoryboardWorkspace', () => {
+  it('formats zero, sub-minor-unit, and currency-specific known costs without showing a nonzero amount as zero', async () => {
+    await mountWorkspace();
+    const model = screen.getByTestId('storyboard-model');
+    const hint = screen.getByTestId('storyboard-cost-hint');
+
+    expect(hint).toHaveTextContent('0.03 USD');
+    fireEvent.change(model, { target: { value: 'small-usd' } });
+    expect(hint).toHaveTextContent('<0.01 USD');
+    fireEvent.change(model, { target: { value: 'zero-usd' } });
+    expect(hint).toHaveTextContent('0.00 USD');
+    fireEvent.change(model, { target: { value: 'jpy' } });
+    expect(hint).toHaveTextContent('12 JPY');
+    expect(hint).not.toHaveTextContent('12.00 JPY');
+  });
+
+  it('uses unique ARIA relationships and routes captured keys within each Studio root', async () => {
+    const firstRef = createRef<LumoraStudioHandle>();
+    const secondRef = createRef<LumoraStudioHandle>();
+    render(
+      <>
+        <div data-testid="first-studio">
+          <LumoraStudio
+            ref={firstRef}
+            plugins={[plugin]}
+            initialProject={createBlankProject('lumora://storyboard-first', 'First storyboard')}
+            scene={() => <div />}
+          />
+        </div>
+        <div data-testid="second-studio">
+          <LumoraStudio
+            ref={secondRef}
+            plugins={[plugin]}
+            initialProject={createBlankProject('lumora://storyboard-second', 'Second storyboard')}
+            scene={() => <div />}
+          />
+        </div>
+      </>,
+    );
+    await waitFor(() => {
+      expect(firstRef.current?.runtime.host.services.ai.listStoryboardProviders()).toHaveLength(1);
+      expect(secondRef.current?.runtime.host.services.ai.listStoryboardProviders()).toHaveLength(1);
+    });
+    const triggers = screen.getAllByTestId('open-storyboard-workspace');
+    fireEvent.click(triggers[0]!);
+    fireEvent.click(triggers[1]!);
+    const workspaces = await screen.findAllByTestId('storyboard-workspace');
+
+    const ids = workspaces.map((workspace) => ({
+      title: workspace.getAttribute('aria-labelledby'),
+      draftTab: within(workspace).getByRole('tab', { name: '生成草案' }).id,
+      draftPanel: within(workspace).getByRole('tabpanel').id,
+    }));
+    expect(new Set(ids.flatMap((item) => Object.values(item))).size).toBe(6);
+    expect(ids[0]?.draftPanel).toBe(within(workspaces[0]!).getByRole('tab', { name: '生成草案' }).getAttribute('aria-controls'));
+    expect(ids[1]?.draftPanel).toBe(within(workspaces[1]!).getByRole('tab', { name: '生成草案' }).getAttribute('aria-controls'));
+
+    const secondConcept = within(workspaces[1]!).getByTestId('storyboard-concept');
+    const delivered = vi.fn();
+    secondConcept.addEventListener('keydown', delivered);
+    const key = new KeyboardEvent('keydown', { key: 'a', bubbles: true, cancelable: true });
+    expect(secondConcept.dispatchEvent(key)).toBe(true);
+    expect(delivered).toHaveBeenCalledOnce();
+  });
+
   it('allows a core-valid exact minimum duration at the 24-shot boundary', async () => {
     await mountWorkspace();
     fireEvent.change(screen.getByTestId('storyboard-concept'), {
@@ -172,6 +251,92 @@ describe('StoryboardWorkspace', () => {
     expect(generate).toHaveBeenCalledTimes(1);
   });
 
+  it('marks a successful draft stale after the brief changes and disables adoption', async () => {
+    await mountWorkspace();
+    const concept = screen.getByTestId('storyboard-concept');
+    fireEvent.change(concept, { target: { value: 'A complete first brief for stale draft validation.' } });
+    fireEvent.click(screen.getByTestId('storyboard-generate'));
+    expect(await screen.findByText('Generated pursuit')).toBeInTheDocument();
+
+    fireEvent.change(concept, { target: { value: 'A materially different brief that makes the old draft stale.' } });
+
+    expect(screen.getByTestId('storyboard-stale-draft')).toBeInTheDocument();
+    expect(screen.getByTestId('storyboard-accept-all')).toBeDisabled();
+    expect(screen.getByTestId('storyboard-accept-0')).toBeDisabled();
+  });
+
+  it('retains the edited last-success draft when a later generation fails', async () => {
+    await mountWorkspace();
+    fireEvent.change(screen.getByTestId('storyboard-concept'), {
+      target: { value: 'A complete brief whose edited draft must survive a failed retry.' },
+    });
+    fireEvent.click(screen.getByTestId('storyboard-generate'));
+    expect(await screen.findByText('Generated pursuit')).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId('storyboard-draft-prompt-0'), { target: { value: 'Keep this edited prompt' } });
+
+    fireEvent.change(screen.getByTestId('storyboard-model'), { target: { value: 'invalid-schema' } });
+    fireEvent.click(screen.getByTestId('storyboard-generate'));
+    expect(await screen.findByTestId('storyboard-error')).toHaveTextContent('schema_invalid');
+
+    expect(screen.getByText('Generated pursuit')).toBeInTheDocument();
+    expect(screen.getByTestId('storyboard-draft-prompt-0')).toHaveValue('Keep this edited prompt');
+  });
+
+  it('retains the edited last-success draft when a later generation is cancelled', async () => {
+    await mountWorkspace();
+    fireEvent.change(screen.getByTestId('storyboard-concept'), {
+      target: { value: 'A complete brief whose edited draft must survive cancellation.' },
+    });
+    fireEvent.click(screen.getByTestId('storyboard-generate'));
+    expect(await screen.findByText('Generated pursuit')).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId('storyboard-draft-prompt-0'), { target: { value: 'Keep after cancellation' } });
+
+    fireEvent.change(screen.getByTestId('storyboard-model'), { target: { value: 'slow' } });
+    fireEvent.click(screen.getByTestId('storyboard-generate'));
+    fireEvent.click(await screen.findByTestId('storyboard-cancel'));
+    expect(await screen.findByTestId('storyboard-error')).toHaveTextContent('cancelled');
+
+    expect(screen.getByText('Generated pursuit')).toBeInTheDocument();
+    expect(screen.getByTestId('storyboard-draft-prompt-0')).toHaveValue('Keep after cancellation');
+  });
+
+  it('preserves adoption lineage across delete, re-adopt, undo, and redo', async () => {
+    const ref = await mountWorkspace();
+    fireEvent.change(screen.getByTestId('storyboard-concept'), {
+      target: { value: 'A complete brief for project-derived adoption state.' },
+    });
+    fireEvent.click(screen.getByTestId('storyboard-generate'));
+    expect(await screen.findByText('Generated pursuit')).toBeInTheDocument();
+    const accept = screen.getByTestId('storyboard-accept-0');
+    fireEvent.click(accept);
+    await waitFor(() => expect(accept).toBeDisabled());
+    const firstAdoptedId = ref.current?.runtime.editor.getProject()?.shots[0]?.id;
+
+    fireEvent.click(screen.getByTestId('storyboard-tab-adopted'));
+    fireEvent.click(screen.getByRole('button', { name: '删除分镜 Beat 1' }));
+    await waitFor(() => expect(ref.current?.runtime.editor.getProject()?.shots).toHaveLength(0));
+    fireEvent.click(screen.getByRole('tab', { name: '生成草案' }));
+    expect(screen.getByTestId('storyboard-accept-0')).toBeEnabled();
+    fireEvent.click(screen.getByTestId('storyboard-accept-0'));
+    await waitFor(() => expect(ref.current?.runtime.editor.getProject()?.shots).toHaveLength(1));
+    const secondAdoptedId = ref.current?.runtime.editor.getProject()?.shots[0]?.id;
+    expect(secondAdoptedId).not.toBe(firstAdoptedId);
+
+    act(() => {
+      ref.current?.runtime.editor.undo();
+      ref.current?.runtime.editor.undo();
+    });
+    await waitFor(() => expect(ref.current?.runtime.editor.getProject()?.shots[0]?.id).toBe(firstAdoptedId));
+    await waitFor(() => expect(screen.getByTestId('storyboard-accept-0')).toBeDisabled());
+
+    act(() => {
+      ref.current?.runtime.editor.redo();
+      ref.current?.runtime.editor.redo();
+    });
+    await waitFor(() => expect(ref.current?.runtime.editor.getProject()?.shots[0]?.id).toBe(secondAdoptedId));
+    expect(screen.getByTestId('storyboard-accept-0')).toBeDisabled();
+  });
+
   it('cancels a running task and does not adopt any shots', async () => {
     const ref = await mountWorkspace();
     fireEvent.change(screen.getByTestId('storyboard-concept'), {
@@ -211,14 +376,19 @@ describe('StoryboardWorkspace', () => {
     await mountWorkspace();
     const draftTab = screen.getByRole('tab', { name: '生成草案' });
     const adoptedTab = screen.getByRole('tab', { name: /已采用/ });
+    const draftTabId = draftTab.id;
+    const adoptedTabId = adoptedTab.id;
+    const draftPanelId = draftTab.getAttribute('aria-controls');
+    const adoptedPanelId = adoptedTab.getAttribute('aria-controls');
 
-    expect(draftTab).toHaveAttribute('id', 'storyboard-tab-draft');
-    expect(draftTab).toHaveAttribute('aria-controls', 'storyboard-panel-draft');
+    expect(draftTabId).not.toBe('');
+    expect(adoptedTabId).not.toBe('');
+    expect(draftTabId).not.toBe(adoptedTabId);
+    expect(draftPanelId).not.toBe(adoptedPanelId);
     expect(draftTab).toHaveAttribute('tabindex', '0');
-    expect(adoptedTab).toHaveAttribute('id', 'storyboard-tab-adopted');
-    expect(adoptedTab).toHaveAttribute('aria-controls', 'storyboard-panel-adopted');
     expect(adoptedTab).toHaveAttribute('tabindex', '-1');
-    expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'storyboard-tab-draft');
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('id', draftPanelId);
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', draftTabId);
 
     draftTab.focus();
     fireEvent.keyDown(draftTab, { key: 'ArrowRight' });
@@ -227,7 +397,8 @@ describe('StoryboardWorkspace', () => {
     expect(adoptedTab).toHaveAttribute('aria-selected', 'true');
     expect(adoptedTab).toHaveAttribute('tabindex', '0');
     expect(draftTab).toHaveAttribute('tabindex', '-1');
-    expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'storyboard-tab-adopted');
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('id', adoptedPanelId);
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', adoptedTabId);
 
     fireEvent.keyDown(adoptedTab, { key: 'Home' });
     expect(draftTab).toHaveFocus();
@@ -296,5 +467,29 @@ describe('StoryboardWorkspace', () => {
       startTime: 0,
       endTime: 2,
     });
+  });
+
+  it('skips unchanged blur history and removes a cleared optional prompt from a non-AI shot', async () => {
+    const project = createBlankProject('lumora://storyboard-optional-prompt', 'Optional prompt storyboard');
+    project.shots = [{
+      id: 'optional-prompt-shot',
+      name: 'Optional prompt shot',
+      cameraObjectId: null,
+      startTime: 0,
+      endTime: 2,
+      prompt: 'Can be cleared',
+    }];
+    const ref = await mountWorkspace(project);
+    fireEvent.click(screen.getByTestId('storyboard-tab-adopted'));
+
+    fireEvent.blur(screen.getByDisplayValue('Optional prompt shot'));
+    expect(ref.current?.runtime.editor.getProject()?.revision).toBe(0);
+    expect(ref.current?.runtime.editor.getHistoryState().canUndo).toBe(false);
+
+    const prompt = screen.getByTestId('storyboard-adopted-prompt');
+    fireEvent.change(prompt, { target: { value: '   ' } });
+    fireEvent.blur(prompt);
+    await waitFor(() => expect(ref.current?.runtime.editor.getProject()?.shots[0]?.prompt).toBeUndefined());
+    expect(ref.current?.runtime.editor.getProject()?.revision).toBe(1);
   });
 });

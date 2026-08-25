@@ -48,12 +48,14 @@ function buildMockStoryboard(request: StoryboardGenerateRequest): StoryboardDraf
   const movements = ['dolly-in', 'tracking', 'static'] as const;
   const durationSeconds = Math.min(600, Math.max(0.1, brief.targetDurationSeconds / brief.shotCount));
   const shots = Array.from({ length: brief.shotCount }, (_, index) => {
+    const suffix = ` Shot ${index + 1} of ${brief.shotCount}; ${brief.visualStyle ?? 'cinematic naturalism'}.`;
+    const concept = brief.concept.slice(0, Math.max(0, 4_000 - suffix.length)).trimEnd();
     return {
       title: `Shot ${index + 1}`,
       shotSize: shotSizes[index % shotSizes.length]!,
       movement: movements[index % movements.length]!,
       durationSeconds,
-      prompt: `${brief.concept} Shot ${index + 1} of ${brief.shotCount}; ${brief.visualStyle ?? 'cinematic naturalism'}.`,
+      prompt: `${concept}${suffix}`,
     };
   });
   return {

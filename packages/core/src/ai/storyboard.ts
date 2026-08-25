@@ -263,41 +263,67 @@ export function redactAiDiagnosticText(message: string): string {
     );
 }
 
+const KNOWN_AI_PROVIDER_ERROR_CODES = new Set<AiProviderErrorCode>([
+  'invalid_request',
+  'provider_unavailable',
+  'model_unsupported',
+  'timeout',
+  'rate_limited',
+  'schema_invalid',
+  'cancelled',
+  'provider_error',
+]);
+
+const GENERIC_PROVIDER_ERROR_MESSAGE = 'The AI provider request failed.';
+const MAX_PROVIDER_DIAGNOSTIC_LENGTH = 2_000;
+
+function readOwnDataProperty(value: unknown, key: string): unknown {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return undefined;
+  try {
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+    return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safeProviderDiagnostic(value: unknown): string {
+  if (typeof value !== 'string') return GENERIC_PROVIDER_ERROR_MESSAGE;
+  try {
+    return redactAiDiagnosticText(value.slice(0, MAX_PROVIDER_DIAGNOSTIC_LENGTH))
+      .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]*$/gi, '$1 [REDACTED]')
+      .replace(/\bsk-[A-Za-z0-9_-]*$/g, '[REDACTED]')
+      .slice(0, MAX_PROVIDER_DIAGNOSTIC_LENGTH);
+  } catch {
+    return GENERIC_PROVIDER_ERROR_MESSAGE;
+  }
+}
+
 export function normalizeAiProviderError(error: unknown, fallbackCostKnown = false): AiProviderErrorData {
-  if (error instanceof AiProviderRequestError) {
+  try {
+    const candidateCode = readOwnDataProperty(error, 'code');
+    const normalizedCode = typeof candidateCode === 'string' && KNOWN_AI_PROVIDER_ERROR_CODES.has(candidateCode as AiProviderErrorCode)
+      ? (candidateCode as AiProviderErrorCode)
+      : 'provider_error';
+    const code = normalizedCode === 'cancelled' ? 'provider_error' : normalizedCode;
+    const retryable = readOwnDataProperty(error, 'retryable');
+    const costKnown = readOwnDataProperty(error, 'costKnown');
+    const retryAfterMs = readOwnDataProperty(error, 'retryAfterMs');
     return {
-      code: error.code,
-      message: redactAiDiagnosticText(error.message),
-      retryable: error.retryable,
-      costKnown: error.costKnown,
-      ...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
+      code,
+      message: safeProviderDiagnostic(readOwnDataProperty(error, 'message')),
+      retryable: typeof retryable === 'boolean' ? retryable : code === 'timeout' || code === 'rate_limited',
+      costKnown: typeof costKnown === 'boolean' ? costKnown : fallbackCostKnown === true,
+      ...(typeof retryAfterMs === 'number' && Number.isFinite(retryAfterMs) && retryAfterMs >= 0
+        ? { retryAfterMs }
+        : {}),
+    };
+  } catch {
+    return {
+      code: 'provider_error',
+      message: GENERIC_PROVIDER_ERROR_MESSAGE,
+      retryable: false,
+      costKnown: fallbackCostKnown === true,
     };
   }
-  if (error instanceof DOMException && error.name === 'AbortError') {
-    return { code: 'cancelled', message: 'Generation cancelled.', retryable: false, costKnown: false };
-  }
-  const candidate = error as Partial<AiProviderErrorData> | null;
-  const knownCodes: AiProviderErrorCode[] = [
-    'invalid_request',
-    'provider_unavailable',
-    'model_unsupported',
-    'timeout',
-    'rate_limited',
-    'schema_invalid',
-    'cancelled',
-    'provider_error',
-  ];
-  const code = candidate && typeof candidate.code === 'string' && knownCodes.includes(candidate.code as AiProviderErrorCode)
-    ? (candidate.code as AiProviderErrorCode)
-    : 'provider_error';
-  const rawMessage = error instanceof Error ? error.message : 'The AI provider request failed.';
-  return {
-    code,
-    message: redactAiDiagnosticText(rawMessage),
-    retryable: typeof candidate?.retryable === 'boolean' ? candidate.retryable : code === 'timeout' || code === 'rate_limited',
-    costKnown: typeof candidate?.costKnown === 'boolean' ? candidate.costKnown : fallbackCostKnown,
-    ...(typeof candidate?.retryAfterMs === 'number' && Number.isFinite(candidate.retryAfterMs)
-      ? { retryAfterMs: candidate.retryAfterMs }
-      : {}),
-  };
 }

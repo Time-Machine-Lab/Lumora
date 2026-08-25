@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import {
   STORYBOARD_CAMERA_MOVEMENTS,
   STORYBOARD_SHOT_SIZES,
@@ -51,6 +51,36 @@ function errorText(error: AiProviderErrorData): string {
   return `${error.code}: ${error.message} ${retry}；未自动重试。`;
 }
 
+function formatKnownCost(amount: number, currency: string): string {
+  let fractionDigits = 2;
+  try {
+    fractionDigits = new Intl.NumberFormat('en-US', { style: 'currency', currency })
+      .resolvedOptions().maximumFractionDigits ?? 2;
+  } catch {
+    // Non-ISO provider currencies retain a conservative two-decimal fallback.
+  }
+  const formatter = new Intl.NumberFormat('en-US', {
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits,
+    useGrouping: false,
+  });
+  const minimumUnit = 10 ** -fractionDigits;
+  const value = amount > 0 && amount < minimumUnit
+    ? `<${formatter.format(minimumUnit)}`
+    : formatter.format(amount);
+  return `${value} ${currency}`;
+}
+
+function sameEditableShot(left: ShotClipData, right: ShotClipData): boolean {
+  return left.name === right.name &&
+    left.cameraObjectId === right.cameraObjectId &&
+    left.startTime === right.startTime &&
+    left.endTime === right.endTime &&
+    left.shotSize === right.shotSize &&
+    left.movement === right.movement &&
+    left.prompt === right.prompt;
+}
+
 function AdoptedShotRow({
   runtime,
   project,
@@ -78,24 +108,35 @@ function AdoptedShotRow({
   const save = useCallback(
     (overrides: Partial<ShotClipData> = {}) => {
       const nextDuration = Number(durationSeconds);
+      const applyEdits = (current: ShotClipData): ShotClipData => {
+        const { prompt: promptOverride, ...otherOverrides } = overrides;
+        const promptProvided = Object.prototype.hasOwnProperty.call(overrides, 'prompt');
+        const next: ShotClipData = {
+          ...current,
+          name: name.trim(),
+          endTime:
+            Number.isFinite(nextDuration) && nextDuration >= 0.1
+              ? current.startTime + nextDuration
+              : current.endTime,
+          ...otherOverrides,
+        };
+        if (promptProvided) {
+          const nextPrompt = promptOverride?.trim() ?? '';
+          if (nextPrompt || current.aiSource) next.prompt = nextPrompt;
+          else delete next.prompt;
+        }
+        return next;
+      };
+      const preview = applyEdits(shot);
+      if (sameEditableShot(preview, shot)) {
+        setName(preview.name);
+        setDurationSeconds(String(preview.endTime - preview.startTime));
+        setPrompt(preview.prompt ?? '');
+        return;
+      }
       const result = runtime.editor.updateShot(
         shot.id,
-        (current) => {
-          const { prompt: promptOverride, ...otherOverrides } = overrides;
-          const nextPrompt = promptOverride?.trim();
-          return {
-            ...current,
-            name: name.trim(),
-            endTime:
-              Number.isFinite(nextDuration) && nextDuration >= 0.1
-                ? current.startTime + nextDuration
-                : current.endTime,
-            ...otherOverrides,
-            ...(promptOverride === undefined || (nextPrompt === '' && current.prompt === undefined)
-              ? {}
-              : { prompt: nextPrompt }),
-          };
-        },
+        applyEdits,
         `编辑分镜「${shot.name}」`,
       );
       if (!result.ok) {
@@ -211,7 +252,7 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
   const [shotCount, setShotCount] = useState(3);
   const [visualStyle, setVisualStyle] = useState('电影感写实');
   const [draft, setDraft] = useState<StoryboardDraft | null>(null);
-  const [acceptedIds, setAcceptedIds] = useState<Set<string>>(() => new Set());
+  const [draftShotToProjectShots, setDraftShotToProjectShots] = useState<Map<string, ReadonlySet<string>>>(() => new Map());
   const [taskId, setTaskId] = useState<string | null>(null);
   const [error, setError] = useState<AiProviderErrorData | null>(null);
   const [tab, setTab] = useState<WorkspaceTab>('draft');
@@ -223,7 +264,28 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
   const adoptedTabRef = useRef<HTMLButtonElement>(null);
   const onCloseRef = useRef(onClose);
   const returnFocusRef = useRef<HTMLElement | null>(null);
+  const instanceId = useId();
+  const workspaceTitleId = `lumora-storyboard-title-${instanceId}`;
+  const draftTabId = `lumora-storyboard-tab-draft-${instanceId}`;
+  const adoptedTabId = `lumora-storyboard-tab-adopted-${instanceId}`;
+  const draftPanelId = `lumora-storyboard-panel-draft-${instanceId}`;
+  const adoptedPanelId = `lumora-storyboard-panel-adopted-${instanceId}`;
   onCloseRef.current = onClose;
+
+  const projectShotIds = new Set(project.shots.map((shot) => shot.id));
+  const acceptedIds = new Set(
+    [...draftShotToProjectShots]
+      .filter(([, adoptedProjectShotIds]) => [...adoptedProjectShotIds].some((id) => projectShotIds.has(id)))
+      .map(([draftShotId]) => draftShotId),
+  );
+  const draftIsStale = !!draft && (
+    draft.providerId !== selectedProvider?.id ||
+    draft.model !== selectedModel?.id ||
+    draft.brief.concept !== concept.trim() ||
+    draft.brief.targetDurationSeconds !== targetDurationSeconds ||
+    draft.brief.shotCount !== shotCount ||
+    draft.brief.visualStyle !== (visualStyle.trim() || undefined)
+  );
 
   useEffect(() => {
     if (!returnFocusRef.current && document.activeElement instanceof HTMLElement) {
@@ -248,6 +310,9 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
       const workspace = workspaceRef.current;
       const inside = event.target instanceof Node && workspace?.contains(event.target);
       if (inside) return;
+      const studioRoot = workspace?.closest('.lumora-studio');
+      const routeTarget = event.target instanceof Node ? event.target : document.activeElement;
+      if (!studioRoot || !(routeTarget instanceof Node) || !studioRoot.contains(routeTarget)) return;
       if (event.key === 'Escape') {
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -283,8 +348,6 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
 
   const generate = async () => {
     if (!canGenerate || !selectedProvider || !selectedModel) return;
-    setDraft(null);
-    setAcceptedIds(new Set());
     setError(null);
     const generation = requestGenerationRef.current + 1;
     requestGenerationRef.current = generation;
@@ -306,6 +369,7 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
       setTaskId(null);
       if (completed.status === 'succeeded' && completed.draft) {
         setDraft(completed.draft);
+        setDraftShotToProjectShots(new Map());
       } else if (completed.error) {
         setError(completed.error);
       }
@@ -356,7 +420,7 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
   };
 
   const acceptIndexes = (indexes: number[]) => {
-    if (!draft) return;
+    if (!draft || draftIsStale) return;
     const pending = indexes
       .filter((index) => draft.shots[index] && !acceptedIds.has(draft.shots[index]!.id))
       .map((index) => draft.shots[index]!);
@@ -384,7 +448,14 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
       showToast(result.error.message, 'error');
       return;
     }
-    setAcceptedIds((current) => new Set([...current, ...pending.map((shot) => shot.id)]));
+    const projectShotIds = Array.isArray(result.value) ? result.value : [result.value];
+    setDraftShotToProjectShots((current) => {
+      const next = new Map(current);
+      pending.forEach((shot, index) => {
+        next.set(shot.id, new Set([...(next.get(shot.id) ?? []), projectShotIds[index]!]));
+      });
+      return next;
+    });
     showToast(`已采用 ${shots.length} 个分镜`, 'success');
   };
 
@@ -395,7 +466,7 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
       data-testid="storyboard-workspace"
       role="dialog"
       aria-modal="true"
-      aria-labelledby="storyboard-workspace-title"
+      aria-labelledby={workspaceTitleId}
       onKeyDown={(event) => {
         event.stopPropagation();
         if (event.key === 'Escape') {
@@ -426,17 +497,17 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
     >
       <header className="lumora-storyboard__header">
         <div>
-          <h2 id="storyboard-workspace-title">AI 分镜工作台</h2>
+          <h2 id={workspaceTitleId}>AI 分镜工作台</h2>
           <p>{project.name}</p>
         </div>
         <div className="lumora-storyboard__header-actions">
           <div className="lumora-storyboard__tabs" role="tablist" aria-label="分镜工作台视图">
             <button
               ref={draftTabRef}
-              id="storyboard-tab-draft"
+              id={draftTabId}
               type="button"
               role="tab"
-              aria-controls="storyboard-panel-draft"
+              aria-controls={draftPanelId}
               aria-selected={tab === 'draft'}
               tabIndex={tab === 'draft' ? 0 : -1}
               className={tab === 'draft' ? 'is-active' : ''}
@@ -447,10 +518,10 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
             </button>
             <button
               ref={adoptedTabRef}
-              id="storyboard-tab-adopted"
+              id={adoptedTabId}
               type="button"
               role="tab"
-              aria-controls="storyboard-panel-adopted"
+              aria-controls={adoptedPanelId}
               aria-selected={tab === 'adopted'}
               tabIndex={tab === 'adopted' ? 0 : -1}
               className={tab === 'adopted' ? 'is-active' : ''}
@@ -469,10 +540,10 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
 
       {tab === 'draft' ? (
         <div
-          id="storyboard-panel-draft"
+          id={draftPanelId}
           className="lumora-storyboard__layout"
           role="tabpanel"
-          aria-labelledby="storyboard-tab-draft"
+          aria-labelledby={draftTabId}
         >
           <form
             className="lumora-storyboard__brief"
@@ -541,7 +612,6 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
                   const next = providers.find((provider) => provider.id === event.target.value);
                   setProviderId(event.target.value);
                   setModelId(next?.models[0]?.id ?? '');
-                  setDraft(null);
                   setError(null);
                 }}
               >
@@ -557,7 +627,6 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
                 disabled={!!taskId}
                 onChange={(event) => {
                   setModelId(event.target.value);
-                  setDraft(null);
                   setError(null);
                 }}
               >
@@ -567,7 +636,7 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
             <div className="lumora-storyboard__cost" data-testid="storyboard-cost-hint">
               <span>费用预估</span>
               {selectedModel?.cost.kind === 'known'
-                ? <strong>{selectedModel.cost.amount.toFixed(2)} {selectedModel.cost.currency}</strong>
+                ? <strong>{formatKnownCost(selectedModel.cost.amount, selectedModel.cost.currency)}</strong>
                 : <strong>未知</strong>}
               <small>{selectedModel?.cost.note ?? '选择模型后显示'}</small>
             </div>
@@ -613,6 +682,11 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
             )}
             {draft && (
               <>
+                {draftIsStale && (
+                  <div className="lumora-storyboard__stale" data-testid="storyboard-stale-draft" role="status">
+                    简报、供应商或模型已更改；请重新生成后再采用。
+                  </div>
+                )}
                 <div className="lumora-storyboard__draft-summary">
                   <div>
                     <h3>{draft.title}</h3>
@@ -622,7 +696,7 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
                     type="button"
                     className="lumora-button lumora-storyboard__primary"
                     data-testid="storyboard-accept-all"
-                    disabled={draft.shots.every((shot) => acceptedIds.has(shot.id))}
+                    disabled={draftIsStale || draft.shots.every((shot) => acceptedIds.has(shot.id))}
                     onClick={() => acceptIndexes(draft.shots.map((_, index) => index))}
                   >
                     采用全部
@@ -646,7 +720,7 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
                             type="button"
                             className="lumora-button"
                             data-testid={`storyboard-accept-${index}`}
-                            disabled={accepted}
+                            disabled={accepted || draftIsStale}
                             onClick={() => acceptIndexes([index])}
                           >
                             {accepted ? '已采用' : '采用'}
@@ -697,10 +771,10 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
         </div>
       ) : (
         <div
-          id="storyboard-panel-adopted"
+          id={adoptedPanelId}
           className="lumora-storyboard__adopted"
           role="tabpanel"
-          aria-labelledby="storyboard-tab-adopted"
+          aria-labelledby={adoptedTabId}
         >
           <div className="lumora-storyboard__section-heading">
             <span>项目分镜</span>

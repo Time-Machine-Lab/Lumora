@@ -178,6 +178,82 @@ describe('AI storyboard capability', () => {
     expect(completed.error).toMatchObject({ code: 'schema_invalid', retryable: false, costKnown: false });
   });
 
+  it('summarizes invalid schema diagnostics without exposing credential-shaped enum values', async () => {
+    const secret = 'sk-live-1234567890abcdef';
+    const ai = servicesWith(async () => ({
+      ...VALID_PAYLOAD,
+      shots: [{ ...VALID_PAYLOAD.shots[0], shotSize: secret }, ...VALID_PAYLOAD.shots.slice(1)],
+    }));
+
+    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
+    const completed = await ai.waitForGenerationTask(submitted.id);
+
+    expect(completed).toMatchObject({ status: 'failed', error: { code: 'schema_invalid' } });
+    expect(completed.error?.message).toContain('shots[0].shotSize');
+    expect(completed.error?.message).not.toContain(secret);
+  });
+
+  it.each([
+    ['throwing data getter', Object.defineProperty({}, 'code', { get: () => { throw new Error('getter exploded'); } })],
+    ['throwing descriptor proxy', new Proxy({}, {
+      getOwnPropertyDescriptor: () => { throw new Error('descriptor exploded'); },
+      getPrototypeOf: () => { throw new Error('prototype exploded'); },
+    })],
+  ])('always completes a failed task when provider normalization receives a %s', async (_label, hostileError) => {
+    const ai = servicesWith(async () => { throw hostileError; });
+    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
+    const outcome = await Promise.race([
+      ai.waitForGenerationTask(submitted.id),
+      new Promise<'still-running'>((resolve) => setTimeout(() => resolve('still-running'), 50)),
+    ]);
+
+    expect(outcome).not.toBe('still-running');
+    expect(outcome).toMatchObject({ status: 'failed', error: { code: 'provider_error' } });
+  });
+
+  it('keeps a provider-originated AbortError consistent with a failed terminal status', async () => {
+    const ai = servicesWith(async () => { throw new DOMException('Provider aborted internally', 'AbortError'); });
+    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
+
+    await expect(ai.waitForGenerationTask(submitted.id)).resolves.toMatchObject({
+      status: 'failed',
+      error: { code: 'provider_error', retryable: false },
+    });
+  });
+
+  it.each([
+    new core.AiProviderRequestError({
+      code: 'cancelled',
+      message: 'Provider cancelled internally.',
+      retryable: false,
+      costKnown: false,
+    }),
+    {
+      code: 'cancelled',
+      message: 'Provider returned a cancelled code.',
+      retryable: false,
+      costKnown: false,
+    },
+  ])('treats a provider-originated cancelled code as a failed provider error', async (providerError) => {
+    const ai = servicesWith(async () => { throw providerError; });
+    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
+
+    await expect(ai.waitForGenerationTask(submitted.id)).resolves.toMatchObject({
+      status: 'failed',
+      error: { code: 'provider_error', retryable: false },
+    });
+  });
+
+  it('redacts credential fragments cut off by the provider diagnostic length cap', async () => {
+    const credentialFragmentAtBoundary = `${'x'.repeat(1_989)} sk-1234567`;
+    const ai = servicesWith(async () => { throw new Error(`${credentialFragmentAtBoundary}890abcdef`); });
+    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
+    const completed = await ai.waitForGenerationTask(submitted.id);
+
+    expect(completed.error?.message).not.toContain('sk-1234567');
+    expect(completed.error?.message).toContain('[REDACTED]');
+  });
+
   it('normalizes provider errors, redacts credentials, and never auto-retries unknown-cost failures', async () => {
     const generate = vi.fn(async () => {
       const error = new Error(

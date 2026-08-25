@@ -12,6 +12,8 @@ import type { Command, CommandContext } from '../src/commands/command-registry';
 import { createSampleProject } from '../src/scene/sample-project';
 import type { Manifest } from '../src/manifest/validate';
 import type { AiStoryboardCapability } from '../src/ai/storyboard';
+import type { AiProviderContribution } from '../src/contributions/types';
+import type { Disposable } from '../src/disposable';
 
 const VALID_MANIFEST: Manifest = {
   schemaVersion: '1',
@@ -136,6 +138,99 @@ describe('PluginHost', () => {
 
     expect(outcome).not.toBe('still-running');
     expect(outcome).toMatchObject({ status: 'cancelled', error: { code: 'cancelled' } });
+  });
+
+  it('cancels running storyboard tasks when the provider contribution handle is disposed early', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const providerId = 'com.example.plugin.disposable-storyboard';
+    let contribution: Disposable | undefined;
+    await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => {
+              contribution = context.contribute({
+                aiProviders: [{
+                  kind: 'aiProvider',
+                  id: providerId,
+                  name: 'Disposable storyboard provider',
+                  models: [],
+                  chat: async function* () {},
+                  storyboard: {
+                    capability: 'ai.storyboard.generate',
+                    models: [{ id: 'slow', name: 'Slow', cost: { kind: 'unknown', note: 'Unknown' } }],
+                    generate: async () => new Promise<unknown>(() => undefined),
+                  },
+                }],
+              });
+            },
+          },
+        }),
+      ),
+    );
+    const task = host.services.ai.submitStoryboard(providerId, {
+      model: 'slow',
+      brief: { concept: 'A complete early disposal lifecycle test.', targetDurationSeconds: 2, shotCount: 1 },
+    });
+
+    await contribution?.dispose();
+    const outcome = await Promise.race([
+      host.services.ai.waitForGenerationTask(task.id),
+      new Promise<'still-running'>((resolve) => setTimeout(() => resolve('still-running'), 25)),
+    ]);
+
+    expect(host.services.ai.listStoryboardProviders()).toEqual([]);
+    expect(outcome).not.toBe('still-running');
+    expect(outcome).toMatchObject({ status: 'cancelled', error: { code: 'cancelled' } });
+  });
+
+  it('snapshots provider identity so deactivate cannot move registration or admit a task under a changed id', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const providerId = 'com.example.plugin.stable-storyboard';
+    const changedProviderId = 'com.example.plugin.changed-storyboard';
+    let changedIdTask: ReturnType<typeof host.services.ai.submitStoryboard> | undefined;
+    let changedIdError: unknown;
+    const provider: AiProviderContribution = {
+      kind: 'aiProvider',
+      id: providerId,
+      name: 'Stable identity storyboard provider',
+      models: [],
+      chat: async function* () {},
+      storyboard: {
+        capability: 'ai.storyboard.generate',
+        models: [{ id: 'slow', name: 'Slow', cost: { kind: 'unknown', note: 'Unknown' } }],
+        generate: async () => new Promise<unknown>(() => undefined),
+      },
+    };
+    await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => context.contribute({ aiProviders: [provider] }),
+            deactivate: () => {
+              provider.id = changedProviderId;
+              try {
+                changedIdTask = host.services.ai.submitStoryboard(changedProviderId, {
+                  model: 'slow',
+                  brief: { concept: 'A complete changed identity lifecycle test.', targetDurationSeconds: 2, shotCount: 1 },
+                });
+              } catch (error) {
+                changedIdError = error;
+              }
+            },
+          },
+        }),
+      ),
+    );
+
+    await host.disable('com.example.plugin');
+
+    expect(changedIdTask).toBeUndefined();
+    expect(changedIdError).toBeInstanceOf(Error);
+    expect(host.services.ai.listStoryboardProviders()).toEqual([]);
+    expect(host.contributions.getAiProviders()).toEqual([]);
   });
 
   it('cancels storyboard tasks admitted while provider deactivation is awaiting', async () => {

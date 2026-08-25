@@ -115,3 +115,26 @@ test('keeps the generation workflow usable without horizontal overflow on mobile
   await expect(page.getByText('Offline storyboard draft')).toBeVisible();
   await expect(page.getByTestId('storyboard-draft-shot')).toHaveCount(3);
 });
+
+test('collapses the storyboard layout inside a narrow embed on a wide desktop viewport', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  const studio = page.getByTestId('lumora-studio');
+  await studio.evaluate((element) => {
+    element.style.width = '600px';
+    element.style.flex = '0 0 600px';
+    element.style.maxWidth = '600px';
+  });
+  await expect.poll(async () => (await studio.boundingBox())?.width).toBe(600);
+  await openStoryboard(page);
+
+  const layout = page.locator('.lumora-storyboard__layout');
+  const dimensions = await layout.evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+    display: getComputedStyle(element).display,
+  }));
+  expect(dimensions.display).toBe('block');
+  expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.clientWidth + 1);
+  await expect(page.getByTestId('storyboard-provider')).toBeVisible();
+  await expect(page.locator('.lumora-storyboard__drafts')).toBeVisible();
+});
