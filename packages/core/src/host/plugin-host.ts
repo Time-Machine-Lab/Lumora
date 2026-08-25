@@ -160,6 +160,12 @@ interface PluginRecord {
   info(): PluginInfo;
 }
 
+function projectPluginDiagnostic(record: Pick<PluginRecord, 'reason' | 'error'>): PluginDiagnostic | undefined {
+  const error = record.reason ?? record.error;
+  if (error === undefined) return undefined;
+  return deepFreeze({ message: publicPluginDiagnosticMessage(error) });
+}
+
 /** 插件可见的事件总线：订阅归入尝试暂存集合，随停用整体移除；代际失效后订阅被拒绝 */
 class TrackedEventBridge implements PluginEventBus {
   private readonly tracked: DisposableSet;
@@ -670,7 +676,7 @@ export class PluginHost {
           name: record.name,
           version: record.version,
           state: record.state,
-          error: this.publicErrorSnapshot(record.error),
+          error: projectPluginDiagnostic(record),
           reason: record.reason,
           contributes: [...(record.manifest.contributes ?? [])],
         });
@@ -1197,16 +1203,13 @@ export class PluginHost {
   }
 
   private emitState(record: PluginRecord, state: PluginState): void {
-    const publicError = record.reason === undefined && record.error === undefined
-      ? undefined
-      : this.normalizePluginError(record.reason ?? record.error);
     const payload = deepFreeze({
       // instanceId：稳定唯一的记录标识，事件关联与寻址（disable/enable）使用它；
       // pluginId 仅作 Manifest 展示（缺 id 时为 '<unknown>'），不得用于寻址
       instanceId: record.key,
       pluginId: record.id,
       state,
-      error: publicError,
+      error: projectPluginDiagnostic(record),
     });
     this.events.emit('plugin:state-changed', payload);
   }
@@ -1216,16 +1219,6 @@ export class PluginHost {
     const record = this.plugins.get(instanceId);
     if (!record) throw new Error(`未知插件: ${instanceId}`);
     return record;
-  }
-
-  private normalizePluginError(error: unknown): PluginDiagnostic {
-    return { message: publicPluginDiagnosticMessage(error) };
-  }
-
-  private publicErrorSnapshot(error: unknown): PluginInfo['error'] {
-    if (error === undefined) return undefined;
-    if (Array.isArray(error)) return error.map((item) => this.normalizePluginError(item));
-    return this.normalizePluginError(error);
   }
 
 }

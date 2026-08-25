@@ -67,7 +67,7 @@ export interface PluginInfo {
   readonly name: string;
   readonly version: string;
   readonly state: PluginState;
-  readonly error?: PluginDiagnostic | ReadonlyArray<PluginDiagnostic>;
+  readonly error?: PluginDiagnostic;
   readonly reason?: string;
   readonly contributes: ReadonlyArray<ContributionKind>;
 }

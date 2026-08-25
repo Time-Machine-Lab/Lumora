@@ -30,9 +30,14 @@ void assertReadonlyPluginStateEvent;
 function assertReadonlyPluginInfo(info: PluginInfo): void {
   // @ts-expect-error plugin info snapshots are immutable by contract.
   info.state = 'active';
-  const errors = info.error as ReadonlyArray<PluginDiagnostic>;
-  // @ts-expect-error plugin diagnostic lists are readonly snapshots.
-  errors.push({ message: 'mutated' });
+  const diagnostic = info.error!;
+  const message: string = diagnostic.message;
+  void message;
+  // @ts-expect-error plugin diagnostics are a single object, never a list.
+  const diagnostics: ReadonlyArray<PluginDiagnostic> = diagnostic;
+  void diagnostics;
+  // @ts-expect-error plugin diagnostics are immutable by contract.
+  diagnostic.message = 'mutated';
   // @ts-expect-error plugin diagnostics cannot be replaced by callers.
   info.error = undefined;
   // @ts-expect-error contribution lists are readonly snapshots.
@@ -84,6 +89,15 @@ function definitionOf(overrides: Partial<PluginDefinition> = {}): PluginDefiniti
 
 function descriptor(manifest: Record<string, unknown> = VALID_MANIFEST, entry?: () => Promise<PluginModule>): PluginDescriptor {
   return { manifest: manifest as PluginDescriptor['manifest'], entry };
+}
+
+function expectPublicPluginDiagnostic(value: unknown, message: string): void {
+  expect(value).toEqual({ message });
+  expect(Array.isArray(value)).toBe(false);
+  expect(Object.keys(value as PluginDiagnostic)).toEqual(['message']);
+  expect(value).not.toHaveProperty('stack');
+  expect(value).not.toHaveProperty('cause');
+  expect(Object.isFrozen(value)).toBe(true);
 }
 
 describe('PluginHost', () => {
@@ -200,6 +214,30 @@ describe('PluginHost', () => {
     expect((failedEventError as PluginDiagnostic).message.length).toBeLessThanOrEqual(2_000);
   });
 
+  it('publishes one diagnostic object for an entry load failure across events and snapshots', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    let failedEventError: PluginDiagnostic | undefined;
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'failed') failedEventError = event.error;
+    });
+
+    const registered = await host.register(
+      descriptor(VALID_MANIFEST, async () => {
+        throw new Error('PRIVATE_ENTRY_LOAD_FAILURE');
+      }),
+    );
+
+    const polled = host.getPlugin('com.example.plugin')!;
+    const listed = host.listPlugins()[0]!;
+    expect(failedEventError).toEqual(registered.error);
+    expect(polled.error).toEqual(registered.error);
+    expect(listed.error).toEqual(registered.error);
+    expectPublicPluginDiagnostic(failedEventError, '入口模块加载失败');
+    expectPublicPluginDiagnostic(registered.error, '入口模块加载失败');
+    expectPublicPluginDiagnostic(polled.error, '入口模块加载失败');
+    expectPublicPluginDiagnostic(listed.error, '入口模块加载失败');
+  });
+
   it('publishes only host-owned plugin summaries without retaining message, response, or cause', async () => {
     const host = new PluginHost({ hostVersion: '0.1.0' });
     const privateMarker = 'PRIVATE_PLUGIN_PROVIDER_RESPONSE';
@@ -248,11 +286,11 @@ describe('PluginHost', () => {
     expect(JSON.stringify(failedEvent)).not.toContain(privateMarker);
   });
 
-  it('publishes bounded redacted deactivation errors without retaining the original object', async () => {
+  it('publishes one diagnostic object for a single deactivation failure across events and snapshots', async () => {
     const host = new PluginHost({ hostVersion: '0.1.0' });
     const privateTail = 'PRIVATE_DEACTIVATION_TAIL';
     const originalError = new Error(`accessToken="prefix\\"; ${privateTail}${'x'.repeat(2_500)}"`);
-    let disabledEventError: unknown;
+    let disabledEventError: PluginDiagnostic | undefined;
     host.events.on('plugin:state-changed', (event) => {
       if (event.state === 'disabled') disabledEventError = event.error;
     });
@@ -270,28 +308,78 @@ describe('PluginHost', () => {
     await host.disable('com.example.plugin');
 
     const info = host.getPlugin('com.example.plugin')!;
-    const infoErrors = (Array.isArray(info.error) ? info.error : [info.error]) as PluginDiagnostic[];
-    const eventErrors = (Array.isArray(disabledEventError) ? disabledEventError : [disabledEventError]) as PluginDiagnostic[];
+    const listed = host.listPlugins()[0]!;
     expect(info.state).toBe('disabled');
     expect(info.reason).toBe('插件停用失败。');
     expect(info.reason).not.toContain(privateTail);
     expect(info.reason?.length).toBeLessThanOrEqual(2_000);
-    for (const error of [...infoErrors, ...eventErrors]) {
-      expect(error).toEqual({ message: '插件停用失败。' });
-      expect(error).not.toBe(originalError);
-      expect(Object.keys(error)).toEqual(['message']);
-      expect(error).not.toHaveProperty('stack');
-      expect(error).not.toHaveProperty('cause');
-      expect(error.message).not.toContain(privateTail);
-      expect(error.message.length).toBeLessThanOrEqual(2_000);
-      expect(Object.isFrozen(error)).toBe(true);
-    }
+    expect(disabledEventError).toEqual(info.error);
+    expect(listed.error).toEqual(info.error);
+    expectPublicPluginDiagnostic(info.error, '插件停用失败。');
+    expectPublicPluginDiagnostic(disabledEventError, '插件停用失败。');
+    expectPublicPluginDiagnostic(listed.error, '插件停用失败。');
+    expect(info.error).not.toBe(originalError);
+    expect(info.error?.message).not.toContain(privateTail);
+    expect(info.error?.message.length).toBeLessThanOrEqual(2_000);
     expect(Object.isFrozen(info)).toBe(true);
-    expect(Object.isFrozen(info.error)).toBe(true);
     expect(Object.isFrozen(info.contributes)).toBe(true);
   });
 
-  it('isolates published activation and deactivation errors from caller mutation', async () => {
+  it('summarizes deactivation hook and owned disposable failures as one isolated diagnostic', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const privateMarker = 'PRIVATE_DOUBLE_DEACTIVATION_FAILURE';
+    const hookError = new Error(`hook:${privateMarker}`, { cause: new Error(`hook-cause:${privateMarker}`) });
+    const disposableError = new Error(`dispose:${privateMarker}`, { cause: new Error(`dispose-cause:${privateMarker}`) });
+    let secondListenerError: PluginDiagnostic | undefined;
+
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state !== 'disabled' || !event.error) return;
+      Reflect.set(event.error, 'message', privateMarker);
+      Reflect.set(event, 'error', { message: privateMarker });
+    });
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'disabled') secondListenerError = event.error;
+    });
+
+    await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => ({
+            dispose: () => {
+              throw disposableError;
+            },
+          }),
+          deactivate: () => {
+            throw hookError;
+          },
+        },
+      })),
+    );
+
+    await host.disable('com.example.plugin');
+
+    const info = host.getPlugin('com.example.plugin')!;
+    const listed = host.listPlugins()[0]!;
+    expect(secondListenerError).toEqual(info.error);
+    expect(listed.error).toEqual(info.error);
+    expectPublicPluginDiagnostic(secondListenerError, '插件停用失败。');
+    expectPublicPluginDiagnostic(info.error, '插件停用失败。');
+    expectPublicPluginDiagnostic(listed.error, '插件停用失败。');
+    expect(JSON.stringify({ secondListenerError, info, listed })).not.toContain(privateMarker);
+    expect(() => {
+      (info.error as { message: string }).message = privateMarker;
+    }).toThrow(TypeError);
+    expect(() => {
+      (info as { error?: PluginDiagnostic }).error = { message: privateMarker };
+    }).toThrow(TypeError);
+
+    const fresh = host.getPlugin('com.example.plugin')!;
+    expect(fresh.error).not.toBe(info.error);
+    expectPublicPluginDiagnostic(fresh.error, '插件停用失败。');
+    expect(fresh.error?.message).not.toContain(privateMarker);
+  });
+
+  it('isolates published activation errors from caller mutation', async () => {
     const activationHost = new PluginHost({ hostVersion: '0.1.0' });
     const activationInfo = await activationHost.register(
       descriptor(VALID_MANIFEST, async () => ({
@@ -309,35 +397,6 @@ describe('PluginHost', () => {
     const freshActivationInfo = activationHost.getPlugin('com.example.plugin')!;
     expect(freshActivationInfo.error).not.toBe(activationInfo.error);
     expect((freshActivationInfo.error as PluginDiagnostic).message).not.toContain('INJECTED_ACTIVATION_SECRET');
-
-    const deactivationHost = new PluginHost({ hostVersion: '0.1.0' });
-    await deactivationHost.register(
-      descriptor(VALID_MANIFEST, async () => ({
-        default: {
-          activate: () => undefined,
-          deactivate: () => {
-            throw new Error('deactivation failed');
-          },
-        },
-      })),
-    );
-    await deactivationHost.disable('com.example.plugin');
-    const deactivationInfo = deactivationHost.getPlugin('com.example.plugin')!;
-    const publishedErrors = deactivationInfo.error as Array<{ message: string }>;
-    expect(() => {
-      publishedErrors[0]!.message = 'accessToken=INJECTED_DEACTIVATION_SECRET';
-    }).toThrow(TypeError);
-    expect(() => {
-      publishedErrors.push({ message: 'refreshToken=ORIGINAL_OBJECT' });
-    }).toThrow(TypeError);
-
-    const freshDeactivationInfo = deactivationHost.getPlugin('com.example.plugin')!;
-    const freshErrors = freshDeactivationInfo.error as ReadonlyArray<PluginDiagnostic>;
-    expect(freshErrors).not.toBe(publishedErrors);
-    expect(freshErrors).toHaveLength(1);
-    expect(freshErrors[0]).not.toBe(publishedErrors[0]);
-    expect(freshErrors[0]!.message).not.toContain('INJECTED_DEACTIVATION_SECRET');
-    expect(freshErrors[0]!.message).not.toContain('ORIGINAL_OBJECT');
   });
 
   it('isolates state event payloads and errors between listeners and onAny', async () => {
