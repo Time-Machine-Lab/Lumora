@@ -8,7 +8,7 @@ The timeline session SHALL allow only the latest begin, resume, or pause recordi
 - **THEN** project B remains authoritative, the recorder is inactive, the controller is paused, and React reports neither recording nor playing
 
 ### Requirement: Camera drive obeys modal and Studio-instance boundaries
-Camera drive SHALL accept keyboard input only for its owning Studio instance, SHALL ignore prevented events, and SHALL clear held input and smoothed motion while overwrite confirmation is pending.
+Camera drive SHALL accept new keyboard input only for its owning Studio instance, SHALL release that instance's held keys regardless of the keyup target or prevented state, and SHALL clear held input and smoothed motion while overwrite confirmation is pending or focus leaves the owning Studio. A hard stop that detaches the drive target MUST permit the selected camera to bind again on later valid input.
 
 #### Scenario: Overwrite confirmation opens during camera motion
 - **WHEN** a camera with disabled recorded tracks is moving and overwrite confirmation opens
@@ -17,6 +17,14 @@ Camera drive SHALL accept keyboard input only for its owning Studio instance, SH
 #### Scenario: Two Studio instances select cameras
 - **WHEN** a drive key originates inside Studio A
 - **THEN** only Studio A's camera moves and Studio B's camera and recording remain unchanged
+
+#### Scenario: Focus leaves a Studio before key release
+- **WHEN** Studio A holds a drive key, focus leaves A for the document body, and keyup consequently targets outside A
+- **THEN** A clears its held input, smoothed speed, and keyboard ownership, stops moving, and can bind and drive again after focus returns
+
+#### Scenario: Held-key release is already canceled
+- **WHEN** a keyup for a drive key held by Studio A has already been prevented
+- **THEN** A still performs an idempotent release without admitting the event as new input for another Studio
 
 ### Requirement: Long recording simplification is stack-safe
 Sample simplification SHALL preserve RDP deviation semantics and chronological output without recursion proportional to sample count.

@@ -280,6 +280,14 @@ function useCameraDrive(
     let last = performance.now();
     let attachedId: string | null = null;
     let attachedNode: THREE.Object3D | null = null;
+    const heldKeys = new Set<string>();
+
+    const clearDrive = () => {
+      heldKeys.clear();
+      drive.stop();
+      attachedId = null;
+      attachedNode = null;
+    };
 
     const attachCurrentCamera = (): boolean => {
       const cameraId = cameraIdRef.current;
@@ -310,10 +318,17 @@ function useCameraDrive(
       }
       if (DRIVE_KEY_CODES.has(event.code)) {
         if (cameraIdRef.current) event.preventDefault();
-        if (attachCurrentCamera()) drive.press(event.code);
+        if (attachCurrentCamera()) {
+          heldKeys.add(event.code);
+          drive.press(event.code);
+        }
       }
     };
     const onKeyUp = (event: KeyboardEvent) => {
+      if (heldKeys.delete(event.code)) {
+        drive.release(event.code);
+        return;
+      }
       if (event.defaultPrevented) return;
       const keyboardRoot = keyboardScopeRef?.current;
       if (keyboardRoot && !isKeyboardEventForStudio(keyboardRoot, event)) return;
@@ -322,16 +337,23 @@ function useCameraDrive(
     const onFocusIn = (event: FocusEvent) => {
       const keyboardRoot = keyboardScopeRef?.current;
       if (keyboardRoot && !isKeyboardEventForStudio(keyboardRoot, event)) {
-        drive.stop();
-        attachedId = null;
-        attachedNode = null;
+        clearDrive();
       }
     };
-    const onBlur = () => drive.stop();
+    const onFocusOut = (event: FocusEvent) => {
+      const keyboardRoot = keyboardScopeRef?.current;
+      const target = event.target;
+      if (!keyboardRoot || !(target instanceof Node) || !keyboardRoot.contains(target)) return;
+      const nextTarget = event.relatedTarget;
+      if (nextTarget instanceof Node && keyboardRoot.contains(nextTarget)) return;
+      clearDrive();
+    };
+    const onBlur = () => clearDrive();
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
     window.addEventListener('blur', onBlur);
     document.addEventListener('focusin', onFocusIn);
+    document.addEventListener('focusout', onFocusOut);
 
     const restoreIfNeeded = () => {
       if (attachedId === null || !attachedNode) return;
@@ -397,8 +419,9 @@ function useCameraDrive(
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('blur', onBlur);
       document.removeEventListener('focusin', onFocusIn);
-      drive.stop();
+      document.removeEventListener('focusout', onFocusOut);
       restoreIfNeeded();
+      clearDrive();
     };
   }, [session, rootRef, editor, keyboardScopeRef]);
 }

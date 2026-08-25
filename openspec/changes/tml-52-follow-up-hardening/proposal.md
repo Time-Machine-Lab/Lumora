@@ -5,7 +5,7 @@ An independent review of merged main commit 93ee788 found one recording-state re
 ## What Changes
 
 - Make begin/resume/pause recording actions reject stale continuation after synchronous timeline events.
-- Scope camera-drive keyboard input to the active Studio instance and hard-disable drive while overwrite confirmation is open.
+- Scope camera-drive keyboard input to the active Studio instance, always release instance-held keys, hard-stop when focus leaves, and hard-disable drive while overwrite confirmation is open.
 - Make RDP simplification stack-safe for at least 8,000 adversarial samples.
 - Add import budgets for tracks, shots, per-track keyframes, and total keyframes before deep validation.
 - Replace timeline reference and shot reorder quadratic scans with Map/Set membership.

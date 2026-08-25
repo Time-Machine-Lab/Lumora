@@ -190,6 +190,55 @@ describe('camera drive keyboard routing', () => {
     expect(cameraA.position.distanceTo(atTransfer)).toBeGreaterThan(0.01);
   });
 
+  it('clears held drive input when focus leaves Studio A and rebinds when focus returns', async () => {
+    const a = await mountStudio('lumora://drive-body-keyup-a');
+    await mountStudio('lumora://drive-body-keyup-b');
+    act(() => a.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const cameraA = findNode(a.scene, 'sample-camera')!;
+    const focusTarget = within(a.root).getByTestId('timeline-play');
+    await act(async () => delay(60));
+
+    focusTarget.focus();
+    fireEvent.keyDown(focusTarget, { key: 's', code: 'KeyS' });
+    await act(async () => delay(120));
+    focusTarget.blur();
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.keyUp(document.body, { key: 's', code: 'KeyS' });
+    const atRelease = cameraA.position.clone();
+    await act(async () => delay(160));
+
+    expect(cameraA.position.distanceTo(atRelease)).toBeLessThan(1e-9);
+
+    focusTarget.focus();
+    const beforeRebind = cameraA.position.clone();
+    fireEvent.keyDown(focusTarget, { key: 's', code: 'KeyS' });
+    await act(async () => delay(120));
+    fireEvent.keyUp(focusTarget, { key: 's', code: 'KeyS' });
+
+    expect(cameraA.position.distanceTo(beforeRebind)).toBeGreaterThan(0.01);
+  });
+
+  it('releases a held drive key even when its scoped keyup was canceled', async () => {
+    const a = await mountStudio('lumora://drive-canceled-keyup-a');
+    await mountStudio('lumora://drive-canceled-keyup-b');
+    act(() => a.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const releaseSpy = vi.spyOn(CameraDrive.prototype, 'release');
+    await act(async () => delay(60));
+
+    fireEvent.keyDown(a.root, { key: 's', code: 'KeyS' });
+    const canceledKeyUp = new KeyboardEvent('keyup', {
+      bubbles: true,
+      cancelable: true,
+      key: 's',
+      code: 'KeyS',
+    });
+    canceledKeyUp.preventDefault();
+    a.root.dispatchEvent(canceledKeyUp);
+
+    expect(canceledKeyUp.defaultPrevented).toBe(true);
+    expect(releaseSpy).toHaveBeenCalledWith('KeyS');
+  });
+
   it('overwrite confirmation clears existing momentum and blocks drive keys from portal controls', async () => {
     const studio = await mountStudio('lumora://drive-modal');
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
