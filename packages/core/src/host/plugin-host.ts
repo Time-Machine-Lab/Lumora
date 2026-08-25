@@ -2,7 +2,7 @@ import { DisposableSet, type Disposable } from '../disposable';
 import { CommandRegistry, PluginCommands, type CommandContext } from '../commands/command-registry';
 import { ContributionRegistry } from '../contributions/contribution-registry';
 import { TypedEventEmitter } from '../events/typed-event-emitter';
-import type { EventMap } from '../events/event-map';
+import type { EventMap, PluginDiagnostic } from '../events/event-map';
 import { checkEngineCompatibility } from '../manifest/engine';
 import { validateManifest } from '../manifest/validate';
 import type { Manifest } from '../manifest/validate';
@@ -293,8 +293,8 @@ export class PluginHost {
     this.project = project;
   }
 
-  listPlugins(): PluginInfo[] {
-    return [...this.plugins.values()].map((record) => record.info());
+  listPlugins(): ReadonlyArray<PluginInfo> {
+    return deepFreeze([...this.plugins.values()].map((record) => record.info()));
   }
 
   /** 按 instanceId 查询插件（合法 Manifest 的 instanceId 与 manifest id 相同） */
@@ -664,7 +664,7 @@ export class PluginHost {
       lifecycle: null,
       lifecycleTarget: null,
       info: () => {
-        return {
+        return deepFreeze({
           instanceId: record.key,
           id: record.id,
           name: record.name,
@@ -673,7 +673,7 @@ export class PluginHost {
           error: this.publicErrorSnapshot(record.error),
           reason: record.reason,
           contributes: [...(record.manifest.contributes ?? [])],
-        };
+        });
       },
     };
     return record;
@@ -1200,16 +1200,14 @@ export class PluginHost {
     const publicError = record.reason === undefined && record.error === undefined
       ? undefined
       : this.normalizePluginError(record.reason ?? record.error);
-    if (publicError) Object.freeze(publicError);
-    const payload = {
+    const payload = deepFreeze({
       // instanceId：稳定唯一的记录标识，事件关联与寻址（disable/enable）使用它；
       // pluginId 仅作 Manifest 展示（缺 id 时为 '<unknown>'），不得用于寻址
       instanceId: record.key,
       pluginId: record.id,
       state,
       error: publicError,
-    };
-    Object.freeze(payload);
+    });
     this.events.emit('plugin:state-changed', payload);
   }
 
@@ -1220,11 +1218,11 @@ export class PluginHost {
     return record;
   }
 
-  private normalizePluginError(error: unknown): Error {
-    return new Error(publicPluginDiagnosticMessage(error));
+  private normalizePluginError(error: unknown): PluginDiagnostic {
+    return { message: publicPluginDiagnosticMessage(error) };
   }
 
-  private publicErrorSnapshot(error: unknown): unknown {
+  private publicErrorSnapshot(error: unknown): PluginInfo['error'] {
     if (error === undefined) return undefined;
     if (Array.isArray(error)) return error.map((item) => this.normalizePluginError(item));
     return this.normalizePluginError(error);

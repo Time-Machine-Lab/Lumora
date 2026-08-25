@@ -1,6 +1,6 @@
 import type { Disposable } from '../disposable';
 import type { PluginCommands } from '../commands/command-registry';
-import type { EventMap } from '../events/event-map';
+import type { EventMap, PluginDiagnostic } from '../events/event-map';
 import type { ContributionBundle, ContributionKind } from '../contributions/types';
 import type { Manifest } from '../manifest/validate';
 import type { Project } from '../scene/types';
@@ -61,13 +61,13 @@ export interface PluginDescriptor {
 
 export interface PluginInfo {
   /** 生命周期与记录标识：稳定唯一（缺 id 的非法 Manifest 亦唯一），disable/enable 等操作使用它 */
-  instanceId: string;
+  readonly instanceId: string;
   /** Manifest 展示 id：仅用于展示；缺 id 时为 '<unknown>'，不得用于寻址 */
-  id: string;
-  name: string;
-  version: string;
-  state: PluginState;
-  error?: unknown;
-  reason?: string;
-  contributes: ContributionKind[];
+  readonly id: string;
+  readonly name: string;
+  readonly version: string;
+  readonly state: PluginState;
+  readonly error?: PluginDiagnostic | ReadonlyArray<PluginDiagnostic>;
+  readonly reason?: string;
+  readonly contributes: ReadonlyArray<ContributionKind>;
 }

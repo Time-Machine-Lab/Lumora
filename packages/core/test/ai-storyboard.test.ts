@@ -1,31 +1,38 @@
 import { describe, expect, it, vi } from 'vitest';
 import * as core from '../src/index';
 import { createPluginServices } from '../src/services';
+import type { AiService, GenerationTask, StoryboardProviderInfo } from '../src/index';
 
-interface ExpectedAiService {
-  listStoryboardProviders(): Array<{
-    id: string;
-    name: string;
-    models: Array<{ id: string; name: string; cost: { kind: 'known' | 'unknown' } }>;
-  }>;
-  submitStoryboard(providerId: string, request: {
-    model: string;
-    brief: {
-      concept: string;
-      targetDurationSeconds: number;
-      shotCount: number;
-      visualStyle?: string;
-    };
-  }): { id: string; status: string };
-  getGenerationTask(taskId: string): unknown;
-  waitForGenerationTask(taskId: string): Promise<{
-    id: string;
-    status: string;
-    draft?: { shots: Array<{ title: string; shotSize: string; movement: string; durationSeconds: number; prompt: string }> };
-    error?: { code: string; message: string; retryable: boolean; costKnown: boolean };
-  }>;
-  cancelGenerationTask(taskId: string): boolean;
+function assertReadonlyAiContracts(
+  task: GenerationTask,
+  provider: StoryboardProviderInfo,
+  providers: ReturnType<AiService['listStoryboardProviders']>,
+): void {
+  // @ts-expect-error public task snapshots are readonly.
+  task.status = 'failed';
+  // @ts-expect-error nested task errors are readonly.
+  task.error!.message = 'mutated';
+  // @ts-expect-error retry metadata is readonly.
+  task.error!.retryAfterMs = 1;
+  // @ts-expect-error nested briefs are readonly.
+  task.brief.concept = 'mutated';
+  // @ts-expect-error nested costs are readonly.
+  task.cost.note = 'mutated';
+  // @ts-expect-error nested draft shots are readonly.
+  task.draft!.shots[0]!.prompt = 'mutated';
+  // @ts-expect-error draft shot arrays are readonly.
+  task.draft!.shots.push(task.draft.shots[0]!);
+  // @ts-expect-error provider snapshots are readonly.
+  provider.name = 'mutated';
+  // @ts-expect-error provider model arrays are readonly.
+  provider.models.push(provider.models[0]!);
+  // @ts-expect-error nested model descriptors are readonly.
+  provider.models[0]!.id = 'mutated';
+  // @ts-expect-error provider lists are readonly.
+  providers.push(provider);
 }
+
+void assertReadonlyAiContracts;
 
 const BRIEF = {
   concept: 'A courier crosses a rain-soaked neon market to deliver a mysterious case.',
@@ -75,7 +82,10 @@ const VALID_PAYLOAD = {
   ],
 };
 
-function servicesWith(generate: (request: { signal: AbortSignal }) => Promise<unknown>, costKind: 'known' | 'unknown' = 'unknown') {
+function servicesWith(
+  generate: (request: { signal: AbortSignal }) => Promise<unknown>,
+  costKind: 'known' | 'unknown' = 'unknown',
+): AiService {
   const registry = {
     getAssetLoaders: () => [],
     getExporters: () => [],
@@ -102,7 +112,7 @@ function servicesWith(generate: (request: { signal: AbortSignal }) => Promise<un
       },
     ],
   };
-  return createPluginServices(registry, () => null).ai as unknown as ExpectedAiService;
+  return createPluginServices(registry, () => null).ai;
 }
 
 function servicesWithMalformedMetadata() {
@@ -121,7 +131,23 @@ function servicesWithMalformedMetadata() {
       },
     }],
   };
-  return createPluginServices(registry as never, () => null).ai as unknown as ExpectedAiService;
+  return createPluginServices(registry as never, () => null).ai;
+}
+
+function expectPublicProviderFailure(task: GenerationTask): void {
+  expect(task.status).toBe('failed');
+  expect(task.error).toEqual({
+    code: 'provider_error',
+    message: GENERIC_PROVIDER_ERROR_MESSAGE,
+    retryable: false,
+    costKnown: false,
+  });
+  expect(Object.keys(task.error ?? {}).sort()).toEqual(['code', 'costKnown', 'message', 'retryable']);
+  expect(task.error).not.toHaveProperty('cause');
+  expect(task.error).not.toHaveProperty('responseBody');
+  expect(JSON.stringify(task)).not.toContain(PRIVATE_PROVIDER_MARKER);
+  expect(Object.isFrozen(task)).toBe(true);
+  expect(Object.isFrozen(task.error)).toBe(true);
 }
 
 describe('AI storyboard capability', () => {
@@ -159,7 +185,8 @@ describe('AI storyboard capability', () => {
     const generate = vi.fn(async () => VALID_PAYLOAD);
     const ai = servicesWith(generate, 'known');
 
-    expect(ai.listStoryboardProviders()).toEqual([
+    const providers = ai.listStoryboardProviders();
+    expect(providers).toEqual([
       {
         id: 'com.example.storyboard',
         name: 'Example Storyboard',
@@ -172,15 +199,47 @@ describe('AI storyboard capability', () => {
         ],
       },
     ]);
+    expect(Object.isFrozen(providers)).toBe(true);
+    expect(Object.isFrozen(providers[0])).toBe(true);
+    expect(Object.isFrozen(providers[0]?.models)).toBe(true);
+    expect(Object.isFrozen(providers[0]?.models[0])).toBe(true);
+    expect(Object.isFrozen(providers[0]?.models[0]?.cost)).toBe(true);
+    expect(() => {
+      (providers[0] as { name: string }).name = 'mutated';
+    }).toThrow(TypeError);
+    expect(ai.listStoryboardProviders()[0]?.name).toBe('Example Storyboard');
 
     const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
     expect(['queued', 'running']).toContain(submitted.status);
+    expect(Object.isFrozen(submitted)).toBe(true);
+    expect(Object.isFrozen(submitted.brief)).toBe(true);
+    expect(Object.isFrozen(submitted.cost)).toBe(true);
+    expect(() => {
+      (submitted.brief as { concept: string }).concept = 'mutated';
+    }).toThrow(TypeError);
+    expect(submitted.brief.concept).toBe(BRIEF.concept);
 
     const completed = await ai.waitForGenerationTask(submitted.id);
     expect(completed.status).toBe('succeeded');
     expect(completed.draft?.shots).toHaveLength(3);
+    expect(Object.isFrozen(completed)).toBe(true);
+    expect(Object.isFrozen(completed.brief)).toBe(true);
+    expect(Object.isFrozen(completed.cost)).toBe(true);
+    expect(Object.isFrozen(completed.draft)).toBe(true);
+    expect(Object.isFrozen(completed.draft?.brief)).toBe(true);
+    expect(Object.isFrozen(completed.draft?.cost)).toBe(true);
+    expect(Object.isFrozen(completed.draft?.shots)).toBe(true);
+    expect(Object.isFrozen(completed.draft?.shots[0])).toBe(true);
     expect(generate).toHaveBeenCalledTimes(1);
-    expect(ai.getGenerationTask(submitted.id)).toMatchObject({ status: 'succeeded' });
+    const polled = ai.getGenerationTask(submitted.id)!;
+    expect(polled).toMatchObject({ status: 'succeeded' });
+    expect(polled).not.toBe(completed);
+    expect(Object.isFrozen(polled)).toBe(true);
+    expect(Object.isFrozen(polled.draft)).toBe(true);
+    expect(Object.isFrozen(polled.draft?.shots[0])).toBe(true);
+    expect(completed.brief.concept).toBe(BRIEF.concept);
+    expect(polled.brief.concept).toBe(BRIEF.concept);
+    expect(polled.draft?.shots[0]?.prompt).toBe('Wide market arrival in rain.');
   });
 
   it('excludes providers with malformed storyboard metadata from discovery', () => {
@@ -309,10 +368,12 @@ describe('AI storyboard capability', () => {
       });
       const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
       const completed = await ai.waitForGenerationTask(submitted.id);
+      const polled = ai.getGenerationTask(submitted.id)!;
 
-      expect(completed.status).toBe('failed');
-      expect(completed.error?.message).toBe(GENERIC_PROVIDER_ERROR_MESSAGE);
-      expect(JSON.stringify(completed)).not.toContain(PRIVATE_PROVIDER_MARKER);
+      expectPublicProviderFailure(completed);
+      expectPublicProviderFailure(polled);
+      expect(polled).not.toBe(completed);
+      expect(polled.error).not.toBe(completed.error);
     },
   );
 

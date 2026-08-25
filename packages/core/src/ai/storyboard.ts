@@ -70,33 +70,41 @@ const storyboardDraftPayloadSchema = z
   })
   .strict();
 
-export type CreativeBrief = z.infer<typeof creativeBriefSchema>;
-export type StoryboardDraftShotPayload = z.infer<typeof storyboardDraftShotPayloadSchema>;
-export type StoryboardDraftPayload = z.infer<typeof storyboardDraftPayloadSchema>;
+type CreativeBriefSchemaData = z.infer<typeof creativeBriefSchema>;
+export type CreativeBrief = Omit<Readonly<CreativeBriefSchemaData>, 'constraints'> & {
+  readonly constraints?: ReadonlyArray<string>;
+};
+
+export type StoryboardDraftShotPayload = Readonly<z.infer<typeof storyboardDraftShotPayloadSchema>>;
+
+type StoryboardDraftPayloadSchemaData = z.infer<typeof storyboardDraftPayloadSchema>;
+export type StoryboardDraftPayload = Omit<Readonly<StoryboardDraftPayloadSchemaData>, 'shots'> & {
+  readonly shots: ReadonlyArray<StoryboardDraftShotPayload>;
+};
 
 export interface StoryboardDraftShot extends StoryboardDraftShotPayload {
-  id: string;
+  readonly id: string;
 }
 
 export type AiCostEstimate =
-  | { kind: 'known'; amount: number; currency: string; note?: string }
-  | { kind: 'unknown'; note: string };
+  | { readonly kind: 'known'; readonly amount: number; readonly currency: string; readonly note?: string }
+  | { readonly kind: 'unknown'; readonly note: string };
 
 export interface StoryboardModelDescriptor {
-  id: string;
-  name: string;
-  cost: AiCostEstimate;
+  readonly id: string;
+  readonly name: string;
+  readonly cost: AiCostEstimate;
 }
 
 export interface StoryboardGenerateRequest {
-  model: string;
-  brief: CreativeBrief;
-  signal: AbortSignal;
+  readonly model: string;
+  readonly brief: CreativeBrief;
+  readonly signal: AbortSignal;
 }
 
 export interface AiStoryboardCapability {
-  capability: typeof AI_STORYBOARD_GENERATE_CAPABILITY;
-  models: StoryboardModelDescriptor[];
+  readonly capability: typeof AI_STORYBOARD_GENERATE_CAPABILITY;
+  readonly models: ReadonlyArray<StoryboardModelDescriptor>;
   generate(request: StoryboardGenerateRequest): Promise<unknown>;
 }
 
@@ -150,33 +158,33 @@ const aiStoryboardCapabilitySchema = z
   });
 
 export interface AiReferenceImageRequest {
-  model: string;
-  prompt: string;
-  referenceImage?: { mime: string; data: string };
-  signal: AbortSignal;
+  readonly model: string;
+  readonly prompt: string;
+  readonly referenceImage?: { readonly mime: string; readonly data: string };
+  readonly signal: AbortSignal;
 }
 
 export interface AiReferenceImageResult {
-  mime: string;
-  data: string;
+  readonly mime: string;
+  readonly data: string;
 }
 
 export interface AiReferenceImageCapability {
-  capability: typeof AI_REFERENCE_IMAGE_GENERATE_CAPABILITY;
-  models: StoryboardModelDescriptor[];
+  readonly capability: typeof AI_REFERENCE_IMAGE_GENERATE_CAPABILITY;
+  readonly models: ReadonlyArray<StoryboardModelDescriptor>;
   generate(request: AiReferenceImageRequest): Promise<AiReferenceImageResult>;
 }
 
 export interface StoryboardDraft {
-  id: string;
-  providerId: string;
-  model: string;
-  generatedAt: string;
-  title: string;
-  summary: string;
-  brief: CreativeBrief;
-  cost: AiCostEstimate;
-  shots: StoryboardDraftShot[];
+  readonly id: string;
+  readonly providerId: string;
+  readonly model: string;
+  readonly generatedAt: string;
+  readonly title: string;
+  readonly summary: string;
+  readonly brief: CreativeBrief;
+  readonly cost: AiCostEstimate;
+  readonly shots: ReadonlyArray<StoryboardDraftShot>;
 }
 
 export type AiProviderErrorCode =
@@ -190,11 +198,11 @@ export type AiProviderErrorCode =
   | 'provider_error';
 
 export interface AiProviderErrorData {
-  code: AiProviderErrorCode;
-  message: string;
-  retryable: boolean;
-  costKnown: boolean;
-  retryAfterMs?: number;
+  readonly code: AiProviderErrorCode;
+  readonly message: string;
+  readonly retryable: boolean;
+  readonly costKnown: boolean;
+  readonly retryAfterMs?: number;
 }
 
 export class AiProviderRequestError extends Error implements AiProviderErrorData {
@@ -217,24 +225,24 @@ export class AiProviderRequestError extends Error implements AiProviderErrorData
 export type GenerationTaskStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
 export interface GenerationTask {
-  id: string;
-  capability: typeof AI_STORYBOARD_GENERATE_CAPABILITY;
-  providerId: string;
-  model: string;
-  brief: CreativeBrief;
-  cost: AiCostEstimate;
-  status: GenerationTaskStatus;
-  submittedAt: string;
-  startedAt?: string;
-  completedAt?: string;
-  draft?: StoryboardDraft;
-  error?: AiProviderErrorData;
+  readonly id: string;
+  readonly capability: typeof AI_STORYBOARD_GENERATE_CAPABILITY;
+  readonly providerId: string;
+  readonly model: string;
+  readonly brief: CreativeBrief;
+  readonly cost: AiCostEstimate;
+  readonly status: GenerationTaskStatus;
+  readonly submittedAt: string;
+  readonly startedAt?: string;
+  readonly completedAt?: string;
+  readonly draft?: StoryboardDraft;
+  readonly error?: AiProviderErrorData;
 }
 
 export interface StoryboardProviderInfo {
-  id: string;
-  name: string;
-  models: StoryboardModelDescriptor[];
+  readonly id: string;
+  readonly name: string;
+  readonly models: ReadonlyArray<StoryboardModelDescriptor>;
 }
 
 export function parseCreativeBrief(value: unknown): CreativeBrief {

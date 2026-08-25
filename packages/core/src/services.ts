@@ -1,6 +1,7 @@
 import { ZodError } from 'zod';
 import type { Asset, AiChatRequest, ExportResult } from './contributions/types';
 import type { Project } from './scene/types';
+import { deepFreeze } from './scene/immutable';
 import {
   AI_STORYBOARD_GENERATE_CAPABILITY,
   AiProviderRequestError,
@@ -21,7 +22,7 @@ export interface AssetService {
 
 export interface AiService {
   chat(providerId: string, request: AiChatRequest): AsyncIterable<string>;
-  listStoryboardProviders(): StoryboardProviderInfo[];
+  listStoryboardProviders(): ReadonlyArray<StoryboardProviderInfo>;
   submitStoryboard(providerId: string, request: Omit<StoryboardGenerateRequest, 'signal'>): GenerationTask;
   getGenerationTask(taskId: string): GenerationTask | undefined;
   waitForGenerationTask(taskId: string): Promise<GenerationTask>;
@@ -65,8 +66,8 @@ function isTerminalTask(task: GenerationTask): boolean {
   return task.status === 'succeeded' || task.status === 'failed' || task.status === 'cancelled';
 }
 
-function cloneTask(task: GenerationTask): GenerationTask {
-  return structuredClone(task);
+function publicTaskSnapshot(task: GenerationTask): GenerationTask {
+  return deepFreeze(structuredClone(task));
 }
 
 function taskId(): string {
@@ -116,13 +117,14 @@ class StoryboardTaskService {
     this.registry = registry;
   }
 
-  listProviders(): StoryboardProviderInfo[] {
-    return this.registry.getAiProviders().flatMap((provider) => {
+  listProviders(): ReadonlyArray<StoryboardProviderInfo> {
+    const providers = this.registry.getAiProviders().flatMap((provider) => {
       const storyboard = validatedStoryboardCapability(provider);
       return storyboard
         ? [{ id: provider.id, name: provider.name, models: structuredClone(storyboard.models) }]
         : [];
     });
+    return deepFreeze(providers);
   }
 
   submit(providerId: string, request: Omit<StoryboardGenerateRequest, 'signal'>): GenerationTask {
@@ -178,17 +180,17 @@ class StoryboardTaskService {
     });
     this.controls.set(id, { controller, completion, finish });
     void this.execute(storyboard, task, controller);
-    return cloneTask(this.tasks.get(id)!);
+    return publicTaskSnapshot(this.tasks.get(id)!);
   }
 
   get(taskIdValue: string): GenerationTask | undefined {
     const task = this.tasks.get(taskIdValue);
-    return task ? cloneTask(task) : undefined;
+    return task ? publicTaskSnapshot(task) : undefined;
   }
 
   wait(taskIdValue: string): Promise<GenerationTask> {
     const task = this.tasks.get(taskIdValue);
-    if (task && isTerminalTask(task)) return Promise.resolve(cloneTask(task));
+    if (task && isTerminalTask(task)) return Promise.resolve(publicTaskSnapshot(task));
     const control = this.controls.get(taskIdValue);
     if (!control) {
       return Promise.reject(
@@ -200,7 +202,7 @@ class StoryboardTaskService {
         }),
       );
     }
-    return control.completion.then(cloneTask);
+    return control.completion.then(publicTaskSnapshot);
   }
 
   cancel(taskIdValue: string): boolean {
@@ -318,7 +320,7 @@ class StoryboardTaskService {
     if (!current || isTerminalTask(current)) return;
     this.tasks.set(task.id, task);
     const control = this.controls.get(task.id);
-    control?.finish(cloneTask(task));
+    control?.finish(publicTaskSnapshot(task));
     this.controls.delete(task.id);
     this.pruneTaskHistory();
   }

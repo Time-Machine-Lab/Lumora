@@ -14,7 +14,7 @@ import type { Manifest } from '../src/manifest/validate';
 import type { AiStoryboardCapability } from '../src/ai/storyboard';
 import type { AiProviderContribution } from '../src/contributions/types';
 import type { Disposable } from '../src/disposable';
-import type { EventMap } from '../src/events/event-map';
+import type { EventMap, PluginDiagnostic } from '../src/events/event-map';
 
 function assertReadonlyPluginStateEvent(event: EventMap['plugin:state-changed']): void {
   // @ts-expect-error plugin state event DTOs are immutable by contract.
@@ -26,6 +26,20 @@ function assertReadonlyPluginStateEvent(event: EventMap['plugin:state-changed'])
 }
 
 void assertReadonlyPluginStateEvent;
+
+function assertReadonlyPluginInfo(info: PluginInfo): void {
+  // @ts-expect-error plugin info snapshots are immutable by contract.
+  info.state = 'active';
+  const errors = info.error as ReadonlyArray<PluginDiagnostic>;
+  // @ts-expect-error plugin diagnostic lists are readonly snapshots.
+  errors.push({ message: 'mutated' });
+  // @ts-expect-error plugin diagnostics cannot be replaced by callers.
+  info.error = undefined;
+  // @ts-expect-error contribution lists are readonly snapshots.
+  info.contributes.push('panel');
+}
+
+void assertReadonlyPluginInfo;
 
 const VALID_MANIFEST: Manifest = {
   schemaVersion: '1',
@@ -150,7 +164,7 @@ describe('PluginHost', () => {
     expect(rejection).toBeUndefined();
     expect(info.state).toBe('failed');
     expect(states.at(-1)).toBe('failed');
-    expect(info.error).toBeInstanceOf(Error);
+    expect(info.error).toEqual({ message: '插件激活失败。' });
     expect(info.error === hostile).toBe(false);
   });
 
@@ -176,14 +190,14 @@ describe('PluginHost', () => {
     expect(info.state).toBe('failed');
     expect(info.reason).not.toContain(privateTail);
     expect(info.reason?.length).toBeLessThanOrEqual(2_000);
-    expect(info.error).toBeInstanceOf(Error);
+    expect(info.error).toEqual({ message: '插件激活失败。' });
     expect(info.error).not.toBe(originalError);
-    expect((info.error as Error).message).not.toContain(privateTail);
-    expect((info.error as Error).message.length).toBeLessThanOrEqual(2_000);
-    expect(failedEventError).toBeInstanceOf(Error);
+    expect((info.error as PluginDiagnostic).message).not.toContain(privateTail);
+    expect((info.error as PluginDiagnostic).message.length).toBeLessThanOrEqual(2_000);
+    expect(failedEventError).toEqual({ message: '插件激活失败。' });
     expect(failedEventError).not.toBe(originalError);
-    expect((failedEventError as Error).message).not.toContain(privateTail);
-    expect((failedEventError as Error).message.length).toBeLessThanOrEqual(2_000);
+    expect((failedEventError as PluginDiagnostic).message).not.toContain(privateTail);
+    expect((failedEventError as PluginDiagnostic).message.length).toBeLessThanOrEqual(2_000);
   });
 
   it('publishes only host-owned plugin summaries without retaining message, response, or cause', async () => {
@@ -209,12 +223,27 @@ describe('PluginHost', () => {
     );
 
     expect(info.reason).toBe('插件激活失败。');
-    expect(info.error).toBeInstanceOf(Error);
-    expect((info.error as Error).message).toBe('插件激活失败。');
-    expect((info.error as Error).cause).toBeUndefined();
-    expect(failedEvent?.error).toBeInstanceOf(Error);
-    expect((failedEvent?.error as Error).message).toBe('插件激活失败。');
-    expect((failedEvent?.error as Error).cause).toBeUndefined();
+    expect(info.error).toEqual({ message: '插件激活失败。' });
+    expect(Object.keys(info.error as PluginDiagnostic)).toEqual(['message']);
+    expect(info.error).not.toHaveProperty('stack');
+    expect(info.error).not.toHaveProperty('cause');
+    expect(failedEvent?.error).toEqual({ message: '插件激活失败。' });
+    expect(Object.keys(failedEvent?.error ?? {})).toEqual(['message']);
+    expect(failedEvent?.error).not.toHaveProperty('stack');
+    expect(failedEvent?.error).not.toHaveProperty('cause');
+    expect(Object.isFrozen(info)).toBe(true);
+    expect(Object.isFrozen(info.error)).toBe(true);
+    expect(Object.isFrozen(info.contributes)).toBe(true);
+    expect(Object.isFrozen(failedEvent)).toBe(true);
+    expect(Object.isFrozen(failedEvent?.error)).toBe(true);
+    const pluginList = host.listPlugins();
+    const listed = pluginList[0]!;
+    const polled = host.getPlugin('com.example.plugin')!;
+    expect(Object.isFrozen(pluginList)).toBe(true);
+    expect(Object.isFrozen(listed)).toBe(true);
+    expect(Object.isFrozen(polled)).toBe(true);
+    expect(listed.error).toEqual(info.error);
+    expect(polled.error).toEqual(info.error);
     expect(JSON.stringify(info)).not.toContain(privateMarker);
     expect(JSON.stringify(failedEvent)).not.toContain(privateMarker);
   });
@@ -241,19 +270,25 @@ describe('PluginHost', () => {
     await host.disable('com.example.plugin');
 
     const info = host.getPlugin('com.example.plugin')!;
-    const infoErrors = Array.isArray(info.error) ? info.error : [info.error];
-    const eventErrors = Array.isArray(disabledEventError) ? disabledEventError : [disabledEventError];
+    const infoErrors = (Array.isArray(info.error) ? info.error : [info.error]) as PluginDiagnostic[];
+    const eventErrors = (Array.isArray(disabledEventError) ? disabledEventError : [disabledEventError]) as PluginDiagnostic[];
     expect(info.state).toBe('disabled');
     expect(info.reason).toBe('插件停用失败。');
     expect(info.reason).not.toContain(privateTail);
     expect(info.reason?.length).toBeLessThanOrEqual(2_000);
     for (const error of [...infoErrors, ...eventErrors]) {
-      expect(error).toBeInstanceOf(Error);
+      expect(error).toEqual({ message: '插件停用失败。' });
       expect(error).not.toBe(originalError);
-      expect((error as Error).message).toBe('插件停用失败。');
-      expect((error as Error).message).not.toContain(privateTail);
-      expect((error as Error).message.length).toBeLessThanOrEqual(2_000);
+      expect(Object.keys(error)).toEqual(['message']);
+      expect(error).not.toHaveProperty('stack');
+      expect(error).not.toHaveProperty('cause');
+      expect(error.message).not.toContain(privateTail);
+      expect(error.message.length).toBeLessThanOrEqual(2_000);
+      expect(Object.isFrozen(error)).toBe(true);
     }
+    expect(Object.isFrozen(info)).toBe(true);
+    expect(Object.isFrozen(info.error)).toBe(true);
+    expect(Object.isFrozen(info.contributes)).toBe(true);
   });
 
   it('isolates published activation and deactivation errors from caller mutation', async () => {
@@ -267,11 +302,13 @@ describe('PluginHost', () => {
         },
       })),
     );
-    (activationInfo.error as Error).message = 'apiKey=INJECTED_ACTIVATION_SECRET';
+    expect(() => {
+      (activationInfo.error as { message: string }).message = 'apiKey=INJECTED_ACTIVATION_SECRET';
+    }).toThrow(TypeError);
 
     const freshActivationInfo = activationHost.getPlugin('com.example.plugin')!;
     expect(freshActivationInfo.error).not.toBe(activationInfo.error);
-    expect((freshActivationInfo.error as Error).message).not.toContain('INJECTED_ACTIVATION_SECRET');
+    expect((freshActivationInfo.error as PluginDiagnostic).message).not.toContain('INJECTED_ACTIVATION_SECRET');
 
     const deactivationHost = new PluginHost({ hostVersion: '0.1.0' });
     await deactivationHost.register(
@@ -286,12 +323,16 @@ describe('PluginHost', () => {
     );
     await deactivationHost.disable('com.example.plugin');
     const deactivationInfo = deactivationHost.getPlugin('com.example.plugin')!;
-    const publishedErrors = deactivationInfo.error as Error[];
-    publishedErrors[0]!.message = 'accessToken=INJECTED_DEACTIVATION_SECRET';
-    publishedErrors.push(new Error('refreshToken=ORIGINAL_OBJECT'));
+    const publishedErrors = deactivationInfo.error as Array<{ message: string }>;
+    expect(() => {
+      publishedErrors[0]!.message = 'accessToken=INJECTED_DEACTIVATION_SECRET';
+    }).toThrow(TypeError);
+    expect(() => {
+      publishedErrors.push({ message: 'refreshToken=ORIGINAL_OBJECT' });
+    }).toThrow(TypeError);
 
     const freshDeactivationInfo = deactivationHost.getPlugin('com.example.plugin')!;
-    const freshErrors = freshDeactivationInfo.error as Error[];
+    const freshErrors = freshDeactivationInfo.error as ReadonlyArray<PluginDiagnostic>;
     expect(freshErrors).not.toBe(publishedErrors);
     expect(freshErrors).toHaveLength(1);
     expect(freshErrors[0]).not.toBe(publishedErrors[0]);
@@ -309,21 +350,21 @@ describe('PluginHost', () => {
 
     host.events.on('plugin:state-changed', (event) => {
       if (event.state !== 'failed') return;
-      Reflect.set(event.error as Error, 'message', injectedMessage);
+      Reflect.set(event.error as PluginDiagnostic, 'message', injectedMessage);
       Reflect.set(event, 'state', 'active');
       Reflect.set(event, 'error', new Error(injectedMessage));
     });
     host.events.on('plugin:state-changed', (event) => {
       if (event.state !== 'failed') return;
       secondListenerState = event.state;
-      secondListenerMessage = (event.error as Error).message;
+      secondListenerMessage = (event.error as PluginDiagnostic).message;
     });
     host.events.onAny((eventName, payload) => {
       if (eventName !== 'plugin:state-changed') return;
       const event = payload as { state: PluginState; error?: unknown };
       if (event.state !== 'failed') return;
       anyListenerState = event.state;
-      anyListenerMessage = (event.error as Error).message;
+      anyListenerMessage = (event.error as PluginDiagnostic).message;
     });
 
     const info = await host.register(
@@ -342,7 +383,7 @@ describe('PluginHost', () => {
     expect(anyListenerMessage).not.toContain('INJECTED_EVENT_LISTENER_SECRET');
     expect(info.state).toBe('failed');
     expect(info.reason).not.toContain('INJECTED_EVENT_LISTENER_SECRET');
-    expect((info.error as Error).message).not.toContain('INJECTED_EVENT_LISTENER_SECRET');
+    expect((info.error as PluginDiagnostic).message).not.toContain('INJECTED_EVENT_LISTENER_SECRET');
   });
 
   it('cancels running storyboard tasks when their provider plugin is disabled', async () => {

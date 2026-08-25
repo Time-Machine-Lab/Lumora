@@ -1,7 +1,9 @@
 import type { Project } from '../scene/types';
 import type { PluginState } from '../host/types';
 
-export type PluginDiagnostic = Readonly<Error>;
+export interface PluginDiagnostic {
+  readonly message: string;
+}
 
 export interface PluginStateChangedEvent {
   readonly instanceId: string;
