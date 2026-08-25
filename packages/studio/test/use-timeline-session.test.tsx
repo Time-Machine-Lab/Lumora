@@ -155,6 +155,93 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     act(() => live().stopRecording());
   });
 
+  it('begin recording drops its stale state write when play synchronously opens project B', () => {
+    const sample = createSampleProject();
+    editor.openProject({ ...sample, uri: 'lumora://recording-begin-a', tracks: [] });
+    mount();
+    const projectB = { ...sample, uri: 'lumora://recording-begin-b', tracks: [] };
+    const sub = live().timeline.events.on('state:changed', ({ playing }) => {
+      if (playing && editor.getProject()?.uri !== projectB.uri) editor.openProject(projectB);
+    });
+
+    act(() => live().startRecording('sample-camera'));
+
+    expect(editor.getProject()?.uri).toBe(projectB.uri);
+    expect(live().recorder.active).toBe(false);
+    expect(live().timeline.isPlaying()).toBe(false);
+    expect(live().state.recording).toBe(false);
+    expect(live().state.recordingPaused).toBe(false);
+    expect(live().state.playing).toBe(false);
+    sub.dispose();
+  });
+
+  it('resume recording drops its stale state write when play synchronously opens project B', () => {
+    const sample = createSampleProject();
+    editor.openProject({ ...sample, uri: 'lumora://recording-resume-a', tracks: [] });
+    mount();
+    act(() => {
+      live().startRecording('sample-camera');
+      live().pause();
+    });
+    expect(live().recorder.isPaused).toBe(true);
+    const projectB = { ...sample, uri: 'lumora://recording-resume-b', tracks: [] };
+    const sub = live().timeline.events.on('state:changed', ({ playing }) => {
+      if (playing && editor.getProject()?.uri !== projectB.uri) editor.openProject(projectB);
+    });
+
+    act(() => live().resumeRecording());
+
+    expect(editor.getProject()?.uri).toBe(projectB.uri);
+    expect(live().recorder.active).toBe(false);
+    expect(live().timeline.isPlaying()).toBe(false);
+    expect(live().state.recording).toBe(false);
+    expect(live().state.recordingPaused).toBe(false);
+    expect(live().state.playing).toBe(false);
+    sub.dispose();
+  });
+
+  it('pause recording drops its stale state write when pause synchronously opens project B', () => {
+    const sample = createSampleProject();
+    editor.openProject({ ...sample, uri: 'lumora://recording-pause-a', tracks: [] });
+    mount();
+    act(() => live().startRecording('sample-camera'));
+    const projectB = { ...sample, uri: 'lumora://recording-pause-b', tracks: [] };
+    const sub = live().timeline.events.on('state:changed', ({ playing }) => {
+      if (!playing && editor.getProject()?.uri !== projectB.uri) editor.openProject(projectB);
+    });
+
+    act(() => live().togglePlay());
+
+    expect(editor.getProject()?.uri).toBe(projectB.uri);
+    expect(live().recorder.active).toBe(false);
+    expect(live().timeline.isPlaying()).toBe(false);
+    expect(live().state.recording).toBe(false);
+    expect(live().state.recordingPaused).toBe(false);
+    expect(live().state.playing).toBe(false);
+    sub.dispose();
+  });
+
+  it('blur pause drops its stale state write when pause synchronously opens project B', () => {
+    const sample = createSampleProject();
+    editor.openProject({ ...sample, uri: 'lumora://recording-blur-a', tracks: [] });
+    mount();
+    act(() => live().startRecording('sample-camera'));
+    const projectB = { ...sample, uri: 'lumora://recording-blur-b', tracks: [] };
+    const sub = live().timeline.events.on('state:changed', ({ playing }) => {
+      if (!playing && editor.getProject()?.uri !== projectB.uri) editor.openProject(projectB);
+    });
+
+    act(() => window.dispatchEvent(new Event('blur')));
+
+    expect(editor.getProject()?.uri).toBe(projectB.uri);
+    expect(live().recorder.active).toBe(false);
+    expect(live().timeline.isPlaying()).toBe(false);
+    expect(live().state.recording).toBe(false);
+    expect(live().state.recordingPaused).toBe(false);
+    expect(live().state.playing).toBe(false);
+    sub.dispose();
+  });
+
   it('录制绑定项目身份：录制中切换到另一项目 → 立即取消，样本不写入新项目（审查第 7 项）', () => {
     mount();
     act(() => live().startRecording('sample-camera'));

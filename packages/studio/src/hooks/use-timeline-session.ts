@@ -97,6 +97,26 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
    *  误判为同一会话） */
   const recordedSessionTokenRef = useRef<number | null>(null);
   const recordedProjectUriRef = useRef<string | null>(null);
+  /** 录制动作代：begin/resume/pause 内部 timeline 调用会同步发事件，监听器可在
+   *  调用返回前切换项目或执行另一录制动作。只有仍持有当前代、会话和机位的
+   *  外层动作才允许写 React 状态。 */
+  const recordingOperationGenerationRef = useRef(0);
+  type RecordingOperation = { generation: number; sessionToken: number; cameraId: string };
+  const captureRecordingOperation = useCallback(
+    (cameraId: string): RecordingOperation => ({
+      generation: ++recordingOperationGenerationRef.current,
+      sessionToken: editor.getSessionToken(),
+      cameraId,
+    }),
+    [editor],
+  );
+  const isRecordingOperationCurrent = useCallback(
+    (operation: RecordingOperation): boolean =>
+      recordingOperationGenerationRef.current === operation.generation &&
+      editor.isCurrentSession(operation.sessionToken) &&
+      recorder.recordingCameraId === operation.cameraId,
+    [editor, recorder],
+  );
 
   /** 项目变更：新开/关闭项目重置播放头；时长随轨道/分镜变化收敛（录制中除外）。
    *  录制中的项目身份变化（直接切换项目/重开）或绑定机位被删除 → 取消录制并
@@ -115,6 +135,7 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     }
     const cancelRecording = () => {
       if (!recorder.active) return;
+      recordingOperationGenerationRef.current += 1;
       recorder.stop();
       recordedSessionTokenRef.current = null;
       recordedProjectUriRef.current = null;
@@ -228,9 +249,12 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     const pauseOnHidden = () => {
       const r = recorderRef.current!;
       if (r.active && !r.isPaused) {
+        const operation = captureRecordingOperation(r.recordingCameraId!);
         r.pause();
         timelineRef.current!.pause();
-        setState((s) => ({ ...s, recordingPaused: true, playing: false }));
+        if (isRecordingOperationCurrent(operation)) {
+          setState((s) => ({ ...s, recordingPaused: true, playing: false }));
+        }
       } else if (timelineRef.current!.isPlaying()) {
         timelineRef.current!.pause();
       }
@@ -241,32 +265,46 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       window.removeEventListener('blur', pauseOnHidden);
       document.removeEventListener('visibilitychange', pauseOnHidden);
     };
-  }, []);
+  }, [captureRecordingOperation, isRecordingOperationCurrent]);
 
   const togglePlay = useCallback(() => {
     if (recorder.active) {
       // 录制期间播放键 = 暂停/恢复录制（采样随播放头一起停）
       if (recorder.isPaused) {
+        const cameraId = recorder.recordingCameraId!;
+        const operation = captureRecordingOperation(cameraId);
         recorder.resume();
         timeline.play();
-        setState((s) => ({ ...s, recordingPaused: false, playing: true }));
+        if (isRecordingOperationCurrent(operation)) {
+          setState((s) => ({ ...s, recording: true, recordingPaused: false, playing: true }));
+        }
       } else {
+        const cameraId = recorder.recordingCameraId!;
+        const operation = captureRecordingOperation(cameraId);
         recorder.pause();
         timeline.pause();
-        setState((s) => ({ ...s, recordingPaused: true, playing: false }));
+        if (isRecordingOperationCurrent(operation)) {
+          setState((s) => ({ ...s, recording: true, recordingPaused: true, playing: false }));
+        }
       }
       return;
     }
     timeline.togglePlay();
-  }, [recorder, timeline]);
+  }, [captureRecordingOperation, isRecordingOperationCurrent, recorder, timeline]);
 
   const pause = useCallback(() => {
     if (recorder.active) {
+      const cameraId = recorder.recordingCameraId!;
+      const operation = captureRecordingOperation(cameraId);
       recorder.pause();
-      setState((s) => ({ ...s, recordingPaused: true, playing: false }));
+      timeline.pause();
+      if (isRecordingOperationCurrent(operation)) {
+        setState((s) => ({ ...s, recording: true, recordingPaused: true, playing: false }));
+      }
+      return;
     }
     timeline.pause();
-  }, [recorder, timeline]);
+  }, [captureRecordingOperation, isRecordingOperationCurrent, recorder, timeline]);
 
   const seek = useCallback(
     (time: number, snapOverride?: boolean) => timeline.seek(time, snapOverride),
@@ -296,10 +334,13 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       recorder.start(cameraObjectId, projectUri);
       recordedSessionTokenRef.current = sessionToken;
       recordedProjectUriRef.current = projectUri;
+      const operation = captureRecordingOperation(cameraObjectId);
       timeline.play();
-      setState((s) => ({ ...s, recording: true, recordingPaused: false }));
+      if (isRecordingOperationCurrent(operation)) {
+        setState((s) => ({ ...s, recording: true, recordingPaused: false }));
+      }
     },
-    [editor, recorder, timeline],
+    [captureRecordingOperation, editor, isRecordingOperationCurrent, recorder, timeline],
   );
 
   /** 覆盖确认时重验：等待期间目标可能已被删除或会话已切换（审查第 7 项；
@@ -325,9 +366,13 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     (cameraObjectId: string) => {
       if (recorder.active) {
         if (recorder.isPaused) {
+          const cameraId = recorder.recordingCameraId!;
+          const operation = captureRecordingOperation(cameraId);
           recorder.resume();
           timeline.play();
-          setState((s) => ({ ...s, recordingPaused: false, playing: true }));
+          if (isRecordingOperationCurrent(operation)) {
+            setState((s) => ({ ...s, recording: true, recordingPaused: false, playing: true }));
+          }
         }
         return;
       }
@@ -348,7 +393,7 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       }
       beginRecording(cameraObjectId);
     },
-    [editor, recorder, timeline, beginRecording],
+    [captureRecordingOperation, editor, isRecordingOperationCurrent, recorder, timeline, beginRecording],
   );
 
   const cancelOverwrite = useCallback(() => {
@@ -358,14 +403,19 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
 
   const resumeRecording = useCallback(() => {
     if (recorder.active && recorder.isPaused) {
+      const cameraId = recorder.recordingCameraId!;
+      const operation = captureRecordingOperation(cameraId);
       recorder.resume();
       timeline.play();
-      setState((s) => ({ ...s, recordingPaused: false, playing: true }));
+      if (isRecordingOperationCurrent(operation)) {
+        setState((s) => ({ ...s, recording: true, recordingPaused: false, playing: true }));
+      }
     }
-  }, [recorder, timeline]);
+  }, [captureRecordingOperation, isRecordingOperationCurrent, recorder, timeline]);
 
   const stopRecording = useCallback(() => {
     if (!recorder.active) return;
+    recordingOperationGenerationRef.current += 1;
     // 录制绑定会话令牌已过期（项目切换/重开，含同 URI 重开）→ 仅停止并丢弃
     // 样本：更早注册的 listener 在 project:changed 同步阶段触达 stopRecording
     // 时，本 hook 的取消分支尚未执行，此检查兜底旧会话样本不进入新项目

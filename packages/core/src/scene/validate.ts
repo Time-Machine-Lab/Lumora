@@ -312,25 +312,27 @@ export function validateProjectSchema(project: unknown): string | null {
     }
   }
   // 交叉引用（TML-88）：轨道 objectId 必须指向项目内已注册对象
-  const objectIds = new Set<string>(p.objects.map((object) => object.id));
+  // 无轨道且所有分镜均未绑定机位时没有对象引用可查，避免普通场景提交为
+  // 空时间线无条件构建索引；一旦存在引用，轨道与分镜共享同一个 Map。
+  const hasObjectReferences =
+    p.tracks.length > 0 || p.shots.some((shot) => shot.cameraObjectId !== null);
+  const objectsById = hasObjectReferences
+    ? new Map<string, SceneObjectData>(p.objects.map((object) => [object.id, object]))
+    : undefined;
   for (const track of p.tracks) {
-    if (!objectIds.has(track.objectId)) {
+    const object = objectsById!.get(track.objectId);
+    if (!object) {
       return `轨道引用不存在的对象（${track.objectId}）`;
     }
     // 焦距通道只能绑定相机对象（TML-52 审查第 8 项：fov 推导需要相机载荷）
-    if (track.targetPath === 'focalLength') {
-      const object = p.objects.find((o) => o.id === track.objectId);
-      if (!object || object.type !== 'camera') {
-        return `焦距轨道绑定非相机对象（${track.objectId}）`;
-      }
+    if (track.targetPath === 'focalLength' && object.type !== 'camera') {
+      return `焦距轨道绑定非相机对象（${track.objectId}）`;
     }
   }
   // 交叉引用（TML-52）：分镜 cameraObjectId 必须指向项目内已注册的相机对象
   for (const shot of p.shots) {
     if (shot.cameraObjectId === null) continue;
-    const camera = objectIds.has(shot.cameraObjectId)
-      ? p.objects.find((object) => object.id === shot.cameraObjectId)
-      : undefined;
+    const camera = objectsById!.get(shot.cameraObjectId);
     if (!camera || camera.type !== 'camera') {
       return `分镜「${shot.name}」引用不存在的机位（${shot.cameraObjectId}）`;
     }

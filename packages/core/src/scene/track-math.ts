@@ -322,7 +322,7 @@ function rotationDeviationToSegment(sample: TrackSample, a: TrackSample, b: Trac
  * 采样简化（RDP 抽稀）：始终保留首尾样本，递归剔除与「两端连线的插值」偏差
  * 不超过容差的中间样本（rotation 通道按 slerp 角距离判定，与回放求值同源，
  * 其余按欧氏距离/绝对值）。结果保持时间升序；输入须已按时间升序（非法输入
- * 原样返回防御）。递归深度受样本数限制（最坏 O(n) 栈深，n 为 5s@60Hz≈300 级）。
+ * 原样返回防御）。区间使用显式工作栈，避免长录制的 O(n) 调用栈溢出。
  */
 export function simplifySamples(samples: TrackSample[], options: SimplifyOptions = {}): TrackSample[] {
   if (samples.length <= 2) return [...samples];
@@ -332,9 +332,13 @@ export function simplifySamples(samples: TrackSample[], options: SimplifyOptions
   const scalar = typeof samples[0]!.value === 'number';
   const epsilon = scalar ? options.scalarEpsilon ?? DEFAULT_SCALAR_EPSILON : options.vecEpsilon ?? DEFAULT_VEC_EPSILON;
   const isRotation = options.channel === 'rotation';
-  const kept: TrackSample[] = [samples[0]!];
+  const kept = new Uint8Array(samples.length);
+  kept[0] = 1;
+  kept[samples.length - 1] = 1;
+  const intervals: Array<[start: number, end: number]> = [[0, samples.length - 1]];
 
-  const rdp = (start: number, end: number): void => {
+  while (intervals.length > 0) {
+    const [start, end] = intervals.pop()!;
     let maxDeviation = 0;
     let maxIndex = -1;
     for (let i = start + 1; i < end; i += 1) {
@@ -346,13 +350,10 @@ export function simplifySamples(samples: TrackSample[], options: SimplifyOptions
         maxIndex = i;
       }
     }
-    if (maxIndex === -1 || maxDeviation <= epsilon) return;
-    rdp(start, maxIndex);
-    kept.push(samples[maxIndex]!);
-    rdp(maxIndex, end);
-  };
+    if (maxIndex === -1 || maxDeviation <= epsilon) continue;
+    kept[maxIndex] = 1;
+    intervals.push([start, maxIndex], [maxIndex, end]);
+  }
 
-  rdp(0, samples.length - 1);
-  kept.push(samples[samples.length - 1]!);
-  return kept;
+  return samples.filter((_, index) => kept[index] === 1);
 }

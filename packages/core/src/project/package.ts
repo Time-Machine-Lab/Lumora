@@ -97,12 +97,16 @@ export type PackageParseResult =
   | { ok: false; error: PackageImportError };
 
 /** 导入资源上限（防御性基准，超限一律拒绝，防止解码/结构攻击）：
- *  单资产解码字节、单包累计解码字节、外部分件数、资产数、对象数、层级深度。 */
+ *  单资产解码字节、单包累计解码字节、外部分件数、资产数、对象数、时间线基数与层级深度。 */
 export const MAX_ASSET_PAYLOAD_BYTES = 512 * 1024 * 1024;
 export const MAX_TOTAL_PAYLOAD_BYTES = 1024 * 1024 * 1024;
 export const MAX_ASSET_PARTS = 512;
 export const MAX_ASSETS_PER_PROJECT = 1000;
 export const MAX_OBJECTS_PER_PROJECT = 50000;
+export const MAX_TRACKS_PER_PROJECT = 50000;
+export const MAX_SHOTS_PER_PROJECT = 10000;
+export const MAX_KEYFRAMES_PER_TRACK = 100000;
+export const MAX_TOTAL_KEYFRAMES = 1000000;
 export const MAX_SCENE_DEPTH = 256;
 
 /** 解析限额覆盖（缺省 = 上方常量）。测试注入小预算以验证限额行为；生产不传。 */
@@ -112,6 +116,10 @@ export interface PackageParseLimits {
   maxAssetParts?: number;
   maxAssetsPerProject?: number;
   maxObjectsPerProject?: number;
+  maxTracksPerProject?: number;
+  maxShotsPerProject?: number;
+  maxKeyframesPerTrack?: number;
+  maxTotalKeyframes?: number;
   maxSceneDepth?: number;
 }
 
@@ -1473,6 +1481,10 @@ export async function parseProjectPackage(
   const maxAssetParts = limits.maxAssetParts ?? MAX_ASSET_PARTS;
   const maxAssetsPerProject = limits.maxAssetsPerProject ?? MAX_ASSETS_PER_PROJECT;
   const maxObjectsPerProject = limits.maxObjectsPerProject ?? MAX_OBJECTS_PER_PROJECT;
+  const maxTracksPerProject = limits.maxTracksPerProject ?? MAX_TRACKS_PER_PROJECT;
+  const maxShotsPerProject = limits.maxShotsPerProject ?? MAX_SHOTS_PER_PROJECT;
+  const maxKeyframesPerTrack = limits.maxKeyframesPerTrack ?? MAX_KEYFRAMES_PER_TRACK;
+  const maxTotalKeyframes = limits.maxTotalKeyframes ?? MAX_TOTAL_KEYFRAMES;
   const maxSceneDepth = limits.maxSceneDepth ?? MAX_SCENE_DEPTH;
   let parsed: unknown;
   try {
@@ -1526,7 +1538,30 @@ export async function parseProjectPackage(
     return failure('invalid-project', '迁移后的项目数据不是对象');
   }
 
-  // 资源上限：对象数 / 层级深度 / 资产数
+  // 时间线预算必须先于层级、资产和 schema 深遍历。这里只做数组长度与浅层
+  // keyframes 长度读取；畸形条目仍交给后续 schema 校验给出结构错误。
+  if (Array.isArray(project.tracks) && project.tracks.length > maxTracksPerProject) {
+    return failure('too-large', `工程包轨道数超过上限（${project.tracks.length} > ${maxTracksPerProject}），无法导入`);
+  }
+  if (Array.isArray(project.shots) && project.shots.length > maxShotsPerProject) {
+    return failure('too-large', `工程包分镜数超过上限（${project.shots.length} > ${maxShotsPerProject}），无法导入`);
+  }
+  let totalKeyframes = 0;
+  if (Array.isArray(project.tracks)) {
+    for (const track of project.tracks) {
+      if (!isPlainRecord(track) || !Array.isArray(track.keyframes)) continue;
+      const count = track.keyframes.length;
+      if (count > maxKeyframesPerTrack) {
+        return failure('too-large', `工程包单轨关键帧数超过上限（${count} > ${maxKeyframesPerTrack}），无法导入`);
+      }
+      totalKeyframes += count;
+      if (totalKeyframes > maxTotalKeyframes) {
+        return failure('too-large', `工程包关键帧总数超过上限（${totalKeyframes} > ${maxTotalKeyframes}），无法导入`);
+      }
+    }
+  }
+
+  // 其他资源上限：对象数 / 层级深度 / 资产数
   if (Array.isArray(project.objects) && project.objects.length > maxObjectsPerProject) {
     return failure('too-large', `工程包对象数超过上限（${project.objects.length} > ${maxObjectsPerProject}），无法导入`);
   }

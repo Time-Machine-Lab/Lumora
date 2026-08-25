@@ -142,7 +142,11 @@ export {
   PUBLIC_PROJECT_FIELDS,
   buildProjectPackage,
   estimatePackageBytes,
+  MAX_KEYFRAMES_PER_TRACK,
   MAX_PACKAGE_TEXT_BYTES,
+  MAX_SHOTS_PER_PROJECT,
+  MAX_TOTAL_KEYFRAMES,
+  MAX_TRACKS_PER_PROJECT,
   parseProjectPackage,
   serializeProjectPackage,
 } from './project/package';
