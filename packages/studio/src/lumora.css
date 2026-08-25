@@ -915,6 +915,13 @@
   z-index: 30;
 }
 
+.lumora-studio--portal {
+  width: auto;
+  height: auto;
+  min-height: 0;
+  overflow: visible;
+}
+
 .lumora-timeline__modal {
   background: var(--lumora-surface-2);
   border: 1px solid var(--lumora-border);

@@ -219,6 +219,24 @@ describe('TimelineController：播放/暂停与 tick 推进', () => {
     expect(timeline.getTime()).toBe(4);
   });
 
+  it('non-loop endpoint keeps a synchronous time-listener restart as the latest state', () => {
+    const timeline = new TimelineController({ duration: 4, loop: false });
+    timeline.seek(3.8, false);
+    const states: boolean[] = [];
+    timeline.events.on('time:changed', ({ time }) => {
+      if (time === 4) timeline.play();
+    });
+    timeline.events.on('state:changed', ({ playing }) => states.push(playing));
+    timeline.play();
+
+    const returned = timeline.tick(0.5);
+
+    expect(returned).toBe(0);
+    expect(timeline.getTime()).toBe(0);
+    expect(timeline.isPlaying()).toBe(true);
+    expect(states).toEqual([true, true]);
+  });
+
   it('暂停时 tick 不推进', () => {
     const timeline = new TimelineController({ duration: 10 });
     timeline.play();

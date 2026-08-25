@@ -131,6 +131,38 @@ async function expectShotLeft(page: Page, shotId: string, expectedPx: number): P
   expect(Math.abs(actual - expectedPx)).toBeLessThan(1);
 }
 
+test('overwrite confirmation portal retains resolved Studio theme styles', async ({ page }) => {
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('timeline-record').click();
+  const overlay = page.getByTestId('overwrite-confirm');
+  await expect(overlay).toBeVisible();
+
+  const styles = await overlay.evaluate((element) => {
+    const overlayStyle = getComputedStyle(element);
+    const modal = element.querySelector<HTMLElement>('.lumora-timeline__modal')!;
+    const button = modal.querySelector<HTMLElement>('.lumora-button')!;
+    const modalStyle = getComputedStyle(modal);
+    const buttonStyle = getComputedStyle(button);
+    return {
+      surfaceVariable: overlayStyle.getPropertyValue('--lumora-surface-2').trim(),
+      modalBackground: modalStyle.backgroundColor,
+      modalBorderStyle: modalStyle.borderTopStyle,
+      modalBorderWidth: modalStyle.borderTopWidth,
+      buttonBackground: buttonStyle.backgroundColor,
+      buttonBorderStyle: buttonStyle.borderTopStyle,
+      buttonColor: buttonStyle.color,
+    };
+  });
+  expect(styles.surfaceVariable).toBe('#232734');
+  expect(styles.modalBackground).not.toBe('rgba(0, 0, 0, 0)');
+  expect(styles.modalBorderStyle).toBe('solid');
+  expect(styles.modalBorderWidth).toBe('1px');
+  expect(styles.buttonBackground).not.toBe('rgba(0, 0, 0, 0)');
+  expect(styles.buttonBorderStyle).toBe('solid');
+  expect(styles.buttonColor).not.toBe('rgba(0, 0, 0, 0)');
+  await page.getByText('取消').click();
+});
+
 test('AC1 浏览器级：真实约 5s 持续驾驶录制 → 抽稀覆盖轨道 → 晚段位姿 late delta + 两次回放同一确定终点严格一致', async ({ page }) => {
   await page.getByTestId('view-mode-select').selectOption('sample-camera'); // 主摄像机 POV
   await startRecording(page);
@@ -192,52 +224,32 @@ test('AC1 浏览器级：真实约 5s 持续驾驶录制 → 抽稀覆盖轨道 
   expect(Math.abs(pose45.rotation[0]! - pose40.rotation[0]!)).toBeLessThan(0.05); // 驾驶仅平移
   expect(p45.equals(p40)).toBe(false);
 
-  // 第一次回放：播放推进 → 暂停 → 立即读取位姿/画面（勿先 seek 回精确时刻）
-  await seekByRuler(page, 0.02, zoom);
-  await page.getByTestId('timeline-play').click();
-  await page.waitForTimeout(800);
-  await page.getByTestId('timeline-play').click(); // 暂停
-  const tA = await timeSeconds(page);
-  expect(tA).toBeGreaterThan(0.6);
-  const poseA = await cameraPose(page);
-  const pA = await canvasShot(page);
-  // 位姿数值已离开起点（录制后段位移可测：z 位移 > 0.5m）；画面与起点不同
-  expect(Math.abs(poseA.position[2]! - pose0.position[2]!)).toBeGreaterThan(0.5);
-  expect(pA.equals(s0)).toBe(false);
+  // Two independent real playbacks: start at zero, run to the natural non-looping
+  // endpoint, and read immediately. No endpoint seek is allowed in this helper.
+  await page.getByTestId('timeline-loop').setChecked(false);
+  const playToNaturalEnd = async () => {
+    await seekByRuler(page, 0, zoom);
+    await expect(page.getByTestId('timeline-time')).toHaveText('00:00.00');
+    const play = page.getByTestId('timeline-play');
+    await play.click();
+    await expect(play).toHaveAttribute('title', '暂停（空格）');
+    await expect(play).toHaveAttribute('title', '播放（空格）', { timeout: 10_000 });
+    const endTime = await timeSeconds(page);
+    expect(Math.abs(endTime - lastKfTime)).toBeLessThan(0.08);
+    const pose = await cameraPose(page);
+    const pixels = await canvasShot(page);
+    return { endTime, pose, pixels };
+  };
 
-  // 第二次回放：同样从起点播放 → 暂停点一致（回放时钟 1:1）
-  await seekByRuler(page, 0.02, zoom);
-  await page.getByTestId('timeline-play').click();
-  await page.waitForTimeout(800);
-  await page.getByTestId('timeline-play').click();
-  const tB = await timeSeconds(page);
-  const poseB = await cameraPose(page);
-  const pB = await canvasShot(page);
-  expect(Math.abs(tB - tA)).toBeLessThan(0.3);
-
-  // 两次暂停的数值位姿一致：每轴容差覆盖 ≤0.3s × 2.5m/s 的推进差（+采样误差）
-  for (let i = 0; i < 3; i += 1) {
-    expect(Math.abs(poseB.position[i]! - poseA.position[i]!)).toBeLessThan(0.9);
-    expect(Math.abs(poseB.rotation[i]! - poseA.rotation[i]!)).toBeLessThan(0.05);
-  }
-  // 两次暂停的画面一致（像素差异比例小，而非逐像素相等 —— 两帧相隔 ≤0.3s）
-  const diff = await pixelDiffRatio(page, pA, pB);
-  expect(diff).toBeLessThan(0.15);
-
-  // 收紧（复审阻断 5）：两次回放都驱动到同一确定终点（4.0s）后严格比较 ——
-  // 同一 seek 输入（吸附关闭坐标精确、滚动位置确定性设置）→ 两次落点逐位
-  // 一致，位姿必须完全相等、画面近乎逐像素一致。修复前容差式断言
-  // （|Δt|<0.3s、位置<0.9m、像素<15%）可放过明显不同的停帧
-  await seekByRuler(page, 4.0, zoom);
-  const poseA4 = await cameraPose(page);
-  const pA4 = await canvasShot(page);
-  await seekByRuler(page, 4.0, zoom);
-  const poseB4 = await cameraPose(page);
-  const pB4 = await canvasShot(page);
-  expect(poseB4.position).toEqual(poseA4.position);
-  expect(poseB4.rotation).toEqual(poseA4.rotation);
-  expect(poseB4.focalLength).toEqual(poseA4.focalLength);
-  const diffEnd = await pixelDiffRatio(page, pA4, pB4);
+  const runA = await playToNaturalEnd();
+  expect(Math.abs(runA.pose.position[2]! - pose0.position[2]!)).toBeGreaterThan(0.5);
+  expect(runA.pixels.equals(s0)).toBe(false);
+  const runB = await playToNaturalEnd();
+  expect(runB.endTime).toBe(runA.endTime);
+  expect(runB.pose.position).toEqual(runA.pose.position);
+  expect(runB.pose.rotation).toEqual(runA.pose.rotation);
+  expect(runB.pose.focalLength).toEqual(runA.pose.focalLength);
+  const diffEnd = await pixelDiffRatio(page, runA.pixels, runB.pixels);
   expect(diffEnd).toBeLessThan(0.01);
 });
 

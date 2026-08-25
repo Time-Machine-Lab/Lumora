@@ -7,8 +7,8 @@ import type { RefObject } from 'react';
 import {
   TIMELINE_LABEL_WIDTH,
   TimelinePanel,
-  projectContentFingerprint,
 } from '../src/components/editor/TimelinePanel';
+import { projectContentFingerprint } from '../src/components/editor/timeline-thumbnail-cache';
 import { TimelineRecorder } from '../src/components/editor/timeline-recorder';
 import type { TimelineSession, TimelineSessionState } from '../src/hooks/use-timeline-session';
 
@@ -53,9 +53,14 @@ function baseState(): TimelineSessionState {
 }
 
 /** 每次调用独立挂载；同一测试内多个场景必须先 unmount() 上一棵再挂载（screen 查询作用于最新渲染树） */
-function mountPanel(overrides: Partial<TimelineSession> = {}, selection: string[] = [], captureReady = false) {
+function mountPanel(
+  overrides: Partial<TimelineSession> = {},
+  selection: string[] = [],
+  captureReady = false,
+  initialProject = makeProject(),
+) {
   const editor = new SceneEditor();
-  const project = makeProject();
+  const project = initialProject;
   editor.openProject(project);
   const timeline = new TimelineController();
   timeline.setDuration(3);
@@ -371,6 +376,90 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     );
     raf.mockRestore();
   });
+
+  it('same-session active-scene switch and render-content settlement each invalidate every thumbnail', async () => {
+    const raf = vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+    const project = {
+      ...makeProject(),
+      scenes: [
+        ...makeProject().scenes,
+        { id: 'scene-2', name: 'Scene 2', rootObjectIds: [], activeCameraId: null },
+      ],
+    };
+    let count = 0;
+    const capture = vi.fn(() => `data:image/png;base64,generation-${(count += 1)}`);
+    const view = mountPanel({}, [], false, project);
+    view.captureRef.current = capture;
+    const renderPanel = (captureGeneration: number) => (
+      <TimelinePanel
+        session={view.session}
+        editor={view.editor}
+        project={view.editor.getProject()!}
+        selection={[]}
+        captureRef={view.captureRef}
+        captureReady
+        captureGeneration={captureGeneration}
+      />
+    );
+
+    view.rerender(renderPanel(0));
+    await act(async () => {});
+    expect(capture).toHaveBeenCalledTimes(3);
+
+    act(() => view.editor.setActiveScene('scene-2'));
+    view.rerender(renderPanel(0));
+    await act(async () => {});
+    expect(capture).toHaveBeenCalledTimes(6);
+    expect(screen.getByTestId('shot-block-s1').querySelector('img')?.getAttribute('src')).toBe(
+      'data:image/png;base64,generation-4',
+    );
+
+    view.rerender(renderPanel(1));
+    await act(async () => {});
+    expect(capture).toHaveBeenCalledTimes(9);
+    expect(screen.getByTestId('shot-block-s1').querySelector('img')?.getAttribute('src')).toBe(
+      'data:image/png;base64,generation-7',
+    );
+    raf.mockRestore();
+  });
+
+  it('does not cache transient null captures and retries after a later render generation', async () => {
+    const raf = vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+    const capture = vi.fn<() => string | null>(() => null);
+    const view = mountPanel();
+    view.captureRef.current = capture;
+    const renderPanel = (captureGeneration: number) => (
+      <TimelinePanel
+        session={view.session}
+        editor={view.editor}
+        project={view.project}
+        selection={[]}
+        captureRef={view.captureRef}
+        captureReady
+        captureGeneration={captureGeneration}
+      />
+    );
+
+    view.rerender(renderPanel(0));
+    await act(async () => {});
+    expect(capture).toHaveBeenCalledTimes(9);
+    expect(screen.getByTestId('shot-block-s1').querySelector('img')).toBeNull();
+
+    capture.mockImplementation(() => 'data:image/png;base64,recovered');
+    view.rerender(renderPanel(1));
+    await act(async () => {});
+    expect(capture).toHaveBeenCalledTimes(12);
+    expect(screen.getByTestId('shot-block-s1').querySelector('img')?.getAttribute('src')).toBe(
+      'data:image/png;base64,recovered',
+    );
+    raf.mockRestore();
+  });
 });
 
 describe('projectContentFingerprint：缩略图失效代', () => {
@@ -412,5 +501,17 @@ describe('projectContentFingerprint：缩略图失效代', () => {
     expect(projectContentFingerprint(assetPayload)).not.toBe(projectContentFingerprint(project));
     // payload/storageRef 不计入 → 同内容不同载荷/引用指纹一致
     expect(projectContentFingerprint(storageRefOnly)).toBe(projectContentFingerprint(assetPayload));
+  });
+
+  it('includes activeSceneId even when every scene and object record is unchanged', () => {
+    const project = {
+      ...makeProject(),
+      scenes: [
+        ...makeProject().scenes,
+        { id: 'scene-2', name: 'Scene 2', rootObjectIds: [], activeCameraId: null },
+      ],
+    };
+    const switched = { ...project, activeSceneId: 'scene-2' };
+    expect(projectContentFingerprint(switched)).not.toBe(projectContentFingerprint(project));
   });
 });

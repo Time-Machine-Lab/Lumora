@@ -51,6 +51,7 @@ export class TimelineController {
 
   private time = 0;
   private playing = false;
+  private stateGeneration = 0;
   private fps: number;
   private duration: number;
   private zoom: number;
@@ -115,6 +116,7 @@ export class TimelineController {
     if (this.time > next) this.seek(next);
     if (next === 0 && this.playing) {
       this.playing = false;
+      this.stateGeneration += 1;
       // latest-wins（复审一般 6）：状态事件 —— 监听器同步重入 pause 时外层陈旧
       // payload 立即作废，剩余监听器不得收到 [false,true] 镜像
       this.events.emit('state:changed', { playing: false }, { latestWins: true });
@@ -166,12 +168,14 @@ export class TimelineController {
     // state:changed(true)（TML-52 复审一般项 5）
     if (this.playing || this.duration <= 0) return;
     this.playing = true;
+    this.stateGeneration += 1;
     this.events.emit('state:changed', { playing: true }, { latestWins: true });
   }
 
   pause(): void {
     if (!this.playing) return;
     this.playing = false;
+    this.stateGeneration += 1;
     this.events.emit('state:changed', { playing: false }, { latestWins: true });
   }
 
@@ -193,10 +197,13 @@ export class TimelineController {
       } else {
         next = this.duration;
         this.playing = false;
+        const stopGeneration = ++this.stateGeneration;
         this.time = next;
         this.emitTime();
-        this.events.emit('state:changed', { playing: false }, { latestWins: true });
-        return next;
+        if (this.stateGeneration === stopGeneration) {
+          this.events.emit('state:changed', { playing: false }, { latestWins: true });
+        }
+        return this.time;
       }
     }
     this.time = next;

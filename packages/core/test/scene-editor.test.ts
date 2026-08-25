@@ -48,9 +48,12 @@ describe('SceneEditor：项目生命周期', () => {
     const listener = vi.fn();
     editor.events.on('project:changed', listener);
     editor.openProject(createSampleProject());
-    expect(listener).toHaveBeenLastCalledWith({ project: expect.objectContaining({ name: '示例项目' }) });
+    expect(listener).toHaveBeenLastCalledWith({
+      project: expect.objectContaining({ name: '示例项目' }),
+      sessionToken: 1,
+    });
     editor.reset();
-    expect(listener).toHaveBeenLastCalledWith({ project: null });
+    expect(listener).toHaveBeenLastCalledWith({ project: null, sessionToken: 2 });
   });
 });
 

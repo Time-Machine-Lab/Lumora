@@ -39,7 +39,7 @@ export type Result<T = void> =
   | { ok: false; error: Error };
 
 export interface EditorEventMap {
-  'project:changed': { project: Project | null };
+  'project:changed': { project: Project | null; sessionToken: number };
   'selection:changed': { ids: string[] };
   'history:changed': {
     canUndo: boolean;
@@ -1300,7 +1300,7 @@ export class SceneEditor {
 
   /** 固定顺序广播当前状态快照：project → selection → view */
   private emitProjectEvents(): void {
-    this.events.emit('project:changed', { project: this.project });
+    this.events.emit('project:changed', { project: this.project, sessionToken: this.sessionToken });
     this.events.emit('selection:changed', { ids: this.getSelection() });
     this.events.emit('view:changed', { view: this.getView() });
   }

@@ -121,8 +121,10 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       setState((s) => ({ ...s, recording: false, recordingPaused: false }));
     };
     const subs = [
-      editor.events.on('project:changed', ({ project }) => {
-        const sessionToken = editor.getSessionToken();
+      editor.events.on('project:changed', ({ project, sessionToken }) => {
+        // An earlier listener may synchronously open or edit another project.
+        // Never combine an old payload with the current editor session.
+        if (sessionToken !== editor.getSessionToken() || project !== editor.getProject()) return;
         // 会话令牌变化（打开/重开/重置项目）→ 覆盖确认作废：新项目的同 ID
         // 相机不得在旧确认下误启动录制（复审阻断 3）
         if (

@@ -230,6 +230,34 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     expect(live().timeline.getTime()).toBe(0);
   });
 
+  it('drops an outer project event when an earlier listener synchronously opens a newer session', () => {
+    const projectB = {
+      ...createSampleProject(),
+      uri: 'lumora://project-b',
+      settings: { ...createSampleProject().settings, fps: 24 },
+    };
+    const projectC = {
+      ...createSampleProject(),
+      uri: 'lumora://project-c',
+      settings: { ...createSampleProject().settings, fps: 60 },
+      tracks: [],
+      shots: [],
+    };
+    const earlySub = editor.events.on('project:changed', ({ project }) => {
+      if (project?.uri === projectB.uri) editor.openProject(projectC);
+    });
+    mount();
+
+    act(() => editor.openProject(projectB));
+
+    expect(editor.getProject()?.uri).toBe(projectC.uri);
+    expect(live().timeline.getFps()).toBe(60);
+    expect(live().timeline.getDuration()).toBe(0);
+    expect(live().state.fps).toBe(60);
+    expect(live().state.duration).toBe(0);
+    earlySub.dispose();
+  });
+
   it('更早注册的 project:changed listener 同步执行旧 confirm/stop → 入口自检拒绝，样本不写入新项目（复审阻断 3）', () => {
     // 先于 hook 内部 listener 注册：openProject 同步分发 project:changed 时本
     // listener 先执行，hook 的取消分支尚未运行 —— 只能靠 confirm/stop 入口的

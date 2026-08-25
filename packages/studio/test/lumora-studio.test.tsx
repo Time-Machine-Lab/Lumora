@@ -639,6 +639,7 @@ describe('LumoraStudio：覆盖确认模态（复审阻断 4：全应用级模�
     fireEvent.click(screen.getByTestId('timeline-record'));
     expect(screen.getByTestId('overwrite-confirm')).toBeInTheDocument();
     expect(screen.getByTestId('overwrite-confirm')).toHaveAttribute('role', 'dialog');
+    expect(screen.getByTestId('overwrite-confirm')).toHaveClass('lumora-studio', 'lumora-studio--portal');
     // 整壳 inert：工具栏/对象树/视口/时间线整体不可达（修复前仅时间线内容 inert）
     expect(screen.getByTestId('lumora-studio')).toHaveAttribute('inert');
     // 打开后焦点进入首个可聚焦项

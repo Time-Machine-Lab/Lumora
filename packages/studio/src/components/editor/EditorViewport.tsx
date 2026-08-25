@@ -20,6 +20,7 @@ import {
 import { showToast } from './toasts';
 import { CameraDrive, captureCameraSample, DRIVE_KEY_CODES, restoreObjectOnNode } from './camera-drive';
 import { PlaybackDriver } from './PlaybackDriver';
+import { captureProjectFrame } from './frame-capture';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
 
 interface EditorViewportProps {
@@ -36,6 +37,8 @@ interface EditorViewportProps {
   /** 截图通道就绪通知（FrameCaptureBridge 挂载/卸载时回调；缩略图链据此
    *  启动，复审阻断 2） */
   onCaptureReady?: (ready: boolean) => void;
+  /** Scene tree or deferred model content changed and cached frames are stale. */
+  onRenderContentChange?: () => void;
 }
 
 /** 沿父链找到最近的对象 id（GLB 内容网格挂在模型组下，需要向上追溯）。
@@ -62,6 +65,7 @@ export function EditorViewport({
   session = null,
   captureRef: captureRefProp,
   onCaptureReady,
+  onRenderContentChange,
 }: EditorViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<THREE.Group | null>(null);
@@ -195,7 +199,13 @@ export function EditorViewport({
         <color attach="background" args={['#14161f']} />
         <ambientLight intensity={0.35} />
         <gridHelper args={[20, 20, '#3a3f52', '#2a2e3d']} />
-        <SceneContent editor={editor} rootRef={rootRef} project={project} cache={cache} />
+        <SceneContent
+          editor={editor}
+          rootRef={rootRef}
+          project={project}
+          cache={cache}
+          onRenderContentChange={onRenderContentChange}
+        />
         {cameraView && project && (
           <CameraRig rootRef={rootRef} cameraObjectId={cameraView} aspect={aspect} project={project} />
         )}
@@ -437,7 +447,6 @@ function FrameCaptureBridge({
   const gl = useThree((s) => s.gl);
   const scene = useThree((s) => s.scene);
   const camera = useThree((s) => s.camera);
-  const size = useThree((s) => s.size);
   useEffect(() => {
     captureRef.current = (cameraObjectId?: string | null) => {
       if (typeof gl.render !== 'function') return null;
@@ -448,14 +457,9 @@ function FrameCaptureBridge({
         if (cameraObjectId) {
           const node = rootRef.current ? findNode(rootRef.current, cameraObjectId) : null;
           if (!node || !(node instanceof THREE.PerspectiveCamera)) return null;
-          node.aspect = aspect;
-          node.updateProjectionMatrix();
           viewCamera = node;
         }
-        gl.setScissorTest(false);
-        gl.setViewport(0, 0, size.width, size.height);
-        gl.render(scene, viewCamera);
-        return gl.domElement.toDataURL('image/png');
+        return captureProjectFrame(gl, scene, viewCamera, aspect);
       } catch {
         return null;
       }
@@ -465,7 +469,7 @@ function FrameCaptureBridge({
       captureRef.current = null;
       onCaptureReady?.(false);
     };
-  }, [gl, scene, camera, size, captureRef, onCaptureReady, rootRef, aspect]);
+  }, [gl, scene, camera, captureRef, onCaptureReady, rootRef, aspect]);
   return null;
 }
 
@@ -474,11 +478,13 @@ function SceneContent({
   rootRef,
   project,
   cache,
+  onRenderContentChange,
 }: {
   editor: SceneEditor;
   rootRef: React.MutableRefObject<THREE.Group | null>;
   project: Project | null;
   cache: ContentCache;
+  onRenderContentChange?: () => void;
 }) {
   const scene = useThree((s) => s.scene);
   const prevProjectRef = useRef<Project | null>(null);
@@ -506,7 +512,10 @@ function SceneContent({
     const newSession = session !== sessionRef.current;
     if (current && prevProjectRef.current && !sceneSwitched && !newSession) {
       const { rebuiltModelIds, structuralChange } = syncScene(current, prevProjectRef.current, project, aspect);
-      if (structuralChange || rebuiltModelIds.length > 0) setContentVersion((v) => v + 1);
+      if (structuralChange || rebuiltModelIds.length > 0) {
+        setContentVersion((v) => v + 1);
+        onRenderContentChange?.();
+      }
     } else {
       // 切场景/新会话（或重建）：旧树节点整体释放，避免跨场景残留 GPU 资源
       if (current) {
@@ -518,9 +527,10 @@ function SceneContent({
       scene.add(root);
       sessionRef.current = session;
       setContentVersion((v) => v + 1);
+      onRenderContentChange?.();
     }
     prevProjectRef.current = project;
-  }, [project, scene, rootRef, editor]);
+  }, [project, scene, rootRef, editor, onRenderContentChange]);
 
   // 模型内容挂载：渲染消费者在使用期持有 lease（禁止裸资源旁路）——
   // 按「活动场景内 hash → 全部模型对象 id」映射，统一「先 retain，失败再 seed」：
@@ -556,10 +566,15 @@ function SceneContent({
         (gltf) => {
           // 失效守卫：lease 已释放（cleanup/缓存 dispose 撤销）或效应已重建后不再挂载
           if (!active || lease.isReleased) return;
+          let attached = false;
           for (const objectId of objectIds) {
             const node = findNode(root, objectId);
-            if (node) attachModelContent(node, gltf);
+            if (node) {
+              attachModelContent(node, gltf);
+              attached = true;
+            }
           }
+          if (attached) onRenderContentChange?.();
         },
         () => undefined,
       );
@@ -570,7 +585,7 @@ function SceneContent({
     };
     // contentVersion：身份分叉重建的模型（rebuiltModelIds）需要重新挂载内容；
     // attachModelContent 幂等（已有内容子树直接返回），全量重跑安全
-  }, [project, cache, rootRef, contentVersion]);
+  }, [project, cache, rootRef, contentVersion, onRenderContentChange]);
 
   // 项目变更后按 Project 全量 model→asset 关系清扫缓存（null=关闭项目，全部释放）
   useEffect(() => {

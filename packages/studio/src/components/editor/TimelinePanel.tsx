@@ -15,6 +15,7 @@ import { MAX_TIMELINE_ZOOM, MIN_TIMELINE_ZOOM } from '@lumora/core';
 import type { Project, SceneEditor } from '@lumora/core';
 import { findObject } from '@lumora/core';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
+import { projectContentFingerprint } from './timeline-thumbnail-cache';
 
 /** 标签列宽度：标尺/轨道/分镜共用，测试与坐标换算引用此常量 */
 export const TIMELINE_LABEL_WIDTH = 186;
@@ -30,6 +31,8 @@ export interface TimelinePanelProps {
   /** 截图通道就绪信号：FrameCaptureBridge 挂载后才置 true。仅改稳定 ref 的
    *  .current 不触发 effect 重跑，初载缩略图链须经此状态启动（复审阻断 2） */
   captureReady?: boolean;
+  /** Monotonic generation for scene-tree rebuilds and deferred render-content settlement. */
+  captureGeneration?: number;
 }
 
 const CHANNEL_LABELS: Record<string, string> = {
@@ -45,31 +48,6 @@ const CHANNEL_LABELS: Record<string, string> = {
  * 任何影响画面的编辑（对象变换、轨道关键帧、分镜绑定、画幅、资源替换）都会
  * 改变指纹 → 缩略图键换代 → 旧代键淘汰重截（复审阻断 2）。
  */
-export function projectContentFingerprint(project: Project): string {
-  const projection = {
-    settings: project.settings,
-    scenes: project.scenes,
-    objects: project.objects,
-    tracks: project.tracks,
-    shots: project.shots,
-    assets: project.assets.map((a) => ({
-      id: a.id,
-      kind: a.kind,
-      name: a.name,
-      format: a.format,
-      mime: a.mime,
-      hash: a.hash,
-      size: a.size,
-      source: a.source,
-    })),
-  };
-  let hash = 5381;
-  for (const char of JSON.stringify(projection)) {
-    hash = ((hash << 5) + hash + char.charCodeAt(0)) >>> 0;
-  }
-  return hash.toString(36);
-}
-
 /** 面板本地播放头订阅：tick 频率的时间镜像，不经过全局状态 */
 function usePlayheadTime(session: TimelineSession): number {
   const [time, setTime] = useState(() => session.timeline.getTime());
@@ -90,7 +68,15 @@ function formatTime(seconds: number): string {
   return `${String(minutes).padStart(2, '0')}:${secs.toFixed(2).padStart(5, '0')}`;
 }
 
-export function TimelinePanel({ session, editor, project, selection, captureRef, captureReady }: TimelinePanelProps) {
+export function TimelinePanel({
+  session,
+  editor,
+  project,
+  selection,
+  captureRef,
+  captureReady,
+  captureGeneration = 0,
+}: TimelinePanelProps) {
   const { timeline, state } = session;
   const time = usePlayheadTime(session);
   const zoom = state.zoom;
@@ -151,14 +137,14 @@ export function TimelinePanel({ session, editor, project, selection, captureRef,
   // 缩略图：串行截取缺失分镜（一次 seek → 双 RAF → capture → 下一分镜），
   // 链尾统一恢复播放头；播放/录制开始、外部 seek、项目切换或卸载 → 取消链，
   // 不再有陈旧 previous 互踩（TML-52 审查第 4 项）。
-  const [thumbs, setThumbs] = useState<Record<string, string | null>>({});
+  const [thumbs, setThumbs] = useState<Record<string, string>>({});
   const thumbChainRef = useRef<{ cancelled: boolean; seeking: boolean } | null>(null);
   // 失效代 = 会话令牌 + 项目内容指纹：任何影响画面的编辑或重开都会换代，旧代键
   // 不再命中且被淘汰（仅按 shot.id 键控时编辑后旧键永不过期，复审阻断 2）。
   // effect 与渲染共用同一派生，保证写入键与展示键一致
   const thumbGeneration = useMemo(
-    () => `${editor.getSessionToken()}:${projectContentFingerprint(project)}`,
-    [editor, project],
+    () => `${editor.getSessionToken()}:${projectContentFingerprint(project)}:${captureGeneration}`,
+    [editor, project, captureGeneration],
   );
 
   useEffect(() => {
@@ -214,13 +200,25 @@ export function TimelinePanel({ session, editor, project, selection, captureRef,
           chain.lastSeek = shot.startTime;
           moved = true;
         }
-        // 先等两帧、再在取消检查后执行 capture：被后继链替换的旧链若在帧回调
-        // 里直接截取，会与替代链重复截取同一分镜（帧间提交竞态）
-        await new Promise<void>((resolve) => {
-          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-        });
-        if (chain.cancelled) break;
-        setThumbs((m) => ({ ...m, [thumbKey(shot)]: capture(shot.cameraObjectId) }));
+        let dataUrl: string | null = null;
+        for (let attempt = 0; attempt < 3 && !chain.cancelled; attempt += 1) {
+          // A frame-delayed retry covers transient node/WebGL readiness without
+          // converting a null result into a permanent cache entry.
+          await new Promise<void>((resolve) => {
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+          });
+          if (chain.cancelled) break;
+          try {
+            const candidate = capture(shot.cameraObjectId);
+            if (typeof candidate === 'string' && candidate.startsWith('data:image/')) {
+              dataUrl = candidate;
+              break;
+            }
+          } catch {
+            // Retry within this generation; later generations can retry again.
+          }
+        }
+        if (dataUrl) setThumbs((m) => ({ ...m, [thumbKey(shot)]: dataUrl }));
       }
       // 链未被外部打断且确实移动过播放头 → 统一恢复一次（审查第 4 项）
       if (!chain.cancelled && moved) timeline.seek(previous, false);

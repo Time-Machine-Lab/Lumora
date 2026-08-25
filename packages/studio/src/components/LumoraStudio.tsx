@@ -198,6 +198,8 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   // （复审阻断 2：初载时 effect 早于 FrameCaptureBridge 挂载而空转）
   const [captureReady, setCaptureReady] = useState(false);
   const handleCaptureReady = useCallback((ready: boolean) => setCaptureReady(ready), []);
+  const [captureGeneration, setCaptureGeneration] = useState(0);
+  const handleRenderContentChange = useCallback(() => setCaptureGeneration((generation) => generation + 1), []);
 
   const cacheRef = useRef<ContentCache | null>(null);
   if (!cacheRef.current) cacheRef.current = new ContentCache();
@@ -457,6 +459,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
                   session={session}
                   captureRef={captureRef}
                   onCaptureReady={handleCaptureReady}
+                  onRenderContentChange={handleRenderContentChange}
                 />
               )}
               {!project && (
@@ -473,6 +476,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
                 selection={editorState.selection}
                 captureRef={captureRef}
                 captureReady={captureReady}
+                captureGeneration={captureGeneration}
               />
             )}
           </main>
@@ -489,7 +493,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       {session.state.overwritePending &&
         createPortal(
           <div
-            className="lumora-timeline__overlay"
+            className="lumora-studio lumora-studio--portal lumora-timeline__overlay"
             data-testid="overwrite-confirm"
             role="dialog"
             aria-modal="true"
