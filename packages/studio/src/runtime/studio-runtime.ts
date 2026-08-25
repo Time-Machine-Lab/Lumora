@@ -72,10 +72,10 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
   // 的 persistence，连接泄漏）
   let initPromise: Promise<void> | null = null;
   // 编辑器每次变更（提交/撤销/重做/打开/关闭）都同步宿主快照并广播给插件
-  const unsubscribe = editor.events.on('project:changed', ({ project }) => {
-    if (disposed) return;
+  const unsubscribe = editor.events.on('project:changed', ({ project, sessionToken }) => {
+    if (disposed || !editor.isCurrentSession(sessionToken) || project !== editor.getProject()) return;
     host.setProject(project);
-    host.events.emit('project:changed', { project });
+    host.events.emit('project:changed', { project }, { latestWins: true });
   });
   return {
     host,

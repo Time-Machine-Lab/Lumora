@@ -237,6 +237,24 @@ describe('TimelineController：播放/暂停与 tick 推进', () => {
     expect(states).toEqual([true, true]);
   });
 
+  it('later time listeners never receive a stale endpoint after an earlier listener restarts', () => {
+    const timeline = new TimelineController({ duration: 4, loop: false });
+    timeline.seek(3.8, false);
+    timeline.events.on('time:changed', ({ time }) => {
+      if (time === 4) timeline.play();
+    });
+    const observed: Array<{ payload: number; actual: number; playing: boolean }> = [];
+    timeline.events.on('time:changed', ({ time }) => {
+      observed.push({ payload: time, actual: timeline.getTime(), playing: timeline.isPlaying() });
+    });
+    timeline.play();
+
+    timeline.tick(0.5);
+
+    expect(observed).toEqual([{ payload: 0, actual: 0, playing: false }]);
+    expect(timeline.isPlaying()).toBe(true);
+  });
+
   it('暂停时 tick 不推进', () => {
     const timeline = new TimelineController({ duration: 10 });
     timeline.play();

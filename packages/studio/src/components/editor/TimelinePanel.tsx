@@ -139,6 +139,8 @@ export function TimelinePanel({
   // 不再有陈旧 previous 互踩（TML-52 审查第 4 项）。
   const [thumbs, setThumbs] = useState<Record<string, string>>({});
   const thumbChainRef = useRef<{ cancelled: boolean; seeking: boolean } | null>(null);
+  const thumbAttemptGenerationRef = useRef<string | null>(null);
+  const thumbAttemptsRef = useRef(new Map<string, number>());
   // 失效代 = 会话令牌 + 项目内容指纹：任何影响画面的编辑或重开都会换代，旧代键
   // 不再命中且被淘汰（仅按 shot.id 键控时编辑后旧键永不过期，复审阻断 2）。
   // effect 与渲染共用同一派生，保证写入键与展示键一致
@@ -148,6 +150,10 @@ export function TimelinePanel({
   );
 
   useEffect(() => {
+    if (thumbAttemptGenerationRef.current !== thumbGeneration) {
+      thumbAttemptGenerationRef.current = thumbGeneration;
+      thumbAttemptsRef.current.clear();
+    }
     const prefix = `${thumbGeneration}:`;
     const staleKeys = Object.keys(thumbs).filter((key) => !key.startsWith(prefix));
     if (staleKeys.length > 0) {
@@ -171,7 +177,9 @@ export function TimelinePanel({
     thumbChainRef.current = chain;
     // 缓存键 = 失效代 + 分镜 id（分镜内容身份已含在指纹中）
     const thumbKey = (shot: (typeof project.shots)[number]) => `${prefix}${shot.id}`;
-    const missing = project.shots.filter((shot) => thumbs[thumbKey(shot)] === undefined);
+    const missing = project.shots.filter(
+      (shot) => thumbs[thumbKey(shot)] === undefined && (thumbAttemptsRef.current.get(shot.id) ?? 0) < 3,
+    );
     if (missing.length === 0) return;
     const previous = timeline.getTime();
     let moved = false;
@@ -201,13 +209,14 @@ export function TimelinePanel({
           moved = true;
         }
         let dataUrl: string | null = null;
-        for (let attempt = 0; attempt < 3 && !chain.cancelled; attempt += 1) {
+        while ((thumbAttemptsRef.current.get(shot.id) ?? 0) < 3 && !chain.cancelled) {
           // A frame-delayed retry covers transient node/WebGL readiness without
           // converting a null result into a permanent cache entry.
           await new Promise<void>((resolve) => {
             requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
           });
           if (chain.cancelled) break;
+          thumbAttemptsRef.current.set(shot.id, (thumbAttemptsRef.current.get(shot.id) ?? 0) + 1);
           try {
             const candidate = capture(shot.cameraObjectId);
             if (typeof candidate === 'string' && candidate.startsWith('data:image/')) {

@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+import { act, renderHook } from '@testing-library/react';
 import { createGroupObject, createSampleProject } from '@lumora/core';
 import { createStudioRuntime } from '../src/runtime/studio-runtime';
 import { ProjectStore } from '../src/persistence/project-store';
 import type { ProjectStorage } from '../src/persistence/project-storage';
+import { useSceneEditor } from '../src/hooks/use-scene-editor';
 
 describe('StudioRuntime：宿主快照与事件总线随编辑器同步（S-3）', () => {
   it('编辑器每次变更后 host 快照与 project:changed 广播保持当前', () => {
@@ -28,6 +30,39 @@ describe('StudioRuntime：宿主快照与事件总线随编辑器同步（S-3）
     expect(runtime.host.getProject()!.objects.length).toBe(project.objects.length);
 
     unsubscribe.dispose();
+  });
+
+  it('save-state listener synchronously opening C keeps editor, scene hook, host events, and persistence on C', async () => {
+    const runtime = createStudioRuntime();
+    const projectB = createSampleProject('lumora://project/b', '项目 B');
+    const projectC = createSampleProject('lumora://project/c', '项目 C');
+    runtime.editor.openProject(projectB);
+    const scene = renderHook(() => useSceneEditor(runtime.editor));
+    const hostEvents: string[] = [];
+    const hostSub = runtime.events.on('project:changed', ({ project }) => {
+      hostEvents.push(project?.uri ?? 'null');
+    });
+    let nested = false;
+    const persistenceSub = runtime.persistence.events.on('save-state', () => {
+      if (nested) return;
+      nested = true;
+      runtime.editor.openProject(projectC);
+    });
+
+    act(() => {
+      expect(runtime.editor.addObject(createGroupObject()).ok).toBe(true);
+    });
+
+    expect(runtime.editor.getProject()?.uri).toBe(projectC.uri);
+    expect(scene.result.current.project?.uri).toBe(projectC.uri);
+    expect(runtime.host.getProject()?.uri).toBe(projectC.uri);
+    expect(runtime.persistence.openUri).toBe(projectC.uri);
+    expect(hostEvents).toEqual([projectC.uri]);
+
+    persistenceSub.dispose();
+    hostSub.dispose();
+    scene.unmount();
+    await runtime.dispose();
   });
 
   it('closeProject 清空宿主快照并广播；dispose 后编辑器变更不再同步到宿主', async () => {

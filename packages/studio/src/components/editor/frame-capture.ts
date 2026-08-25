@@ -43,6 +43,8 @@ export function captureProjectFrame(
 ): string | null {
   const { width, height, aspect } = captureSize(projectAspect);
   const previousTarget = renderer.getRenderTarget();
+  const previousCubeFace = renderer.getActiveCubeFace();
+  const previousMipmapLevel = renderer.getActiveMipmapLevel();
   const previousViewport = renderer.getViewport(new THREE.Vector4()).clone();
   const previousScissor = renderer.getScissor(new THREE.Vector4()).clone();
   const previousScissorTest = renderer.getScissorTest();
@@ -55,6 +57,9 @@ export function captureProjectFrame(
     stencilBuffer: false,
   });
   target.texture.colorSpace = renderer.outputColorSpace;
+  target.viewport.set(0, 0, width, height);
+  target.scissor.set(0, 0, width, height);
+  target.scissorTest = false;
 
   try {
     if (perspectiveCamera) {
@@ -62,9 +67,6 @@ export function captureProjectFrame(
       perspectiveCamera.updateProjectionMatrix();
     }
     renderer.setRenderTarget(target);
-    renderer.setViewport(0, 0, width, height);
-    renderer.setScissor(0, 0, width, height);
-    renderer.setScissorTest(false);
     renderer.setClearColor('#14161f', 1);
     renderer.clear();
     renderer.render(scene, camera);
@@ -74,10 +76,16 @@ export function captureProjectFrame(
   } catch {
     return null;
   } finally {
-    renderer.setRenderTarget(previousTarget);
+    // getViewport/getScissor expose default-framebuffer state even when a
+    // render target is active. Restore those defaults while null is bound,
+    // then rebind the previous target so Three restores its target-local state.
+    renderer.setRenderTarget(null);
     renderer.setViewport(previousViewport);
     renderer.setScissor(previousScissor);
     renderer.setScissorTest(previousScissorTest);
+    if (previousTarget) {
+      renderer.setRenderTarget(previousTarget, previousCubeFace, previousMipmapLevel);
+    }
     renderer.setClearColor(previousClearColor, previousClearAlpha);
     if (perspectiveCamera && previousCameraAspect !== null) {
       perspectiveCamera.aspect = previousCameraAspect;

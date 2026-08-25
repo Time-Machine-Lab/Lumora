@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
+import { resolve } from 'node:path';
 
 /** 标签列宽度（px），与 TimelinePanel 导出的 TIMELINE_LABEL_WIDTH 一致；
  *  播放头 = 标签列 + time * zoom，关键帧/分镜/标尺刻度 = time * zoom（时间画布内） */
@@ -161,6 +162,154 @@ test('overwrite confirmation portal retains resolved Studio theme styles', async
   expect(styles.buttonBorderStyle).toBe('solid');
   expect(styles.buttonColor).not.toBe('rgba(0, 0, 0, 0)');
   await page.getByText('取消').click();
+});
+
+test('offscreen capture preserves a non-default cube face/mip and encodes real WebGL pixels upright', async ({ page }) => {
+  const frameCaptureUrl = `/@fs/${resolve('packages/studio/src/components/editor/frame-capture.ts').replace(/\\/g, '/')}`;
+  const threeUrl = `/@fs/${resolve('node_modules/three/build/three.module.js').replace(/\\/g, '/')}`;
+  const result = await page.evaluate(
+    async ({ frameCaptureUrl, threeUrl }) => {
+      const THREE = await import(threeUrl);
+      const { captureProjectFrame } = (await import(frameCaptureUrl)) as {
+        captureProjectFrame: (
+          renderer: InstanceType<typeof THREE.WebGLRenderer>,
+          scene: InstanceType<typeof THREE.Scene>,
+          camera: InstanceType<typeof THREE.Camera>,
+          aspect: number,
+        ) => string | null;
+      };
+      const canvas = document.createElement('canvas');
+      document.body.append(canvas);
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+      renderer.setPixelRatio(1);
+      renderer.setSize(64, 64, false);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      const defaultViewport = [7, 8, 40, 36];
+      const defaultScissor = [5, 6, 30, 28];
+      const targetViewport = [2, 3, 20, 18];
+      const targetScissor = [1, 2, 16, 14];
+      const cubeTarget = new THREE.WebGLCubeRenderTarget(64, {
+        generateMipmaps: true,
+        minFilter: THREE.LinearMipmapLinearFilter,
+      });
+      cubeTarget.viewport.fromArray(targetViewport);
+      cubeTarget.scissor.fromArray(targetScissor);
+      cubeTarget.scissorTest = true;
+
+      const bindOriginalState = (face: number) => {
+        renderer.setRenderTarget(null);
+        renderer.setViewport(...defaultViewport);
+        renderer.setScissor(...defaultScissor);
+        renderer.setScissorTest(true);
+        renderer.setRenderTarget(cubeTarget, face, 1);
+      };
+      const values = (vector: { toArray: () => number[] }) => vector.toArray();
+      const snapshot = () => {
+        const gl = renderer.getContext();
+        return {
+          target: renderer.getRenderTarget() === cubeTarget,
+          face: renderer.getActiveCubeFace(),
+          mip: renderer.getActiveMipmapLevel(),
+          defaultViewport: values(renderer.getViewport(new THREE.Vector4())),
+          defaultScissor: values(renderer.getScissor(new THREE.Vector4())),
+          defaultScissorTest: renderer.getScissorTest(),
+          currentViewport: values(renderer.getCurrentViewport(new THREE.Vector4())),
+          glScissor: Array.from(gl.getParameter(gl.SCISSOR_BOX) as Int32Array),
+          glScissorTest: gl.isEnabled(gl.SCISSOR_TEST),
+        };
+      };
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color('#000000');
+      const camera = new THREE.PerspectiveCamera(50, 1.5, 0.1, 10);
+      camera.position.z = 2;
+      const geometry = new THREE.PlaneGeometry(3, 0.94);
+      const top = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ color: '#ff0000' }));
+      top.position.y = 0.47;
+      const bottom = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ color: '#0000ff' }));
+      bottom.position.y = -0.47;
+      scene.add(top, bottom);
+
+      bindOriginalState(3);
+      const png = captureProjectFrame(renderer, scene, camera, 1);
+      if (!png) throw new Error('real WebGL capture returned null');
+      const image = await new Promise<HTMLImageElement>((resolveImage, rejectImage) => {
+        const next = new Image();
+        next.onload = () => resolveImage(next);
+        next.onerror = rejectImage;
+        next.src = png;
+      });
+      const decodeCanvas = document.createElement('canvas');
+      decodeCanvas.width = image.width;
+      decodeCanvas.height = image.height;
+      const context = decodeCanvas.getContext('2d')!;
+      context.drawImage(image, 0, 0);
+      const sample = (x: number, y: number) =>
+        Array.from(context.getImageData(x, y, 1, 1).data.slice(0, 3));
+      const successState = snapshot();
+
+      bindOriginalState(5);
+      const realRender = renderer.render.bind(renderer);
+      renderer.render = () => {
+        throw new Error('forced render failure');
+      };
+      const failedCapture = captureProjectFrame(renderer, scene, camera, 1);
+      renderer.render = realRender;
+      const failureState = snapshot();
+
+      top.material.dispose();
+      bottom.material.dispose();
+      geometry.dispose();
+      cubeTarget.dispose();
+      renderer.dispose();
+      canvas.remove();
+      return {
+        size: [image.width, image.height],
+        top: sample(Math.floor(image.width / 2), Math.floor(image.height / 4)),
+        bottom: sample(Math.floor(image.width / 2), Math.floor((image.height * 3) / 4)),
+        successState,
+        failedCapture,
+        failureState,
+        defaultViewport,
+        defaultScissor,
+        targetViewport,
+        targetScissor,
+      };
+    },
+    { frameCaptureUrl, threeUrl },
+  );
+
+  expect(result.size).toEqual([320, 320]);
+  expect(result.top[0]).toBeGreaterThan(180);
+  expect(result.top[1]).toBeLessThan(80);
+  expect(result.top[2]).toBeLessThan(80);
+  expect(result.bottom[0]).toBeLessThan(80);
+  expect(result.bottom[1]).toBeLessThan(80);
+  expect(result.bottom[2]).toBeGreaterThan(180);
+  expect(result.successState).toEqual({
+    target: true,
+    face: 3,
+    mip: 1,
+    defaultViewport: result.defaultViewport,
+    defaultScissor: result.defaultScissor,
+    defaultScissorTest: true,
+    currentViewport: result.targetViewport,
+    glScissor: result.targetScissor,
+    glScissorTest: true,
+  });
+  expect(result.failedCapture).toBeNull();
+  expect(result.failureState).toEqual({
+    target: true,
+    face: 5,
+    mip: 1,
+    defaultViewport: result.defaultViewport,
+    defaultScissor: result.defaultScissor,
+    defaultScissorTest: true,
+    currentViewport: result.targetViewport,
+    glScissor: result.targetScissor,
+    glScissorTest: true,
+  });
 });
 
 test('AC1 浏览器级：真实约 5s 持续驾驶录制 → 抽稀覆盖轨道 → 晚段位姿 late delta + 两次回放同一确定终点严格一致', async ({ page }) => {

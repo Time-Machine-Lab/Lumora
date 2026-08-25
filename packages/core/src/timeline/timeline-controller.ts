@@ -227,7 +227,7 @@ export class TimelineController {
   }
 
   private emitTime(): void {
-    this.events.emit('time:changed', { time: this.time, frame: this.getFrame() });
+    this.events.emit('time:changed', { time: this.time, frame: this.getFrame() }, { latestWins: true });
   }
 
   private emitSettings(): void {

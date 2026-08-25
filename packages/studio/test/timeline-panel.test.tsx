@@ -460,6 +460,61 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     );
     raf.mockRestore();
   });
+
+  it('limits an always-failing shot to three attempts while sibling thumbnails succeed', async () => {
+    const raf = vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+    const project = {
+      ...makeProject(),
+      scenes: makeProject().scenes.map((scene) => ({
+        ...scene,
+        rootObjectIds: [...scene.rootObjectIds, 'cam-fail', 'cam-success'],
+      })),
+      objects: [
+        ...makeProject().objects,
+        { ...createCameraObject(), id: 'cam-fail', name: 'Failing camera' },
+        { ...createCameraObject(), id: 'cam-success', name: 'Successful camera' },
+      ],
+      shots: [
+        { ...makeProject().shots[0]!, cameraObjectId: 'cam-fail' },
+        { ...makeProject().shots[1]!, cameraObjectId: 'cam-success' },
+        { ...makeProject().shots[2]!, cameraObjectId: null },
+      ],
+    };
+    const capture = vi.fn((cameraObjectId?: string | null) =>
+      cameraObjectId === 'cam-fail' ? null : `data:image/png;base64,${cameraObjectId ?? 'director'}`,
+    );
+    const view = mountPanel({}, [], false, project);
+    view.captureRef.current = capture;
+    const renderPanel = (captureGeneration: number) => (
+      <TimelinePanel
+        session={view.session}
+        editor={view.editor}
+        project={project}
+        selection={[]}
+        captureRef={view.captureRef}
+        captureReady
+        captureGeneration={captureGeneration}
+      />
+    );
+
+    view.rerender(renderPanel(0));
+    await act(async () => {});
+    expect(capture.mock.calls.filter(([cameraId]) => cameraId === 'cam-fail')).toHaveLength(3);
+    expect(screen.getByTestId('shot-block-s2').querySelector('img')).not.toBeNull();
+    expect(screen.getByTestId('shot-block-s3').querySelector('img')).not.toBeNull();
+
+    view.rerender(renderPanel(0));
+    await act(async () => {});
+    expect(capture.mock.calls.filter(([cameraId]) => cameraId === 'cam-fail')).toHaveLength(3);
+
+    view.rerender(renderPanel(1));
+    await act(async () => {});
+    expect(capture.mock.calls.filter(([cameraId]) => cameraId === 'cam-fail')).toHaveLength(6);
+    raf.mockRestore();
+  });
 });
 
 describe('projectContentFingerprint：缩略图失效代', () => {

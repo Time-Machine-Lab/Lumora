@@ -28,7 +28,10 @@ export function useSceneEditor(editor: SceneEditor): EditorState {
 
   useEffect(() => {
     const subs = [
-      editor.events.on('project:changed', ({ project }) => setState((s) => ({ ...s, project }))),
+      editor.events.on('project:changed', ({ project, sessionToken }) => {
+        if (!editor.isCurrentSession(sessionToken) || project !== editor.getProject()) return;
+        setState((s) => ({ ...s, project }));
+      }),
       editor.events.on('selection:changed', ({ ids }) => setState((s) => ({ ...s, selection: ids }))),
       editor.events.on('view:changed', ({ view }) => setState((s) => ({ ...s, view }))),
       editor.events.on('history:changed', (h) =>

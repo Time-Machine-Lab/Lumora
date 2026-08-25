@@ -4,18 +4,25 @@ import { captureProjectFrame } from '../src/components/editor/frame-capture';
 
 function createRenderer(options: { throwOnRender?: boolean } = {}) {
   const visibleToDataUrl = vi.fn(() => 'visible-canvas');
-  const previousTarget = { name: 'visible-target' } as unknown as THREE.WebGLRenderTarget;
-  const viewport = new THREE.Vector4(11, 12, 640, 360);
-  const scissor = new THREE.Vector4(13, 14, 620, 340);
+  const previousTarget = new THREE.WebGLCubeRenderTarget(64);
+  const targetViewport = new THREE.Vector4(2, 3, 40, 36);
+  const targetScissor = new THREE.Vector4(4, 5, 32, 28);
+  previousTarget.viewport.copy(targetViewport);
+  previousTarget.scissor.copy(targetScissor);
+  previousTarget.scissorTest = true;
+  const defaultViewport = new THREE.Vector4(11, 12, 640, 360);
+  const defaultScissor = new THREE.Vector4(13, 14, 620, 340);
   const clearColor = new THREE.Color('#123456');
   const renderer = {
     domElement: { toDataURL: visibleToDataUrl },
     outputColorSpace: THREE.SRGBColorSpace,
     getRenderTarget: vi.fn(() => previousTarget),
+    getActiveCubeFace: vi.fn(() => 4),
+    getActiveMipmapLevel: vi.fn(() => 2),
     setRenderTarget: vi.fn(),
-    getViewport: vi.fn((target: THREE.Vector4) => target.copy(viewport)),
+    getViewport: vi.fn((target: THREE.Vector4) => target.copy(defaultViewport)),
     setViewport: vi.fn(),
-    getScissor: vi.fn((target: THREE.Vector4) => target.copy(scissor)),
+    getScissor: vi.fn((target: THREE.Vector4) => target.copy(defaultScissor)),
     setScissor: vi.fn(),
     getScissorTest: vi.fn(() => true),
     setScissorTest: vi.fn(),
@@ -32,7 +39,14 @@ function createRenderer(options: { throwOnRender?: boolean } = {}) {
       },
     ),
   };
-  return { renderer: renderer as unknown as THREE.WebGLRenderer, raw: renderer, previousTarget, visibleToDataUrl };
+  return {
+    renderer: renderer as unknown as THREE.WebGLRenderer,
+    raw: renderer,
+    previousTarget,
+    targetViewport,
+    targetScissor,
+    visibleToDataUrl,
+  };
 }
 
 afterEach(() => {
@@ -41,7 +55,7 @@ afterEach(() => {
 
 describe('captureProjectFrame', () => {
   it('renders offscreen at project aspect and restores all renderer and camera state', () => {
-    const { renderer, raw, previousTarget, visibleToDataUrl } = createRenderer();
+    const { renderer, raw, previousTarget, targetViewport, targetScissor, visibleToDataUrl } = createRenderer();
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(45, 4 / 3);
     const putImageData = vi.fn();
@@ -65,10 +79,19 @@ describe('captureProjectFrame', () => {
     expect(result).toBe('data:image/png;base64,320x180');
     expect(camera.aspect).toBe(4 / 3);
     expect(raw.render).toHaveBeenCalledWith(scene, camera);
-    expect(raw.setRenderTarget.mock.calls.at(-1)?.[0]).toBe(previousTarget);
+    const restoreCalls = raw.setRenderTarget.mock.calls.slice(-2);
+    expect(restoreCalls[0]?.[0]).toBeNull();
+    expect(restoreCalls[1]?.[0]).toBe(previousTarget);
+    expect(restoreCalls[1]?.slice(1)).toEqual([4, 2]);
     expect(raw.setViewport.mock.calls.at(-1)?.[0]).toEqual(new THREE.Vector4(11, 12, 640, 360));
     expect(raw.setScissor.mock.calls.at(-1)?.[0]).toEqual(new THREE.Vector4(13, 14, 620, 340));
     expect(raw.setScissorTest.mock.calls.at(-1)?.[0]).toBe(true);
+    expect(raw.setViewport.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      raw.setRenderTarget.mock.invocationCallOrder.at(-1)!,
+    );
+    expect(previousTarget.viewport).toEqual(targetViewport);
+    expect(previousTarget.scissor).toEqual(targetScissor);
+    expect(previousTarget.scissorTest).toBe(true);
     expect(raw.setClearColor.mock.calls.at(-1)).toEqual([new THREE.Color('#123456'), 0.4]);
     expect(putImageData).toHaveBeenCalledTimes(1);
     expect(encode).toHaveBeenCalledTimes(1);
@@ -76,15 +99,23 @@ describe('captureProjectFrame', () => {
   });
 
   it('restores renderer and camera state when offscreen rendering throws', () => {
-    const { renderer, raw, previousTarget } = createRenderer({ throwOnRender: true });
+    const { renderer, raw, previousTarget, targetViewport, targetScissor } = createRenderer({ throwOnRender: true });
     const camera = new THREE.PerspectiveCamera(45, 1.25);
 
     const result = captureProjectFrame(renderer, new THREE.Scene(), camera, 9 / 16);
 
     expect(result).toBeNull();
     expect(camera.aspect).toBe(1.25);
-    expect(raw.setRenderTarget.mock.calls.at(-1)?.[0]).toBe(previousTarget);
+    const restoreCalls = raw.setRenderTarget.mock.calls.slice(-2);
+    expect(restoreCalls[0]?.[0]).toBeNull();
+    expect(restoreCalls[1]?.[0]).toBe(previousTarget);
+    expect(restoreCalls[1]?.slice(1)).toEqual([4, 2]);
     expect(raw.setViewport.mock.calls.at(-1)?.[0]).toEqual(new THREE.Vector4(11, 12, 640, 360));
     expect(raw.setScissorTest.mock.calls.at(-1)?.[0]).toBe(true);
+    expect(raw.setViewport.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      raw.setRenderTarget.mock.invocationCallOrder.at(-1)!,
+    );
+    expect(previousTarget.viewport).toEqual(targetViewport);
+    expect(previousTarget.scissor).toEqual(targetScissor);
   });
 });

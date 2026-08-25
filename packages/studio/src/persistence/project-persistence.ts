@@ -101,12 +101,13 @@ export class ProjectPersistence {
       // 不做代际截断）
       if (!this.disposed) this.events.emit('save-state', { state }, { latestWins: true });
     });
-    this.unsubscribeEditor = editor.events.on('project:changed', ({ project }) => {
-      if (!this.disposed) {
-        this.autosaver.changed(project);
-        if (project) this.currentUri = project.uri;
-        else this.currentUri = null;
-      }
+    this.unsubscribeEditor = editor.events.on('project:changed', ({ project, sessionToken }) => {
+      if (this.disposed || !editor.isCurrentSession(sessionToken) || project !== editor.getProject()) return;
+      this.autosaver.changed(project);
+      // autosaver.changed() may synchronously publish save-state; a listener can
+      // open another project before this callback resumes.
+      if (this.disposed || !editor.isCurrentSession(sessionToken) || project !== editor.getProject()) return;
+      this.currentUri = project?.uri ?? null;
     });
   }
 
