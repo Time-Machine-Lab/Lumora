@@ -63,8 +63,13 @@ function descriptor(manifest: Record<string, unknown> = VALID_MANIFEST, entry?: 
 describe('PluginHost', () => {
   it('rejects malformed storyboard capability metadata atomically', async () => {
     const host = new PluginHost({ hostVersion: '0.1.0' });
+    const sensitiveCapability = 'sk-live-1234567890abcdef';
+    const failedEventErrors: unknown[] = [];
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'failed') failedEventErrors.push(event.error);
+    });
     const malformedStoryboard = {
-      capability: 'ai.storyboard.generate',
+      capability: sensitiveCapability,
       models: [{ id: 'broken', name: 'Broken model' }],
       generate: async () => ({}),
     } as unknown as AiStoryboardCapability;
@@ -94,9 +99,47 @@ describe('PluginHost', () => {
 
     expect(info.state).toBe('failed');
     expect(info.reason).toContain('激活失败');
+    expect(info.reason).toContain('storyboard.capability:invalid_literal');
+    expect(info.reason).not.toContain(sensitiveCapability);
+    expect(JSON.stringify(info.error)).not.toContain(sensitiveCapability);
+    expect(JSON.stringify(failedEventErrors)).not.toContain(sensitiveCapability);
     expect(host.contributions.count()).toBe(0);
     expect(host.contributions.getPanels()).toEqual([]);
     expect(host.contributions.getAiProviders()).toEqual([]);
+  });
+
+  it('publishes a failed terminal state when an activation throws a hostile value', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const states: PluginState[] = [];
+    host.events.on('plugin:state-changed', (event) => states.push(event.state));
+    const hostile = new Proxy({}, {
+      getOwnPropertyDescriptor: () => {
+        throw new Error('descriptor trap');
+      },
+      getPrototypeOf: () => {
+        throw new Error('prototype trap');
+      },
+    });
+    let rejection: unknown;
+
+    const info = await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => {
+            throw hostile;
+          },
+        },
+      })),
+    ).catch((error: unknown) => {
+      rejection = error;
+      return host.getPlugin('com.example.plugin')!;
+    });
+
+    expect(rejection).toBeUndefined();
+    expect(info.state).toBe('failed');
+    expect(states.at(-1)).toBe('failed');
+    expect(info.error).toBeInstanceOf(Error);
+    expect(info.error === hostile).toBe(false);
   });
 
   it('cancels running storyboard tasks when their provider plugin is disabled', async () => {
@@ -231,6 +274,63 @@ describe('PluginHost', () => {
     expect(changedIdError).toBeInstanceOf(Error);
     expect(host.services.ai.listStoryboardProviders()).toEqual([]);
     expect(host.contributions.getAiProviders()).toEqual([]);
+  });
+
+  it('reads a provider id once so a stateful getter cannot overwrite another provider', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const victimProviderId = 'com.example.provider.victim';
+    const hostileProviderId = 'com.example.provider.hostile';
+    await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, id: 'com.example.victim', contributes: ['aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => context.contribute({
+              aiProviders: [{
+                kind: 'aiProvider',
+                id: victimProviderId,
+                name: 'Victim provider',
+                models: [],
+                chat: async function* () {},
+              }],
+            }),
+          },
+        }),
+      ),
+    );
+    let idReads = 0;
+    const hostileProvider = {
+      kind: 'aiProvider',
+      name: 'Hostile provider',
+      models: [],
+      chat: async function* () {},
+    } as unknown as AiProviderContribution;
+    Object.defineProperty(hostileProvider, 'id', {
+      enumerable: true,
+      get: () => {
+        idReads += 1;
+        return idReads <= 2 ? hostileProviderId : victimProviderId;
+      },
+    });
+
+    const info = await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, id: 'com.example.hostile', contributes: ['aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => context.contribute({ aiProviders: [hostileProvider] }),
+          },
+        }),
+      ),
+    );
+
+    expect(info.reason).toBeUndefined();
+    expect(info.state).toBe('active');
+    expect(idReads).toBe(1);
+    expect(host.contributions.getAiProviders().map((provider) => provider.id).sort()).toEqual([
+      hostileProviderId,
+      victimProviderId,
+    ]);
   });
 
   it('cancels storyboard tasks admitted while provider deactivation is awaiting', async () => {

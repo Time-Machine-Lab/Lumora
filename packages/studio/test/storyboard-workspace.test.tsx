@@ -387,6 +387,12 @@ describe('StoryboardWorkspace', () => {
     expect(draftPanelId).not.toBe(adoptedPanelId);
     expect(draftTab).toHaveAttribute('tabindex', '0');
     expect(adoptedTab).toHaveAttribute('tabindex', '-1');
+    const draftPanel = document.getElementById(draftPanelId!);
+    const adoptedPanel = document.getElementById(adoptedPanelId!);
+    expect(draftPanel).not.toBeNull();
+    expect(adoptedPanel).not.toBeNull();
+    expect(draftPanel).not.toHaveAttribute('hidden');
+    expect(adoptedPanel).toHaveAttribute('hidden');
     expect(screen.getByRole('tabpanel')).toHaveAttribute('id', draftPanelId);
     expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', draftTabId);
 
@@ -397,6 +403,8 @@ describe('StoryboardWorkspace', () => {
     expect(adoptedTab).toHaveAttribute('aria-selected', 'true');
     expect(adoptedTab).toHaveAttribute('tabindex', '0');
     expect(draftTab).toHaveAttribute('tabindex', '-1');
+    expect(draftPanel).toHaveAttribute('hidden');
+    expect(adoptedPanel).not.toHaveAttribute('hidden');
     expect(screen.getByRole('tabpanel')).toHaveAttribute('id', adoptedPanelId);
     expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', adoptedTabId);
 

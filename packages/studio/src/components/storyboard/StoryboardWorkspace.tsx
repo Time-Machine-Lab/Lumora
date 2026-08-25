@@ -479,7 +479,16 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
           event.currentTarget.querySelectorAll<HTMLElement>(
             'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
           ),
-        );
+        ).filter((element) => {
+          if (element.tabIndex < 0) return false;
+          for (let current: HTMLElement | null = element; current; current = current.parentElement) {
+            if (current.hidden || current.hasAttribute('inert')) return false;
+            const style = window.getComputedStyle(current);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            if (current === event.currentTarget) break;
+          }
+          return true;
+        });
         const first = focusables[0];
         const last = focusables.at(-1);
         if (!first || !last) {
@@ -538,13 +547,13 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
         </div>
       </header>
 
-      {tab === 'draft' ? (
-        <div
-          id={draftPanelId}
-          className="lumora-storyboard__layout"
-          role="tabpanel"
-          aria-labelledby={draftTabId}
-        >
+      <div
+        id={draftPanelId}
+        className="lumora-storyboard__layout"
+        role="tabpanel"
+        aria-labelledby={draftTabId}
+        hidden={tab !== 'draft'}
+      >
           <form
             className="lumora-storyboard__brief"
             onSubmit={(event) => {
@@ -768,14 +777,15 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
               </>
             )}
           </div>
-        </div>
-      ) : (
-        <div
-          id={adoptedPanelId}
-          className="lumora-storyboard__adopted"
-          role="tabpanel"
-          aria-labelledby={adoptedTabId}
-        >
+      </div>
+
+      <div
+        id={adoptedPanelId}
+        className="lumora-storyboard__adopted"
+        role="tabpanel"
+        aria-labelledby={adoptedTabId}
+        hidden={tab !== 'adopted'}
+      >
           <div className="lumora-storyboard__section-heading">
             <span>项目分镜</span>
             <span>{String(project.shots.length).padStart(2, '0')}</span>
@@ -787,8 +797,7 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
               {project.shots.map((shot) => <AdoptedShotRow key={shot.id} runtime={runtime} project={project} shot={shot} />)}
             </div>
           )}
-        </div>
-      )}
+      </div>
     </section>
   );
 }

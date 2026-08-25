@@ -1,5 +1,6 @@
 import { DisposableSet, onceDisposable, type Disposable } from '../disposable';
 import { parseAiStoryboardCapability } from '../ai/storyboard';
+import { ZodError } from 'zod';
 import type { EventMap } from '../events/event-map';
 import type { TypedEventEmitter } from '../events/typed-event-emitter';
 import type { CommandRegistry } from '../commands/command-registry';
@@ -43,6 +44,44 @@ export interface ContributionRegistryOptions {
   onAiProviderRemoved?: (providerId: string) => void;
 }
 
+function storyboardValidationSummary(error: unknown): string {
+  try {
+    if (!(error instanceof ZodError)) return 'AI storyboard capability validation failed.';
+    const issues = error.issues.map((issue) => {
+      const path = ['storyboard', ...issue.path].join('.');
+      return `${path}:${issue.code}`;
+    });
+    return `AI storyboard capability validation failed: ${issues.join(', ')}`;
+  } catch {
+    return 'AI storyboard capability validation failed.';
+  }
+}
+
+function parseRegisteredStoryboard(value: unknown): AiProviderContribution['storyboard'] {
+  try {
+    return parseAiStoryboardCapability(value);
+  } catch (error) {
+    throw new Error(storyboardValidationSummary(error));
+  }
+}
+
+function snapshotAiProviders(items: AiProviderContribution[]): AiProviderContribution[] {
+  const providerIds = items.map((item) => item.id);
+  return items.map((item, index) => {
+    const storyboard = item.storyboard;
+    const referenceImage = item.referenceImage;
+    return Object.freeze({
+      kind: 'aiProvider' as const,
+      id: providerIds[index]!,
+      name: item.name,
+      models: [...item.models],
+      chat: item.chat,
+      ...(storyboard === undefined ? {} : { storyboard: parseRegisteredStoryboard(storyboard) }),
+      ...(referenceImage === undefined ? {} : { referenceImage }),
+    });
+  });
+}
+
 /**
  * 六类贡献项注册表。contribute 采用两阶段（先校验后登记），
  * 任一贡献项非法时整体失败，不会留下半注册状态。
@@ -72,15 +111,14 @@ export class ContributionRegistry {
   contribute(pluginId: string, bundle: ContributionBundle): Disposable {
     if (this.disposedFlag) throw new Error('贡献项注册表已销毁');
 
+    const aiProviders = snapshotAiProviders(bundle.aiProviders ?? []);
+
     // 阶段一：整批校验 —— 任一非法整体失败
     this.assertBundleUnique(bundle.panels ?? [], 'panel', (item) => item.id);
     this.assertBundleUnique(bundle.toolbars ?? [], 'toolbar', (item) => item.id);
     this.assertBundleUnique(bundle.assetLoaders ?? [], 'assetLoader', (item) => item.id);
-    this.assertBundleUnique(bundle.aiProviders ?? [], 'aiProvider', (item) => item.id);
+    this.assertBundleUnique(aiProviders, 'aiProvider', (item) => item.id);
     this.assertBundleUnique(bundle.exporters ?? [], 'exporter', (item) => item.id);
-    for (const item of bundle.aiProviders ?? []) {
-      if (item.storyboard !== undefined) parseAiStoryboardCapability(item.storyboard);
-    }
     const commandIds = new Set<string>();
     for (const item of bundle.commands ?? []) {
       if (commandIds.has(item.command.id)) {
@@ -91,7 +129,7 @@ export class ContributionRegistry {
     for (const item of bundle.panels ?? []) this.assertUnique(this.panels, 'panel', item.id);
     for (const item of bundle.toolbars ?? []) this.assertUnique(this.toolbars, 'toolbar', item.id);
     for (const item of bundle.assetLoaders ?? []) this.assertUnique(this.assetLoaders, 'assetLoader', item.id);
-    for (const item of bundle.aiProviders ?? []) this.assertUnique(this.aiProviders, 'aiProvider', item.id);
+    for (const item of aiProviders) this.assertUnique(this.aiProviders, 'aiProvider', item.id);
     for (const item of bundle.exporters ?? []) this.assertUnique(this.exporters, 'exporter', item.id);
     for (const item of bundle.commands ?? []) {
       if (!this.commands) {
@@ -103,7 +141,7 @@ export class ContributionRegistry {
     }
 
     // 阶段二：应用；中途抛错时逆序回滚，不留下半注册状态
-    const plan = this.buildPlan(pluginId, bundle);
+    const plan = this.buildPlan(pluginId, bundle, aiProviders);
     const applied: Disposable[] = [];
     try {
       for (const apply of plan) applied.push(apply());
@@ -122,7 +160,11 @@ export class ContributionRegistry {
     return DisposableSet.from(applied);
   }
 
-  private buildPlan(pluginId: string, bundle: ContributionBundle): Array<() => Disposable> {
+  private buildPlan(
+    pluginId: string,
+    bundle: ContributionBundle,
+    aiProviders: AiProviderContribution[],
+  ): Array<() => Disposable> {
     const plan: Array<() => Disposable> = [];
     for (const item of bundle.panels ?? []) {
       plan.push(() => {
@@ -151,16 +193,10 @@ export class ContributionRegistry {
         });
       });
     }
-    for (const item of bundle.aiProviders ?? []) {
+    for (const item of aiProviders) {
       const providerId = item.id;
-      const registeredItem = Object.freeze({
-        ...item,
-        id: providerId,
-        models: [...item.models],
-        ...(item.storyboard === undefined ? {} : { storyboard: parseAiStoryboardCapability(item.storyboard) }),
-      });
       plan.push(() => {
-        const entry = { pluginId, item: registeredItem };
+        const entry = { pluginId, item };
         this.aiProviders.set(providerId, entry);
         return onceDisposable(() => {
           if (this.aiProviders.get(providerId) !== entry) return;

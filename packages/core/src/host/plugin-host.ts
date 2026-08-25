@@ -891,10 +891,11 @@ export class PluginHost {
     // 当前尝试：先发布失败生命周期（任何回滚 await 之前），再解析唯一完成点驱动
     // 生命周期内的回滚清理；最后等待回滚终态（failed，或清理事件内 disable 合并的
     // disabled），并收敛终态事件内重入启动的新激活
+    const publicError = this.normalizePluginError(error);
     const failure = this.publishLifecycle(record, {
       state: 'failed',
-      reason: `激活失败: ${this.errorMessage(error)}`,
-      error,
+      reason: `激活失败: ${publicError.message}`,
+      error: publicError,
     });
     completion.resolve();
     try {
@@ -989,8 +990,9 @@ export class PluginHost {
         // 换新集合，插件再次启用时不会被已销毁的集合吞掉资源
         record.owned = new DisposableSet();
         if (errors.length > 0) {
-          record.error = errors;
-          record.reason = `停用时出错: ${errors.map((e) => this.errorMessage(e)).join('；')}`;
+          const publicErrors = errors.map((error) => this.normalizePluginError(error));
+          record.error = publicErrors;
+          record.reason = `停用时出错: ${publicErrors.map((error) => error.message).join('；')}`;
         }
       } else if (originalState === 'failed') {
         // failed 插件（校验/加载/激活失败）：幂等清理残留资源，保留失败原因（可重新启用重试）
@@ -1152,7 +1154,7 @@ export class PluginHost {
   private fail(record: PluginRecord, reason: string, error?: unknown): void {
     record.state = 'failed';
     record.reason = reason;
-    record.error = error ?? new Error(reason);
+    record.error = error === undefined ? new Error(reason) : this.normalizePluginError(error);
     this.emitState(record, 'failed');
   }
 
@@ -1174,8 +1176,25 @@ export class PluginHost {
     return record;
   }
 
+  private normalizePluginError(error: unknown): Error {
+    let message = 'Plugin operation failed.';
+    if (typeof error === 'string') {
+      message = error;
+    } else if ((typeof error === 'object' || typeof error === 'function') && error !== null) {
+      try {
+        const descriptor = Reflect.getOwnPropertyDescriptor(error, 'message');
+        if (descriptor && 'value' in descriptor && typeof descriptor.value === 'string') {
+          message = descriptor.value;
+        }
+      } catch {
+        // Hostile values must not prevent the lifecycle from reaching a terminal state.
+      }
+    }
+    return new Error(message);
+  }
+
   private errorMessage(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
+    return this.normalizePluginError(error).message;
   }
 }
 

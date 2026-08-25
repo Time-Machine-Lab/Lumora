@@ -261,6 +261,10 @@
   overflow: hidden;
 }
 
+.lumora-storyboard > [role='tabpanel'][hidden] {
+  display: none;
+}
+
 .lumora-storyboard__adopted {
   flex: 1;
 }

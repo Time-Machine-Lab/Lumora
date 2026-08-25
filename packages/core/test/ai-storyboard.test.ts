@@ -254,6 +254,55 @@ describe('AI storyboard capability', () => {
     expect(completed.error?.message).toContain('[REDACTED]');
   });
 
+  it('redacts a quoted multi-word credential cut off by the provider diagnostic length cap', async () => {
+    const credential = 'TOP SECRET TOKEN WITH MORE DATA';
+    const ai = servicesWith(async () => {
+      throw new Error(`${'x'.repeat(1_975)} apiKey="${credential}"`);
+    });
+    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
+    const completed = await ai.waitForGenerationTask(submitted.id);
+
+    expect(completed.error?.message).toContain('[REDACTED]');
+    expect(completed.error?.message).not.toContain('SECRET');
+    expect(completed.error?.message.length).toBeLessThanOrEqual(2_000);
+  });
+
+  it('redacts a truncated quoted credential containing diagnostic delimiters', async () => {
+    const credential = 'TOP, SECRET; TOKEN WITH MORE DATA';
+    const ai = servicesWith(async () => {
+      throw new Error(`${'x'.repeat(1_970)} apiKey="${credential}"`);
+    });
+    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
+    const completed = await ai.waitForGenerationTask(submitted.id);
+
+    expect(completed.error?.message).toContain('[REDACTED]');
+    expect(completed.error?.message).not.toContain('SECRET');
+    expect(completed.error?.message).not.toContain('TOKEN');
+    expect(completed.error?.message.length).toBeLessThanOrEqual(2_000);
+  });
+
+  it('redacts an unquoted multi-word credential at the provider diagnostic length cap', async () => {
+    const credential = 'TOP SECRET TOKEN WITH MORE DATA';
+    const ai = servicesWith(async () => {
+      throw new Error(`${'x'.repeat(1_968)} apiKey=${credential}`);
+    });
+    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
+    const completed = await ai.waitForGenerationTask(submitted.id);
+
+    expect(completed.error?.message).toContain('[REDACTED]');
+    expect(completed.error?.message).not.toContain('SECRET');
+    expect(completed.error?.message.length).toBeLessThanOrEqual(2_000);
+  });
+
+  it('preserves public diagnostics after complete credential assignments', () => {
+    expect(core.redactAiDiagnosticText('apiKey="TOP, SECRET"; status=401')).toBe(
+      'apiKey=[REDACTED]; status=401',
+    );
+    expect(core.redactAiDiagnosticText('apiKey=TOP SECRET; status=401')).toBe(
+      'apiKey=[REDACTED]; status=401',
+    );
+  });
+
   it('normalizes provider errors, redacts credentials, and never auto-retries unknown-cost failures', async () => {
     const generate = vi.fn(async () => {
       const error = new Error(

@@ -97,6 +97,19 @@ test('cancels a running generation without adopting shots', async ({ page }) => 
   await expect(page.locator('[data-testid^="shot-block-"]')).toHaveCount(3);
 });
 
+test('keeps reverse tab focus inside the workspace when the adopted tab is active', async ({ page }) => {
+  await openStoryboard(page);
+  const workspace = page.getByTestId('storyboard-workspace');
+  const adoptedTab = page.getByTestId('storyboard-tab-adopted');
+  await adoptedTab.click();
+  await adoptedTab.focus();
+
+  await page.keyboard.press('Shift+Tab');
+
+  await expect.poll(() => workspace.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+  await expect(page.getByTestId('studio-mount-toggle')).not.toBeFocused();
+});
+
 test('keeps the generation workflow usable without horizontal overflow on mobile', async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 });
   await openStoryboard(page);

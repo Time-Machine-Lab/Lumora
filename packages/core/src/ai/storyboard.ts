@@ -258,7 +258,11 @@ export function redactAiDiagnosticText(message: string): string {
       '$1$2[REDACTED]$2',
     )
     .replace(
-      /((?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|client[-_ ]?secret|secret)\s*[:=]\s*)[^\s,;]+/gi,
+      /((?:["']?)(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|client[-_ ]?secret|secret)(?:["']?)\s*[:=]\s*)(["'])(?:(?!\2)[^\r\n])*(?=\r?\n|$)/gi,
+      '$1[REDACTED]',
+    )
+    .replace(
+      /((?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|client[-_ ]?secret|secret)\s*[:=]\s*)[^\r\n,;]+/gi,
       '$1[REDACTED]',
     );
 }
