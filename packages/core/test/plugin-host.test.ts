@@ -379,6 +379,95 @@ describe('PluginHost', () => {
     expect(fresh.error?.message).not.toContain(privateMarker);
   });
 
+  it('retains one diagnostic when direct deactivation hook and owned disposable cleanup both fail', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const privateMarker = 'PRIVATE_DIRECT_DEACTIVATION_FAILURE';
+    const hookError = new Error(`hook:${privateMarker}`, { cause: new Error(`hook-cause:${privateMarker}`) });
+    const disposableError = new Error(`dispose:${privateMarker}`, {
+      cause: new Error(`dispose-cause:${privateMarker}`),
+    });
+    const deactivate = vi.fn(() => {
+      throw hookError;
+    });
+    const dispose = vi.fn(() => {
+      throw disposableError;
+    });
+    let inactiveEvent: EventMap['plugin:state-changed'] | undefined;
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'inactive') inactiveEvent = event;
+    });
+
+    await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => ({ dispose }),
+          deactivate,
+        },
+      })),
+    );
+
+    await host.deactivate('com.example.plugin');
+
+    const info = host.getPlugin('com.example.plugin')!;
+    const pluginList = host.listPlugins();
+    const listed = pluginList[0]!;
+    expect(deactivate).toHaveBeenCalledTimes(1);
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(inactiveEvent?.state).toBe('inactive');
+    expect(inactiveEvent?.error).toEqual(info.error);
+    expect(listed.error).toEqual(info.error);
+    expect(info.reason).toBe('插件停用失败。');
+    expectPublicPluginDiagnostic(inactiveEvent?.error, '插件停用失败。');
+    expectPublicPluginDiagnostic(info.error, '插件停用失败。');
+    expectPublicPluginDiagnostic(listed.error, '插件停用失败。');
+    expect(Object.isFrozen(inactiveEvent)).toBe(true);
+    expect(Object.isFrozen(info)).toBe(true);
+    expect(Object.isFrozen(pluginList)).toBe(true);
+    expect(Object.isFrozen(listed)).toBe(true);
+    expect(JSON.stringify({ inactiveEvent, info, listed })).not.toContain(privateMarker);
+  });
+
+  it('clears a previous cleanup diagnostic after a later successful direct deactivation', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    let failCleanup = true;
+    const deactivate = vi.fn(() => {
+      if (failCleanup) throw new Error('private hook failure');
+    });
+    const dispose = vi.fn(() => {
+      if (failCleanup) throw new Error('private disposable failure');
+    });
+    let inactiveEvent: EventMap['plugin:state-changed'] | undefined;
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'inactive') inactiveEvent = event;
+    });
+
+    await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => ({ dispose }),
+          deactivate,
+        },
+      })),
+    );
+    await host.disable('com.example.plugin');
+    expectPublicPluginDiagnostic(host.getPlugin('com.example.plugin')?.error, '插件停用失败。');
+
+    failCleanup = false;
+    await host.enable('com.example.plugin');
+    await host.deactivate('com.example.plugin');
+
+    const info = host.getPlugin('com.example.plugin')!;
+    const listed = host.listPlugins()[0]!;
+    expect(deactivate).toHaveBeenCalledTimes(2);
+    expect(dispose).toHaveBeenCalledTimes(2);
+    expect(inactiveEvent?.state).toBe('inactive');
+    expect(inactiveEvent?.error).toBeUndefined();
+    expect(info.error).toBeUndefined();
+    expect(info.reason).toBeUndefined();
+    expect(listed.error).toBeUndefined();
+    expect(listed.reason).toBeUndefined();
+  });
+
   it('isolates published activation errors from caller mutation', async () => {
     const activationHost = new PluginHost({ hostVersion: '0.1.0' });
     const activationInfo = await activationHost.register(

@@ -1001,6 +1001,7 @@ export class PluginHost {
       ownedProviderIds.add(provider.id);
       cancelStoryboardTasksForProvider(this.services, provider.id);
     }
+    let hasNewCleanupError = false;
 
     try {
       if (attempt) {
@@ -1033,6 +1034,7 @@ export class PluginHost {
         // 换新集合，插件再次启用时不会被已销毁的集合吞掉资源
         record.owned = new DisposableSet();
         if (errors.length > 0) {
+          hasNewCleanupError = true;
           const publicErrors = errors.map(() => new Error(PLUGIN_DEACTIVATION_FAILED_MESSAGE));
           record.error = publicErrors;
           record.reason = PLUGIN_DEACTIVATION_FAILED_MESSAGE;
@@ -1069,7 +1071,7 @@ export class PluginHost {
           record.state = 'disabled';
         } else {
           record.state = 'inactive';
-          if (originalState !== 'failed') {
+          if (originalState !== 'failed' && !hasNewCleanupError) {
             record.error = undefined;
             record.reason = undefined;
           }
@@ -1084,7 +1086,7 @@ export class PluginHost {
       } else {
         record.state = 'inactive';
         // 停用保留失败原因（failed 插件可重新启用重试）；其余场景清理残留错误信息
-        if (originalState !== 'failed') {
+        if (originalState !== 'failed' && !hasNewCleanupError) {
           record.error = undefined;
           record.reason = undefined;
         }
