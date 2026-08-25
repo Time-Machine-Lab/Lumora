@@ -11,9 +11,47 @@ import {
 import { LumoraStudio } from '../src/components/LumoraStudio';
 import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
 
+const STUDIO_PRIVATE_PROVIDER_MARKER = 'PRIVATE_STUDIO_PROVIDER_MARKER';
+const STUDIO_DIAGNOSTIC_DELIMITERS = [
+  ['comma', ','],
+  ['semicolon', ';'],
+  ['line break', '\n'],
+] as const;
+
+function studioDiagnosticQuoteWrapper(depth: number, quote: '"' | "'"): string {
+  return `${'\\'.repeat(depth === 0 ? 0 : (2 ** depth) - 1)}${quote}`;
+}
+
+const STUDIO_UNTRUSTED_PROVIDER_DIAGNOSTICS = [0, 1, 2, 4].flatMap((depth) =>
+  (['"', "'"] as const).flatMap((quote) =>
+    ([2, 3] as const).flatMap((backslashCount) =>
+      STUDIO_DIAGNOSTIC_DELIMITERS.map(([delimiterName, delimiter]) => {
+        const wrapper = studioDiagnosticQuoteWrapper(depth, quote);
+        return {
+          name: `depth ${depth}, ${quote === '"' ? 'double' : 'single'} quote, ${backslashCount % 2 === 0 ? 'even' : 'odd'} backslashes, ${delimiterName}`,
+          message: `${wrapper}apiKey${wrapper}:${wrapper}prefix${'\\'.repeat(backslashCount)}${quote}${delimiter}${STUDIO_PRIVATE_PROVIDER_MARKER}${wrapper}`,
+        };
+      }),
+    ),
+  ),
+).concat([
+  { name: 'URL-encoded credential key', message: `%61%70%69%5F%6B%65%79=${STUDIO_PRIVATE_PROVIDER_MARKER}` },
+  { name: 'Unicode-escaped credential key', message: `api\\u005fkey=${STUDIO_PRIVATE_PROVIDER_MARKER}` },
+  { name: 'unknown response body', message: `<html><body>${STUDIO_PRIVATE_PROVIDER_MARKER}</body></html>` },
+]);
+
+let hostileProviderDiagnostic = STUDIO_UNTRUSTED_PROVIDER_DIAGNOSTICS[0]!.message;
+
 const generate = vi.fn(async (request: StoryboardGenerateRequest): Promise<unknown> => {
   if (request.model === 'invalid-schema') {
     return { title: 'Broken', summary: 'Missing fields', shots: [{ title: 'Broken shot' }] };
+  }
+  if (request.model === 'hostile-error') {
+    const error = new Error(hostileProviderDiagnostic, {
+      cause: new Error(`cause:${STUDIO_PRIVATE_PROVIDER_MARKER}`),
+    });
+    Object.assign(error, { responseBody: `response:${STUDIO_PRIVATE_PROVIDER_MARKER}` });
+    throw error;
   }
   if (request.model === 'slow') {
     return new Promise((resolve, reject) => {
@@ -71,6 +109,11 @@ const plugin: PluginDescriptor = {
                     cost: { kind: 'unknown', note: 'Unknown on failure' },
                   },
                   {
+                    id: 'hostile-error',
+                    name: 'Hostile error',
+                    cost: { kind: 'unknown', note: 'Unknown on failure' },
+                  },
+                  {
                     id: 'small-usd',
                     name: 'Small USD',
                     cost: { kind: 'known', amount: 0.004, currency: 'USD', note: 'Sub-cent estimate' },
@@ -122,6 +165,7 @@ async function mountWorkspace(initialProject = createBlankProject('lumora://stor
 
 beforeEach(() => {
   generate.mockClear();
+  hostileProviderDiagnostic = STUDIO_UNTRUSTED_PROVIDER_DIAGNOSTICS[0]!.message;
 });
 
 describe('StoryboardWorkspace', () => {
@@ -249,6 +293,42 @@ describe('StoryboardWorkspace', () => {
     expect(screen.getByTestId('storyboard-error')).toHaveTextContent('未自动重试');
     expect(ref.current?.runtime.editor.getProject()?.shots).toEqual([]);
     expect(generate).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(STUDIO_UNTRUSTED_PROVIDER_DIAGNOSTICS)(
+    'shows only the host-owned summary for an untrusted provider failure: $name',
+    async ({ message }) => {
+    hostileProviderDiagnostic = message;
+    const ref = await mountWorkspace();
+    fireEvent.change(screen.getByTestId('storyboard-concept'), {
+      target: { value: 'A complete concept long enough to verify safe provider diagnostics.' },
+    });
+    fireEvent.change(screen.getByTestId('storyboard-model'), { target: { value: 'hostile-error' } });
+    fireEvent.click(screen.getByTestId('storyboard-generate'));
+
+    const alert = await screen.findByTestId('storyboard-error');
+    expect(alert).toHaveTextContent('provider_error: The AI provider request failed.');
+    expect(alert).not.toHaveTextContent(STUDIO_PRIVATE_PROVIDER_MARKER);
+    expect(ref.current?.runtime.editor.getProject()?.shots).toEqual([]);
+    },
+  );
+
+  it('shows only a fixed summary when task submission throws untrusted text', async () => {
+    const ref = await mountWorkspace();
+    vi.spyOn(ref.current!.runtime.host.services.ai, 'submitStoryboard').mockImplementationOnce(() => {
+      throw new Error('PRIVATE_STUDIO_SUBMISSION_RESPONSE', {
+        cause: new Error('PRIVATE_STUDIO_SUBMISSION_CAUSE'),
+      });
+    });
+    fireEvent.change(screen.getByTestId('storyboard-concept'), {
+      target: { value: 'A complete concept long enough to verify safe submission diagnostics.' },
+    });
+    fireEvent.click(screen.getByTestId('storyboard-generate'));
+
+    const alert = await screen.findByTestId('storyboard-error');
+    expect(alert).toHaveTextContent('invalid_request: Unable to submit the generation task.');
+    expect(alert).not.toHaveTextContent('PRIVATE_STUDIO_SUBMISSION_RESPONSE');
+    expect(alert).not.toHaveTextContent('PRIVATE_STUDIO_SUBMISSION_CAUSE');
   });
 
   it('marks a successful draft stale after the brief changes and disables adoption', async () => {

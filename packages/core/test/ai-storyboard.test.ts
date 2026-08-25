@@ -34,36 +34,36 @@ const BRIEF = {
   visualStyle: 'Grounded cinematic sci-fi',
 };
 
-const DIAGNOSTIC_QUOTE_WRAPPERS = [
-  ['raw', '"'],
-  ['escaped', '\\"'],
-] as const;
-
 const DIAGNOSTIC_DELIMITERS = [
   ['comma', ','],
   ['semicolon', ';'],
   ['line break', '\n'],
 ] as const;
 
-const SERIALIZED_DIAGNOSTIC_CASES = DIAGNOSTIC_QUOTE_WRAPPERS.flatMap(([keyKind, keyQuote]) =>
-  DIAGNOSTIC_QUOTE_WRAPPERS.flatMap(([valueKind, valueQuote]) =>
-    DIAGNOSTIC_DELIMITERS.map(([delimiterKind, delimiter]) => ({
-      name: `${keyKind} key, ${valueKind} value, ${delimiterKind}`,
-      keyQuote,
-      valueQuote,
-      delimiter,
-    })),
-  ),
-);
+const GENERIC_PROVIDER_ERROR_MESSAGE = 'The AI provider request failed.';
+const PRIVATE_PROVIDER_MARKER = 'PRIVATE_PROVIDER_RESPONSE_MARKER';
 
-function serializedCredentialDiagnostic(
-  keyQuote: string,
-  valueQuote: string,
-  delimiter: string,
-  privateMarker: string,
-): string {
-  return `${keyQuote}apiKey${keyQuote}:${valueQuote}prefix${delimiter} ${privateMarker}${valueQuote}; status=401`;
+function diagnosticQuoteWrapper(depth: number, quote: '"' | "'"): string {
+  return `${'\\'.repeat(depth === 0 ? 0 : (2 ** depth) - 1)}${quote}`;
 }
+
+const UNTRUSTED_PROVIDER_DIAGNOSTICS = [0, 1, 2, 4].flatMap((depth) =>
+  (['"', "'"] as const).flatMap((quote) =>
+    ([2, 3] as const).flatMap((backslashCount) =>
+      DIAGNOSTIC_DELIMITERS.map(([delimiterName, delimiter]) => {
+        const wrapper = diagnosticQuoteWrapper(depth, quote);
+        return {
+          name: `depth ${depth}, ${quote === '"' ? 'double' : 'single'} quote, ${backslashCount % 2 === 0 ? 'even' : 'odd'} backslashes, ${delimiterName}`,
+          message: `${wrapper}apiKey${wrapper}:${wrapper}prefix${'\\'.repeat(backslashCount)}${quote}${delimiter}${PRIVATE_PROVIDER_MARKER}${wrapper}`,
+        };
+      }),
+    ),
+  ),
+).concat([
+  { name: 'URL-encoded credential key', message: `%61%70%69%5F%6B%65%79=${PRIVATE_PROVIDER_MARKER}` },
+  { name: 'Unicode-escaped credential key', message: `api\\u005fkey=${PRIVATE_PROVIDER_MARKER}` },
+  { name: 'unknown response body', message: `<html><body>${PRIVATE_PROVIDER_MARKER}</body></html>` },
+]);
 
 const VALID_PAYLOAD = {
   title: 'Neon delivery',
@@ -275,157 +275,134 @@ describe('AI storyboard capability', () => {
     });
   });
 
-  it('redacts credential fragments cut off by the provider diagnostic length cap', async () => {
-    const credentialFragmentAtBoundary = `${'x'.repeat(1_989)} sk-1234567`;
-    const ai = servicesWith(async () => { throw new Error(`${credentialFragmentAtBoundary}890abcdef`); });
-    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
-    const completed = await ai.waitForGenerationTask(submitted.id);
-
-    expect(completed.error?.message).not.toContain('sk-1234567');
-    expect(completed.error?.message).toContain('[REDACTED]');
-  });
-
-  it('redacts a quoted multi-word credential cut off by the provider diagnostic length cap', async () => {
-    const credential = 'TOP SECRET TOKEN WITH MORE DATA';
-    const ai = servicesWith(async () => {
-      throw new Error(`${'x'.repeat(1_975)} apiKey="${credential}"`);
-    });
-    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
-    const completed = await ai.waitForGenerationTask(submitted.id);
-
-    expect(completed.error?.message).toContain('[REDACTED]');
-    expect(completed.error?.message).not.toContain('SECRET');
-    expect(completed.error?.message.length).toBeLessThanOrEqual(2_000);
-  });
-
-  it('redacts a truncated quoted credential containing diagnostic delimiters', async () => {
-    const credential = 'TOP, SECRET; TOKEN WITH MORE DATA';
-    const ai = servicesWith(async () => {
-      throw new Error(`${'x'.repeat(1_970)} apiKey="${credential}"`);
-    });
-    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
-    const completed = await ai.waitForGenerationTask(submitted.id);
-
-    expect(completed.error?.message).toContain('[REDACTED]');
-    expect(completed.error?.message).not.toContain('SECRET');
-    expect(completed.error?.message).not.toContain('TOKEN');
-    expect(completed.error?.message.length).toBeLessThanOrEqual(2_000);
-  });
-
-  it('redacts an unquoted multi-word credential at the provider diagnostic length cap', async () => {
-    const credential = 'TOP SECRET TOKEN WITH MORE DATA';
-    const ai = servicesWith(async () => {
-      throw new Error(`${'x'.repeat(1_968)} apiKey=${credential}`);
-    });
-    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
-    const completed = await ai.waitForGenerationTask(submitted.id);
-
-    expect(completed.error?.message).toContain('[REDACTED]');
-    expect(completed.error?.message).not.toContain('SECRET');
-    expect(completed.error?.message.length).toBeLessThanOrEqual(2_000);
-  });
-
-  it('preserves public diagnostics after complete credential assignments', () => {
-    expect(core.redactAiDiagnosticText('apiKey="TOP, SECRET"; status=401')).toBe(
-      'apiKey=[REDACTED]; status=401',
-    );
-    expect(core.redactAiDiagnosticText('apiKey=TOP SECRET; status=401')).toBe(
-      'apiKey=[REDACTED]; status=401',
-    );
-  });
-
-  it.each([
-    ['comma', ','],
-    ['semicolon', ';'],
-    ['line break', '\n'],
-  ])('redacts an escaped quote before a %s in direct diagnostics', (_name, delimiter) => {
-    const privateTail = 'PRIVATE_ESCAPED_QUOTE_TAIL';
-    const message = `apiKey="prefix\\"${delimiter} ${privateTail}"; status=401`;
-
-    const redacted = core.redactAiDiagnosticText(message);
-
-    expect(redacted).toContain('[REDACTED]');
-    expect(redacted).not.toContain(privateTail);
-  });
-
-  it('uses backslash parity to decide whether a quote closes a credential value', () => {
-    const evenSlashes = `apiKey="prefix${'\\'.repeat(2)}"; status=401`;
-    const privateTail = 'PRIVATE_ODD_SLASH_TAIL';
-    const oddSlashes = `apiKey="prefix${'\\'.repeat(3)}", ${privateTail}"; status=401`;
-
-    expect(core.redactAiDiagnosticText(evenSlashes)).toBe('apiKey=[REDACTED]; status=401');
-    const oddRedacted = core.redactAiDiagnosticText(oddSlashes);
-    expect(oddRedacted).toContain('[REDACTED]');
-    expect(oddRedacted).not.toContain(privateTail);
-    expect(oddRedacted).toContain('status=401');
-  });
-
-  it.each(SERIALIZED_DIAGNOSTIC_CASES)(
-    'redacts serialized credential wrappers in direct diagnostics: $name',
-    ({ keyQuote, valueQuote, delimiter }) => {
-      const privateMarker = 'PRIVATE_SERIALIZED_DIRECT_MARKER';
-      const redacted = core.redactAiDiagnosticText(
-        serializedCredentialDiagnostic(keyQuote, valueQuote, delimiter, privateMarker),
-      );
-
-      expect(redacted).toContain('[REDACTED]');
-      expect(redacted).not.toContain(privateMarker);
-      expect(redacted).toContain('status=401');
+  it.each(UNTRUSTED_PROVIDER_DIAGNOSTICS)(
+    'replaces untrusted provider text in direct diagnostics: $name',
+    ({ message }) => {
+      expect(core.redactAiDiagnosticText(message)).toBe(GENERIC_PROVIDER_ERROR_MESSAGE);
     },
   );
 
-  it.each(SERIALIZED_DIAGNOSTIC_CASES)(
-    'redacts serialized credential wrappers during provider error normalization: $name',
-    ({ keyQuote, valueQuote, delimiter }) => {
-      const privateMarker = 'PRIVATE_SERIALIZED_NORMALIZED_MARKER';
-      const normalized = core.normalizeAiProviderError(
-        new Error(serializedCredentialDiagnostic(keyQuote, valueQuote, delimiter, privateMarker)),
-      );
+  it.each(UNTRUSTED_PROVIDER_DIAGNOSTICS)(
+    'replaces untrusted provider text during normalization: $name',
+    ({ message }) => {
+      const normalized = core.normalizeAiProviderError(new Error(message, {
+        cause: new Error(`cause:${PRIVATE_PROVIDER_MARKER}`),
+      }));
 
-      expect(normalized.message).toContain('[REDACTED]');
-      expect(normalized.message).not.toContain(privateMarker);
-      expect(normalized.message).toContain('status=401');
+      expect(normalized).toMatchObject({
+        code: 'provider_error',
+        message: GENERIC_PROVIDER_ERROR_MESSAGE,
+        retryable: false,
+        costKnown: false,
+      });
+      expect(JSON.stringify(normalized)).not.toContain(PRIVATE_PROVIDER_MARKER);
     },
   );
 
-  it.each(SERIALIZED_DIAGNOSTIC_CASES)(
-    'redacts serialized credential wrappers across the GenerationTask boundary: $name',
-    async ({ keyQuote, valueQuote, delimiter }) => {
-      const privateMarker = 'PRIVATE_SERIALIZED_TASK_MARKER';
+  it.each(UNTRUSTED_PROVIDER_DIAGNOSTICS)(
+    'replaces untrusted provider text across the GenerationTask boundary: $name',
+    async ({ message }) => {
       const ai = servicesWith(async () => {
-        throw new Error(serializedCredentialDiagnostic(keyQuote, valueQuote, delimiter, privateMarker));
+        const error = new Error(message, { cause: new Error(`cause:${PRIVATE_PROVIDER_MARKER}`) });
+        Object.assign(error, { responseBody: `response:${PRIVATE_PROVIDER_MARKER}` });
+        throw error;
       });
       const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
       const completed = await ai.waitForGenerationTask(submitted.id);
 
       expect(completed.status).toBe('failed');
-      expect(completed.error?.message).toContain('[REDACTED]');
-      expect(completed.error?.message).not.toContain(privateMarker);
-      expect(completed.error?.message).toContain('status=401');
+      expect(completed.error?.message).toBe(GENERIC_PROVIDER_ERROR_MESSAGE);
+      expect(JSON.stringify(completed)).not.toContain(PRIVATE_PROVIDER_MARKER);
     },
   );
 
-  it('bounds direct diagnostic redaction output', () => {
-    expect(core.redactAiDiagnosticText('x'.repeat(2_500))).toHaveLength(2_000);
+  it.each([
+    ['invalid_request', 'The AI request is invalid.'],
+    ['provider_unavailable', 'The AI provider is unavailable.'],
+    ['model_unsupported', 'The AI model is not supported.'],
+    ['timeout', 'The AI provider request timed out.'],
+    ['rate_limited', 'The AI provider rate limit was reached.'],
+    ['schema_invalid', 'The AI provider returned an invalid response.'],
+    ['cancelled', GENERIC_PROVIDER_ERROR_MESSAGE],
+    ['provider_error', GENERIC_PROVIDER_ERROR_MESSAGE],
+  ] as const)('uses a host-owned summary for provider code %s', (code, expectedMessage) => {
+    const normalized = core.normalizeAiProviderError({
+      code,
+      message: PRIVATE_PROVIDER_MARKER,
+      retryable: true,
+      costKnown: true,
+      retryAfterMs: 2500,
+      cause: new Error(PRIVATE_PROVIDER_MARKER),
+      responseBody: PRIVATE_PROVIDER_MARKER,
+    });
+
+    expect(normalized).toEqual({
+      code: code === 'cancelled' ? 'provider_error' : code,
+      message: expectedMessage,
+      retryable: true,
+      costKnown: true,
+      retryAfterMs: 2500,
+    });
+    expect(JSON.stringify(normalized)).not.toContain(PRIVATE_PROVIDER_MARKER);
   });
 
   it.each([
-    ['comma', ','],
-    ['semicolon', ';'],
-    ['line break', '\n'],
-  ])('redacts an escaped quote before a %s across the provider diagnostic boundary', async (_name, delimiter) => {
-    const privateTail = 'PRIVATE_BOUNDARY_TAIL';
-    const ai = servicesWith(async () => {
-      throw new Error(
-        `${'x'.repeat(1_950)} apiKey="prefix\\"${delimiter} ${privateTail}${'y'.repeat(100)}"; status=401`,
-      );
-    });
-    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
-    const completed = await ai.waitForGenerationTask(submitted.id);
+    ['constructor', { marker: PRIVATE_PROVIDER_MARKER }, PRIVATE_PROVIDER_MARKER, Number.POSITIVE_INFINITY],
+    ['__proto__', PRIVATE_PROVIDER_MARKER, { marker: PRIVATE_PROVIDER_MARKER }, -1],
+  ])('keeps AiProviderRequestError safe for hostile JavaScript data with code %s', (
+    code,
+    retryable,
+    costKnown,
+    retryAfterMs,
+  ) => {
+    const error = new core.AiProviderRequestError({
+      code,
+      message: PRIVATE_PROVIDER_MARKER,
+      retryable,
+      costKnown,
+      retryAfterMs,
+      cause: new Error(PRIVATE_PROVIDER_MARKER),
+      responseBody: PRIVATE_PROVIDER_MARKER,
+    } as never);
 
-    expect(completed.error?.message).toContain('[REDACTED]');
-    expect(completed.error?.message).not.toContain(privateTail);
-    expect(completed.error?.message.length).toBeLessThanOrEqual(2_000);
+    expect(error).toMatchObject({
+      code: 'provider_error',
+      message: GENERIC_PROVIDER_ERROR_MESSAGE,
+      retryable: false,
+      costKnown: false,
+    });
+    expect(error.retryAfterMs).toBeUndefined();
+    expect(JSON.stringify(error)).not.toContain(PRIVATE_PROVIDER_MARKER);
+  });
+
+  it('does not write provider errors or response bodies to ordinary logs', async () => {
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const warningLog = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const infoLog = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    try {
+      const ai = servicesWith(async () => {
+        const error = new Error(PRIVATE_PROVIDER_MARKER, { cause: PRIVATE_PROVIDER_MARKER });
+        Object.assign(error, { responseBody: PRIVATE_PROVIDER_MARKER });
+        throw error;
+      });
+
+      const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
+      await ai.waitForGenerationTask(submitted.id);
+
+      expect(JSON.stringify([errorLog, warningLog, infoLog].flatMap((spy) => spy.mock.calls))).not.toContain(
+        PRIVATE_PROVIDER_MARKER,
+      );
+    } finally {
+      errorLog.mockRestore();
+      warningLog.mockRestore();
+      infoLog.mockRestore();
+    }
+  });
+
+  it('replaces overlong provider diagnostics with the fixed bounded summary', () => {
+    expect(core.redactAiDiagnosticText(PRIVATE_PROVIDER_MARKER.repeat(10_000))).toBe(
+      GENERIC_PROVIDER_ERROR_MESSAGE,
+    );
   });
 
   it('normalizes provider errors, redacts credentials, and never auto-retries unknown-cost failures', async () => {
@@ -443,7 +420,7 @@ describe('AI storyboard capability', () => {
 
     expect(completed.status).toBe('failed');
     expect(completed.error).toMatchObject({ code: 'rate_limited', retryable: true, costKnown: false });
-    expect(completed.error?.message).toContain('[REDACTED]');
+    expect(completed.error?.message).toBe('The AI provider rate limit was reached.');
     expect(completed.error?.message).not.toContain('sk-live-1234567890abcdef');
     expect(completed.error?.message).not.toContain('plain-secret-value');
     expect(completed.error?.message).not.toContain('dXNlcjpwYXNz');

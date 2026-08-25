@@ -1,10 +1,19 @@
 import type { Project } from '../scene/types';
 import type { PluginState } from '../host/types';
 
+export type PluginDiagnostic = Readonly<Error>;
+
+export interface PluginStateChangedEvent {
+  readonly instanceId: string;
+  readonly pluginId: string;
+  readonly state: PluginState;
+  readonly error?: PluginDiagnostic;
+}
+
 /** 平台级类型化事件表；插件可经索引签名发射自定义事件 */
 export interface EventMap {
   // instanceId：稳定唯一的记录标识（可寻址）；pluginId：Manifest 展示 id，仅作展示
-  'plugin:state-changed': { instanceId: string; pluginId: string; state: PluginState; error?: unknown };
+  'plugin:state-changed': PluginStateChangedEvent;
   'plugin:contributed': { pluginId: string };
   'contribution:changed': { pluginId: string };
   'command:changed': { id: string; added: boolean };

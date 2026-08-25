@@ -204,12 +204,13 @@ export class AiProviderRequestError extends Error implements AiProviderErrorData
   readonly retryAfterMs?: number;
 
   constructor(data: AiProviderErrorData) {
-    super(redactAiDiagnosticText(data.message));
+    const normalized = normalizeAiProviderErrorData(data, false, true);
+    super(normalized.message);
     this.name = 'AiProviderRequestError';
-    this.code = data.code;
-    this.retryable = data.retryable;
-    this.costKnown = data.costKnown;
-    this.retryAfterMs = data.retryAfterMs;
+    this.code = normalized.code;
+    this.retryable = normalized.retryable;
+    this.costKnown = normalized.costKnown;
+    this.retryAfterMs = normalized.retryAfterMs;
   }
 }
 
@@ -248,95 +249,23 @@ export function parseAiStoryboardCapability(value: unknown): AiStoryboardCapabil
   return aiStoryboardCapabilitySchema.parse(value);
 }
 
-const MAX_PUBLIC_DIAGNOSTIC_LENGTH = 2_000;
-const MAX_DIAGNOSTIC_SCAN_LENGTH = 16_384;
+const GENERIC_PROVIDER_ERROR_MESSAGE = 'The AI provider request failed.';
 
-interface DiagnosticQuoteWrapper {
-  quote: '"' | "'";
-  serializationDepth: 0 | 1;
-  length: 1 | 2;
-}
-
-function readDiagnosticQuoteWrapper(message: string, index: number): DiagnosticQuoteWrapper | undefined {
-  const character = message[index];
-  if (character === '"' || character === "'") {
-    return { quote: character, serializationDepth: 0, length: 1 };
+function publicAiProviderErrorMessage(code: unknown): string {
+  switch (code) {
+    case 'invalid_request': return 'The AI request is invalid.';
+    case 'provider_unavailable': return 'The AI provider is unavailable.';
+    case 'model_unsupported': return 'The AI model is not supported.';
+    case 'timeout': return 'The AI provider request timed out.';
+    case 'rate_limited': return 'The AI provider rate limit was reached.';
+    case 'schema_invalid': return 'The AI provider returned an invalid response.';
+    case 'cancelled': return 'Generation cancelled.';
+    default: return GENERIC_PROVIDER_ERROR_MESSAGE;
   }
-  const escapedQuote = message[index + 1];
-  if (character === '\\' && (escapedQuote === '"' || escapedQuote === "'")) {
-    return { quote: escapedQuote, serializationDepth: 1, length: 2 };
-  }
-  return undefined;
 }
 
-function closesDiagnosticQuote(backslashCount: number, serializationDepth: 0 | 1): boolean {
-  if (serializationDepth === 0) return backslashCount % 2 === 0;
-  return backslashCount % 4 === 1;
-}
-
-function scanDiagnosticQuotedValue(
-  message: string,
-  start: number,
-  wrapper: DiagnosticQuoteWrapper,
-): number {
-  let cursor = start + wrapper.length;
-  let backslashCount = 0;
-  while (cursor < message.length) {
-    const character = message[cursor]!;
-    if (character === '\\') {
-      backslashCount += 1;
-      cursor += 1;
-      continue;
-    }
-    if (
-      character === wrapper.quote &&
-      closesDiagnosticQuote(backslashCount, wrapper.serializationDepth)
-    ) {
-      return cursor + 1;
-    }
-    backslashCount = 0;
-    cursor += 1;
-  }
-  return message.length;
-}
-
-function redactCredentialAssignments(message: string): string {
-  const assignmentPattern = /(?:\\?["'])?\b(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|client[-_ ]?secret|secret)\b(?:\\?["'])?\s*[:=]\s*/gi;
-  let output = '';
-  let cursor = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = assignmentPattern.exec(message)) !== null) {
-    if (match.index < cursor) continue;
-    output += message.slice(cursor, match.index);
-    output += match[0];
-
-    let valueEnd = assignmentPattern.lastIndex;
-    const wrapper = readDiagnosticQuoteWrapper(message, valueEnd);
-    if (wrapper) {
-      valueEnd = scanDiagnosticQuotedValue(message, valueEnd, wrapper);
-    } else {
-      while (valueEnd < message.length && !/[\r\n,;]/.test(message[valueEnd]!)) {
-        valueEnd += 1;
-      }
-    }
-
-    output += '[REDACTED]';
-    cursor = valueEnd;
-    assignmentPattern.lastIndex = valueEnd;
-  }
-
-  return output + message.slice(cursor);
-}
-
-export function redactAiDiagnosticText(message: string): string {
-  return redactCredentialAssignments(message.slice(0, MAX_DIAGNOSTIC_SCAN_LENGTH))
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [REDACTED]')
-    .replace(/\bBasic\s+[A-Za-z0-9+/=_-]{8,}/gi, 'Basic [REDACTED]')
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
-    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]*$/gi, '$1 [REDACTED]')
-    .replace(/\bsk-[A-Za-z0-9_-]*$/g, '[REDACTED]')
-    .slice(0, MAX_PUBLIC_DIAGNOSTIC_LENGTH);
+export function redactAiDiagnosticText(_message: string): string {
+  return GENERIC_PROVIDER_ERROR_MESSAGE;
 }
 
 const KNOWN_AI_PROVIDER_ERROR_CODES = new Set<AiProviderErrorCode>([
@@ -350,7 +279,6 @@ const KNOWN_AI_PROVIDER_ERROR_CODES = new Set<AiProviderErrorCode>([
   'provider_error',
 ]);
 
-const GENERIC_PROVIDER_ERROR_MESSAGE = 'The AI provider request failed.';
 function readOwnDataProperty(value: unknown, key: string): unknown {
   if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return undefined;
   try {
@@ -361,28 +289,23 @@ function readOwnDataProperty(value: unknown, key: string): unknown {
   }
 }
 
-function safeProviderDiagnostic(value: unknown): string {
-  if (typeof value !== 'string') return GENERIC_PROVIDER_ERROR_MESSAGE;
-  try {
-    return redactAiDiagnosticText(value);
-  } catch {
-    return GENERIC_PROVIDER_ERROR_MESSAGE;
-  }
-}
-
-export function normalizeAiProviderError(error: unknown, fallbackCostKnown = false): AiProviderErrorData {
+function normalizeAiProviderErrorData(
+  error: unknown,
+  fallbackCostKnown: boolean,
+  allowCancelled: boolean,
+): AiProviderErrorData {
   try {
     const candidateCode = readOwnDataProperty(error, 'code');
     const normalizedCode = typeof candidateCode === 'string' && KNOWN_AI_PROVIDER_ERROR_CODES.has(candidateCode as AiProviderErrorCode)
       ? (candidateCode as AiProviderErrorCode)
       : 'provider_error';
-    const code = normalizedCode === 'cancelled' ? 'provider_error' : normalizedCode;
+    const code = !allowCancelled && normalizedCode === 'cancelled' ? 'provider_error' : normalizedCode;
     const retryable = readOwnDataProperty(error, 'retryable');
     const costKnown = readOwnDataProperty(error, 'costKnown');
     const retryAfterMs = readOwnDataProperty(error, 'retryAfterMs');
     return {
       code,
-      message: safeProviderDiagnostic(readOwnDataProperty(error, 'message')),
+      message: publicAiProviderErrorMessage(code),
       retryable: typeof retryable === 'boolean' ? retryable : code === 'timeout' || code === 'rate_limited',
       costKnown: typeof costKnown === 'boolean' ? costKnown : fallbackCostKnown === true,
       ...(typeof retryAfterMs === 'number' && Number.isFinite(retryAfterMs) && retryAfterMs >= 0
@@ -397,4 +320,8 @@ export function normalizeAiProviderError(error: unknown, fallbackCostKnown = fal
       costKnown: fallbackCostKnown === true,
     };
   }
+}
+
+export function normalizeAiProviderError(error: unknown, fallbackCostKnown = false): AiProviderErrorData {
+  return normalizeAiProviderErrorData(error, fallbackCostKnown, false);
 }

@@ -5,7 +5,7 @@ export type { Disposable, DisposeFn } from './disposable';
 // 事件总线
 export { TypedEventEmitter } from './events/typed-event-emitter';
 export type { EventHandler, TypedEventEmitterOptions } from './events/typed-event-emitter';
-export type { EventMap } from './events/event-map';
+export type { EventMap, PluginDiagnostic, PluginStateChangedEvent } from './events/event-map';
 
 // 场景数据模型（Project v3）
 export { createSampleProject } from './scene/sample-project';

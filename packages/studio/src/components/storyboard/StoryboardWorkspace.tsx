@@ -373,13 +373,13 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
       } else if (completed.error) {
         setError(completed.error);
       }
-    } catch (caught) {
+    } catch {
       if (requestGenerationRef.current !== generation) return;
       taskIdRef.current = null;
       setTaskId(null);
       setError({
         code: 'invalid_request',
-        message: caught instanceof Error ? caught.message : '无法提交生成任务。',
+        message: 'Unable to submit the generation task.',
         retryable: false,
         costKnown: false,
       });

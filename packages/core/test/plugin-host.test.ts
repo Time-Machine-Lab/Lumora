@@ -14,6 +14,18 @@ import type { Manifest } from '../src/manifest/validate';
 import type { AiStoryboardCapability } from '../src/ai/storyboard';
 import type { AiProviderContribution } from '../src/contributions/types';
 import type { Disposable } from '../src/disposable';
+import type { EventMap } from '../src/events/event-map';
+
+function assertReadonlyPluginStateEvent(event: EventMap['plugin:state-changed']): void {
+  // @ts-expect-error plugin state event DTOs are immutable by contract.
+  event.state = 'active';
+  if (event.error) {
+    // @ts-expect-error published diagnostics are immutable by contract.
+    event.error.message = 'mutated';
+  }
+}
+
+void assertReadonlyPluginStateEvent;
 
 const VALID_MANIFEST: Manifest = {
   schemaVersion: '1',
@@ -99,7 +111,7 @@ describe('PluginHost', () => {
 
     expect(info.state).toBe('failed');
     expect(info.reason).toContain('激活失败');
-    expect(info.reason).toContain('storyboard.capability:invalid_literal');
+    expect(info.reason).not.toContain('storyboard.capability:invalid_literal');
     expect(info.reason).not.toContain(sensitiveCapability);
     expect(JSON.stringify(info.error)).not.toContain(sensitiveCapability);
     expect(JSON.stringify(failedEventErrors)).not.toContain(sensitiveCapability);
@@ -174,6 +186,39 @@ describe('PluginHost', () => {
     expect((failedEventError as Error).message.length).toBeLessThanOrEqual(2_000);
   });
 
+  it('publishes only host-owned plugin summaries without retaining message, response, or cause', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const privateMarker = 'PRIVATE_PLUGIN_PROVIDER_RESPONSE';
+    const originalError = new Error(privateMarker, {
+      cause: new Error(`cause:${privateMarker}`),
+    });
+    Object.assign(originalError, { responseBody: `response:${privateMarker}` });
+    let failedEvent: EventMap['plugin:state-changed'] | undefined;
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'failed') failedEvent = event;
+    });
+
+    const info = await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => {
+            throw originalError;
+          },
+        },
+      })),
+    );
+
+    expect(info.reason).toBe('插件激活失败。');
+    expect(info.error).toBeInstanceOf(Error);
+    expect((info.error as Error).message).toBe('插件激活失败。');
+    expect((info.error as Error).cause).toBeUndefined();
+    expect(failedEvent?.error).toBeInstanceOf(Error);
+    expect((failedEvent?.error as Error).message).toBe('插件激活失败。');
+    expect((failedEvent?.error as Error).cause).toBeUndefined();
+    expect(JSON.stringify(info)).not.toContain(privateMarker);
+    expect(JSON.stringify(failedEvent)).not.toContain(privateMarker);
+  });
+
   it('publishes bounded redacted deactivation errors without retaining the original object', async () => {
     const host = new PluginHost({ hostVersion: '0.1.0' });
     const privateTail = 'PRIVATE_DEACTIVATION_TAIL';
@@ -199,11 +244,13 @@ describe('PluginHost', () => {
     const infoErrors = Array.isArray(info.error) ? info.error : [info.error];
     const eventErrors = Array.isArray(disabledEventError) ? disabledEventError : [disabledEventError];
     expect(info.state).toBe('disabled');
+    expect(info.reason).toBe('插件停用失败。');
     expect(info.reason).not.toContain(privateTail);
     expect(info.reason?.length).toBeLessThanOrEqual(2_000);
     for (const error of [...infoErrors, ...eventErrors]) {
       expect(error).toBeInstanceOf(Error);
       expect(error).not.toBe(originalError);
+      expect((error as Error).message).toBe('插件停用失败。');
       expect((error as Error).message).not.toContain(privateTail);
       expect((error as Error).message.length).toBeLessThanOrEqual(2_000);
     }
@@ -804,7 +851,7 @@ describe('PluginHost', () => {
       })),
     );
     expect(info.state).toBe('failed');
-    expect(info.reason).toContain('id 重复');
+    expect(info.reason).toBe('插件激活失败。');
     expect(host.contributions.getPanels()).toHaveLength(1);
   });
 
@@ -873,7 +920,7 @@ describe('PluginHost', () => {
       })),
     );
     expect(info.state).toBe('failed');
-    expect(info.reason).toContain('在 bundle 内重复');
+    expect(info.reason).toBe('插件激活失败。');
     // 非法 bundle 中即便含合法项也不得部分生效
     expect(host.contributions.count()).toBe(0);
     expect(host.commands.count()).toBe(0);
@@ -895,7 +942,7 @@ describe('PluginHost', () => {
       })),
     );
     expect(info.state).toBe('failed');
-    expect(info.reason).toContain('在 bundle 内重复');
+    expect(info.reason).toBe('插件激活失败。');
     expect(host.commands.count()).toBe(0);
   });
 
@@ -1476,7 +1523,7 @@ describe('PluginHost', () => {
     // 重新启用：重新加载，失败正常进入 failed 并给出原因
     await host.enable('com.example.plugin');
     expect(host.getPlugin('com.example.plugin')?.state).toBe('failed');
-    expect(host.getPlugin('com.example.plugin')?.reason).toContain('加载爆炸');
+    expect(host.getPlugin('com.example.plugin')?.reason).toBe('入口模块加载失败');
     expect(entry).toHaveBeenCalledTimes(2);
   });
 
