@@ -52,6 +52,7 @@ export class TimelineController {
   private time = 0;
   private playing = false;
   private stateGeneration = 0;
+  private durationOperationGeneration = 0;
   private fps: number;
   private duration: number;
   private zoom: number;
@@ -112,8 +113,12 @@ export class TimelineController {
   setDuration(duration: number): void {
     const next = Number.isFinite(duration) && duration > 0 ? duration : 0;
     if (next === this.duration) return;
+    const operationGeneration = ++this.durationOperationGeneration;
     this.duration = next;
-    if (this.time > next) this.seek(next);
+    if (this.time > next) {
+      this.seek(next);
+      if (this.durationOperationGeneration !== operationGeneration) return;
+    }
     if (next === 0 && this.playing) {
       this.playing = false;
       this.stateGeneration += 1;

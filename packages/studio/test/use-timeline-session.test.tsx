@@ -298,6 +298,56 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     settingsSub.dispose();
   });
 
+  it('keeps nested C playing when deleting the only shot re-enters setDuration through time changed', () => {
+    const sample = createSampleProject();
+    const onlyShot = { ...sample.shots[0]!, id: 'only-shot', startTime: 0, endTime: 10 };
+    editor.openProject({
+      ...sample,
+      uri: 'lumora://duration-reentry',
+      tracks: [],
+      shots: [onlyShot],
+    });
+    mount();
+    const sessionToken = editor.getSessionToken();
+    act(() => {
+      live().timeline.seek(5, false);
+      live().timeline.play();
+    });
+    const settingsDurations: number[] = [];
+    const settingsSub = live().timeline.events.on('settings:changed', ({ duration }) => {
+      settingsDurations.push(duration);
+    });
+    let nested = false;
+    const timeSub = live().timeline.events.on('time:changed', ({ time }) => {
+      if (nested || time !== 0 || editor.getProject()?.shots.length !== 0) return;
+      nested = true;
+      expect(editor.addShot({ ...onlyShot, id: 'nested-shot', endTime: 8 }).ok).toBe(true);
+    });
+
+    act(() => {
+      expect(editor.deleteShot(onlyShot.id).ok).toBe(true);
+    });
+
+    expect(nested).toBe(true);
+    expect(editor.getSessionToken()).toBe(sessionToken);
+    expect(editor.getProject()?.shots.map((shot) => shot.id)).toEqual(['nested-shot']);
+    expect({
+      controllerDuration: live().timeline.getDuration(),
+      stateDuration: live().state.duration,
+      controllerPlaying: live().timeline.isPlaying(),
+      statePlaying: live().state.playing,
+      settingsDurations,
+    }).toEqual({
+      controllerDuration: 8,
+      stateDuration: 8,
+      controllerPlaying: true,
+      statePlaying: true,
+      settingsDurations: [8],
+    });
+    timeSub.dispose();
+    settingsSub.dispose();
+  });
+
   it('更早注册的 project:changed listener 同步执行旧 confirm/stop → 入口自检拒绝，样本不写入新项目（复审阻断 3）', () => {
     // 先于 hook 内部 listener 注册：openProject 同步分发 project:changed 时本
     // listener 先执行，hook 的取消分支尚未运行 —— 只能靠 confirm/stop 入口的
