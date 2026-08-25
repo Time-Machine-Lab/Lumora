@@ -1,4 +1,5 @@
 import { DisposableSet, type Disposable } from '../disposable';
+import { redactAiDiagnosticText } from '../ai/storyboard';
 import { CommandRegistry, PluginCommands, type CommandContext } from '../commands/command-registry';
 import { ContributionRegistry } from '../contributions/contribution-registry';
 import { TypedEventEmitter } from '../events/typed-event-emitter';
@@ -591,6 +592,7 @@ export class PluginHost {
         reason = engine.reason;
       }
     }
+    if (reason !== undefined) reason = redactAiDiagnosticText(reason);
 
     // 校验失败时使用安全占位 Manifest（仅含可安全提取的展示字段），
     // info()/事件等后续环节只接触占位对象，不再触碰原始输入。
@@ -625,14 +627,14 @@ export class PluginHost {
       gate: null,
       lifecycle: null,
       lifecycleTarget: null,
-      info() {
+      info: () => {
         return {
           instanceId: record.key,
           id: record.id,
           name: record.name,
           version: record.version,
           state: record.state,
-          error: record.error,
+          error: this.publicErrorSnapshot(record.error),
           reason: record.reason,
           contributes: [...(record.manifest.contributes ?? [])],
         };
@@ -894,7 +896,7 @@ export class PluginHost {
     const publicError = this.normalizePluginError(error);
     const failure = this.publishLifecycle(record, {
       state: 'failed',
-      reason: `激活失败: ${publicError.message}`,
+      reason: redactAiDiagnosticText(`激活失败: ${publicError.message}`),
       error: publicError,
     });
     completion.resolve();
@@ -992,7 +994,9 @@ export class PluginHost {
         if (errors.length > 0) {
           const publicErrors = errors.map((error) => this.normalizePluginError(error));
           record.error = publicErrors;
-          record.reason = `停用时出错: ${publicErrors.map((error) => error.message).join('；')}`;
+          record.reason = redactAiDiagnosticText(
+            `停用时出错: ${publicErrors.map((error) => error.message).join('；')}`,
+          );
         }
       } else if (originalState === 'failed') {
         // failed 插件（校验/加载/激活失败）：幂等清理残留资源，保留失败原因（可重新启用重试）
@@ -1152,20 +1156,24 @@ export class PluginHost {
   }
 
   private fail(record: PluginRecord, reason: string, error?: unknown): void {
+    const publicReason = redactAiDiagnosticText(reason);
     record.state = 'failed';
-    record.reason = reason;
-    record.error = error === undefined ? new Error(reason) : this.normalizePluginError(error);
+    record.reason = publicReason;
+    record.error = error === undefined ? new Error(publicReason) : this.normalizePluginError(error);
     this.emitState(record, 'failed');
   }
 
   private emitState(record: PluginRecord, state: PluginState): void {
+    const publicError = record.reason === undefined && record.error === undefined
+      ? undefined
+      : new Error(redactAiDiagnosticText(record.reason ?? this.errorMessage(record.error)));
     this.events.emit('plugin:state-changed', {
       // instanceId：稳定唯一的记录标识，事件关联与寻址（disable/enable）使用它；
       // pluginId 仅作 Manifest 展示（缺 id 时为 '<unknown>'），不得用于寻址
       instanceId: record.key,
       pluginId: record.id,
       state,
-      error: record.error ?? record.reason,
+      error: publicError,
     });
   }
 
@@ -1190,7 +1198,13 @@ export class PluginHost {
         // Hostile values must not prevent the lifecycle from reaching a terminal state.
       }
     }
-    return new Error(message);
+    return new Error(redactAiDiagnosticText(message));
+  }
+
+  private publicErrorSnapshot(error: unknown): unknown {
+    if (error === undefined) return undefined;
+    if (Array.isArray(error)) return error.map((item) => this.normalizePluginError(item));
+    return this.normalizePluginError(error);
   }
 
   private errorMessage(error: unknown): string {

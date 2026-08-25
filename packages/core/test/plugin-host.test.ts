@@ -142,6 +142,116 @@ describe('PluginHost', () => {
     expect(info.error === hostile).toBe(false);
   });
 
+  it('publishes bounded redacted activation errors without retaining the original object', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const privateTail = 'PRIVATE_ACTIVATION_TAIL';
+    const originalError = new Error(`apiKey="prefix\\", ${privateTail}${'x'.repeat(2_500)}"`);
+    let failedEventError: unknown;
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'failed') failedEventError = event.error;
+    });
+
+    const info = await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => {
+            throw originalError;
+          },
+        },
+      })),
+    );
+
+    expect(info.state).toBe('failed');
+    expect(info.reason).not.toContain(privateTail);
+    expect(info.reason?.length).toBeLessThanOrEqual(2_000);
+    expect(info.error).toBeInstanceOf(Error);
+    expect(info.error).not.toBe(originalError);
+    expect((info.error as Error).message).not.toContain(privateTail);
+    expect((info.error as Error).message.length).toBeLessThanOrEqual(2_000);
+    expect(failedEventError).toBeInstanceOf(Error);
+    expect(failedEventError).not.toBe(originalError);
+    expect((failedEventError as Error).message).not.toContain(privateTail);
+    expect((failedEventError as Error).message.length).toBeLessThanOrEqual(2_000);
+  });
+
+  it('publishes bounded redacted deactivation errors without retaining the original object', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const privateTail = 'PRIVATE_DEACTIVATION_TAIL';
+    const originalError = new Error(`accessToken="prefix\\"; ${privateTail}${'x'.repeat(2_500)}"`);
+    let disabledEventError: unknown;
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'disabled') disabledEventError = event.error;
+    });
+    await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => undefined,
+          deactivate: () => {
+            throw originalError;
+          },
+        },
+      })),
+    );
+
+    await host.disable('com.example.plugin');
+
+    const info = host.getPlugin('com.example.plugin')!;
+    const infoErrors = Array.isArray(info.error) ? info.error : [info.error];
+    const eventErrors = Array.isArray(disabledEventError) ? disabledEventError : [disabledEventError];
+    expect(info.state).toBe('disabled');
+    expect(info.reason).not.toContain(privateTail);
+    expect(info.reason?.length).toBeLessThanOrEqual(2_000);
+    for (const error of [...infoErrors, ...eventErrors]) {
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBe(originalError);
+      expect((error as Error).message).not.toContain(privateTail);
+      expect((error as Error).message.length).toBeLessThanOrEqual(2_000);
+    }
+  });
+
+  it('isolates published activation and deactivation errors from caller mutation', async () => {
+    const activationHost = new PluginHost({ hostVersion: '0.1.0' });
+    const activationInfo = await activationHost.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => {
+            throw new Error('activation failed');
+          },
+        },
+      })),
+    );
+    (activationInfo.error as Error).message = 'apiKey=INJECTED_ACTIVATION_SECRET';
+
+    const freshActivationInfo = activationHost.getPlugin('com.example.plugin')!;
+    expect(freshActivationInfo.error).not.toBe(activationInfo.error);
+    expect((freshActivationInfo.error as Error).message).not.toContain('INJECTED_ACTIVATION_SECRET');
+
+    const deactivationHost = new PluginHost({ hostVersion: '0.1.0' });
+    await deactivationHost.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => undefined,
+          deactivate: () => {
+            throw new Error('deactivation failed');
+          },
+        },
+      })),
+    );
+    await deactivationHost.disable('com.example.plugin');
+    const deactivationInfo = deactivationHost.getPlugin('com.example.plugin')!;
+    const publishedErrors = deactivationInfo.error as Error[];
+    publishedErrors[0]!.message = 'accessToken=INJECTED_DEACTIVATION_SECRET';
+    publishedErrors.push(new Error('refreshToken=ORIGINAL_OBJECT'));
+
+    const freshDeactivationInfo = deactivationHost.getPlugin('com.example.plugin')!;
+    const freshErrors = freshDeactivationInfo.error as Error[];
+    expect(freshErrors).not.toBe(publishedErrors);
+    expect(freshErrors).toHaveLength(1);
+    expect(freshErrors[0]).not.toBe(publishedErrors[0]);
+    expect(freshErrors[0]!.message).not.toContain('INJECTED_DEACTIVATION_SECRET');
+    expect(freshErrors[0]!.message).not.toContain('ORIGINAL_OBJECT');
+  });
+
   it('cancels running storyboard tasks when their provider plugin is disabled', async () => {
     const host = new PluginHost({ hostVersion: '0.1.0' });
     const providerId = 'com.example.plugin.storyboard';

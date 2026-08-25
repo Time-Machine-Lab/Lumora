@@ -248,23 +248,59 @@ export function parseAiStoryboardCapability(value: unknown): AiStoryboardCapabil
   return aiStoryboardCapabilitySchema.parse(value);
 }
 
+const MAX_PUBLIC_DIAGNOSTIC_LENGTH = 2_000;
+const MAX_DIAGNOSTIC_SCAN_LENGTH = 16_384;
+
+function redactCredentialAssignments(message: string): string {
+  const assignmentPattern = /["']?\b(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|client[-_ ]?secret|secret)\b["']?\s*[:=]\s*/gi;
+  let output = '';
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = assignmentPattern.exec(message)) !== null) {
+    if (match.index < cursor) continue;
+    output += message.slice(cursor, match.index);
+    output += match[0];
+
+    let valueEnd = assignmentPattern.lastIndex;
+    const quote = message[valueEnd];
+    if (quote === '"' || quote === "'") {
+      let escaped = false;
+      valueEnd += 1;
+      while (valueEnd < message.length) {
+        const character = message[valueEnd]!;
+        if (escaped) {
+          escaped = false;
+        } else if (character === '\\') {
+          escaped = true;
+        } else if (character === quote) {
+          valueEnd += 1;
+          break;
+        }
+        valueEnd += 1;
+      }
+    } else {
+      while (valueEnd < message.length && !/[\r\n,;]/.test(message[valueEnd]!)) {
+        valueEnd += 1;
+      }
+    }
+
+    output += '[REDACTED]';
+    cursor = valueEnd;
+    assignmentPattern.lastIndex = valueEnd;
+  }
+
+  return output + message.slice(cursor);
+}
+
 export function redactAiDiagnosticText(message: string): string {
-  return message
+  return redactCredentialAssignments(message.slice(0, MAX_DIAGNOSTIC_SCAN_LENGTH))
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [REDACTED]')
     .replace(/\bBasic\s+[A-Za-z0-9+/=_-]{8,}/gi, 'Basic [REDACTED]')
     .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
-    .replace(
-      /((?:["']?)(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|client[-_ ]?secret|secret)(?:["']?)\s*[:=]\s*)(["'])[^\r\n]*?\2/gi,
-      '$1$2[REDACTED]$2',
-    )
-    .replace(
-      /((?:["']?)(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|client[-_ ]?secret|secret)(?:["']?)\s*[:=]\s*)(["'])(?:(?!\2)[^\r\n])*(?=\r?\n|$)/gi,
-      '$1[REDACTED]',
-    )
-    .replace(
-      /((?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|client[-_ ]?secret|secret)\s*[:=]\s*)[^\r\n,;]+/gi,
-      '$1[REDACTED]',
-    );
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]*$/gi, '$1 [REDACTED]')
+    .replace(/\bsk-[A-Za-z0-9_-]*$/g, '[REDACTED]')
+    .slice(0, MAX_PUBLIC_DIAGNOSTIC_LENGTH);
 }
 
 const KNOWN_AI_PROVIDER_ERROR_CODES = new Set<AiProviderErrorCode>([
@@ -279,8 +315,6 @@ const KNOWN_AI_PROVIDER_ERROR_CODES = new Set<AiProviderErrorCode>([
 ]);
 
 const GENERIC_PROVIDER_ERROR_MESSAGE = 'The AI provider request failed.';
-const MAX_PROVIDER_DIAGNOSTIC_LENGTH = 2_000;
-
 function readOwnDataProperty(value: unknown, key: string): unknown {
   if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return undefined;
   try {
@@ -294,10 +328,7 @@ function readOwnDataProperty(value: unknown, key: string): unknown {
 function safeProviderDiagnostic(value: unknown): string {
   if (typeof value !== 'string') return GENERIC_PROVIDER_ERROR_MESSAGE;
   try {
-    return redactAiDiagnosticText(value.slice(0, MAX_PROVIDER_DIAGNOSTIC_LENGTH))
-      .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]*$/gi, '$1 [REDACTED]')
-      .replace(/\bsk-[A-Za-z0-9_-]*$/g, '[REDACTED]')
-      .slice(0, MAX_PROVIDER_DIAGNOSTIC_LENGTH);
+    return redactAiDiagnosticText(value);
   } catch {
     return GENERIC_PROVIDER_ERROR_MESSAGE;
   }

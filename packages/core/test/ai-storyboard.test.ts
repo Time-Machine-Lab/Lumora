@@ -303,6 +303,55 @@ describe('AI storyboard capability', () => {
     );
   });
 
+  it.each([
+    ['comma', ','],
+    ['semicolon', ';'],
+    ['line break', '\n'],
+  ])('redacts an escaped quote before a %s in direct diagnostics', (_name, delimiter) => {
+    const privateTail = 'PRIVATE_ESCAPED_QUOTE_TAIL';
+    const message = `apiKey="prefix\\"${delimiter} ${privateTail}"; status=401`;
+
+    const redacted = core.redactAiDiagnosticText(message);
+
+    expect(redacted).toContain('[REDACTED]');
+    expect(redacted).not.toContain(privateTail);
+  });
+
+  it('uses backslash parity to decide whether a quote closes a credential value', () => {
+    const evenSlashes = `apiKey="prefix${'\\'.repeat(2)}"; status=401`;
+    const privateTail = 'PRIVATE_ODD_SLASH_TAIL';
+    const oddSlashes = `apiKey="prefix${'\\'.repeat(3)}", ${privateTail}"; status=401`;
+
+    expect(core.redactAiDiagnosticText(evenSlashes)).toBe('apiKey=[REDACTED]; status=401');
+    const oddRedacted = core.redactAiDiagnosticText(oddSlashes);
+    expect(oddRedacted).toContain('[REDACTED]');
+    expect(oddRedacted).not.toContain(privateTail);
+    expect(oddRedacted).toContain('status=401');
+  });
+
+  it('bounds direct diagnostic redaction output', () => {
+    expect(core.redactAiDiagnosticText('x'.repeat(2_500))).toHaveLength(2_000);
+  });
+
+  it.each([
+    ['comma', ','],
+    ['semicolon', ';'],
+    ['line break', '\n'],
+  ])('redacts an escaped quote before a %s across the provider diagnostic boundary', async (_name, delimiter) => {
+    const privateTail = 'PRIVATE_BOUNDARY_TAIL';
+    const ai = servicesWith(async () => {
+      throw new Error(
+        `${'x'.repeat(1_950)} apiKey="prefix\\"${delimiter} ${privateTail}${'y'.repeat(100)}"; status=401`,
+      );
+    });
+    const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
+    const completed = await ai.waitForGenerationTask(submitted.id);
+
+    expect(completed.error?.message).toContain('[REDACTED]');
+    expect(completed.error?.message).not.toContain(privateTail);
+    expect(completed.error?.message.length).toBeLessThanOrEqual(2_000);
+  });
+
   it('normalizes provider errors, redacts credentials, and never auto-retries unknown-cost failures', async () => {
     const generate = vi.fn(async () => {
       const error = new Error(
