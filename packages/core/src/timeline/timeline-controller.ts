@@ -231,12 +231,16 @@ export class TimelineController {
   }
 
   private emitSettings(): void {
-    this.events.emit('settings:changed', {
-      fps: this.fps,
-      zoom: this.zoom,
-      snap: this.snapToFrame,
-      loop: this.loop,
-      duration: this.duration,
-    });
+    this.events.emit(
+      'settings:changed',
+      {
+        fps: this.fps,
+        zoom: this.zoom,
+        snap: this.snapToFrame,
+        loop: this.loop,
+        duration: this.duration,
+      },
+      { latestWins: true },
+    );
   }
 }

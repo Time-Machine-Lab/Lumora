@@ -93,6 +93,22 @@ describe('TimelineController：统一时间引擎', () => {
     expect(last).toEqual({ fps: 30, zoom: 500, snap: false, loop: false, duration: 20 });
   });
 
+  it('later settings listeners receive only the nested final snapshot', () => {
+    const timeline = new TimelineController({ fps: 24, duration: 10 });
+    timeline.events.on('settings:changed', ({ fps }) => {
+      if (fps === 30) timeline.setFps(60);
+    });
+    const observed: Array<{ payload: number; actual: number }> = [];
+    timeline.events.on('settings:changed', ({ fps }) => {
+      observed.push({ payload: fps, actual: timeline.getFps() });
+    });
+
+    timeline.setFps(30);
+
+    expect(observed).toEqual([{ payload: 60, actual: 60 }]);
+    expect(timeline.getFps()).toBe(60);
+  });
+
   it('时长缩短到播放头之后：播放头收敛到新时长', () => {
     const timeline = new TimelineController({ duration: 10 });
     timeline.seek(8);

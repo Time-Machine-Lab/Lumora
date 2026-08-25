@@ -1,6 +1,6 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { SceneEditor, createSampleProject, getProjectDuration } from '@lumora/core';
+import { SceneEditor, createGroupObject, createSampleProject, getProjectDuration } from '@lumora/core';
 import type { RenderHookResult } from '@testing-library/react';
 import type { CaptureNodeSample } from '../src/components/editor/camera-drive';
 import { useTimelineSession } from '../src/hooks/use-timeline-session';
@@ -256,6 +256,46 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     expect(live().state.fps).toBe(60);
     expect(live().state.duration).toBe(0);
     earlySub.dispose();
+  });
+
+  it('converges on C when applying project B fps synchronously opens C from inside the hook', () => {
+    const sample = createSampleProject();
+    const projectB = {
+      ...sample,
+      uri: 'lumora://project-b',
+      settings: { ...sample.settings, fps: 30 },
+      tracks: [],
+      shots: [{ ...sample.shots[0]!, startTime: 0, endTime: 4.5 }],
+    };
+    const projectC = {
+      ...sample,
+      uri: 'lumora://project-c',
+      settings: { ...sample.settings, fps: 60 },
+      tracks: [],
+      shots: [{ ...sample.shots[0]!, startTime: 0, endTime: 8 }],
+    };
+    mount();
+    const settingsSub = live().timeline.events.on('settings:changed', ({ fps }) => {
+      if (fps === 30 && editor.getProject()?.uri === projectB.uri) editor.openProject(projectC);
+    });
+
+    act(() => editor.openProject(projectB));
+
+    expect(editor.getProject()?.uri).toBe(projectC.uri);
+    expect(live().timeline.getFps()).toBe(60);
+    expect(live().timeline.getDuration()).toBe(8);
+    expect(live().state.fps).toBe(60);
+    expect(live().state.duration).toBe(8);
+
+    // A same-session C edit must not be mistaken for another session switch.
+    act(() => {
+      live().timeline.seek(2, false);
+      live().timeline.play();
+      expect(editor.addObject(createGroupObject()).ok).toBe(true);
+    });
+    expect(live().timeline.getTime()).toBe(2);
+    expect(live().timeline.isPlaying()).toBe(true);
+    settingsSub.dispose();
   });
 
   it('更早注册的 project:changed listener 同步执行旧 confirm/stop → 入口自检拒绝，样本不写入新项目（复审阻断 3）', () => {

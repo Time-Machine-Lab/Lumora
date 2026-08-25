@@ -122,9 +122,16 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     };
     const subs = [
       editor.events.on('project:changed', ({ project, sessionToken }) => {
+        const isCurrentPayload = () =>
+          sessionToken === editor.getSessionToken() && project === editor.getProject();
+        const runWhileCurrent = (operation: () => void) => {
+          if (!isCurrentPayload()) return false;
+          operation();
+          return isCurrentPayload();
+        };
         // An earlier listener may synchronously open or edit another project.
         // Never combine an old payload with the current editor session.
-        if (sessionToken !== editor.getSessionToken() || project !== editor.getProject()) return;
+        if (!isCurrentPayload()) return;
         // 会话令牌变化（打开/重开/重置项目）→ 覆盖确认作废：新项目的同 ID
         // 相机不得在旧确认下误启动录制（复审阻断 3）
         if (
@@ -133,36 +140,44 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
         ) {
           pendingRecordingRef.current = null;
           setState((s) => ({ ...s, overwritePending: false }));
+          if (!isCurrentPayload()) return;
         }
         if (project === null) {
           cancelRecording();
-          timeline.pause();
-          timeline.setDuration(0);
-          timeline.seek(0);
+          if (!isCurrentPayload()) return;
+          if (!runWhileCurrent(() => timeline.pause())) return;
+          if (!runWhileCurrent(() => timeline.setDuration(0))) return;
+          if (!runWhileCurrent(() => timeline.seek(0))) return;
           return;
         }
         const fps = project.settings?.fps;
-        if (typeof fps === 'number' && fps > 0) timeline.setFps(fps);
+        if (typeof fps === 'number' && fps > 0 && !runWhileCurrent(() => timeline.setFps(fps))) return;
         // 会话切换（A→B 直接打开 / 同 URI 重开 / 关闭后重开）：无条件停止录制、
         // 暂停并回零 —— 不得只在「上一项目为 null」时回零，否则播放头带着旧
         // 项目的时刻直接进入新项目（复审阻断 3）
         const sessionChanged =
           currentSessionTokenRef.current !== null && sessionToken !== currentSessionTokenRef.current;
+        if (!isCurrentPayload()) return;
         currentSessionTokenRef.current = sessionToken;
         if (sessionChanged) {
-          if (recorder.active) cancelRecording();
-          timeline.pause();
-          timeline.seek(0);
-          timeline.setDuration(getProjectDuration(project));
+          if (recorder.active) {
+            cancelRecording();
+            if (!isCurrentPayload()) return;
+          }
+          if (!runWhileCurrent(() => timeline.pause())) return;
+          if (!runWhileCurrent(() => timeline.seek(0))) return;
+          if (!runWhileCurrent(() => timeline.setDuration(getProjectDuration(project)))) return;
           return;
         }
-        if (!recorder.active) timeline.setDuration(getProjectDuration(project));
-        else if (!project.objects.some((o) => o.id === recorder.recordingCameraId)) {
+        if (!recorder.active) {
+          if (!runWhileCurrent(() => timeline.setDuration(getProjectDuration(project)))) return;
+        } else if (!project.objects.some((o) => o.id === recorder.recordingCameraId)) {
           // 录制中绑定机位被删除/撤销：采样源已失效，取消录制并把时长收敛回
           // 项目时长（录制扩容出的时长不得残留，复审阻断 3）
           cancelRecording();
-          timeline.pause();
-          timeline.setDuration(getProjectDuration(project));
+          if (!isCurrentPayload()) return;
+          if (!runWhileCurrent(() => timeline.pause())) return;
+          if (!runWhileCurrent(() => timeline.setDuration(getProjectDuration(project)))) return;
         }
       }),
     ];
