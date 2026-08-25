@@ -22,6 +22,7 @@ import { CameraDrive, captureCameraSample, DRIVE_KEY_CODES, restoreObjectOnNode 
 import { PlaybackDriver } from './PlaybackDriver';
 import { captureProjectFrame } from './frame-capture';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
+import { isKeyboardEventForStudio } from '../studio-keyboard-scope';
 
 interface EditorViewportProps {
   editor: SceneEditor;
@@ -39,6 +40,8 @@ interface EditorViewportProps {
   onCaptureReady?: (ready: boolean) => void;
   /** Scene tree or deferred model content changed and cached frames are stale. */
   onRenderContentChange?: () => void;
+  /** Owning Studio root used to isolate window-level camera-drive keys. */
+  keyboardScopeRef?: React.RefObject<HTMLElement | null>;
 }
 
 /** 沿父链找到最近的对象 id（GLB 内容网格挂在模型组下，需要向上追溯）。
@@ -66,6 +69,7 @@ export function EditorViewport({
   captureRef: captureRefProp,
   onCaptureReady,
   onRenderContentChange,
+  keyboardScopeRef,
 }: EditorViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<THREE.Group | null>(null);
@@ -88,7 +92,7 @@ export function EditorViewport({
     return object && object.type === 'camera' ? object.id : null;
   }, [project, selection]);
 
-  useCameraDrive(session, drivenCameraId, rootRef, editor);
+  useCameraDrive(session, drivenCameraId, rootRef, editor, keyboardScopeRef);
 
   // 录制采样源：视口把机位节点映射为通道样本（录制期间节点由驾驶/静止接管）
   useEffect(() => {
@@ -147,6 +151,11 @@ export function EditorViewport({
   };
 
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    const pointerTarget = event.target;
+    const interactiveTarget =
+      pointerTarget instanceof HTMLElement &&
+      pointerTarget.closest('button, input, select, textarea, [contenteditable="true"]');
+    if (!interactiveTarget) event.currentTarget.focus({ preventScroll: true });
     if (event.button !== 0 || !project || draggingRef.current) return;
     const root = rootRef.current;
     const camera = cameraRef.current;
@@ -189,6 +198,7 @@ export function EditorViewport({
       ref={containerRef}
       className="lumora-scene lumora-viewport"
       data-testid="lumora-viewport"
+      tabIndex={-1}
       onPointerDown={handlePointerDown}
     >
       <Canvas
@@ -256,6 +266,7 @@ function useCameraDrive(
   drivenCameraId: string | null,
   rootRef: React.RefObject<THREE.Group | null>,
   editor: SceneEditor,
+  keyboardScopeRef?: React.RefObject<HTMLElement | null>,
 ) {
   const cameraIdRef = useRef<string | null>(null);
   cameraIdRef.current = drivenCameraId;
@@ -270,7 +281,23 @@ function useCameraDrive(
     let attachedId: string | null = null;
     let attachedNode: THREE.Object3D | null = null;
 
+    const attachCurrentCamera = (): boolean => {
+      const cameraId = cameraIdRef.current;
+      const root = rootRef.current;
+      const node = root && cameraId ? findNode(root, cameraId) : null;
+      if (!cameraId || !node) return false;
+      if (attachedId !== cameraId || attachedNode !== node) {
+        drive.attach(node);
+        attachedId = cameraId;
+        attachedNode = node;
+      }
+      return true;
+    };
+
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      const keyboardRoot = keyboardScopeRef?.current;
+      if (keyboardRoot && !isKeyboardEventForStudio(keyboardRoot, event)) return;
       const target = event.target as HTMLElement | null;
       if (
         target &&
@@ -283,20 +310,35 @@ function useCameraDrive(
       }
       if (DRIVE_KEY_CODES.has(event.code)) {
         if (cameraIdRef.current) event.preventDefault();
-        drive.press(event.code);
+        if (attachCurrentCamera()) drive.press(event.code);
       }
     };
-    const onKeyUp = (event: KeyboardEvent) => drive.release(event.code);
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      const keyboardRoot = keyboardScopeRef?.current;
+      if (keyboardRoot && !isKeyboardEventForStudio(keyboardRoot, event)) return;
+      drive.release(event.code);
+    };
+    const onFocusIn = (event: FocusEvent) => {
+      const keyboardRoot = keyboardScopeRef?.current;
+      if (keyboardRoot && !isKeyboardEventForStudio(keyboardRoot, event)) {
+        drive.stop();
+        attachedId = null;
+        attachedNode = null;
+      }
+    };
     const onBlur = () => drive.stop();
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
     window.addEventListener('blur', onBlur);
+    document.addEventListener('focusin', onFocusIn);
 
     const restoreIfNeeded = () => {
       if (attachedId === null || !attachedNode) return;
       const st = sessionRef.current?.state;
-      // 回放中/录制中不还原（分别由回放驱动与录制接管）
-      if (st && (st.playing || st.recording)) return;
+      // 回放中/录制中不还原（分别由回放驱动与录制接管）；覆盖确认冻结
+      // 弹窗打开瞬间的姿态，只清输入/动量，不跳回项目静态位姿。
+      if (st && (st.playing || st.recording || st.overwritePending)) return;
       const project = editor.getProject();
       // 绑定机位已有启用轨道：节点由轨道求值接管（回放驱动最后一次 apply
       // 已把播放头时刻的值写到节点），还原静态位姿会让画面与播放头脱节
@@ -326,6 +368,7 @@ function useCameraDrive(
       const canDrive =
         !!st &&
         cameraId !== null &&
+        !st.overwritePending &&
         !st.recordingPaused &&
         (!st.playing || st.recording) &&
         (!hasTracks || st.recording);
@@ -339,16 +382,9 @@ function useCameraDrive(
         raf = requestAnimationFrame(loop);
         return;
       }
-      const root = rootRef.current;
-      const node = root ? findNode(root, cameraId!) : null;
-      if (!node) {
+      if (!attachCurrentCamera()) {
         raf = requestAnimationFrame(loop);
         return;
-      }
-      if (attachedId !== cameraId) {
-        drive.attach(node);
-        attachedId = cameraId;
-        attachedNode = node;
       }
       drive.update(dt);
       raf = requestAnimationFrame(loop);
@@ -360,10 +396,11 @@ function useCameraDrive(
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('blur', onBlur);
+      document.removeEventListener('focusin', onFocusIn);
       drive.stop();
       restoreIfNeeded();
     };
-  }, [session, rootRef, editor]);
+  }, [session, rootRef, editor, keyboardScopeRef]);
 }
 
 /** 把当前渲染相机镜像给外层（点击拾取用） */

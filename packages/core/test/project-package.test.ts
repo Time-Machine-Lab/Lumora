@@ -14,6 +14,7 @@ import {
   serializeProjectPackage,
 } from '../src/project/package';
 import { CURRENT_PROJECT_SCHEMA_VERSION, PACKAGE_FORMAT_VERSION, PROJECT_PACKAGE_FORMAT } from '../src/project/schema';
+import { validateProjectSchema } from '../src/scene/validate';
 import type { AssetData, AssetPartData, Project, SceneObjectData } from '../src/scene/types';
 
 /** 生成含模型（含载荷）、三镜头（三场景各一台活动机位）与轨道的项目。
@@ -2780,6 +2781,86 @@ describe('parseProjectPackage：损坏资产载荷一律拒绝导入（严重项
       expect(result.error.code).toBe('too-large');
       expect(result.error.message).toContain('资产数超过上限');
     }
+  });
+});
+
+describe('parseProjectPackage：timeline 基数预算先于深校验', () => {
+  function rawSamplePackage(): { project: Record<string, unknown> } {
+    return JSON.parse(
+      serializeProjectPackage(buildProjectPackage(createSampleProject())),
+    ) as { project: Record<string, unknown> };
+  }
+
+  const limits = (overrides: Record<string, number>) => ({
+    maxTracksPerProject: 100,
+    maxShotsPerProject: 100,
+    maxKeyframesPerTrack: 100,
+    maxTotalKeyframes: 100,
+    ...overrides,
+  });
+
+  it('轨道数超限时在非法轨道条目深校验前返回 too-large', async () => {
+    const raw = rawSamplePackage();
+    raw.project.tracks = [null, null, null];
+    const result = await parseProjectPackage(JSON.stringify(raw), limits({ maxTracksPerProject: 2 }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('too-large');
+      expect(result.error.message).toContain('轨道数超过上限（3 > 2）');
+    }
+  });
+
+  it('分镜数超限时在非法分镜条目深校验前返回 too-large', async () => {
+    const raw = rawSamplePackage();
+    raw.project.shots = [null, null, null, null];
+    const result = await parseProjectPackage(JSON.stringify(raw), limits({ maxShotsPerProject: 3 }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('too-large');
+      expect(result.error.message).toContain('分镜数超过上限（4 > 3）');
+    }
+  });
+
+  it('单轨关键帧超限时在非法关键帧深校验前返回 too-large', async () => {
+    const raw = rawSamplePackage();
+    raw.project.tracks = [{ keyframes: [null, null, null] }];
+    const result = await parseProjectPackage(JSON.stringify(raw), limits({ maxKeyframesPerTrack: 2 }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('too-large');
+      expect(result.error.message).toContain('单轨关键帧数超过上限（3 > 2）');
+    }
+  });
+
+  it('累计关键帧超限时在非法轨道深校验前返回 too-large', async () => {
+    const raw = rawSamplePackage();
+    raw.project.tracks = [
+      { keyframes: [null, null] },
+      { keyframes: [null, null] },
+    ];
+    const result = await parseProjectPackage(JSON.stringify(raw), limits({ maxTotalKeyframes: 3 }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('too-large');
+      expect(result.error.message).toContain('关键帧总数超过上限（4 > 3）');
+    }
+  });
+
+  it('轨道与分镜引用校验不对 objects 数组执行逐条 find 扫描', () => {
+    const sample = createSampleProject();
+    const guardedObjects = [...sample.objects];
+    Object.defineProperty(guardedObjects, 'find', {
+      configurable: true,
+      value: () => {
+        throw new Error('quadratic object-array find is forbidden');
+      },
+    });
+    let problem: string | null | undefined;
+
+    expect(() => {
+      problem = validateProjectSchema({ ...sample, objects: guardedObjects });
+    }).not.toThrow();
+    expect(problem).toBeNull();
   });
 });
 

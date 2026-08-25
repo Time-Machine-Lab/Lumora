@@ -999,13 +999,14 @@ export class SceneEditor {
     if (!baseline) return failure('未打开项目');
     const project = baseline.project!; // beginIngress 已保证非空（disposed/无项目返回 null）
     const current = project.shots.map((s) => s.id);
+    const currentIds = new Set(current);
     const seen = new Set<string>();
     const valid =
       orderedIds.length === current.length &&
       orderedIds.every((id) => {
         if (seen.has(id)) return false;
         seen.add(id);
-        return current.includes(id);
+        return currentIds.has(id);
       });
     if (!valid) return failure('分镜重排列表必须是全部分镜 id 的排列');
     if (orderedIds.every((id, i) => id === current[i])) return { ok: true };

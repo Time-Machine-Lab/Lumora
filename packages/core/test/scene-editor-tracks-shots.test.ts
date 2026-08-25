@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { SceneEditor } from '../src/editor/scene-editor';
 import type { Result } from '../src/editor/scene-editor';
 import { createSampleProject } from '../src/scene/sample-project';
@@ -293,6 +293,38 @@ describe('SceneEditor 分镜写入口', () => {
     ok(editor.undo());
     expect(editor.getProject()!.shots.map((s) => s.id)).toEqual(shots);
     expect(editor.getProject()!.shots.map((s) => s.startTime)).toEqual([0, 1.5, 3]);
+  });
+
+  it('reorderShots 使用线性成员索引，不对当前 shot id 数组逐项 includes', () => {
+    const sample = createSampleProject();
+    const shots = Array.from({ length: 256 }, (_, index) => ({
+      ...sample.shots[0]!,
+      id: `linear-shot-${index}`,
+      name: `Linear ${index}`,
+      startTime: index,
+      endTime: index + 1,
+    }));
+    const editor = new SceneEditor();
+    editor.openProject({ ...sample, shots });
+    const orderedIds = shots.map((shot) => shot.id).reverse();
+    const originalIncludes = Array.prototype.includes;
+    const includesSpy = vi.spyOn(Array.prototype, 'includes').mockImplementation(function (
+      this: unknown[],
+      searchElement: unknown,
+      fromIndex?: number,
+    ) {
+      if (this.length === shots.length && this[0] === 'linear-shot-0') {
+        throw new Error('quadratic shot-id includes is forbidden');
+      }
+      return Reflect.apply(originalIncludes, this, [searchElement, fromIndex]) as boolean;
+    });
+
+    try {
+      expect(() => ok(editor.reorderShots(orderedIds))).not.toThrow();
+      expect(editor.getProject()!.shots.map((shot) => shot.id)).toEqual(orderedIds);
+    } finally {
+      includesSpy.mockRestore();
+    }
   });
 
   it('分镜排序在 openProject 往返后保持一致（AC4：重排并保存 → 重开一致，区段坐标/机位绑定同存）', () => {

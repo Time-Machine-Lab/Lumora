@@ -17,15 +17,9 @@ import { ObjectTree } from './editor/ObjectTree';
 import { PropertiesPanel } from './editor/PropertiesPanel';
 import { ToastHost, showToast } from './editor/toasts';
 import { ContentCache } from './editor/content-cache';
+import { DRIVE_KEY_CODES } from './editor/camera-drive';
+import { isKeyboardEventForStudio, registerStudioKeyboardRoot } from './studio-keyboard-scope';
 import '../lumora.css';
-
-/**
- * 已挂载实例根节点注册表（R8-9 修正）：快捷键隔离需要区分「多实例共存」与
- * 「单实例嵌入」。浏览器里点击画布后焦点会回到页面 body——单实例页面中按键
- * 目标在实例外是正常用户操作（Ctrl+K/Delete 等仍应生效）；多实例共存时才
- * 只响应本实例子树内的按键，杜绝跨实例误触。
- */
-const mountedRoots = new Set<HTMLElement>();
 
 /**
  * 第三十六轮一般 4：宿主 onCloseError 回调的统一安全调用 —— 同步 throw 隔离，
@@ -127,7 +121,8 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         key === '2' ||
         key === '3' ||
         ((event.ctrlKey || event.metaKey) &&
-          (key === 'k' || key === 'z' || key === 'y' || key === 'd'))
+          (key === 'k' || key === 'z' || key === 'y' || key === 'd')) ||
+        DRIVE_KEY_CODES.has(event.code)
       );
     };
     const onKeyDownCapture = (event: KeyboardEvent) => {
@@ -345,10 +340,9 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   useEffect(() => {
     const root = rootRef.current;
     if (!root) return;
-    mountedRoots.add(root);
+    const unregisterRoot = registerStudioKeyboardRoot(root);
     const onKey = (event: KeyboardEvent) => {
-      const onlyInstance = mountedRoots.size === 1 && mountedRoots.has(root);
-      if (!root.contains(event.target as Node) && !onlyInstance) return;
+      if (!isKeyboardEventForStudio(root, event)) return;
       // 已由内层处理（对话框/下拉等 stopPropagation 的兜底）：全局键处理不得越权执行
       if (event.defaultPrevented) return;
       const key = event.key.toLowerCase();
@@ -409,7 +403,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     window.addEventListener('keydown', onKey);
     return () => {
       window.removeEventListener('keydown', onKey);
-      mountedRoots.delete(root);
+      unregisterRoot();
     };
   }, [runtime]);
 
@@ -460,6 +454,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
                   captureRef={captureRef}
                   onCaptureReady={handleCaptureReady}
                   onRenderContentChange={handleRenderContentChange}
+                  keyboardScopeRef={rootRef}
                 />
               )}
               {!project && (

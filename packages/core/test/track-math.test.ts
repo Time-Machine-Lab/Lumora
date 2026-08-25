@@ -278,6 +278,22 @@ describe('simplifySamples：采样简化（RDP 抽稀）', () => {
     ];
     expect(simplifySamples(unsorted)).toHaveLength(3);
   });
+
+  it('8,000 点交替长录制使用默认容差完成简化且保持端点与升序', () => {
+    const samples: TrackSample[] = Array.from({ length: 8_000 }, (_, index) => ({
+      time: index / 60,
+      value: [index / 60, index % 2 === 0 ? -1 : 1, 0],
+    }));
+
+    const simplified = simplifySamples(samples);
+
+    expect(simplified[0]).toBe(samples[0]);
+    expect(simplified[simplified.length - 1]).toBe(samples[samples.length - 1]);
+    expect(simplified.length).toBeGreaterThan(2);
+    for (let index = 1; index < simplified.length; index += 1) {
+      expect(simplified[index]!.time).toBeGreaterThan(simplified[index - 1]!.time);
+    }
+  });
 });
 
 describe('rotation 通道 RDP 与回放求值同源（TML-52 复审阻断 1）', () => {
