@@ -34,6 +34,37 @@ const BRIEF = {
   visualStyle: 'Grounded cinematic sci-fi',
 };
 
+const DIAGNOSTIC_QUOTE_WRAPPERS = [
+  ['raw', '"'],
+  ['escaped', '\\"'],
+] as const;
+
+const DIAGNOSTIC_DELIMITERS = [
+  ['comma', ','],
+  ['semicolon', ';'],
+  ['line break', '\n'],
+] as const;
+
+const SERIALIZED_DIAGNOSTIC_CASES = DIAGNOSTIC_QUOTE_WRAPPERS.flatMap(([keyKind, keyQuote]) =>
+  DIAGNOSTIC_QUOTE_WRAPPERS.flatMap(([valueKind, valueQuote]) =>
+    DIAGNOSTIC_DELIMITERS.map(([delimiterKind, delimiter]) => ({
+      name: `${keyKind} key, ${valueKind} value, ${delimiterKind}`,
+      keyQuote,
+      valueQuote,
+      delimiter,
+    })),
+  ),
+);
+
+function serializedCredentialDiagnostic(
+  keyQuote: string,
+  valueQuote: string,
+  delimiter: string,
+  privateMarker: string,
+): string {
+  return `${keyQuote}apiKey${keyQuote}:${valueQuote}prefix${delimiter} ${privateMarker}${valueQuote}; status=401`;
+}
+
 const VALID_PAYLOAD = {
   title: 'Neon delivery',
   summary: 'A concise three-beat pursuit.',
@@ -328,6 +359,51 @@ describe('AI storyboard capability', () => {
     expect(oddRedacted).not.toContain(privateTail);
     expect(oddRedacted).toContain('status=401');
   });
+
+  it.each(SERIALIZED_DIAGNOSTIC_CASES)(
+    'redacts serialized credential wrappers in direct diagnostics: $name',
+    ({ keyQuote, valueQuote, delimiter }) => {
+      const privateMarker = 'PRIVATE_SERIALIZED_DIRECT_MARKER';
+      const redacted = core.redactAiDiagnosticText(
+        serializedCredentialDiagnostic(keyQuote, valueQuote, delimiter, privateMarker),
+      );
+
+      expect(redacted).toContain('[REDACTED]');
+      expect(redacted).not.toContain(privateMarker);
+      expect(redacted).toContain('status=401');
+    },
+  );
+
+  it.each(SERIALIZED_DIAGNOSTIC_CASES)(
+    'redacts serialized credential wrappers during provider error normalization: $name',
+    ({ keyQuote, valueQuote, delimiter }) => {
+      const privateMarker = 'PRIVATE_SERIALIZED_NORMALIZED_MARKER';
+      const normalized = core.normalizeAiProviderError(
+        new Error(serializedCredentialDiagnostic(keyQuote, valueQuote, delimiter, privateMarker)),
+      );
+
+      expect(normalized.message).toContain('[REDACTED]');
+      expect(normalized.message).not.toContain(privateMarker);
+      expect(normalized.message).toContain('status=401');
+    },
+  );
+
+  it.each(SERIALIZED_DIAGNOSTIC_CASES)(
+    'redacts serialized credential wrappers across the GenerationTask boundary: $name',
+    async ({ keyQuote, valueQuote, delimiter }) => {
+      const privateMarker = 'PRIVATE_SERIALIZED_TASK_MARKER';
+      const ai = servicesWith(async () => {
+        throw new Error(serializedCredentialDiagnostic(keyQuote, valueQuote, delimiter, privateMarker));
+      });
+      const submitted = ai.submitStoryboard('com.example.storyboard', { model: 'storyboard-1', brief: BRIEF });
+      const completed = await ai.waitForGenerationTask(submitted.id);
+
+      expect(completed.status).toBe('failed');
+      expect(completed.error?.message).toContain('[REDACTED]');
+      expect(completed.error?.message).not.toContain(privateMarker);
+      expect(completed.error?.message).toContain('status=401');
+    },
+  );
 
   it('bounds direct diagnostic redaction output', () => {
     expect(core.redactAiDiagnosticText('x'.repeat(2_500))).toHaveLength(2_000);

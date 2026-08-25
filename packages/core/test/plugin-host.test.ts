@@ -252,6 +252,52 @@ describe('PluginHost', () => {
     expect(freshErrors[0]!.message).not.toContain('ORIGINAL_OBJECT');
   });
 
+  it('isolates state event payloads and errors between listeners and onAny', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const injectedMessage = 'apiKey=INJECTED_EVENT_LISTENER_SECRET';
+    let secondListenerState: PluginState | undefined;
+    let secondListenerMessage: string | undefined;
+    let anyListenerState: PluginState | undefined;
+    let anyListenerMessage: string | undefined;
+
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state !== 'failed') return;
+      Reflect.set(event.error as Error, 'message', injectedMessage);
+      Reflect.set(event, 'state', 'active');
+      Reflect.set(event, 'error', new Error(injectedMessage));
+    });
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state !== 'failed') return;
+      secondListenerState = event.state;
+      secondListenerMessage = (event.error as Error).message;
+    });
+    host.events.onAny((eventName, payload) => {
+      if (eventName !== 'plugin:state-changed') return;
+      const event = payload as { state: PluginState; error?: unknown };
+      if (event.state !== 'failed') return;
+      anyListenerState = event.state;
+      anyListenerMessage = (event.error as Error).message;
+    });
+
+    const info = await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => {
+            throw new Error('activation failed');
+          },
+        },
+      })),
+    );
+
+    expect(secondListenerState).toBe('failed');
+    expect(secondListenerMessage).not.toContain('INJECTED_EVENT_LISTENER_SECRET');
+    expect(anyListenerState).toBe('failed');
+    expect(anyListenerMessage).not.toContain('INJECTED_EVENT_LISTENER_SECRET');
+    expect(info.state).toBe('failed');
+    expect(info.reason).not.toContain('INJECTED_EVENT_LISTENER_SECRET');
+    expect((info.error as Error).message).not.toContain('INJECTED_EVENT_LISTENER_SECRET');
+  });
+
   it('cancels running storyboard tasks when their provider plugin is disabled', async () => {
     const host = new PluginHost({ hostVersion: '0.1.0' });
     const providerId = 'com.example.plugin.storyboard';

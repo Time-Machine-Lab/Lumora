@@ -1167,14 +1167,17 @@ export class PluginHost {
     const publicError = record.reason === undefined && record.error === undefined
       ? undefined
       : new Error(redactAiDiagnosticText(record.reason ?? this.errorMessage(record.error)));
-    this.events.emit('plugin:state-changed', {
+    if (publicError) Object.freeze(publicError);
+    const payload = {
       // instanceId：稳定唯一的记录标识，事件关联与寻址（disable/enable）使用它；
       // pluginId 仅作 Manifest 展示（缺 id 时为 '<unknown>'），不得用于寻址
       instanceId: record.key,
       pluginId: record.id,
       state,
       error: publicError,
-    });
+    };
+    Object.freeze(payload);
+    this.events.emit('plugin:state-changed', payload);
   }
 
   /** 按 instanceId 寻址记录（合法 Manifest 的 instanceId 与 manifest id 相同） */

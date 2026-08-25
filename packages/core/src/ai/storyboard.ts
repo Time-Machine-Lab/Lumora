@@ -251,8 +251,57 @@ export function parseAiStoryboardCapability(value: unknown): AiStoryboardCapabil
 const MAX_PUBLIC_DIAGNOSTIC_LENGTH = 2_000;
 const MAX_DIAGNOSTIC_SCAN_LENGTH = 16_384;
 
+interface DiagnosticQuoteWrapper {
+  quote: '"' | "'";
+  serializationDepth: 0 | 1;
+  length: 1 | 2;
+}
+
+function readDiagnosticQuoteWrapper(message: string, index: number): DiagnosticQuoteWrapper | undefined {
+  const character = message[index];
+  if (character === '"' || character === "'") {
+    return { quote: character, serializationDepth: 0, length: 1 };
+  }
+  const escapedQuote = message[index + 1];
+  if (character === '\\' && (escapedQuote === '"' || escapedQuote === "'")) {
+    return { quote: escapedQuote, serializationDepth: 1, length: 2 };
+  }
+  return undefined;
+}
+
+function closesDiagnosticQuote(backslashCount: number, serializationDepth: 0 | 1): boolean {
+  if (serializationDepth === 0) return backslashCount % 2 === 0;
+  return backslashCount % 4 === 1;
+}
+
+function scanDiagnosticQuotedValue(
+  message: string,
+  start: number,
+  wrapper: DiagnosticQuoteWrapper,
+): number {
+  let cursor = start + wrapper.length;
+  let backslashCount = 0;
+  while (cursor < message.length) {
+    const character = message[cursor]!;
+    if (character === '\\') {
+      backslashCount += 1;
+      cursor += 1;
+      continue;
+    }
+    if (
+      character === wrapper.quote &&
+      closesDiagnosticQuote(backslashCount, wrapper.serializationDepth)
+    ) {
+      return cursor + 1;
+    }
+    backslashCount = 0;
+    cursor += 1;
+  }
+  return message.length;
+}
+
 function redactCredentialAssignments(message: string): string {
-  const assignmentPattern = /["']?\b(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|client[-_ ]?secret|secret)\b["']?\s*[:=]\s*/gi;
+  const assignmentPattern = /(?:\\?["'])?\b(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|client[-_ ]?secret|secret)\b(?:\\?["'])?\s*[:=]\s*/gi;
   let output = '';
   let cursor = 0;
   let match: RegExpExecArray | null;
@@ -263,22 +312,9 @@ function redactCredentialAssignments(message: string): string {
     output += match[0];
 
     let valueEnd = assignmentPattern.lastIndex;
-    const quote = message[valueEnd];
-    if (quote === '"' || quote === "'") {
-      let escaped = false;
-      valueEnd += 1;
-      while (valueEnd < message.length) {
-        const character = message[valueEnd]!;
-        if (escaped) {
-          escaped = false;
-        } else if (character === '\\') {
-          escaped = true;
-        } else if (character === quote) {
-          valueEnd += 1;
-          break;
-        }
-        valueEnd += 1;
-      }
+    const wrapper = readDiagnosticQuoteWrapper(message, valueEnd);
+    if (wrapper) {
+      valueEnd = scanDiagnosticQuotedValue(message, valueEnd, wrapper);
     } else {
       while (valueEnd < message.length && !/[\r\n,;]/.test(message[valueEnd]!)) {
         valueEnd += 1;
