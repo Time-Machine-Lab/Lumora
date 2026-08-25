@@ -22,6 +22,7 @@
   line-height: 1.5;
   overflow: hidden;
   box-sizing: border-box;
+  position: relative;
 }
 
 .lumora-studio *,
@@ -68,6 +69,12 @@
   border-color: rgba(77, 171, 247, 0.45);
 }
 
+.lumora-button--active {
+  border-color: var(--lumora-accent);
+  background: #17344a;
+  color: #d9f0ff;
+}
+
 /* ---------- 工具栏 ---------- */
 
 .lumora-toolbar {
@@ -106,10 +113,500 @@
 
 /* ---------- 主体布局 ---------- */
 
+.lumora-studio__stage {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+}
+
 .lumora-studio__body {
   display: flex;
   flex: 1;
   min-height: 0;
+  width: 100%;
+}
+
+/* ---------- AI 分镜工作台 ---------- */
+
+.lumora-storyboard {
+  position: absolute;
+  inset: 0;
+  z-index: 45;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #12151c;
+  color: var(--lumora-text);
+}
+
+.lumora-storyboard__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 66px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--lumora-border);
+  background: #191d26;
+  flex-shrink: 0;
+}
+
+.lumora-storyboard__header h2,
+.lumora-storyboard__draft-summary h3 {
+  margin: 0;
+  letter-spacing: 0;
+}
+
+.lumora-storyboard__header h2 {
+  font-size: 19px;
+  line-height: 1.3;
+}
+
+.lumora-storyboard__header p,
+.lumora-storyboard__draft-summary p,
+.lumora-storyboard__empty-state p {
+  margin: 3px 0 0;
+  color: var(--lumora-text-dim);
+  overflow-wrap: anywhere;
+}
+
+.lumora-storyboard__header-actions,
+.lumora-storyboard__tabs,
+.lumora-storyboard__row-heading,
+.lumora-storyboard__draft-summary,
+.lumora-storyboard__submit-row {
+  display: flex;
+  align-items: center;
+}
+
+.lumora-storyboard__header-actions {
+  gap: 12px;
+  min-width: 0;
+}
+
+.lumora-storyboard__header-actions > .lumora-icon-button {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  font-size: 22px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.lumora-storyboard__tabs {
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--lumora-border);
+  border-radius: 6px;
+  background: var(--lumora-bg);
+}
+
+.lumora-storyboard__tabs button {
+  min-height: 30px;
+  padding: 4px 10px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--lumora-text-dim);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.lumora-storyboard__tabs button:hover,
+.lumora-storyboard__tabs button.is-active {
+  background: var(--lumora-surface-2);
+  color: var(--lumora-text);
+}
+
+.lumora-storyboard__tabs button.is-active {
+  box-shadow: inset 0 -2px 0 var(--lumora-accent);
+}
+
+.lumora-storyboard__layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.72fr) minmax(430px, 1.55fr);
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.lumora-storyboard__brief,
+.lumora-storyboard__drafts,
+.lumora-storyboard__adopted {
+  min-width: 0;
+  min-height: 0;
+  padding: 18px;
+}
+
+.lumora-storyboard__brief {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  overflow-y: auto;
+  border-right: 1px solid var(--lumora-border);
+  background: #171a22;
+}
+
+.lumora-storyboard__drafts,
+.lumora-storyboard__adopted {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.lumora-storyboard__adopted {
+  flex: 1;
+}
+
+.lumora-storyboard__section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 28px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--lumora-border);
+  color: #f1c75b;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+
+.lumora-storyboard__field,
+.lumora-storyboard__prompt-field,
+.lumora-storyboard__compact-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  color: var(--lumora-text-dim);
+  font-size: 12px;
+}
+
+.lumora-storyboard__field--grow {
+  flex: 1;
+  min-height: 150px;
+}
+
+.lumora-storyboard input,
+.lumora-storyboard textarea,
+.lumora-storyboard select {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--lumora-border);
+  border-radius: 5px;
+  outline: none;
+  background: #20242e;
+  color: var(--lumora-text);
+  font: inherit;
+  letter-spacing: 0;
+}
+
+.lumora-storyboard textarea {
+  resize: vertical;
+}
+
+.lumora-storyboard__field--grow textarea {
+  flex: 1;
+  min-height: 110px;
+}
+
+.lumora-storyboard input:focus,
+.lumora-storyboard textarea:focus,
+.lumora-storyboard select:focus,
+.lumora-storyboard button:focus-visible {
+  border-color: var(--lumora-accent);
+  box-shadow: 0 0 0 2px rgba(77, 171, 247, 0.2);
+}
+
+.lumora-storyboard__field small,
+.lumora-storyboard__cost small {
+  color: var(--lumora-text-dim);
+  overflow-wrap: anywhere;
+}
+
+.lumora-storyboard__field small {
+  align-self: flex-end;
+}
+
+.lumora-storyboard__compact-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+
+.lumora-storyboard__compact-grid--three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.lumora-storyboard__cost {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 3px 12px;
+  padding: 10px;
+  border-left: 3px solid #f1c75b;
+  background: #20242e;
+}
+
+.lumora-storyboard__cost strong {
+  color: #f5d77f;
+}
+
+.lumora-storyboard__cost small {
+  grid-column: 1 / -1;
+}
+
+.lumora-storyboard__submit-row {
+  justify-content: flex-end;
+  margin-top: auto;
+  padding-top: 4px;
+}
+
+.lumora-storyboard__primary {
+  border-color: #2f9e74;
+  background: #16634d;
+  color: #e9fff7;
+}
+
+.lumora-storyboard__primary:hover:not(:disabled) {
+  border-color: #63e6be;
+  background: #1a765b;
+}
+
+.lumora-storyboard__status,
+.lumora-storyboard__error,
+.lumora-storyboard__empty-state {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--lumora-border);
+  background: #191d26;
+}
+
+.lumora-storyboard__status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #b9e2ff;
+}
+
+.lumora-storyboard__spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(77, 171, 247, 0.3);
+  border-top-color: var(--lumora-accent);
+  border-radius: 50%;
+  animation: lumora-storyboard-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes lumora-storyboard-spin {
+  to { transform: rotate(360deg); }
+}
+
+.lumora-storyboard__error {
+  border-color: rgba(255, 107, 107, 0.55);
+  color: #ffc9c9;
+  overflow-wrap: anywhere;
+}
+
+.lumora-storyboard__empty-state {
+  display: grid;
+  place-content: center;
+  flex: 1;
+  min-height: 160px;
+  color: var(--lumora-text-dim);
+  text-align: center;
+}
+
+.lumora-storyboard__empty-state > span {
+  color: var(--lumora-text);
+  font-weight: 600;
+}
+
+.lumora-storyboard__draft-summary {
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 0;
+}
+
+.lumora-storyboard__draft-summary > div {
+  min-width: 0;
+}
+
+.lumora-storyboard__draft-summary h3 {
+  font-size: 16px;
+}
+
+.lumora-storyboard__draft-list,
+.lumora-storyboard__adopted-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.lumora-storyboard__adopted-list {
+  margin-top: 14px;
+}
+
+.lumora-storyboard__draft-row,
+.lumora-storyboard__adopted-row {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--lumora-border);
+  border-radius: 6px;
+  background: #1a1e27;
+}
+
+.lumora-storyboard__draft-row.is-accepted {
+  border-color: rgba(105, 219, 124, 0.45);
+  background: #19251f;
+}
+
+.lumora-storyboard__row-heading {
+  gap: 8px;
+  min-width: 0;
+}
+
+.lumora-storyboard__shot-number {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--lumora-border);
+  border-radius: 4px;
+  color: #f1c75b;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.lumora-storyboard .lumora-storyboard__title-input {
+  min-height: 30px;
+  padding: 4px 8px;
+  font-weight: 600;
+}
+
+.lumora-storyboard__row-heading .lumora-button,
+.lumora-storyboard__row-heading .lumora-icon-button {
+  flex-shrink: 0;
+}
+
+.lumora-storyboard__row-heading .lumora-icon-button {
+  width: 28px;
+  height: 28px;
+}
+
+.lumora-storyboard__source {
+  padding: 2px 6px;
+  border: 1px solid rgba(77, 171, 247, 0.5);
+  border-radius: 4px;
+  color: #b9e2ff;
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+@media (max-width: 900px) {
+  .lumora-storyboard {
+    overflow-y: auto;
+  }
+
+  .lumora-storyboard__layout {
+    display: block;
+    overflow: visible;
+  }
+
+  .lumora-storyboard__brief,
+  .lumora-storyboard__drafts,
+  .lumora-storyboard__adopted {
+    overflow: visible;
+  }
+
+  .lumora-storyboard__brief {
+    border-right: 0;
+    border-bottom: 1px solid var(--lumora-border);
+  }
+
+  .lumora-storyboard__drafts {
+    min-height: 420px;
+  }
+
+  .lumora-storyboard__draft-list,
+  .lumora-storyboard__adopted-list {
+    overflow: visible;
+  }
+}
+
+@media (max-width: 560px) {
+  .lumora-storyboard__header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px;
+  }
+
+  .lumora-storyboard__header-actions {
+    width: 100%;
+  }
+
+  .lumora-storyboard__tabs {
+    flex: 1;
+  }
+
+  .lumora-storyboard__tabs button {
+    flex: 1;
+    min-width: 0;
+    white-space: normal;
+  }
+
+  .lumora-storyboard__brief,
+  .lumora-storyboard__drafts,
+  .lumora-storyboard__adopted {
+    padding: 12px;
+  }
+
+  .lumora-storyboard__compact-grid,
+  .lumora-storyboard__compact-grid--three {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .lumora-storyboard__draft-summary {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .lumora-storyboard__draft-summary .lumora-button {
+    align-self: flex-end;
+  }
+
+  .lumora-storyboard__row-heading {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .lumora-storyboard__row-heading .lumora-button {
+    grid-column: 2 / -1;
+    justify-self: end;
+  }
+
+  .lumora-storyboard input,
+  .lumora-storyboard textarea,
+  .lumora-storyboard select {
+    font-size: 16px;
+  }
 }
 
 .lumora-studio__empty {

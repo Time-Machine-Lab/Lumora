@@ -199,6 +199,40 @@ export type { ContributionRegistryOptions } from './contributions/contribution-r
 export { createPluginServices } from './services';
 export type { AiService, AssetService, ExporterService, PluginServices } from './services';
 
+// AI storyboard generation
+export {
+  AI_REFERENCE_IMAGE_GENERATE_CAPABILITY,
+  AI_STORYBOARD_GENERATE_CAPABILITY,
+  AiProviderRequestError,
+  STORYBOARD_CAMERA_MOVEMENTS,
+  STORYBOARD_SHOT_SIZES,
+  normalizeAiProviderError,
+  parseCreativeBrief,
+  parseStoryboardDraftPayload,
+  redactAiDiagnosticText,
+} from './ai/storyboard';
+export type {
+  AiCostEstimate,
+  AiProviderErrorCode,
+  AiProviderErrorData,
+  AiReferenceImageCapability,
+  AiReferenceImageRequest,
+  AiReferenceImageResult,
+  AiStoryboardCapability,
+  CreativeBrief,
+  GenerationTask,
+  GenerationTaskStatus,
+  StoryboardCameraMovement,
+  StoryboardDraft,
+  StoryboardDraftPayload,
+  StoryboardDraftShot,
+  StoryboardDraftShotPayload,
+  StoryboardGenerateRequest,
+  StoryboardModelDescriptor,
+  StoryboardProviderInfo,
+  StoryboardShotSize,
+} from './ai/storyboard';
+
 // 插件宿主
 export { PluginHost } from './host/plugin-host';
 export type { PluginHostOptions } from './host/plugin-host';

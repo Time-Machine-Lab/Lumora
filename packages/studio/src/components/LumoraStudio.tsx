@@ -15,6 +15,7 @@ import { EditorViewport } from './editor/EditorViewport';
 import { TimelinePanel } from './editor/TimelinePanel';
 import { ObjectTree } from './editor/ObjectTree';
 import { PropertiesPanel } from './editor/PropertiesPanel';
+import { StoryboardWorkspace } from './storyboard/StoryboardWorkspace';
 import { ToastHost, showToast } from './editor/toasts';
 import { ContentCache } from './editor/content-cache';
 import { DRIVE_KEY_CODES } from './editor/camera-drive';
@@ -203,7 +204,18 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
 
   const [pluginManagerOpen, setPluginManagerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [storyboardOpen, setStoryboardOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const closeWorkspace = () => setStoryboardOpen(false);
+    const opened = runtime.events.on('project:opened', closeWorkspace);
+    const closed = runtime.events.on('project:closed', closeWorkspace);
+    return () => {
+      opened.dispose();
+      closed.dispose();
+    };
+  }, [runtime.events]);
 
   // 第三十轮严重 6：统一卸载屏障 —— 卸载 cleanup 与宿主显式卸载共用同一通道。
   // 释放失败（冲刷失败 / 未解决恢复 fork）时运行时保留未 teardown，缓存也不
@@ -349,6 +361,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       // 命令面板开关先于输入守卫处理：面板打开时焦点在其搜索输入框内，Ctrl+K 仍需能关闭
       if ((event.ctrlKey || event.metaKey) && key === 'k') {
         event.preventDefault();
+        setStoryboardOpen(false);
         setPaletteOpen((open) => !open);
         return;
       }
@@ -422,10 +435,23 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
           project={project}
           editorState={editorState}
           cache={cache}
-          onTogglePlugins={() => setPluginManagerOpen((open) => !open)}
-          onTogglePalette={() => setPaletteOpen((open) => !open)}
+          storyboardOpen={storyboardOpen}
+          onToggleStoryboard={() => {
+            setPluginManagerOpen(false);
+            setPaletteOpen(false);
+            setStoryboardOpen((open) => !open);
+          }}
+          onTogglePlugins={() => {
+            setStoryboardOpen(false);
+            setPluginManagerOpen((open) => !open);
+          }}
+          onTogglePalette={() => {
+            setStoryboardOpen(false);
+            setPaletteOpen((open) => !open);
+          }}
         />
-        <div className="lumora-studio__body">
+        <div className="lumora-studio__stage">
+        <div className="lumora-studio__body" inert={storyboardOpen || undefined}>
           <div className="lumora-studio__sidebar">
             <ObjectTree
               editor={runtime.editor}
@@ -480,6 +506,15 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
             project={project}
             selection={editorState.selection}
           />
+        </div>
+        {storyboardOpen && project && (
+          <StoryboardWorkspace
+            key={project.uri}
+            runtime={runtime}
+            project={project}
+            onClose={() => setStoryboardOpen(false)}
+          />
+        )}
         </div>
         <ToastHost />
         {pluginManagerOpen && <PluginManager runtime={runtime} onClose={() => setPluginManagerOpen(false)} />}

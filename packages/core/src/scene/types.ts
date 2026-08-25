@@ -1,3 +1,5 @@
+import type { StoryboardCameraMovement, StoryboardShotSize } from '../ai/storyboard';
+
 /** 场景数据模型（Project v3）：对象为扁平列表 + 场景根引用，构成可序列化层级；轨道绑定对象属性通道。 */
 
 export type Vec3 = [number, number, number];
@@ -127,6 +129,16 @@ export interface ShotClipData {
   startTime: number;
   /** 时间线区段终点（秒，须大于 startTime） */
   endTime: number;
+  /** AI/人工分镜语义字段；旧时间线分镜可缺省。 */
+  shotSize?: StoryboardShotSize;
+  movement?: StoryboardCameraMovement;
+  prompt?: string;
+  /** 仅记录可审计来源，不包含请求载荷或凭据。 */
+  aiSource?: {
+    providerId: string;
+    model: string;
+    draftId: string;
+  };
 }
 
 export interface ProjectSettings {

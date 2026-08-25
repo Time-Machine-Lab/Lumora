@@ -1,4 +1,5 @@
 import { DisposableSet, onceDisposable, type Disposable } from '../disposable';
+import { parseAiStoryboardCapability } from '../ai/storyboard';
 import type { EventMap } from '../events/event-map';
 import type { TypedEventEmitter } from '../events/typed-event-emitter';
 import type { CommandRegistry } from '../commands/command-registry';
@@ -74,6 +75,9 @@ export class ContributionRegistry {
     this.assertBundleUnique(bundle.assetLoaders ?? [], 'assetLoader', (item) => item.id);
     this.assertBundleUnique(bundle.aiProviders ?? [], 'aiProvider', (item) => item.id);
     this.assertBundleUnique(bundle.exporters ?? [], 'exporter', (item) => item.id);
+    for (const item of bundle.aiProviders ?? []) {
+      if (item.storyboard !== undefined) parseAiStoryboardCapability(item.storyboard);
+    }
     const commandIds = new Set<string>();
     for (const item of bundle.commands ?? []) {
       if (commandIds.has(item.command.id)) {

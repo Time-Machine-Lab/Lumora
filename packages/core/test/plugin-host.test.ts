@@ -11,6 +11,7 @@ import type {
 import type { Command, CommandContext } from '../src/commands/command-registry';
 import { createSampleProject } from '../src/scene/sample-project';
 import type { Manifest } from '../src/manifest/validate';
+import type { AiStoryboardCapability } from '../src/ai/storyboard';
 
 const VALID_MANIFEST: Manifest = {
   schemaVersion: '1',
@@ -58,6 +59,141 @@ function descriptor(manifest: Record<string, unknown> = VALID_MANIFEST, entry?: 
 }
 
 describe('PluginHost', () => {
+  it('rejects malformed storyboard capability metadata atomically', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const malformedStoryboard = {
+      capability: 'ai.storyboard.generate',
+      models: [{ id: 'broken', name: 'Broken model' }],
+      generate: async () => ({}),
+    } as unknown as AiStoryboardCapability;
+
+    const info = await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, contributes: ['panel', 'aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => context.contribute({
+              panels: [
+                { kind: 'panel', id: 'com.example.plugin.before-invalid-ai', title: 'Should roll back', component: () => null },
+              ],
+              aiProviders: [{
+                kind: 'aiProvider',
+                id: 'com.example.plugin.invalid-ai',
+                name: 'Invalid storyboard provider',
+                models: [],
+                chat: async function* () {},
+                storyboard: malformedStoryboard,
+              }],
+            }),
+          },
+        }),
+      ),
+    );
+
+    expect(info.state).toBe('failed');
+    expect(info.reason).toContain('激活失败');
+    expect(host.contributions.count()).toBe(0);
+    expect(host.contributions.getPanels()).toEqual([]);
+    expect(host.contributions.getAiProviders()).toEqual([]);
+  });
+
+  it('cancels running storyboard tasks when their provider plugin is disabled', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const providerId = 'com.example.plugin.storyboard';
+    await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => context.contribute({
+              aiProviders: [{
+                kind: 'aiProvider',
+                id: providerId,
+                name: 'Storyboard provider',
+                models: [],
+                chat: async function* () {},
+                storyboard: {
+                  capability: 'ai.storyboard.generate',
+                  models: [{ id: 'slow', name: 'Slow', cost: { kind: 'unknown', note: 'Unknown' } }],
+                  generate: async () => new Promise<unknown>(() => undefined),
+                },
+              }],
+            }),
+          },
+        }),
+      ),
+    );
+    const task = host.services.ai.submitStoryboard(providerId, {
+      model: 'slow',
+      brief: { concept: 'A complete storyboard concept for lifecycle testing.', targetDurationSeconds: 2, shotCount: 1 },
+    });
+
+    await host.disable('com.example.plugin');
+    const outcome = await Promise.race([
+      host.services.ai.waitForGenerationTask(task.id),
+      new Promise<'still-running'>((resolve) => setTimeout(() => resolve('still-running'), 25)),
+    ]);
+
+    expect(outcome).not.toBe('still-running');
+    expect(outcome).toMatchObject({ status: 'cancelled', error: { code: 'cancelled' } });
+  });
+
+  it('cancels storyboard tasks admitted while provider deactivation is awaiting', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const providerId = 'com.example.plugin.deactivating-storyboard';
+    let releaseDeactivate!: () => void;
+    let markDeactivateStarted!: () => void;
+    const deactivateGate = new Promise<void>((resolve) => {
+      releaseDeactivate = resolve;
+    });
+    const deactivateStarted = new Promise<void>((resolve) => {
+      markDeactivateStarted = resolve;
+    });
+    await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => context.contribute({
+              aiProviders: [{
+                kind: 'aiProvider',
+                id: providerId,
+                name: 'Deactivating storyboard provider',
+                models: [],
+                chat: async function* () {},
+                storyboard: {
+                  capability: 'ai.storyboard.generate',
+                  models: [{ id: 'slow', name: 'Slow', cost: { kind: 'unknown', note: 'Unknown' } }],
+                  generate: async () => new Promise<unknown>(() => undefined),
+                },
+              }],
+            }),
+            deactivate: async () => {
+              markDeactivateStarted();
+              await deactivateGate;
+            },
+          },
+        }),
+      ),
+    );
+
+    const disabling = host.disable('com.example.plugin');
+    await deactivateStarted;
+    const lateTask = host.services.ai.submitStoryboard(providerId, {
+      model: 'slow',
+      brief: { concept: 'A complete late storyboard lifecycle test.', targetDurationSeconds: 2, shotCount: 1 },
+    });
+    releaseDeactivate();
+    await disabling;
+    const outcome = await Promise.race([
+      host.services.ai.waitForGenerationTask(lateTask.id),
+      new Promise<'still-running'>((resolve) => setTimeout(() => resolve('still-running'), 25)),
+    ]);
+
+    expect(outcome).not.toBe('still-running');
+    expect(outcome).toMatchObject({ status: 'cancelled', error: { code: 'cancelled' } });
+  });
+
   it('注册并激活插件：六类贡献项全部就位，状态序列正确', async () => {
     const host = new PluginHost({ hostVersion: '0.1.0' });
     const states: string[] = [];

@@ -4,6 +4,7 @@ import type { EventMap } from '../events/event-map';
 import type { TypedEventEmitter } from '../events/typed-event-emitter';
 import type { Project } from '../scene/types';
 import type { PluginServices } from '../services';
+import type { AiReferenceImageCapability, AiStoryboardCapability } from '../ai/storyboard';
 
 export const CONTRIBUTION_KINDS = [
   'panel',
@@ -98,6 +99,10 @@ export interface AiProviderContribution {
   models: string[];
   /** 流式返回文本块 */
   chat(request: AiChatRequest): AsyncIterable<string>;
+  /** Structured storyboard generation capability. Provider output is validated by the host. */
+  storyboard?: AiStoryboardCapability;
+  /** Optional reference-image capability; no launch provider is selected in TML-55. */
+  referenceImage?: AiReferenceImageCapability;
 }
 
 // ---------- exporter ----------

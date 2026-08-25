@@ -7,7 +7,12 @@ import { checkEngineCompatibility } from '../manifest/engine';
 import { validateManifest } from '../manifest/validate';
 import type { Manifest } from '../manifest/validate';
 import { deepFreeze } from '../scene/immutable';
-import { createPluginServices, type PluginServices } from '../services';
+import {
+  cancelStoryboardTasksForProvider,
+  createPluginServices,
+  disposePluginServices,
+  type PluginServices,
+} from '../services';
 import type { Project } from '../scene/types';
 import type {
   PluginContext,
@@ -480,6 +485,7 @@ export class PluginHost {
     const disposals = records.map((record) => this.deactivateRecord(record, 'inactive'));
     await Promise.all(disposals);
     this.plugins.clear();
+    disposePluginServices(this.services);
     this.contributions.dispose();
     this.commands.dispose();
     this.events.dispose();
@@ -941,6 +947,12 @@ export class PluginHost {
     record.gate = null;
     record.state = 'deactivating';
     this.emitState(record, 'deactivating');
+    const ownedProviderIds = new Set<string>();
+    for (const provider of this.contributions.getAiProviders()) {
+      if (provider.pluginId !== record.id) continue;
+      ownedProviderIds.add(provider.id);
+      cancelStoryboardTasksForProvider(this.services, provider.id);
+    }
 
     try {
       if (attempt) {
@@ -984,6 +996,10 @@ export class PluginHost {
           // 清理失败不掩盖停用
         }
         record.owned = new DisposableSet();
+      }
+      // Contributions are gone, so cancel requests admitted while an async deactivate hook awaited.
+      for (const providerId of ownedProviderIds) {
+        cancelStoryboardTasksForProvider(this.services, providerId);
       }
       // 发布终态事件前让旧操作完整 detach：终态事件内的重入（enable 重新激活、
       // failed 后再次停用等）将发布全新的操作/尝试，而不是合并进已消费完 target
