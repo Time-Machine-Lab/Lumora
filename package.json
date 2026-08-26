@@ -20,6 +20,7 @@
     "lint": "eslint .",
     "e2e": "playwright test",
     "e2e:install": "playwright install chromium",
+    "licenses:generate": "node scripts/generate-third-party-notices.mjs",
     "smoke:pack": "node scripts/smoke-pack.mjs",
     "smoke:pack:boundary": "node scripts/smoke-pack.mjs --self-test"
   },

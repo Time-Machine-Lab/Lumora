@@ -79,6 +79,24 @@ const badPlugin: PluginDescriptor = {
 };
 
 describe('LumoraStudio', () => {
+  it('opens and closes the export workspace without changing the current project', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://export-integration', '导出集成');
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    const trigger = await screen.findByTestId('open-export-workspace');
+    await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri));
+
+    trigger.click();
+    expect(await screen.findByRole('heading', { name: '导出' })).toBeInTheDocument();
+    expect(screen.getByTestId('lumora-studio')).toHaveAttribute('data-workspace', 'export');
+    expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri);
+
+    screen.getByRole('button', { name: '关闭导出' }).click();
+    await waitFor(() => expect(screen.queryByTestId('export-workspace')).not.toBeInTheDocument());
+    expect(trigger).toHaveFocus();
+    expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri);
+  });
+
   it('渲染壳层并激活合法插件：面板、工具栏贡献项可见', async () => {
     render(<LumoraStudio plugins={[goodPlugin]} hostVersion="0.1.0" />);
     expect(await screen.findByTestId('lumora-studio')).toBeInTheDocument();

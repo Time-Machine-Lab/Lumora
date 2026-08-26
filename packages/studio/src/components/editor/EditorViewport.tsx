@@ -20,7 +20,8 @@ import {
 import { showToast } from './toasts';
 import { CameraDrive, captureCameraSample, DRIVE_KEY_CODES, restoreObjectOnNode } from './camera-drive';
 import { PlaybackDriver } from './PlaybackDriver';
-import { captureProjectFrame } from './frame-capture';
+import { captureProjectFrame, renderProjectFrameToCanvas } from './frame-capture';
+import type { ProjectFrameCapture } from './frame-capture';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
 import { isKeyboardEventForStudio } from '../studio-keyboard-scope';
 
@@ -35,6 +36,8 @@ interface EditorViewportProps {
   /** 帧截图通道：FrameCaptureBridge 在 Canvas 内注册（分镜缩略图用）；
    *  可选参数 = 分镜绑定机位 id，传参时按该机位渲染 */
   captureRef?: React.RefObject<((cameraObjectId?: string | null) => string | null) | null>;
+  /** Exact-size export frame channel used by the WebM/PNG export workspace. */
+  exportFrameRef?: React.RefObject<ProjectFrameCapture | null>;
   /** 截图通道就绪通知（FrameCaptureBridge 挂载/卸载时回调；缩略图链据此
    *  启动，复审阻断 2） */
   onCaptureReady?: (ready: boolean) => void;
@@ -67,6 +70,7 @@ export function EditorViewport({
   cache,
   session = null,
   captureRef: captureRefProp,
+  exportFrameRef: exportFrameRefProp,
   onCaptureReady,
   onRenderContentChange,
   keyboardScopeRef,
@@ -84,6 +88,8 @@ export function EditorViewport({
   // 分镜缩略图截图通道（FrameCaptureBridge 在 Canvas 内挂载后可用）
   const localCaptureRef = useRef<((cameraObjectId?: string | null) => string | null) | null>(null);
   const captureRef = captureRefProp ?? localCaptureRef;
+  const localExportFrameRef = useRef<ProjectFrameCapture | null>(null);
+  const exportFrameRef = exportFrameRefProp ?? localExportFrameRef;
 
   // 驾驶目标：单选机位；已有轨道机位在暂停态不驾驶（时间线接管），录制中始终可驾驶
   const drivenCameraId = useMemo(() => {
@@ -233,7 +239,13 @@ export function EditorViewport({
         />
         {!cameraView && <OrbitControls makeDefault enableDamping enabled={!dragging} />}
         <CameraProxy cameraRef={cameraRef} />
-        <FrameCaptureBridge captureRef={captureRef} onCaptureReady={onCaptureReady} rootRef={rootRef} aspect={aspect} />
+        <FrameCaptureBridge
+          captureRef={captureRef}
+          exportFrameRef={exportFrameRef}
+          onCaptureReady={onCaptureReady}
+          rootRef={rootRef}
+          aspect={aspect}
+        />
       </Canvas>
       {session && (
         <>
@@ -491,11 +503,13 @@ function CameraPoseReadout({
  */
 function FrameCaptureBridge({
   captureRef,
+  exportFrameRef,
   onCaptureReady,
   rootRef,
   aspect,
 }: {
   captureRef: React.RefObject<((cameraObjectId?: string | null) => string | null) | null>;
+  exportFrameRef: React.RefObject<ProjectFrameCapture | null>;
   /** 通道就绪通知：挂载置 true、卸载置 false。仅写 ref 不触发 React 渲染，
    *  缩略图链依赖该回调启动（复审阻断 2） */
   onCaptureReady?: (ready: boolean) => void;
@@ -508,28 +522,43 @@ function FrameCaptureBridge({
   const scene = useThree((s) => s.scene);
   const camera = useThree((s) => s.camera);
   useEffect(() => {
+    const resolveCamera = (cameraObjectId?: string | null): THREE.Camera | null => {
+      if (!cameraObjectId) return camera;
+      const node = rootRef.current ? findNode(rootRef.current, cameraObjectId) : null;
+      return node instanceof THREE.PerspectiveCamera ? node : null;
+    };
     captureRef.current = (cameraObjectId?: string | null) => {
       if (typeof gl.render !== 'function') return null;
       try {
         // 分镜机位截图：解析绑定相机并按项目画幅校正投影；绑定缺失时返回 null
         // 让缩略图保持占位，而不是用当前相机渲染出错误画面（复审阻断 2）
-        let viewCamera = camera;
-        if (cameraObjectId) {
-          const node = rootRef.current ? findNode(rootRef.current, cameraObjectId) : null;
-          if (!node || !(node instanceof THREE.PerspectiveCamera)) return null;
-          viewCamera = node;
-        }
+        const viewCamera = resolveCamera(cameraObjectId);
+        if (!viewCamera) return null;
         return captureProjectFrame(gl, scene, viewCamera, aspect);
       } catch {
         return null;
       }
     };
+    exportFrameRef.current = (cameraObjectId, canvas, options) => {
+      if (typeof gl.render !== 'function') return false;
+      try {
+        const viewCamera = resolveCamera(cameraObjectId);
+        if (!viewCamera) return false;
+        return renderProjectFrameToCanvas(gl, scene, viewCamera, canvas, {
+          ...options,
+          excludeEditorHelpers: true,
+        });
+      } catch {
+        return false;
+      }
+    };
     onCaptureReady?.(true);
     return () => {
       captureRef.current = null;
+      exportFrameRef.current = null;
       onCaptureReady?.(false);
     };
-  }, [gl, scene, camera, captureRef, onCaptureReady, rootRef, aspect]);
+  }, [gl, scene, camera, captureRef, exportFrameRef, onCaptureReady, rootRef, aspect]);
   return null;
 }
 

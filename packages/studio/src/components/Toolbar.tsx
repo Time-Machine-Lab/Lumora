@@ -1,4 +1,5 @@
 import { useRef } from 'react';
+import type { RefObject } from 'react';
 import { createSampleProject } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import type { StudioRuntime } from '../runtime/studio-runtime';
@@ -15,7 +16,10 @@ interface ToolbarProps {
   editorState: EditorState;
   cache: ContentCache;
   storyboardOpen: boolean;
+  exportOpen: boolean;
+  exportButtonRef: RefObject<HTMLButtonElement | null>;
   onToggleStoryboard: () => void;
+  onToggleExport: () => void;
   onTogglePlugins: () => void;
   onTogglePalette: () => void;
 }
@@ -26,7 +30,10 @@ export function Toolbar({
   editorState,
   cache,
   storyboardOpen,
+  exportOpen,
+  exportButtonRef,
   onToggleStoryboard,
+  onToggleExport,
   onTogglePlugins,
   onTogglePalette,
 }: ToolbarProps) {
@@ -50,7 +57,7 @@ export function Toolbar({
   };
 
   return (
-    <header className="lumora-toolbar" data-testid="lumora-toolbar" inert={storyboardOpen || undefined}>
+    <header className="lumora-toolbar" data-testid="lumora-toolbar" inert={storyboardOpen || exportOpen || undefined}>
       <span className="lumora-toolbar__brand">Lumora Studio</span>
       <div className="lumora-toolbar__actions">
         <ProjectMenu runtime={runtime} project={project} />
@@ -131,6 +138,17 @@ export function Toolbar({
           onClick={onToggleStoryboard}
         >
           AI 分镜
+        </button>
+        <button
+          ref={exportButtonRef}
+          type="button"
+          className={`lumora-button${exportOpen ? ' lumora-button--active' : ''}`}
+          data-testid="open-export-workspace"
+          aria-pressed={exportOpen}
+          disabled={!project}
+          onClick={onToggleExport}
+        >
+          导出
         </button>
         <input
           ref={fileInputRef}

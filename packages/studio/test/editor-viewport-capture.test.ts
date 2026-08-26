@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
-import { captureProjectFrame } from '../src/components/editor/frame-capture';
+import {
+  captureProjectFrame,
+  renderProjectFrameToCanvas,
+} from '../src/components/editor/frame-capture';
 
 function createRenderer(options: { throwOnRender?: boolean } = {}) {
   const visibleToDataUrl = vi.fn(() => 'visible-canvas');
@@ -54,6 +57,116 @@ afterEach(() => {
 });
 
 describe('captureProjectFrame', () => {
+  it('renders an exact 1280x720 export frame into the caller canvas', () => {
+    const { renderer, raw } = createRenderer();
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, 4 / 3);
+    const target = document.createElement('canvas');
+    const putImageData = vi.fn();
+    const createImageData = vi.fn((width: number, height: number) => ({
+      width,
+      height,
+      data: new Uint8ClampedArray(width * height * 4),
+    }));
+    vi.spyOn(target, 'getContext').mockReturnValue({ createImageData, putImageData } as never);
+
+    const rendered = renderProjectFrameToCanvas(renderer, scene, camera, target, {
+      width: 1280,
+      height: 720,
+      aspect: 16 / 9,
+    });
+
+    expect(rendered).toBe(true);
+    expect(target.width).toBe(1280);
+    expect(target.height).toBe(720);
+    expect(createImageData).toHaveBeenCalledWith(1280, 720);
+    expect(putImageData).toHaveBeenCalledTimes(1);
+    expect(raw.readRenderTargetPixels.mock.calls[0]?.slice(1, 5)).toEqual([0, 0, 1280, 720]);
+    expect(camera.aspect).toBe(4 / 3);
+  });
+
+  it('letterboxes a 4:3 project inside a 16:9 export frame', () => {
+    const { renderer, raw } = createRenderer();
+    const target = document.createElement('canvas');
+    vi.spyOn(target, 'getContext').mockReturnValue({
+      createImageData: (width: number, height: number) => ({
+        width,
+        height,
+        data: new Uint8ClampedArray(width * height * 4),
+      }),
+      putImageData: vi.fn(),
+    } as never);
+
+    expect(renderProjectFrameToCanvas(
+      renderer,
+      new THREE.Scene(),
+      new THREE.PerspectiveCamera(),
+      target,
+      { width: 1280, height: 720, aspect: 4 / 3 },
+    )).toBe(true);
+
+    expect(raw.setViewport).toHaveBeenCalledWith(160, 0, 960, 720);
+  });
+
+  it('pillarboxes a portrait project inside a 16:9 export frame', () => {
+    const { renderer, raw } = createRenderer();
+    const target = document.createElement('canvas');
+    vi.spyOn(target, 'getContext').mockReturnValue({
+      createImageData: (width: number, height: number) => ({
+        width,
+        height,
+        data: new Uint8ClampedArray(width * height * 4),
+      }),
+      putImageData: vi.fn(),
+    } as never);
+
+    expect(renderProjectFrameToCanvas(
+      renderer,
+      new THREE.Scene(),
+      new THREE.PerspectiveCamera(),
+      target,
+      { width: 1280, height: 720, aspect: 9 / 16 },
+    )).toBe(true);
+
+    expect(raw.setViewport).toHaveBeenCalledWith(437, 0, 405, 720);
+  });
+
+  it('omits editor helpers from export frames and restores their visibility', () => {
+    const { renderer, raw } = createRenderer();
+    const scene = new THREE.Scene();
+    const grid = new THREE.GridHelper();
+    const transformControls = new THREE.Group() as THREE.Group & { isTransformControls: boolean };
+    transformControls.isTransformControls = true;
+    const content = new THREE.Mesh();
+    scene.add(grid, transformControls, content);
+    const target = document.createElement('canvas');
+    vi.spyOn(target, 'getContext').mockReturnValue({
+      createImageData: (width: number, height: number) => ({
+        width,
+        height,
+        data: new Uint8ClampedArray(width * height * 4),
+      }),
+      putImageData: vi.fn(),
+    } as never);
+    raw.render.mockImplementation(() => {
+      expect(grid.visible).toBe(false);
+      expect(transformControls.visible).toBe(false);
+      expect(content.visible).toBe(true);
+    });
+
+    const rendered = renderProjectFrameToCanvas(
+      renderer,
+      scene,
+      new THREE.PerspectiveCamera(),
+      target,
+      { width: 1280, height: 720, aspect: 16 / 9, excludeEditorHelpers: true },
+    );
+
+    expect(rendered).toBe(true);
+    expect(grid.visible).toBe(true);
+    expect(transformControls.visible).toBe(true);
+  });
+
   it('renders offscreen at project aspect and restores all renderer and camera state', () => {
     const { renderer, raw, previousTarget, targetViewport, targetScissor, visibleToDataUrl } = createRenderer();
     const scene = new THREE.Scene();
@@ -101,11 +214,21 @@ describe('captureProjectFrame', () => {
   it('restores renderer and camera state when offscreen rendering throws', () => {
     const { renderer, raw, previousTarget, targetViewport, targetScissor } = createRenderer({ throwOnRender: true });
     const camera = new THREE.PerspectiveCamera(45, 1.25);
+    const scene = new THREE.Scene();
+    const grid = new THREE.GridHelper();
+    scene.add(grid);
 
-    const result = captureProjectFrame(renderer, new THREE.Scene(), camera, 9 / 16);
+    const result = renderProjectFrameToCanvas(
+      renderer,
+      scene,
+      camera,
+      document.createElement('canvas'),
+      { width: 320, height: 180, aspect: 9 / 16, excludeEditorHelpers: true },
+    );
 
-    expect(result).toBeNull();
+    expect(result).toBe(false);
     expect(camera.aspect).toBe(1.25);
+    expect(grid.visible).toBe(true);
     const restoreCalls = raw.setRenderTarget.mock.calls.slice(-2);
     expect(restoreCalls[0]?.[0]).toBeNull();
     expect(restoreCalls[1]?.[0]).toBe(previousTarget);

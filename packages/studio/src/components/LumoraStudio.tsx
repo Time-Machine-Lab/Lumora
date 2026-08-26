@@ -17,6 +17,8 @@ import { TimelinePanel } from './editor/TimelinePanel';
 import { ObjectTree } from './editor/ObjectTree';
 import { PropertiesPanel } from './editor/PropertiesPanel';
 import { StoryboardWorkspace } from './storyboard/StoryboardWorkspace';
+import { ExportWorkspace } from './export/ExportWorkspace';
+import type { ExportFrameCapture } from './export/ExportWorkspace';
 import { ToastHost, showToast } from './editor/toasts';
 import { ContentCache } from './editor/content-cache';
 import { DRIVE_KEY_CODES } from './editor/camera-drive';
@@ -217,6 +219,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   }, [session.state.overwritePending, session]);
   // 分镜缩略图截图通道：EditorViewport 的 FrameCaptureBridge 挂载后可用
   const captureRef = useRef<((cameraObjectId?: string | null) => string | null) | null>(null);
+  const exportFrameRef = useRef<ExportFrameCapture | null>(null);
   // 通道就绪状态：仅写 ref 不触发渲染，缩略图链依赖该状态在通道就绪后重跑
   // （复审阻断 2：初载时 effect 早于 FrameCaptureBridge 挂载而空转）
   const [captureReady, setCaptureReady] = useState(false);
@@ -232,10 +235,15 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   const [pluginManagerOpen, setPluginManagerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [storyboardOpen, setStoryboardOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const exportButtonRef = useRef<HTMLButtonElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const closeWorkspace = () => setStoryboardOpen(false);
+    const closeWorkspace = () => {
+      setStoryboardOpen(false);
+      setExportOpen(false);
+    };
     const opened = runtime.events.on('project:opened', closeWorkspace);
     const closed = runtime.events.on('project:closed', closeWorkspace);
     return () => {
@@ -453,6 +461,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         ref={rootRef}
         className={`lumora-studio${className ? ` ${className}` : ''}`}
         data-testid="lumora-studio"
+        data-workspace={storyboardOpen ? 'storyboard' : exportOpen ? 'export' : undefined}
         // 覆盖确认模态打开时整壳 inert：工具栏/对象树/视口/时间线整体不可达
         // （复审阻断 4：仅时间线内容 inert 时其余应用仍可交互）
         inert={session.state.overwritePending || undefined}
@@ -463,22 +472,33 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
           editorState={editorState}
           cache={cache}
           storyboardOpen={storyboardOpen}
+          exportOpen={exportOpen}
+          exportButtonRef={exportButtonRef}
           onToggleStoryboard={() => {
             setPluginManagerOpen(false);
             setPaletteOpen(false);
+            setExportOpen(false);
             setStoryboardOpen((open) => !open);
+          }}
+          onToggleExport={() => {
+            setPluginManagerOpen(false);
+            setPaletteOpen(false);
+            setStoryboardOpen(false);
+            setExportOpen((open) => !open);
           }}
           onTogglePlugins={() => {
             setStoryboardOpen(false);
+            setExportOpen(false);
             setPluginManagerOpen((open) => !open);
           }}
           onTogglePalette={() => {
             setStoryboardOpen(false);
+            setExportOpen(false);
             setPaletteOpen((open) => !open);
           }}
         />
         <div className="lumora-studio__stage">
-        <div className="lumora-studio__body" inert={storyboardOpen || undefined}>
+        <div className="lumora-studio__body" inert={storyboardOpen || exportOpen || undefined}>
           <div className="lumora-studio__sidebar">
             <ObjectTree
               editor={runtime.editor}
@@ -505,6 +525,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
                   cache={cache}
                   session={session}
                   captureRef={captureRef}
+                  exportFrameRef={exportFrameRef}
                   onCaptureReady={handleCaptureReady}
                   onRenderContentChange={handleRenderContentChange}
                   keyboardScopeRef={rootRef}
@@ -540,6 +561,21 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
             runtime={runtime}
             project={project}
             onClose={() => setStoryboardOpen(false)}
+          />
+        )}
+        {exportOpen && project && (
+          <ExportWorkspace
+            key={project.uri}
+            runtime={runtime}
+            project={project}
+            session={session}
+            captureRef={captureRef}
+            exportFrameRef={exportFrameRef}
+            captureReady={captureReady}
+            onClose={() => {
+              setExportOpen(false);
+              queueMicrotask(() => exportButtonRef.current?.focus());
+            }}
           />
         )}
         </div>
