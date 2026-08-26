@@ -96,6 +96,10 @@ export interface StoryboardModelDescriptor {
   readonly cost: AiCostEstimate;
 }
 
+export type StoryboardModelCatalog =
+  | ReadonlyArray<StoryboardModelDescriptor>
+  | (() => ReadonlyArray<StoryboardModelDescriptor>);
+
 export interface StoryboardGenerateRequest {
   readonly model: string;
   readonly brief: CreativeBrief;
@@ -104,7 +108,7 @@ export interface StoryboardGenerateRequest {
 
 export interface AiStoryboardCapability {
   readonly capability: typeof AI_STORYBOARD_GENERATE_CAPABILITY;
-  readonly models: ReadonlyArray<StoryboardModelDescriptor>;
+  readonly models: StoryboardModelCatalog;
   generate(request: StoryboardGenerateRequest): Promise<unknown>;
 }
 
@@ -133,29 +137,40 @@ const storyboardModelDescriptorSchema = z
   })
   .strict();
 
-const aiStoryboardCapabilitySchema = z
-  .object({
-    capability: z.literal(AI_STORYBOARD_GENERATE_CAPABILITY),
-    models: z.array(storyboardModelDescriptorSchema).min(1).max(100),
-    generate: z.custom<AiStoryboardCapability['generate']>(
-      (value) => typeof value === 'function',
-      'Storyboard capability generate must be callable.',
-    ),
-  })
-  .strict()
-  .superRefine((capability, context) => {
+const storyboardModelListSchema = z
+  .array(storyboardModelDescriptorSchema)
+  .min(1)
+  .max(100)
+  .superRefine((models, context) => {
     const modelIds = new Set<string>();
-    capability.models.forEach((model, index) => {
+    models.forEach((model, index) => {
       if (modelIds.has(model.id)) {
         context.addIssue({
           code: z.ZodIssueCode.custom,
           message: `Storyboard model id must be unique: ${model.id}`,
-          path: ['models', index, 'id'],
+          path: [index, 'id'],
         });
       }
       modelIds.add(model.id);
     });
   });
+
+const aiStoryboardCapabilitySchema = z
+  .object({
+    capability: z.literal(AI_STORYBOARD_GENERATE_CAPABILITY),
+    models: z.union([
+      storyboardModelListSchema,
+      z.custom<() => ReadonlyArray<StoryboardModelDescriptor>>(
+        (value) => typeof value === 'function',
+        'Storyboard model catalog must be an array or callable resolver.',
+      ),
+    ]),
+    generate: z.custom<AiStoryboardCapability['generate']>(
+      (value) => typeof value === 'function',
+      'Storyboard capability generate must be callable.',
+    ),
+  })
+  .strict();
 
 export interface AiReferenceImageRequest {
   readonly model: string;
@@ -189,6 +204,8 @@ export interface StoryboardDraft {
 
 export type AiProviderErrorCode =
   | 'invalid_request'
+  | 'authentication_failed'
+  | 'network_error'
   | 'provider_unavailable'
   | 'model_unsupported'
   | 'timeout'
@@ -257,11 +274,18 @@ export function parseAiStoryboardCapability(value: unknown): AiStoryboardCapabil
   return aiStoryboardCapabilitySchema.parse(value);
 }
 
+export function resolveStoryboardModels(capability: AiStoryboardCapability): ReadonlyArray<StoryboardModelDescriptor> {
+  const models = typeof capability.models === 'function' ? capability.models() : capability.models;
+  return storyboardModelListSchema.parse(models);
+}
+
 const GENERIC_PROVIDER_ERROR_MESSAGE = 'The AI provider request failed.';
 
 function publicAiProviderErrorMessage(code: unknown): string {
   switch (code) {
     case 'invalid_request': return 'The AI request is invalid.';
+    case 'authentication_failed': return 'The AI provider rejected authentication.';
+    case 'network_error': return 'The AI provider could not be reached from this browser.';
     case 'provider_unavailable': return 'The AI provider is unavailable.';
     case 'model_unsupported': return 'The AI model is not supported.';
     case 'timeout': return 'The AI provider request timed out.';
@@ -278,6 +302,8 @@ export function redactAiDiagnosticText(_message: string): string {
 
 const KNOWN_AI_PROVIDER_ERROR_CODES = new Set<AiProviderErrorCode>([
   'invalid_request',
+  'authentication_failed',
+  'network_error',
   'provider_unavailable',
   'model_unsupported',
   'timeout',

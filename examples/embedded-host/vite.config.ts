@@ -11,6 +11,15 @@ export default defineConfig({
         new URL('../../examples/mock-plugin/lumora.plugin.json', import.meta.url),
       ),
       '@lumora/mock-plugin': fileURLToPath(new URL('../../examples/mock-plugin/src/index.tsx', import.meta.url)),
+      '@lumora/openai-compatible-plugin/style.css': fileURLToPath(
+        new URL('../../examples/openai-compatible-plugin/src/style.css', import.meta.url),
+      ),
+      '@lumora/openai-compatible-plugin/lumora.plugin.json': fileURLToPath(
+        new URL('../../examples/openai-compatible-plugin/lumora.plugin.json', import.meta.url),
+      ),
+      '@lumora/openai-compatible-plugin': fileURLToPath(
+        new URL('../../examples/openai-compatible-plugin/src/index.tsx', import.meta.url),
+      ),
       '@lumora/studio': fileURLToPath(new URL('../../packages/studio/src/index.ts', import.meta.url)),
       '@lumora/plugin-sdk': fileURLToPath(new URL('../../packages/plugin-sdk/src/index.ts', import.meta.url)),
       '@lumora/core': fileURLToPath(new URL('../../packages/core/src/index.ts', import.meta.url)),

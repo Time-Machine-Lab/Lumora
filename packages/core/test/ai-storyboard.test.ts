@@ -134,6 +134,32 @@ function servicesWithMalformedMetadata() {
   return createPluginServices(registry as never, () => null).ai;
 }
 
+function servicesWithDynamicModel(
+  getModels: () => ReadonlyArray<{
+    id: string;
+    name: string;
+    cost: { kind: 'unknown'; note: string };
+  }>,
+  generate: () => Promise<unknown>,
+): AiService {
+  const registry = {
+    getAssetLoaders: () => [],
+    getExporters: () => [],
+    getAiProviders: () => [{
+      id: 'com.example.dynamic-storyboard',
+      name: 'Dynamic Storyboard',
+      models: [],
+      chat: async function* () {},
+      storyboard: {
+        capability: 'ai.storyboard.generate' as const,
+        models: getModels,
+        generate,
+      },
+    }],
+  };
+  return createPluginServices(registry, () => null).ai;
+}
+
 function expectPublicProviderFailure(task: GenerationTask): void {
   expect(task.status).toBe('failed');
   expect(task.error).toEqual({
@@ -240,6 +266,38 @@ describe('AI storyboard capability', () => {
     expect(completed.brief.concept).toBe(BRIEF.concept);
     expect(polled.brief.concept).toBe(BRIEF.concept);
     expect(polled.draft?.shots[0]?.prompt).toBe('Wide market arrival in rain.');
+  });
+
+  it('resolves configurable model catalogs again for discovery and the next submission', async () => {
+    let configuredModel = 'custom-model-a';
+    const generate = vi.fn(async () => VALID_PAYLOAD);
+    const ai = servicesWithDynamicModel(
+      () => [{
+        id: configuredModel,
+        name: configuredModel,
+        cost: { kind: 'unknown', note: 'The compatible endpoint does not expose a preflight price.' },
+      }],
+      generate,
+    );
+
+    expect(ai.listStoryboardProviders()[0]?.models.map((model) => model.id)).toEqual(['custom-model-a']);
+
+    configuredModel = 'vendor/model-b';
+    expect(ai.listStoryboardProviders()[0]?.models.map((model) => model.id)).toEqual(['vendor/model-b']);
+    expect(() => ai.submitStoryboard('com.example.dynamic-storyboard', {
+      model: 'custom-model-a',
+      brief: BRIEF,
+    })).toThrow(/not supported/i);
+
+    const submitted = ai.submitStoryboard('com.example.dynamic-storyboard', {
+      model: 'vendor/model-b',
+      brief: BRIEF,
+    });
+    const completed = await ai.waitForGenerationTask(submitted.id);
+
+    expect(completed).toMatchObject({ status: 'succeeded', model: 'vendor/model-b' });
+    expect(completed.draft).toMatchObject({ model: 'vendor/model-b' });
+    expect(generate).toHaveBeenCalledTimes(1);
   });
 
   it('excludes providers with malformed storyboard metadata from discovery', () => {
@@ -379,6 +437,8 @@ describe('AI storyboard capability', () => {
 
   it.each([
     ['invalid_request', 'The AI request is invalid.'],
+    ['authentication_failed', 'The AI provider rejected authentication.'],
+    ['network_error', 'The AI provider could not be reached from this browser.'],
     ['provider_unavailable', 'The AI provider is unavailable.'],
     ['model_unsupported', 'The AI model is not supported.'],
     ['timeout', 'The AI provider request timed out.'],

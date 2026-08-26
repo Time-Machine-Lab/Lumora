@@ -169,6 +169,69 @@ beforeEach(() => {
 });
 
 describe('StoryboardWorkspace', () => {
+  it('refreshes a dynamic provider model before the next generation and adoption', async () => {
+    let dynamicModel = 'configurable-model-a';
+    const dynamicGenerate = vi.fn(generate);
+    const dynamicPlugin: PluginDescriptor = {
+      manifest: {
+        ...manifest,
+        id: 'com.test.dynamicstoryboard',
+        name: 'Dynamic storyboard provider',
+      },
+      entry: async () => ({
+        default: {
+          activate: (context) => context.contribute({
+            aiProviders: [{
+              kind: 'aiProvider',
+              id: 'com.test.dynamicstoryboard.ai',
+              name: 'Dynamic storyboard provider',
+              models: [],
+              chat: async function* () {},
+              storyboard: {
+                capability: AI_STORYBOARD_GENERATE_CAPABILITY,
+                models: () => [{
+                  id: dynamicModel,
+                  name: dynamicModel,
+                  cost: { kind: 'unknown', note: 'Dynamic model' },
+                }],
+                generate: dynamicGenerate,
+              },
+            }],
+          }),
+        },
+      }),
+    };
+    const ref = createRef<LumoraStudioHandle>();
+    render(
+      <LumoraStudio
+        ref={ref}
+        plugins={[dynamicPlugin]}
+        initialProject={createBlankProject('lumora://dynamic-storyboard-ui', 'Dynamic storyboard UI')}
+        scene={() => <div />}
+      />,
+    );
+    await waitFor(() => expect(ref.current?.runtime.host.services.ai.listStoryboardProviders()).toHaveLength(1));
+    fireEvent.click(screen.getByTestId('open-storyboard-workspace'));
+    expect(await screen.findByTestId('storyboard-model')).toHaveValue('configurable-model-a');
+
+    dynamicModel = 'vendor/model-b';
+    act(() => ref.current?.runtime.events.emit('contribution:changed', { pluginId: 'com.test.dynamicstoryboard' }));
+    await waitFor(() => expect(screen.getByTestId('storyboard-model')).toHaveValue('vendor/model-b'));
+    fireEvent.change(screen.getByTestId('storyboard-concept'), {
+      target: { value: 'A complete concept for the dynamically configured model.' },
+    });
+    fireEvent.click(screen.getByTestId('storyboard-generate'));
+    expect(await screen.findByText('Generated pursuit')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('storyboard-accept-all'));
+
+    await waitFor(() => expect(ref.current?.runtime.editor.getProject()?.shots).toHaveLength(3));
+    expect(dynamicGenerate).toHaveBeenCalledWith(expect.objectContaining({ model: 'vendor/model-b' }));
+    expect(ref.current?.runtime.editor.getProject()?.shots[0]?.aiSource).toMatchObject({
+      providerId: 'com.test.dynamicstoryboard.ai',
+      model: 'vendor/model-b',
+    });
+  });
+
   it('formats zero, sub-minor-unit, and currency-specific known costs without showing a nonzero amount as zero', async () => {
     await mountWorkspace();
     const model = screen.getByTestId('storyboard-model');

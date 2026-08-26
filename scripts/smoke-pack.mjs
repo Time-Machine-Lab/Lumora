@@ -14,7 +14,13 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const run = (cmd, opts = {}) => execSync(cmd, { cwd: opts.cwd ?? root, stdio: 'inherit', timeout: 600_000, ...opts });
 
-const PACKAGES = ['@lumora/core', '@lumora/plugin-sdk', '@lumora/studio', '@lumora/mock-plugin'];
+const PACKAGES = [
+  '@lumora/core',
+  '@lumora/plugin-sdk',
+  '@lumora/studio',
+  '@lumora/mock-plugin',
+  '@lumora/openai-compatible-plugin',
+];
 const CONSUMER_DEP_PEERS = [
   'react@^19.0.0',
   'react-dom@^19.0.0',
@@ -151,6 +157,7 @@ withRawTempDir('lumora-smoke-', (tmp) => {
       '@lumora/plugin-sdk': tarballs['@lumora/plugin-sdk'],
       '@lumora/studio': tarballs['@lumora/studio'],
       '@lumora/mock-plugin': tarballs['@lumora/mock-plugin'],
+      '@lumora/openai-compatible-plugin': tarballs['@lumora/openai-compatible-plugin'],
     },
     // 强制图中 @lumora/core、@lumora/plugin-sdk 引用解析到本地 tarball
     //（各包依赖声明为 0.1.0，尚未发布到 registry，安装时由 overrides 兜底）
@@ -204,7 +211,9 @@ import type { LumoraStudioHandle } from '@lumora/studio';
 import type { PluginDescriptor } from '@lumora/core';
 import { definePlugin } from '@lumora/plugin-sdk';
 import '@lumora/studio/style.css';
+import '@lumora/openai-compatible-plugin/style.css';
 import mockManifest from '@lumora/mock-plugin/lumora.plugin.json';
+import openAiCompatibleManifest from '@lumora/openai-compatible-plugin/lumora.plugin.json';
 
 const plugins: PluginDescriptor[] = [
   {
@@ -238,6 +247,10 @@ const plugins: PluginDescriptor[] = [
     manifest: mockManifest as unknown as PluginDescriptor['manifest'],
     entry: () => import('@lumora/mock-plugin'),
   },
+  {
+    manifest: openAiCompatibleManifest as unknown as PluginDescriptor['manifest'],
+    entry: () => import('@lumora/openai-compatible-plugin'),
+  },
 ];
 
 // LumoraStudioHandle 导出与样式导入必须通过类型检查与构建
@@ -260,6 +273,15 @@ createRoot(document.getElementById('root')!).render(
   const studioPkg = JSON.parse(readFileSync(join(consumerDir, 'node_modules', '@lumora', 'studio', 'package.json'), 'utf8'));
   if (!studioPkg.exports?.['./style.css']) {
     throw new Error('@lumora/studio 安装后 exports 缺少 "./style.css"');
+  }
+  const openAiPluginDir = join(consumerDir, 'node_modules', '@lumora', 'openai-compatible-plugin');
+  const openAiStyleCss = join(openAiPluginDir, 'dist', 'style.css');
+  if (!existsSync(openAiStyleCss)) {
+    throw new Error('@lumora/openai-compatible-plugin 安装产物缺少 dist/style.css');
+  }
+  const openAiPluginPkg = JSON.parse(readFileSync(join(openAiPluginDir, 'package.json'), 'utf8'));
+  if (!openAiPluginPkg.exports?.['./style.css']) {
+    throw new Error('@lumora/openai-compatible-plugin 安装后 exports 缺少 "./style.css"');
   }
   // 依赖隔离：4 个 @lumora 包必须来自本地 tarball 副本（安装进消费工程内），
   // canonical 边界判定不得解析到仓库内；包含边界与断言提示语一致（consumerDir）

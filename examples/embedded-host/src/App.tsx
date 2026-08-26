@@ -3,6 +3,8 @@ import type { Manifest, PluginDescriptor } from '@lumora/core';
 import { LumoraStudio } from '@lumora/studio';
 import type { LumoraStudioHandle } from '@lumora/studio';
 import mockManifest from '@lumora/mock-plugin/lumora.plugin.json';
+import openAiCompatibleManifest from '@lumora/openai-compatible-plugin/lumora.plugin.json';
+import '@lumora/openai-compatible-plugin/style.css';
 import { formatLogLine } from './summarize';
 import './app.css';
 
@@ -10,6 +12,11 @@ const mockPlugin: PluginDescriptor = {
   manifest: mockManifest as unknown as PluginDescriptor['manifest'],
   // 通过 workspace 源码别名直接加载；生产环境下此入口为构建产物 dist/index.js
   entry: () => import('@lumora/mock-plugin'),
+};
+
+const openAiCompatiblePlugin: PluginDescriptor = {
+  manifest: openAiCompatibleManifest as unknown as PluginDescriptor['manifest'],
+  entry: () => import('@lumora/openai-compatible-plugin'),
 };
 
 /** 演示验收标准 2：非法 Manifest 的插件不会被激活 */
@@ -148,6 +155,7 @@ const LEAKY_PLUGINS = new URLSearchParams(window.location.search).get('plugins')
 
 const PLUGINS: PluginDescriptor[] = [
   mockPlugin,
+  openAiCompatiblePlugin,
   brokenManifestPlugin,
   brokenEnginePlugin,
   explodingPlugin,

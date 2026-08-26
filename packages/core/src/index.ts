@@ -229,6 +229,7 @@ export type {
   StoryboardDraftShotPayload,
   StoryboardGenerateRequest,
   StoryboardModelDescriptor,
+  StoryboardModelCatalog,
   StoryboardProviderInfo,
   StoryboardShotSize,
 } from './ai/storyboard';

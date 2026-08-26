@@ -61,6 +61,7 @@ export type {
   StoryboardDraftShot,
   StoryboardGenerateRequest,
   StoryboardModelDescriptor,
+  StoryboardModelCatalog,
   StoryboardProviderInfo,
   StoryboardShotSize,
 } from '@lumora/core';

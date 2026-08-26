@@ -9,6 +9,7 @@ import {
   parseAiStoryboardCapability,
   parseCreativeBrief,
   parseStoryboardDraftPayload,
+  resolveStoryboardModels,
   type AiStoryboardCapability,
   type AiProviderErrorData,
   type GenerationTask,
@@ -120,9 +121,12 @@ class StoryboardTaskService {
   listProviders(): ReadonlyArray<StoryboardProviderInfo> {
     const providers = this.registry.getAiProviders().flatMap((provider) => {
       const storyboard = validatedStoryboardCapability(provider);
-      return storyboard
-        ? [{ id: provider.id, name: provider.name, models: structuredClone(storyboard.models) }]
-        : [];
+      if (!storyboard) return [];
+      try {
+        return [{ id: provider.id, name: provider.name, models: structuredClone(resolveStoryboardModels(storyboard)) }];
+      } catch {
+        return [];
+      }
     });
     return deepFreeze(providers);
   }
@@ -138,7 +142,18 @@ class StoryboardTaskService {
         costKnown: false,
       });
     }
-    const model = storyboard.models.find((candidate) => candidate.id === request.model);
+    let models;
+    try {
+      models = resolveStoryboardModels(storyboard);
+    } catch {
+      throw new AiProviderRequestError({
+        code: 'provider_unavailable',
+        message: `Storyboard provider model catalog is unavailable: ${providerId}`,
+        retryable: false,
+        costKnown: false,
+      });
+    }
+    const model = models.find((candidate) => candidate.id === request.model);
     if (!model) {
       throw new AiProviderRequestError({
         code: 'model_unsupported',

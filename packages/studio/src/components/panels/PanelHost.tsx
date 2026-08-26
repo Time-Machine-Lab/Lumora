@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { PanelContribution, Project } from '@lumora/core';
 import type { StudioRuntime } from '../../runtime/studio-runtime';
 import { useEventRefresh } from '../../hooks/use-event-refresh';
@@ -15,6 +15,7 @@ export function PanelHost({ runtime, project, onDisablePlugin }: PanelHostProps)
   useEventRefresh(runtime.events, ['contribution:changed', 'plugin:state-changed']);
   const panels = runtime.host.contributions.getPanels();
   const [activeId, setActiveId] = useState<string | null>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
 
   if (panels.length === 0) return null;
   const active = panels.find((panel) => panel.id === activeId) ?? panels[0];
@@ -30,13 +31,16 @@ export function PanelHost({ runtime, project, onDisablePlugin }: PanelHostProps)
             aria-selected={panel.id === active.id}
             className={`lumora-panels__tab${panel.id === active.id ? ' lumora-panels__tab--active' : ''}`}
             data-testid={`panel-tab-${panel.id}`}
-            onClick={() => setActiveId(panel.id)}
+            onClick={() => {
+              setActiveId(panel.id);
+              requestAnimationFrame(() => contentRef.current?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }));
+            }}
           >
             {panel.title}
           </button>
         ))}
       </div>
-      <div className="lumora-panels__content" role="tabpanel">
+      <div ref={contentRef} className="lumora-panels__content" role="tabpanel">
         <ActivePanel panel={active} runtime={runtime} project={project} onDisablePlugin={onDisablePlugin} />
       </div>
     </aside>
