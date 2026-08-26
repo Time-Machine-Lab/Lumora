@@ -10,6 +10,8 @@ export type {
   PluginEventBus,
   PluginInfo,
   PluginModule,
+  PluginSettings,
+  PluginSettingsStorage,
   PluginState,
 } from '@lumora/core';
 
@@ -22,6 +24,7 @@ export type { Manifest, ManifestValidationResult } from '@lumora/core';
 // 贡献项协议
 export type {
   AiChatMessage,
+  AiChatModelCatalog,
   AiChatRequest,
   AiProviderContribution,
   Asset,

@@ -177,6 +177,7 @@ export type { Command, CommandContext, CommandResult, CommandRegistryOptions } f
 export { CONTRIBUTION_KINDS } from './contributions/types';
 export type {
   AiChatMessage,
+  AiChatModelCatalog,
   AiChatRequest,
   AiProviderContribution,
   Asset,
@@ -246,5 +247,7 @@ export type {
   PluginEventBus,
   PluginInfo,
   PluginModule,
+  PluginSettings,
+  PluginSettingsStorage,
   PluginState,
 } from './host/types';

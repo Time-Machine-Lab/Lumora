@@ -39,6 +39,23 @@ export interface PluginEventBus {
   onAny(handler: (event: string, payload: unknown) => void): Disposable;
 }
 
+/** 宿主为一个插件实例提供的非敏感设置命名空间。 */
+export interface PluginSettings {
+  get(key: string): string | null;
+  set(key: string, value: string): void;
+  remove(key: string): void;
+}
+
+/**
+ * 宿主级设置后端。每个 `PluginHost` 持有独立后端，Core 再按插件 instanceId
+ * 提供作用域门面，避免插件自行拼接全局存储 key。
+ */
+export interface PluginSettingsStorage {
+  get(pluginInstanceId: string, key: string): string | null;
+  set(pluginInstanceId: string, key: string, value: string): void;
+  remove(pluginInstanceId: string, key: string): void;
+}
+
 export interface PluginContext {
   pluginId: string;
   manifest: Manifest;
@@ -47,6 +64,8 @@ export interface PluginContext {
   /** 只读/执行能力面：禁止绕过生命周期直接注册命令（见 PluginCommands） */
   commands: PluginCommands;
   services: PluginServices;
+  /** 仅用于非敏感插件设置；凭据仍必须保留在插件运行时内存中。 */
+  settings: PluginSettings;
   /** 提交贡献项；返回的 Disposable 由宿主在停用时自动释放，插件亦可提前释放 */
   contribute(bundle: ContributionBundle): Disposable;
   getProject(): Project | null;

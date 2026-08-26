@@ -21,12 +21,38 @@ import type {
   PluginEventBus,
   PluginInfo,
   PluginModule,
+  PluginSettingsStorage,
   PluginState,
 } from './types';
 
 export interface PluginHostOptions {
   hostVersion?: string;
   onError?: (error: unknown) => void;
+  /** 此 `PluginHost` 实例专属的非敏感插件设置后端；缺省为隔离的内存实现。 */
+  pluginSettingsStorage?: PluginSettingsStorage;
+}
+
+class MemoryPluginSettingsStorage implements PluginSettingsStorage {
+  private readonly plugins = new Map<string, Map<string, string>>();
+
+  get(pluginInstanceId: string, key: string): string | null {
+    return this.plugins.get(pluginInstanceId)?.get(key) ?? null;
+  }
+
+  set(pluginInstanceId: string, key: string, value: string): void {
+    let settings = this.plugins.get(pluginInstanceId);
+    if (!settings) {
+      settings = new Map();
+      this.plugins.set(pluginInstanceId, settings);
+    }
+    settings.set(key, value);
+  }
+
+  remove(pluginInstanceId: string, key: string): void {
+    const settings = this.plugins.get(pluginInstanceId);
+    settings?.delete(key);
+    if (settings?.size === 0) this.plugins.delete(pluginInstanceId);
+  }
 }
 
 const PLUGIN_MANIFEST_INVALID_MESSAGE = 'Manifest 非法';
@@ -260,6 +286,7 @@ export class PluginHost {
 
   private readonly plugins = new Map<string, PluginRecord>();
   private readonly onError: (error: unknown) => void;
+  private readonly pluginSettingsStorage: PluginSettingsStorage;
   private project: Project | null = null;
   private disposedFlag = false;
   /** 销毁的真实清理完成点：publish-first 登记，所有并发/二次 dispose 等待同一清理 */
@@ -274,6 +301,7 @@ export class PluginHost {
       ((error) => {
         console.error('[lumora:host] 未捕获的宿主错误:', error);
       });
+    this.pluginSettingsStorage = options.pluginSettingsStorage ?? new MemoryPluginSettingsStorage();
     // 宿主自身就绪后再构造命令/贡献项/服务：onError 与惰性 services 才能正确注入
     this.commands = new CommandRegistry({
       events: this.events,
@@ -1130,6 +1158,20 @@ export class PluginHost {
       // 只读/执行能力面：插件不得绕过生命周期直接注册命令
       commands: gate.commands,
       services: this.services,
+      settings: {
+        get: (key) => {
+          if (!this.isGateAlive(record, attempt)) throw new Error('插件已停用或宿主已销毁，无法读取设置');
+          return this.pluginSettingsStorage.get(record.key, key);
+        },
+        set: (key, value) => {
+          if (!this.isGateAlive(record, attempt)) throw new Error('插件已停用或宿主已销毁，无法保存设置');
+          this.pluginSettingsStorage.set(record.key, key, value);
+        },
+        remove: (key) => {
+          if (!this.isGateAlive(record, attempt)) throw new Error('插件已停用或宿主已销毁，无法删除设置');
+          this.pluginSettingsStorage.remove(record.key, key);
+        },
+      },
       contribute: (bundle) => {
         if (this.disposedFlag || record.generation !== attempt.generation) {
           throw new Error('插件已停用或宿主已销毁，无法提交贡献项');

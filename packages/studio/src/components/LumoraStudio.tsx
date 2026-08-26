@@ -1,9 +1,10 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import { forwardRef, useCallback, useEffect, useId, useImperativeHandle, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { ReactNode } from 'react';
 import type { PluginDescriptor, Project } from '@lumora/core';
 import { createStudioRuntime } from '../runtime/studio-runtime';
 import type { StudioRuntime } from '../runtime/studio-runtime';
+import { BrowserPluginSettingsStorage } from '../runtime/browser-plugin-settings';
 import { useSceneEditor } from '../hooks/use-scene-editor';
 import { useTimelineSession } from '../hooks/use-timeline-session';
 import type { StorageBackend } from '../persistence/project-storage';
@@ -61,6 +62,11 @@ export interface LumoraStudioProps {
   scene?: (project: Project | null) => ReactNode;
   /** 本地存储后端（缺省 indexeddb；opfs = Origin Private File System） */
   storage?: StorageBackend;
+  /**
+   * 非敏感插件设置的 Studio 实例命名空间。嵌入方需要跨卸载/重载恢复设置时应提供稳定值；
+   * 缺省使用 React 实例 id，保证同页多个 Studio 不共享设置。
+   */
+  pluginSettingsNamespace?: string;
   className?: string;
 }
 
@@ -79,12 +85,33 @@ export interface LumoraStudioHandle {
  * - 卸载时释放全部资源：停用插件、移除订阅、销毁事件总线、资源缓存与 WebGL 场景
  */
 export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(function LumoraStudio(
-  { plugins = [], hostVersion, initialProject, onError, onCloseError, scene, storage, className },
+  {
+    plugins = [],
+    hostVersion,
+    initialProject,
+    onError,
+    onCloseError,
+    scene,
+    storage,
+    pluginSettingsNamespace,
+    className,
+  },
   ref,
 ) {
+  const generatedPluginSettingsNamespace = useId();
+  const pluginSettingsStorageRef = useRef<BrowserPluginSettingsStorage | null>(null);
+  if (!pluginSettingsStorageRef.current) {
+    pluginSettingsStorageRef.current = new BrowserPluginSettingsStorage(
+      pluginSettingsNamespace ?? generatedPluginSettingsNamespace,
+    );
+  }
   const runtimeRef = useRef<StudioRuntime | null>(null);
   if (!runtimeRef.current) {
-    runtimeRef.current = createStudioRuntime({ hostVersion, onError });
+    runtimeRef.current = createStudioRuntime({
+      hostVersion,
+      onError,
+      pluginSettingsStorage: pluginSettingsStorageRef.current,
+    });
   }
   const runtime = runtimeRef.current;
   const editorState = useSceneEditor(runtime.editor);

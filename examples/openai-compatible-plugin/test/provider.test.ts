@@ -56,7 +56,13 @@ describe('OpenAI-compatible Chat Completions client', () => {
     expect(init.method).toBe('POST');
     expect(new Headers(init.headers).get('Authorization')).toBe('Bearer sk-runtime-only-marker');
     const body = JSON.parse(String(init.body));
+    expect(Object.keys(body).sort()).toEqual(['messages', 'model', 'temperature']);
     expect(body.model).toBe('vendor/storyboard-v2');
+    expect(body).not.toHaveProperty('apiKey');
+    expect(body).not.toHaveProperty('api_key');
+    expect(String(init.body)).not.toContain(CONFIG.apiKey);
+    expect(body.messages.map((message: Record<string, unknown>) => Object.keys(message).sort()))
+      .toEqual([['content', 'role'], ['content', 'role']]);
     expect(body.messages[0]).toMatchObject({ role: 'system' });
     expect(body.messages[1].content).toContain(BRIEF.concept);
     expect(body.messages[1].content).toContain('"shotCount":3');
@@ -147,11 +153,70 @@ describe('OpenAI-compatible Chat Completions client', () => {
     expect(hangingFetch).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    ['caller abort', 'caller', 'cancelled'],
+    ['lifecycle abort', 'lifecycle', 'cancelled'],
+    ['deadline', 'deadline', 'timeout'],
+  ] as const)('preserves %s while the response body is still being read', async (_label, trigger, code) => {
+    const caller = new AbortController();
+    const lifecycle = new AbortController();
+    let rejectBody!: (reason: unknown) => void;
+    let resolveBody!: (value: unknown) => void;
+    const response = completion(JSON.stringify(VALID_DRAFT));
+    const body = new Promise<unknown>((resolve, reject) => {
+      resolveBody = resolve;
+      rejectBody = reject;
+    });
+    vi.spyOn(response, 'json').mockImplementation(() => body);
+    const fetchImpl = vi.fn<OpenAiFetch>(async (_url, init) => {
+      init?.signal?.addEventListener('abort', () => {
+        rejectBody(new DOMException('Body stream aborted', 'AbortError'));
+      }, { once: true });
+      return response;
+    });
+    const outcome = requestOpenAiChat(CONFIG, [{ role: 'user', content: 'ping' }], {
+      fetchImpl,
+      signal: caller.signal,
+      lifecycleSignal: lifecycle.signal,
+      timeoutMs: trigger === 'deadline' ? 5 : 1_000,
+    });
+    const rejection = expect(outcome).rejects.toMatchObject({ code });
+    await vi.waitFor(() => expect(response.json).toHaveBeenCalledTimes(1));
+
+    if (trigger === 'caller') caller.abort();
+    if (trigger === 'lifecycle') lifecycle.abort();
+
+    await rejection;
+    resolveBody({ choices: [{ message: { content: JSON.stringify(VALID_DRAFT) } }] });
+    await Promise.resolve();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('settles a body-stage deadline before an abort-ignoring late success arrives', async () => {
+    let resolveBody!: (value: unknown) => void;
+    const response = completion(JSON.stringify(VALID_DRAFT));
+    vi.spyOn(response, 'json').mockImplementation(() => new Promise((resolve) => {
+      resolveBody = resolve;
+    }));
+
+    const outcome = requestOpenAiChat(CONFIG, [{ role: 'user', content: 'ping' }], {
+      fetchImpl: vi.fn(async () => response),
+      timeoutMs: 5,
+    });
+
+    await expect(outcome).rejects.toMatchObject({ code: 'timeout' });
+    resolveBody({ choices: [{ message: { content: JSON.stringify(VALID_DRAFT) } }] });
+    await Promise.resolve();
+    expect(response.json).toHaveBeenCalledTimes(1);
+  });
+
   it('tests the current connection through the same sanitized protocol path', async () => {
     const fetchImpl = vi.fn<OpenAiFetch>(async () => completion('OK'));
 
     await expect(testOpenAiConnection(CONFIG, { fetchImpl })).resolves.toEqual({ ok: true });
     const body = JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body));
+    expect(Object.keys(body).sort()).toEqual(['max_tokens', 'messages', 'model', 'temperature']);
+    expect(String(fetchImpl.mock.calls[0]?.[1]?.body)).not.toContain(CONFIG.apiKey);
     expect(body.model).toBe(CONFIG.model);
     expect(body.max_tokens).toBe(1);
   });

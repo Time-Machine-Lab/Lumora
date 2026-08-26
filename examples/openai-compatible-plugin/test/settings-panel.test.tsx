@@ -9,7 +9,10 @@ describe('OpenAI-compatible settings panel', () => {
 
   beforeEach(() => {
     localStorage.clear();
-    configStore = new ProviderConfigStore(localStorage);
+    configStore = new ProviderConfigStore({
+      get: (key) => localStorage.getItem(`settings-panel:${key}`),
+      set: (key, value) => localStorage.setItem(`settings-panel:${key}`, value),
+    });
     configStore.activate();
     lifecycleController = new AbortController();
     vi.unstubAllGlobals();
@@ -57,7 +60,7 @@ describe('OpenAI-compatible settings panel', () => {
       model: 'vendor/custom-model',
       apiKey: 'sk-panel-runtime-marker',
     });
-    expect(localStorage.getItem(OPENAI_COMPATIBLE_STORAGE_KEY)).not.toContain('sk-panel-runtime-marker');
+    expect(localStorage.getItem(`settings-panel:${OPENAI_COMPATIBLE_STORAGE_KEY}`)).not.toContain('sk-panel-runtime-marker');
     expect(emit).toHaveBeenCalledWith('contribution:changed', { pluginId: 'com.lumora.openai.compatible' });
   });
 

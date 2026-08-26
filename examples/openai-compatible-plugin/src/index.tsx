@@ -4,6 +4,7 @@ import {
   disposable,
   type AiChatRequest,
   type PanelContextProps,
+  type PluginSettings,
   type PluginDefinition,
   type StoryboardGenerateRequest,
 } from '@lumora/plugin-sdk';
@@ -16,16 +17,16 @@ import './style.css';
 export const OPENAI_COMPATIBLE_PROVIDER_ID = 'com.lumora.openai.compatible.ai';
 
 export function createOpenAiCompatiblePlugin(
-  createConfigStore: () => ProviderConfigStore = () => new ProviderConfigStore(),
+  createConfigStore: (settings: PluginSettings) => ProviderConfigStore = (settings) => new ProviderConfigStore(settings),
 ): PluginDefinition {
   return definePlugin({
     activate(context) {
-      const configStore = createConfigStore();
+      const configStore = createConfigStore(context.settings);
       const runtime = new ProviderRuntime();
       configStore.activate();
 
       async function* compatibleChat(request: AiChatRequest): AsyncIterable<string> {
-        const content = await requestOpenAiChat(configStore.getSnapshot(), request.messages, {
+        const content = await requestOpenAiChat({ ...configStore.getSnapshot(), model: request.model }, request.messages, {
           signal: request.signal,
           lifecycleSignal: runtime.signal,
         });
@@ -60,7 +61,7 @@ export function createOpenAiCompatiblePlugin(
           kind: 'aiProvider',
           id: OPENAI_COMPATIBLE_PROVIDER_ID,
           name: 'OpenAI 兼容',
-          models: [configStore.getSnapshot().model],
+          models: () => [configStore.getSnapshot().model],
           chat: compatibleChat,
           storyboard: {
             capability: AI_STORYBOARD_GENERATE_CAPABILITY,

@@ -7,6 +7,10 @@ The OpenAI-compatible provider SHALL expose a discoverable settings panel where 
 - **WHEN** the user saves a different valid model and starts the next storyboard request
 - **THEN** provider discovery, the request body, the generation task, the draft, and adopted shot lineage use that new model
 
+#### Scenario: Generic Chat uses the refreshed model
+- **WHEN** model A was active, the user saves model B, and a generic Chat request is submitted
+- **THEN** model B is accepted and sent unchanged, while stale model A is rejected before any network request
+
 #### Scenario: User enters an unsafe endpoint
 - **WHEN** the endpoint is invalid, uses remote HTTP, contains credentials, query parameters, or a fragment
 - **THEN** save and connection test are rejected before a network request with actionable configuration feedback
@@ -29,6 +33,10 @@ The provider SHALL allow an empty API key. A non-empty key SHALL be held only in
 #### Scenario: Plugin is disabled and enabled
 - **WHEN** a configured plugin with a runtime key is disabled and later enabled
 - **THEN** the endpoint and model are restored, the key is empty, and every request active during disable is cancelled
+
+#### Scenario: Two host instances save different settings
+- **WHEN** two Host or Studio instances on the same origin save different endpoint/model/key values and one plugin is disabled and enabled
+- **THEN** each instance restores only its own endpoint/model, neither key is persisted, and one instance's lifecycle does not cancel the other
 
 ### Requirement: Browser direct connection feedback
 The settings panel SHALL state that the endpoint must permit the current browser origin through CORS and SHALL provide an immediate connection test. The test SHALL distinguish invalid configuration, authentication failure, unsupported endpoint/model, browser network/CORS failure, timeout, rate limit, provider unavailability, and invalid Chat Completions response structure without exposing response bodies.
@@ -74,3 +82,7 @@ The provider SHALL make exactly one HTTP attempt per user submission and SHALL m
 #### Scenario: User cancels generation
 - **WHEN** the host abort signal fires before response completion
 - **THEN** fetch is aborted, the task becomes cancelled, and a late provider success cannot create a draft or project shots
+
+#### Scenario: Cancellation or deadline occurs while reading the body
+- **WHEN** headers have arrived but the response body stalls and caller abort, plugin lifecycle abort, or the request deadline fires
+- **THEN** the request settles as `cancelled`, `cancelled`, or `timeout` respectively, and an abort-ignoring late body cannot change the terminal task or project

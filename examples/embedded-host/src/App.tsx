@@ -260,7 +260,14 @@ export default function App() {
       </header>
       <div className="host__layout">
         {mounted ? (
-          <LumoraStudio ref={handleRef} plugins={PLUGINS} hostVersion="0.1.0" storage={STORAGE} className="host__studio" />
+          <LumoraStudio
+            ref={handleRef}
+            plugins={PLUGINS}
+            hostVersion="0.1.0"
+            storage={STORAGE}
+            pluginSettingsNamespace="embedded-host"
+            className="host__studio"
+          />
         ) : (
           <div className="host__placeholder" data-testid="studio-placeholder">
             Studio 已卸载 —— WebGL 场景、插件贡献项与事件订阅均已释放

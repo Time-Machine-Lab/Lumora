@@ -74,7 +74,7 @@ function snapshotAiProviders(items: AiProviderContribution[]): AiProviderContrib
       kind: 'aiProvider' as const,
       id: providerIds[index]!,
       name: item.name,
-      models: [...item.models],
+      models: typeof item.models === 'function' ? item.models : [...item.models],
       chat: item.chat,
       ...(storyboard === undefined ? {} : { storyboard: parseRegisteredStoryboard(storyboard) }),
       ...(referenceImage === undefined ? {} : { referenceImage }),

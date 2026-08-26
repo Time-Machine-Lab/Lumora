@@ -84,6 +84,17 @@ function normalizedConfig(config: OpenAiRuntimeConfig): OpenAiRuntimeConfig {
   }
 }
 
+function readResponseJson(response: Response, signal: AbortSignal): Promise<unknown> {
+  if (signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+  return new Promise<unknown>((resolve, reject) => {
+    const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    void response.json().then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+  });
+}
+
 export async function requestOpenAiChat(
   configInput: OpenAiRuntimeConfig,
   messages: ReadonlyArray<AiChatMessage>,
@@ -132,17 +143,19 @@ export async function requestOpenAiChat(
     if (!response.ok) throw httpError(response);
     let envelope: unknown;
     try {
-      envelope = await response.json();
+      envelope = await readResponseJson(response, controller.signal);
     } catch {
+      if (externallyAborted) throw providerError('cancelled');
+      if (timedOut) throw providerError('timeout', true);
       throw providerError('schema_invalid');
     }
     if (externallyAborted) throw providerError('cancelled');
     if (timedOut) throw providerError('timeout', true);
     return completionContent(envelope);
   } catch (error) {
-    if (error instanceof AiProviderRequestError) throw error;
     if (externallyAborted) throw providerError('cancelled');
     if (timedOut) throw providerError('timeout', true);
+    if (error instanceof AiProviderRequestError) throw error;
     throw providerError('network_error', true);
   } finally {
     clearTimeout(timer);

@@ -1,6 +1,8 @@
+import type { PluginSettings } from '@lumora/plugin-sdk';
+
 export const DEFAULT_ENDPOINT = 'https://api.openai.com/v1/chat/completions';
 export const DEFAULT_MODEL = 'gpt-4o-mini';
-export const OPENAI_COMPATIBLE_STORAGE_KEY = 'lumora.plugin.openai-compatible.settings.v1';
+export const OPENAI_COMPATIBLE_STORAGE_KEY = 'settings.v1';
 
 export interface OpenAiProviderConfig {
   readonly endpoint: string;
@@ -8,7 +10,7 @@ export interface OpenAiProviderConfig {
   readonly apiKey: string;
 }
 
-type StorageLike = Pick<Storage, 'getItem' | 'setItem'>;
+type SettingsLike = Pick<PluginSettings, 'get' | 'set'>;
 type ConfigListener = () => void;
 
 export class ProviderConfigurationError extends Error {
@@ -68,16 +70,8 @@ export function normalizeModelName(input: string): string {
   return model;
 }
 
-function defaultStorage(): StorageLike | undefined {
-  try {
-    return typeof window === 'undefined' ? undefined : window.localStorage;
-  } catch {
-    return undefined;
-  }
-}
-
 export class ProviderConfigStore {
-  private readonly storage?: StorageLike;
+  private readonly settings: SettingsLike;
   private snapshot: OpenAiProviderConfig = {
     endpoint: DEFAULT_ENDPOINT,
     model: DEFAULT_MODEL,
@@ -85,15 +79,15 @@ export class ProviderConfigStore {
   };
   private readonly listeners = new Set<ConfigListener>();
 
-  constructor(storage: StorageLike | undefined = defaultStorage()) {
-    this.storage = storage;
+  constructor(settings: SettingsLike) {
+    this.settings = settings;
   }
 
   activate(): void {
     let endpoint = DEFAULT_ENDPOINT;
     let model = DEFAULT_MODEL;
     try {
-      const raw = this.storage?.getItem(OPENAI_COMPATIBLE_STORAGE_KEY);
+      const raw = this.settings.get(OPENAI_COMPATIBLE_STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as { endpoint?: unknown; model?: unknown };
         if (typeof parsed.endpoint !== 'string' || typeof parsed.model !== 'string') {
@@ -118,7 +112,7 @@ export class ProviderConfigStore {
     };
     const persisted = JSON.stringify({ endpoint: next.endpoint, model: next.model });
     try {
-      this.storage?.setItem(OPENAI_COMPATIBLE_STORAGE_KEY, persisted);
+      this.settings.set(OPENAI_COMPATIBLE_STORAGE_KEY, persisted);
     } catch {
       throw new ProviderConfigurationError('浏览器无法保存端点和模型设置。');
     }

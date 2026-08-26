@@ -10,6 +10,12 @@ import {
 describe('OpenAI-compatible provider configuration', () => {
   beforeEach(() => localStorage.clear());
 
+  const scopedStorageKey = `test-provider:${OPENAI_COMPATIBLE_STORAGE_KEY}`;
+  const settings = {
+    get: (key: string) => localStorage.getItem(`test-provider:${key}`),
+    set: (key: string, value: string) => localStorage.setItem(`test-provider:${key}`, value),
+  };
+
   it.each([
     ['https://api.example.com/v1', 'https://api.example.com/v1/chat/completions'],
     ['https://api.example.com/v1/chat/completions', 'https://api.example.com/v1/chat/completions'],
@@ -32,7 +38,7 @@ describe('OpenAI-compatible provider configuration', () => {
   });
 
   it('persists only normalized endpoint and model while clearing the key on deactivation', () => {
-    const store = new ProviderConfigStore(localStorage);
+    const store = new ProviderConfigStore(settings);
     store.activate();
     expect(store.getSnapshot()).toEqual({ endpoint: DEFAULT_ENDPOINT, model: DEFAULT_MODEL, apiKey: '' });
 
@@ -42,7 +48,7 @@ describe('OpenAI-compatible provider configuration', () => {
       apiKey: 'sk-runtime-only-marker',
     });
 
-    const persisted = localStorage.getItem(OPENAI_COMPATIBLE_STORAGE_KEY) ?? '';
+    const persisted = localStorage.getItem(scopedStorageKey) ?? '';
     expect(JSON.parse(persisted)).toEqual({
       endpoint: 'https://compatible.example/v1/chat/completions',
       model: 'vendor/custom-model',
@@ -53,7 +59,7 @@ describe('OpenAI-compatible provider configuration', () => {
     store.deactivate();
     expect(store.getSnapshot().apiKey).toBe('');
 
-    const restored = new ProviderConfigStore(localStorage);
+    const restored = new ProviderConfigStore(settings);
     restored.activate();
     expect(restored.getSnapshot()).toEqual({
       endpoint: 'https://compatible.example/v1/chat/completions',
@@ -63,12 +69,12 @@ describe('OpenAI-compatible provider configuration', () => {
   });
 
   it('does not replace a valid runtime snapshot with malformed stored data', () => {
-    localStorage.setItem(OPENAI_COMPATIBLE_STORAGE_KEY, JSON.stringify({
+    localStorage.setItem(scopedStorageKey, JSON.stringify({
       endpoint: 'http://remote.example/v1',
       model: '',
       apiKey: 'persisted-secret',
     }));
-    const store = new ProviderConfigStore(localStorage);
+    const store = new ProviderConfigStore(settings);
 
     store.activate();
 

@@ -1,5 +1,5 @@
 import { ZodError } from 'zod';
-import type { Asset, AiChatRequest, ExportResult } from './contributions/types';
+import type { Asset, AiChatModelCatalog, AiChatRequest, ExportResult } from './contributions/types';
 import type { Project } from './scene/types';
 import { deepFreeze } from './scene/immutable';
 import {
@@ -44,9 +44,22 @@ export interface PluginServices {
 interface RegisteredAiProvider {
   id: string;
   name: string;
-  models: string[];
+  models: AiChatModelCatalog;
   chat(request: AiChatRequest): AsyncIterable<string>;
   storyboard?: AiStoryboardCapability;
+}
+
+function resolveChatModels(catalog: AiChatModelCatalog): ReadonlyArray<string> {
+  const models = typeof catalog === 'function' ? catalog() : catalog;
+  if (!Array.isArray(models) || models.length > 100) throw new Error('AI Chat 模型目录不可用');
+  const resolved = models.map((model) => {
+    if (typeof model !== 'string' || !model.trim() || model.length > 160) {
+      throw new Error('AI Chat 模型目录不可用');
+    }
+    return model;
+  });
+  if (new Set(resolved).size !== resolved.length) throw new Error('AI Chat 模型目录不可用');
+  return resolved;
 }
 
 interface ServiceRegistry {
@@ -392,10 +405,12 @@ export function createPluginServices(
       async *chat(providerId, request) {
         const provider = registry.getAiProviders().find((p) => p.id === providerId);
         if (!provider) throw new Error(`未知 AI 提供方: ${providerId}`);
-        if (!provider.models.includes(request.model)) {
-          throw new Error(`模型 "${request.model}" 不受支持，可用: ${provider.models.join(', ')}`);
+        const models = resolveChatModels(provider.models);
+        const requestedModel = request.model;
+        if (!models.includes(requestedModel)) {
+          throw new Error(`模型 "${requestedModel}" 不受支持，可用: ${models.join(', ')}`);
         }
-        yield* provider.chat(request);
+        yield* provider.chat({ ...request, model: requestedModel });
       },
       listStoryboardProviders: () => storyboardTasks.listProviders(),
       submitStoryboard: (providerId, request) => storyboardTasks.submit(providerId, request),

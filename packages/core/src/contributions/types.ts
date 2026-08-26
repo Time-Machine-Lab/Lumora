@@ -92,11 +92,13 @@ export interface AiChatRequest {
   signal?: AbortSignal;
 }
 
+export type AiChatModelCatalog = ReadonlyArray<string> | (() => ReadonlyArray<string>);
+
 export interface AiProviderContribution {
   kind: 'aiProvider';
   id: string;
   name: string;
-  models: string[];
+  models: AiChatModelCatalog;
   /** 流式返回文本块 */
   chat(request: AiChatRequest): AsyncIterable<string>;
   /** Structured storyboard generation capability. Provider output is validated by the host. */

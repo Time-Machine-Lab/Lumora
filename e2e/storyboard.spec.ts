@@ -108,7 +108,14 @@ test('configures an OpenAI-compatible endpoint and keeps its runtime key out of 
   const endpointOrigin = 'http://127.0.0.1:48765';
   const endpoint = `${endpointOrigin}/v1/chat/completions`;
   const apiKey = 'sk-e2e-runtime-only-marker';
-  const requests: Array<{ authorization?: string; model?: string; connectionTest: boolean }> = [];
+  const requests: Array<{
+    authorization?: string;
+    model?: string;
+    connectionTest: boolean;
+    bodyKeys: string[];
+    messageKeys: string[][];
+    containsApiKey: boolean;
+  }> = [];
   await page.route(`${endpointOrigin}/**`, async (route) => {
     const request = route.request();
     const corsHeaders = {
@@ -120,11 +127,19 @@ test('configures an OpenAI-compatible endpoint and keeps its runtime key out of 
       await route.fulfill({ status: 204, headers: corsHeaders });
       return;
     }
-    const body = request.postDataJSON() as { model?: string; max_tokens?: number };
+    const rawBody = request.postData() ?? '';
+    const body = request.postDataJSON() as {
+      model?: string;
+      max_tokens?: number;
+      messages?: Array<Record<string, unknown>>;
+    };
     requests.push({
       authorization: request.headers().authorization,
       model: body.model,
       connectionTest: body.max_tokens === 1,
+      bodyKeys: Object.keys(body).sort(),
+      messageKeys: (body.messages ?? []).map((message) => Object.keys(message).sort()),
+      containsApiKey: rawBody.includes(apiKey),
     });
     await route.fulfill({
       status: 200,
@@ -178,8 +193,22 @@ test('configures an OpenAI-compatible endpoint and keeps its runtime key out of 
   ]);
   expect(exportedText).not.toContain(apiKey);
   expect(requests).toEqual([
-    { authorization: `Bearer ${apiKey}`, model: 'vendor/custom-storyboard-v2', connectionTest: true },
-    { authorization: `Bearer ${apiKey}`, model: 'vendor/custom-storyboard-v2', connectionTest: false },
+    {
+      authorization: `Bearer ${apiKey}`,
+      model: 'vendor/custom-storyboard-v2',
+      connectionTest: true,
+      bodyKeys: ['max_tokens', 'messages', 'model', 'temperature'],
+      messageKeys: [['content', 'role'], ['content', 'role']],
+      containsApiKey: false,
+    },
+    {
+      authorization: `Bearer ${apiKey}`,
+      model: 'vendor/custom-storyboard-v2',
+      connectionTest: false,
+      bodyKeys: ['messages', 'model', 'temperature'],
+      messageKeys: [['content', 'role'], ['content', 'role']],
+      containsApiKey: false,
+    },
   ]);
 
   const persistedText = await page.evaluate(async () => {
@@ -353,7 +382,9 @@ test('cancels an in-flight compatible request without accepting its late success
   const endpointOrigin = 'http://127.0.0.1:48770';
   let attempts = 0;
   let release!: () => void;
+  let markRouteSettled!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
+  const routeSettled = new Promise<void>((resolve) => { markRouteSettled = resolve; });
   await page.route(`${endpointOrigin}/**`, async (route) => {
     if (route.request().method() === 'OPTIONS') {
       await route.fulfill({
@@ -368,11 +399,15 @@ test('cancels an in-flight compatible request without accepting its late success
     }
     attempts += 1;
     await gate;
-    await route.fulfill({
-      status: 200,
-      headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ choices: [{ message: { content: JSON.stringify(COMPATIBLE_DRAFT) } }] }),
-    }).catch(() => undefined);
+    try {
+      await route.fulfill({
+        status: 200,
+        headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ choices: [{ message: { content: JSON.stringify(COMPATIBLE_DRAFT) } }] }),
+      }).catch(() => undefined);
+    } finally {
+      markRouteSettled();
+    }
   });
 
   await configureOpenAi(page, `${endpointOrigin}/v1`, 'cancel-model');
@@ -382,6 +417,7 @@ test('cancels an in-flight compatible request without accepting its late success
   await page.getByTestId('storyboard-cancel').click();
   await expect(page.getByTestId('storyboard-error')).toContainText('cancelled');
   release();
+  await routeSettled;
   await expect(page.getByText('Compatible endpoint storyboard')).toHaveCount(0);
   await page.getByRole('button', { name: '关闭 AI 分镜工作台' }).click();
   await expect(page.locator('[data-testid^="shot-block-"]')).toHaveCount(3);

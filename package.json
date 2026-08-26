@@ -12,7 +12,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "npm run build -w @lumora/core && npm run build -w @lumora/plugin-sdk && npm run build -w @lumora/studio && npm run build -w @lumora/mock-plugin && npm run build -w @lumora/openai-compatible-plugin",
+    "build": "npm run build -w @lumora/core && npm run build -w @lumora/plugin-sdk && npm run build -w @lumora/studio && npm run build -w @lumora/mock-plugin && npm run build -w @lumora/openai-compatible-plugin && npm run build -w @lumora/embedded-host",
     "dev": "npm run dev -w examples/embedded-host",
     "test": "vitest run",
     "test:watch": "vitest",

@@ -101,6 +101,81 @@ function expectPublicPluginDiagnostic(value: unknown, message: string): void {
 }
 
 describe('PluginHost', () => {
+  it('keeps plugin settings scoped to one host and restores them after disable and enable', async () => {
+    const firstActivations: Array<string | null> = [];
+    const secondActivations: Array<string | null> = [];
+    const settingsDescriptor = (savedValue: string, activations: Array<string | null>) => descriptor(
+      VALID_MANIFEST,
+      async () => ({
+        default: {
+          activate: (context) => {
+            activations.push(context.settings.get('provider-config'));
+            if (context.settings.get('provider-config') === null) {
+              context.settings.set('provider-config', savedValue);
+            }
+          },
+        },
+      }),
+    );
+    const firstHost = new PluginHost();
+    const secondHost = new PluginHost();
+
+    const first = await firstHost.register(settingsDescriptor('host-a', firstActivations));
+    await secondHost.register(settingsDescriptor('host-b', secondActivations));
+    await firstHost.disable(first.instanceId);
+    await firstHost.enable(first.instanceId);
+
+    expect(firstActivations).toEqual([null, 'host-a']);
+    expect(secondActivations).toEqual([null]);
+    await firstHost.dispose();
+    await secondHost.dispose();
+  });
+
+  it('resolves the latest Chat model catalog and dispatches the validated request model', async () => {
+    let currentModel = 'model-a';
+    const sentModels: string[] = [];
+    const host = new PluginHost();
+    await host.register(descriptor(
+      { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+      async () => ({
+        default: {
+          activate: (context) => context.contribute({
+            aiProviders: [{
+              kind: 'aiProvider',
+              id: 'com.example.dynamic.chat',
+              name: 'Dynamic Chat',
+              models: () => [currentModel],
+              chat: async function* (request) {
+                sentModels.push(request.model);
+                yield request.model;
+              },
+            }],
+          }),
+        },
+      }),
+    ));
+
+    currentModel = 'model-b';
+    const chunks: string[] = [];
+    for await (const chunk of host.services.ai.chat('com.example.dynamic.chat', {
+      model: 'model-b',
+      messages: [],
+    })) chunks.push(chunk);
+
+    expect(chunks).toEqual(['model-b']);
+    expect(sentModels).toEqual(['model-b']);
+    await expect((async () => {
+      for await (const _chunk of host.services.ai.chat('com.example.dynamic.chat', {
+        model: 'model-a',
+        messages: [],
+      })) {
+        // Consume the stream so validation and dispatch both execute.
+      }
+    })()).rejects.toThrow(/model-a/);
+    expect(sentModels).toEqual(['model-b']);
+    await host.dispose();
+  });
+
   it('rejects malformed storyboard capability metadata atomically', async () => {
     const host = new PluginHost({ hostVersion: '0.1.0' });
     const sensitiveCapability = 'sk-live-1234567890abcdef';

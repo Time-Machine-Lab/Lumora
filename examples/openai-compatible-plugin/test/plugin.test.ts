@@ -1,8 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { PluginHost, type CreativeBrief, type Manifest } from '@lumora/core';
+import {
+  createSampleProject,
+  PluginHost,
+  type CreativeBrief,
+  type Manifest,
+  type PluginSettingsStorage,
+} from '@lumora/core';
 import manifest from '../lumora.plugin.json';
 import { createOpenAiCompatiblePlugin, OPENAI_COMPATIBLE_PROVIDER_ID } from '../src/index';
-import { OPENAI_COMPATIBLE_STORAGE_KEY, ProviderConfigStore } from '../src/config';
+import { ProviderConfigStore } from '../src/config';
+import type { OpenAiFetch } from '../src/openai-client';
 
 const BRIEF: CreativeBrief = {
   concept: 'A courier crosses a rain-soaked neon market to deliver a mysterious case.',
@@ -24,13 +31,37 @@ function completion(content: string): Response {
   return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
 }
 
+let fixtureSequence = 0;
+
 function pluginFixture() {
-  const configStore = new ProviderConfigStore(localStorage);
+  const prefix = `openai-fixture-${fixtureSequence += 1}`;
+  let configStore: ProviderConfigStore | undefined;
+  const pluginSettingsStorage: PluginSettingsStorage = {
+    get: (pluginInstanceId, key) => localStorage.getItem(`${prefix}:${pluginInstanceId}:${key}`),
+    set: (pluginInstanceId, key, value) => localStorage.setItem(`${prefix}:${pluginInstanceId}:${key}`, value),
+    remove: (pluginInstanceId, key) => localStorage.removeItem(`${prefix}:${pluginInstanceId}:${key}`),
+  };
   const descriptor = {
     manifest: manifest as Manifest,
-    entry: async () => ({ default: createOpenAiCompatiblePlugin(() => configStore) }),
+    entry: async () => ({
+      default: createOpenAiCompatiblePlugin((settings) => {
+        configStore = new ProviderConfigStore(settings);
+        return configStore;
+      }),
+    }),
   };
-  return { configStore, descriptor };
+  return {
+    descriptor,
+    pluginSettingsStorage,
+    get configStore(): ProviderConfigStore {
+      if (!configStore) throw new Error('Plugin is not active.');
+      return configStore;
+    },
+    persistedText: () => Array.from({ length: localStorage.length }, (_, index) => {
+      const key = localStorage.key(index);
+      return key?.startsWith(`${prefix}:`) ? localStorage.getItem(key) : null;
+    }).join('\n'),
+  };
 }
 
 describe('OpenAI-compatible plugin lifecycle', () => {
@@ -41,13 +72,13 @@ describe('OpenAI-compatible plugin lifecycle', () => {
 
   it('uses the newly configured custom model for the next host task and draft lineage', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => completion(JSON.stringify(VALID_DRAFT))));
-    const { configStore, descriptor } = pluginFixture();
-    const host = new PluginHost({ hostVersion: '0.1.0' });
-    await host.register(descriptor);
+    const fixture = pluginFixture();
+    const host = new PluginHost({ hostVersion: '0.1.0', pluginSettingsStorage: fixture.pluginSettingsStorage });
+    await host.register(fixture.descriptor);
 
     expect(host.services.ai.listStoryboardProviders().find((item) => item.id === OPENAI_COMPATIBLE_PROVIDER_ID)?.models[0]?.id)
       .toBe('gpt-4o-mini');
-    configStore.save({
+    fixture.configStore.save({
       endpoint: 'https://compatible.example/v1',
       model: 'vendor/new-storyboard-model',
       apiKey: '',
@@ -67,15 +98,47 @@ describe('OpenAI-compatible plugin lifecycle', () => {
     await host.dispose();
   });
 
+  it('uses the latest configured model for Chat validation and the exact outgoing request', async () => {
+    const fetchImpl = vi.fn<OpenAiFetch>(async () => completion('model-b-response'));
+    vi.stubGlobal('fetch', fetchImpl);
+    const fixture = pluginFixture();
+    const host = new PluginHost({ hostVersion: '0.1.0', pluginSettingsStorage: fixture.pluginSettingsStorage });
+    await host.register(fixture.descriptor);
+    fixture.configStore.save({
+      endpoint: 'https://compatible.example/v1',
+      model: 'model-b',
+      apiKey: '',
+    });
+
+    const chunks: string[] = [];
+    for await (const chunk of host.services.ai.chat(OPENAI_COMPATIBLE_PROVIDER_ID, {
+      model: 'model-b',
+      messages: [{ role: 'user', content: 'hello' }],
+    })) chunks.push(chunk);
+
+    expect(chunks).toEqual(['model-b-response']);
+    expect(JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body))).toMatchObject({ model: 'model-b' });
+    await expect((async () => {
+      for await (const _chunk of host.services.ai.chat(OPENAI_COMPATIBLE_PROVIDER_ID, {
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: 'stale' }],
+      })) {
+        // Consume the stream so host validation executes.
+      }
+    })()).rejects.toThrow(/gpt-4o-mini/);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    await host.dispose();
+  });
+
   it('lets the host reject a structurally incomplete provider payload without exposing a draft', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => completion(JSON.stringify({
       title: 'Incomplete response',
       summary: 'Missing required shot fields.',
       shots: [{ title: 'Broken' }, { title: 'Broken' }, { title: 'Broken' }],
     }))));
-    const { descriptor } = pluginFixture();
-    const host = new PluginHost({ hostVersion: '0.1.0' });
-    await host.register(descriptor);
+    const fixture = pluginFixture();
+    const host = new PluginHost({ hostVersion: '0.1.0', pluginSettingsStorage: fixture.pluginSettingsStorage });
+    await host.register(fixture.descriptor);
     const model = host.services.ai.listStoryboardProviders().find((item) => item.id === OPENAI_COMPATIBLE_PROVIDER_ID)!.models[0]!.id;
 
     const submitted = host.services.ai.submitStoryboard(OPENAI_COMPATIBLE_PROVIDER_ID, { model, brief: BRIEF });
@@ -92,10 +155,10 @@ describe('OpenAI-compatible plugin lifecycle', () => {
       captured.signal = init?.signal ?? undefined;
       init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
     })));
-    const { configStore, descriptor } = pluginFixture();
-    const host = new PluginHost({ hostVersion: '0.1.0' });
-    const info = await host.register(descriptor);
-    configStore.save({
+    const fixture = pluginFixture();
+    const host = new PluginHost({ hostVersion: '0.1.0', pluginSettingsStorage: fixture.pluginSettingsStorage });
+    const info = await host.register(fixture.descriptor);
+    fixture.configStore.save({
       endpoint: 'https://compatible.example/v1',
       model: 'vendor/persisted-model',
       apiKey: 'sk-disable-runtime-marker',
@@ -110,16 +173,47 @@ describe('OpenAI-compatible plugin lifecycle', () => {
 
     await expect(completed).resolves.toMatchObject({ status: 'cancelled', error: { code: 'cancelled' } });
     expect(captured.signal?.aborted).toBe(true);
-    expect(configStore.getSnapshot().apiKey).toBe('');
-    expect(localStorage.getItem(OPENAI_COMPATIBLE_STORAGE_KEY)).toContain('vendor/persisted-model');
-    expect(localStorage.getItem(OPENAI_COMPATIBLE_STORAGE_KEY)).not.toContain('sk-disable-runtime-marker');
+    expect(fixture.configStore.getSnapshot().apiKey).toBe('');
+    expect(fixture.persistedText()).toContain('vendor/persisted-model');
+    expect(fixture.persistedText()).not.toContain('sk-disable-runtime-marker');
 
     await host.enable(info.instanceId);
-    expect(configStore.getSnapshot()).toMatchObject({
+    expect(fixture.configStore.getSnapshot()).toMatchObject({
       endpoint: 'https://compatible.example/v1/chat/completions',
       model: 'vendor/persisted-model',
       apiKey: '',
     });
+    await host.dispose();
+  });
+
+  it('keeps a cancelled task and project unchanged when an abort-ignoring body succeeds late', async () => {
+    let resolveBody!: (value: unknown) => void;
+    const response = completion(JSON.stringify(VALID_DRAFT));
+    vi.spyOn(response, 'json').mockImplementation(() => new Promise((resolve) => {
+      resolveBody = resolve;
+    }));
+    vi.stubGlobal('fetch', vi.fn(async () => response));
+    const fixture = pluginFixture();
+    const host = new PluginHost({ hostVersion: '0.1.0', pluginSettingsStorage: fixture.pluginSettingsStorage });
+    const project = createSampleProject();
+    host.setProject(project);
+    await host.register(fixture.descriptor);
+    const submitted = host.services.ai.submitStoryboard(OPENAI_COMPATIBLE_PROVIDER_ID, {
+      model: 'gpt-4o-mini',
+      brief: BRIEF,
+    });
+    await vi.waitFor(() => expect(response.json).toHaveBeenCalledTimes(1));
+
+    expect(host.services.ai.cancelGenerationTask(submitted.id)).toBe(true);
+    await expect(host.services.ai.waitForGenerationTask(submitted.id)).resolves.toMatchObject({
+      status: 'cancelled',
+      error: { code: 'cancelled' },
+    });
+    resolveBody({ choices: [{ message: { content: JSON.stringify(VALID_DRAFT) } }] });
+    await Promise.resolve();
+
+    expect(host.services.ai.getGenerationTask(submitted.id)).toMatchObject({ status: 'cancelled' });
+    expect(host.getProject()).toEqual(project);
     await host.dispose();
   });
 
@@ -145,8 +239,8 @@ describe('OpenAI-compatible plugin lifecycle', () => {
       });
     }));
 
-    const firstHost = new PluginHost({ hostVersion: '0.1.0' });
-    const secondHost = new PluginHost({ hostVersion: '0.1.0' });
+    const firstHost = new PluginHost({ hostVersion: '0.1.0', pluginSettingsStorage: first.pluginSettingsStorage });
+    const secondHost = new PluginHost({ hostVersion: '0.1.0', pluginSettingsStorage: second.pluginSettingsStorage });
     const firstInfo = await firstHost.register(first.descriptor);
     await secondHost.register(second.descriptor);
     first.configStore.save({ endpoint: 'https://first.example/v1', model: 'first-model', apiKey: 'first-key' });
@@ -170,6 +264,19 @@ describe('OpenAI-compatible plugin lifecycle', () => {
     });
     expect(captured.get('https://second.example/v1/chat/completions')?.signal?.aborted).toBe(false);
     expect(second.configStore.getSnapshot().apiKey).toBe('second-key');
+
+    await firstHost.enable(firstInfo.instanceId);
+    expect(first.configStore.getSnapshot()).toEqual({
+      endpoint: 'https://first.example/v1/chat/completions',
+      model: 'first-model',
+      apiKey: '',
+    });
+    expect(first.persistedText()).toContain('first-model');
+    expect(second.persistedText()).toContain('second-model');
+    expect(first.persistedText()).not.toContain('first-key');
+    expect(first.persistedText()).not.toContain('second-key');
+    expect(second.persistedText()).not.toContain('first-key');
+    expect(second.persistedText()).not.toContain('second-key');
 
     resolveSecond(completion(JSON.stringify(VALID_DRAFT)));
     await expect(secondHost.services.ai.waitForGenerationTask(secondTask.id)).resolves.toMatchObject({
