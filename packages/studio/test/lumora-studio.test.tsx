@@ -9,6 +9,7 @@ import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
 import type { ProjectStorage } from '../src/persistence/project-storage';
 import { ContentCache } from '../src/components/editor/content-cache';
 import { CommandPalette } from '../src/components/CommandPalette';
+import * as previewExport from '../src/export/preview-export';
 
 vi.mock('@react-three/fiber', () => ({
   Canvas: ({ children }: { children?: React.ReactNode }) => (
@@ -125,6 +126,7 @@ describe('LumoraStudio', () => {
     fireEvent.keyDown(target, { key: 'Delete' });
     fireEvent.keyDown(target, { key: ' ' });
     fireEvent.keyDown(target, { key: 'w', code: 'KeyW' });
+    fireEvent.keyDown(target, { key: 'Escape' });
 
     expect(screen.queryByTestId('command-palette')).not.toBeInTheDocument();
     expect(undo).not.toHaveBeenCalled();
@@ -133,6 +135,46 @@ describe('LumoraStudio', () => {
     expect(driveDefaultPrevented).toBe(true);
     expect(editor.getSelection()).toEqual(['sample-camera']);
     expect(screen.getByTestId('timeline-play')).toHaveTextContent(playBefore ?? '');
+  });
+
+  it('keeps the editor selection when Escape is pressed while export is running', async () => {
+    let finishRecording: ((blob: Blob) => void) | undefined;
+    const supportSpy = vi.spyOn(previewExport, 'detectWebmSupport').mockReturnValue({
+      supported: true,
+      mimeType: 'video/webm;codecs=vp9',
+    });
+    const recordingSpy = vi.spyOn(previewExport, 'recordPreviewWebm').mockImplementation(
+      () => new Promise<Blob>((resolve) => {
+        finishRecording = resolve;
+      }),
+    );
+    const handle = createRef<LumoraStudioHandle>();
+
+    try {
+      render(
+        <LumoraStudio
+          ref={handle}
+          initialProject={createSampleProject('lumora://export-escape-running', 'Export Escape running')}
+        />,
+      );
+      const trigger = await screen.findByTestId('open-export-workspace');
+      await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe('lumora://export-escape-running'));
+      const editor = handle.current!.runtime.editor;
+      act(() => editor.setSelection(['sample-camera']));
+
+      fireEvent.click(trigger);
+      fireEvent.click(await screen.findByRole('button', { name: '导出 WebM' }));
+      const cancel = await screen.findByRole('button', { name: '取消导出' });
+      fireEvent.keyDown(cancel, { key: 'Escape' });
+
+      expect(editor.getSelection()).toEqual(['sample-camera']);
+    } finally {
+      await act(async () => {
+        finishRecording?.(new Blob(['webm'], { type: 'video/webm' }));
+      });
+      supportSpy.mockRestore();
+      recordingSpy.mockRestore();
+    }
   });
 
   it('remounts export for a replacement session with the same project URI', async () => {

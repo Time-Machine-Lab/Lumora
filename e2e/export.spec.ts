@@ -266,6 +266,7 @@ test('isolates editor shortcuts while export is idle and while recording', async
     await page.keyboard.press('Control+D');
     await page.keyboard.press('Delete');
     await page.keyboard.press('Space');
+    await page.keyboard.press('Escape');
     await page.keyboard.down('w');
     await page.waitForTimeout(150);
     await page.keyboard.up('w');

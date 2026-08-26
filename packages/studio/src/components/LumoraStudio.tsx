@@ -54,6 +54,7 @@ function isStudioEditingShortcut(event: KeyboardEvent): boolean {
     key === ' ' ||
     key === 'delete' ||
     key === 'backspace' ||
+    key === 'escape' ||
     key === '1' ||
     key === '2' ||
     key === '3' ||
