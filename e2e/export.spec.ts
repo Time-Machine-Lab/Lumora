@@ -8,6 +8,10 @@ interface VideoMetadata {
   width: number;
   height: number;
   decodedPixelCount: number;
+  frameComparisons: Array<{
+    time: number;
+    differences: number[];
+  }>;
 }
 
 interface ExportInstrumentation {
@@ -23,9 +27,14 @@ async function readDownload(download: Download): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-async function inspectWebm(page: Page, bytes: Buffer): Promise<VideoMetadata> {
-  return page.evaluate(async (base64) => {
-    const binary = atob(base64);
+async function inspectWebm(
+  page: Page,
+  bytes: Buffer,
+  referencePngs: Buffer[] = [],
+  sampleTimes: number[] = [],
+): Promise<VideoMetadata> {
+  return page.evaluate(async ({ webmBase64, referenceBase64s, requestedTimes }) => {
+    const binary = atob(webmBase64);
     const data = new Uint8Array(binary.length);
     for (let index = 0; index < binary.length; index += 1) data[index] = binary.charCodeAt(index);
     const url = URL.createObjectURL(new Blob([data], { type: 'video/webm' }));
@@ -51,14 +60,27 @@ async function inspectWebm(page: Page, bytes: Buffer): Promise<VideoMetadata> {
         }, { once: true });
       });
 
+    const loadImage = (base64: string) => new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('Chromium could not decode a reference PNG'));
+      image.src = `data:image/png;base64,${base64}`;
+    });
+
+    const seekTo = async (time: number) => {
+      const bounded = Math.min(Math.max(time, 0.001), Math.max(video.duration - 0.001, 0.001));
+      if (Math.abs(video.currentTime - bounded) < 0.0001) return;
+      const seeked = waitForEvent('seeked');
+      video.currentTime = bounded;
+      await seeked;
+    };
+
     try {
       const metadataReady = waitForEvent('loadedmetadata');
       video.load();
       await metadataReady;
       const duration = video.duration;
-      const seeked = waitForEvent('seeked');
-      video.currentTime = Math.min(Math.max(duration / 2, 0.01), Math.max(duration - 0.01, 0.01));
-      await seeked;
+      await seekTo(duration / 2);
       const canvas = document.createElement('canvas');
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
@@ -72,17 +94,53 @@ async function inspectWebm(page: Page, bytes: Buffer): Promise<VideoMetadata> {
           decodedPixelCount += 1;
         }
       }
+      const frameComparisons: VideoMetadata['frameComparisons'] = [];
+      if (referenceBase64s.length > 0 && requestedTimes.length > 0) {
+        const references = await Promise.all(referenceBase64s.map(loadImage));
+        const signatureCanvas = document.createElement('canvas');
+        signatureCanvas.width = 64;
+        signatureCanvas.height = 36;
+        const signatureContext = signatureCanvas.getContext('2d', { willReadFrequently: true });
+        if (!signatureContext) throw new Error('2D signature canvas is unavailable');
+        const signature = (source: CanvasImageSource) => {
+          signatureContext.clearRect(0, 0, signatureCanvas.width, signatureCanvas.height);
+          signatureContext.drawImage(source, 0, 0, signatureCanvas.width, signatureCanvas.height);
+          return new Uint8ClampedArray(
+            signatureContext.getImageData(0, 0, signatureCanvas.width, signatureCanvas.height).data,
+          );
+        };
+        const referenceSignatures = references.map(signature);
+        for (const time of requestedTimes) {
+          await seekTo(time);
+          const frame = signature(video);
+          const differences = referenceSignatures.map((reference) => {
+            let difference = 0;
+            for (let index = 0; index < frame.length; index += 4) {
+              difference += Math.abs(frame[index]! - reference[index]!);
+              difference += Math.abs(frame[index + 1]! - reference[index + 1]!);
+              difference += Math.abs(frame[index + 2]! - reference[index + 2]!);
+            }
+            return difference / (signatureCanvas.width * signatureCanvas.height * 3 * 255);
+          });
+          frameComparisons.push({ time, differences });
+        }
+      }
       return {
         duration,
         width: video.videoWidth,
         height: video.videoHeight,
         decodedPixelCount,
+        frameComparisons,
       };
     } finally {
       video.remove();
       URL.revokeObjectURL(url);
     }
-  }, bytes.toString('base64'));
+  }, {
+    webmBase64: bytes.toString('base64'),
+    referenceBase64s: referencePngs.map((reference) => reference.toString('base64')),
+    requestedTimes: sampleTimes,
+  });
 }
 
 async function openSampleExport(page: Page): Promise<void> {
@@ -123,21 +181,101 @@ async function exportWebm(page: Page): Promise<{ bytes: Buffer; order: string[] 
   return { bytes, order };
 }
 
+async function exportShotPng(page: Page, accessibleName: RegExp): Promise<Buffer> {
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: accessibleName }).click();
+  return readDownload(await downloadPromise);
+}
+
+async function cameraPose(
+  page: Page,
+  cameraId: string,
+): Promise<{ position: [number, number, number]; rotation: [number, number, number] }> {
+  const readout = page.getByTestId('camera-pose-readout');
+  await expect.poll(() => readout.textContent()).not.toBe('');
+  const text = await readout.textContent();
+  if (!text) throw new Error('Camera pose readout is unavailable');
+  const pose = JSON.parse(text)[cameraId];
+  if (!pose) throw new Error(`Camera ${cameraId} is missing from the pose readout`);
+  return pose;
+}
+
+function blueSphereSilhouetteAspect(png: ReturnType<typeof decodePng>): number {
+  let minX = png.width;
+  let minY = png.height;
+  let maxX = -1;
+  let maxY = -1;
+  let pixels = 0;
+  for (let y = 0; y < png.height; y += 1) {
+    for (let x = 0; x < png.width; x += 1) {
+      const [red, green, blue] = pngPixel(png, x, y);
+      if (blue < 60 || blue - red < 20 || blue - green < 10 || green - red < 10) continue;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+      pixels += 1;
+    }
+  }
+  if (pixels < 100 || maxX < minX || maxY < minY) {
+    throw new Error('Known foreground sphere silhouette was not found in the exported frame');
+  }
+  return (maxX - minX + 1) / (maxY - minY + 1);
+}
+
+test('opens export with the native Space button action without toggling playback', async ({ page }) => {
+  await page.goto('/');
+  await page.getByTestId('open-sample-project').click();
+  await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
+  const trigger = page.getByTestId('open-export-workspace');
+  const playBefore = await page.getByTestId('timeline-play').textContent();
+
+  await trigger.focus();
+  await trigger.press('Space');
+
+  await expect(page.getByTestId('export-workspace')).toBeVisible();
+  await expect(page.getByTestId('timeline-play')).toHaveText(playBefore ?? '');
+});
+
 test('exports three ordered shots as a playable 720p/24fps WebM', async ({ page }) => {
   await openSampleExport(page);
+  await page.getByRole('button', { name: '关闭导出' }).click();
+  await page.getByTestId('open-storyboard-workspace').click();
+  await page.getByTestId('storyboard-tab-adopted').click();
+  const adoptedShots = page.getByTestId('storyboard-adopted-shot');
+  await expect(adoptedShots).toHaveCount(3);
+  await adoptedShots.nth(2).locator('label').filter({ hasText: '机位' }).locator('select')
+    .selectOption('sample-camera');
+  await page.getByRole('button', { name: '关闭 AI 分镜工作台' }).click();
+  await page.getByTestId('open-export-workspace').click();
+  await expect(page.getByTestId('export-workspace')).toBeVisible();
   await expect(page.getByLabel('分辨率')).toHaveValue('720p');
   await expect(page.getByLabel('帧率')).toHaveValue('24');
+  const referencePngs = [
+    await exportShotPng(page, /导出 分镜 1.*PNG/),
+    await exportShotPng(page, /导出 分镜 2.*PNG/),
+    await exportShotPng(page, /导出 分镜 3.*PNG/),
+  ];
 
   const { bytes, order } = await exportWebm(page);
   expect(bytes.length).toBeGreaterThan(1_000);
   expect([...bytes.subarray(0, 4)]).toEqual([0x1a, 0x45, 0xdf, 0xa3]);
   expect(order).toEqual(['分镜 1 · 开场全景', '分镜 2 · 推近主体', '分镜 3 · 特写']);
 
-  const metadata = await inspectWebm(page, bytes);
+  const metadata = await inspectWebm(page, bytes, referencePngs, [0.75, 2.25, 3.75]);
   expect(metadata.width).toBe(1280);
   expect(metadata.height).toBe(720);
-  expect(Math.abs(metadata.duration - 4.5)).toBeLessThanOrEqual(0.15);
+  expect(Math.abs(metadata.duration - 4.5)).toBeLessThanOrEqual(1 / 24);
   expect(metadata.decodedPixelCount).toBeGreaterThan(1280 * 720 * 0.9);
+  expect(metadata.frameComparisons).toHaveLength(3);
+  expect(metadata.frameComparisons.map(({ differences }) => (
+    differences.indexOf(Math.min(...differences))
+  ))).toEqual([0, 1, 2]);
+  for (const [index, comparison] of metadata.frameComparisons.entries()) {
+    const ordered = [...comparison.differences].sort((a, b) => a - b);
+    expect(comparison.differences[index]).toBeLessThan(0.08);
+    expect(ordered[1]! - ordered[0]!).toBeGreaterThan(0.001);
+  }
 });
 
 test('reports unsupported codecs before constructing a recorder or downloading a file', async ({ page }) => {
@@ -248,14 +386,11 @@ test('cancels recording, releases media tracks, and returns to an editable proje
 test('isolates editor shortcuts while export is idle and while recording', async ({ page }) => {
   await page.goto('/');
   await page.getByTestId('open-sample-project').click();
-  await expect(page.getByTestId('tree-row-sample-camera')).toBeVisible();
-  await page.getByTestId('tree-row-sample-camera').click();
+  await expect(page.getByTestId('tree-row-sample-camera-2')).toBeVisible();
+  await page.getByTestId('tree-row-sample-camera-2').click();
   const rows = page.locator('.lumora-tree-row');
   const rowCount = await rows.count();
-  const cameraPosition = page.locator('[data-testid^="inspector-axis-"]');
-  const cameraPositionBefore = await cameraPosition.evaluateAll((inputs) => (
-    inputs.map((input) => (input as HTMLInputElement).value)
-  ));
+  const cameraPoseBefore = await cameraPose(page, 'sample-camera-2');
   const playBefore = await page.getByTestId('timeline-play').textContent();
   await page.getByTestId('open-export-workspace').click();
 
@@ -263,34 +398,34 @@ test('isolates editor shortcuts while export is idle and while recording', async
     await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
     await page.keyboard.press('Control+Shift+K');
     await page.keyboard.press('Control+Z');
+    await page.keyboard.press('Control+Shift+Z');
+    await page.keyboard.press('Control+Y');
     await page.keyboard.press('Control+D');
     await page.keyboard.press('Delete');
+    await page.keyboard.press('Backspace');
     await page.keyboard.press('Space');
     await page.keyboard.press('Escape');
     await page.keyboard.down('w');
     await page.waitForTimeout(150);
     await page.keyboard.up('w');
+    await page.waitForTimeout(50);
   };
 
   await pressEditorShortcuts();
   await expect(page.getByTestId('command-palette')).toHaveCount(0);
   await expect(rows).toHaveCount(rowCount);
-  await expect(page.getByTestId('tree-row-sample-camera')).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByTestId('tree-row-sample-camera-2')).toHaveAttribute('aria-selected', 'true');
   await expect(page.getByTestId('timeline-play')).toHaveText(playBefore ?? '');
-  expect(await cameraPosition.evaluateAll((inputs) => (
-    inputs.map((input) => (input as HTMLInputElement).value)
-  ))).toEqual(cameraPositionBefore);
+  expect(await cameraPose(page, 'sample-camera-2')).toEqual(cameraPoseBefore);
 
   await page.getByRole('button', { name: '导出 WebM' }).click();
   await expect(page.getByLabel('导出进度')).not.toHaveJSProperty('value', 0);
   await pressEditorShortcuts();
   await expect(page.getByTestId('command-palette')).toHaveCount(0);
   await expect(rows).toHaveCount(rowCount);
-  await expect(page.getByTestId('tree-row-sample-camera')).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByTestId('tree-row-sample-camera-2')).toHaveAttribute('aria-selected', 'true');
   await expect(page.getByTestId('timeline-play')).toHaveText(playBefore ?? '');
-  expect(await cameraPosition.evaluateAll((inputs) => (
-    inputs.map((input) => (input as HTMLInputElement).value)
-  ))).toEqual(cameraPositionBefore);
+  expect(await cameraPose(page, 'sample-camera-2')).toEqual(cameraPoseBefore);
   await page.getByRole('button', { name: '取消导出' }).click();
   await expect(page.getByRole('status')).toContainText('导出已取消');
 });
@@ -387,14 +522,107 @@ test('invalidates an old export when the same project URI is reopened', async ({
   expect(previewDownloads).toBe(0);
 });
 
-test('exports a full-width 854x480 PNG with populated edge pixels', async ({ page }) => {
-  await openSampleExport(page);
+test('preserves foreground geometry in a full-width 854x480 PNG', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => {
+    const focalLength = 50;
+    const fov = (2 * Math.atan(24 / 2 / focalLength) * 180) / Math.PI;
+    const project = {
+      uri: 'lumora://export-geometry-probe',
+      name: 'Export geometry probe',
+      schemaVersion: 4,
+      createdAt: new Date().toISOString(),
+      revision: 0,
+      settings: { fps: 24, aspect: [16, 9] },
+      activeSceneId: 'probe-scene',
+      scenes: [{
+        id: 'probe-scene',
+        name: 'Probe scene',
+        rootObjectIds: ['probe-camera', 'probe-sphere', 'probe-ground', 'probe-light'],
+        activeCameraId: 'probe-camera',
+      }],
+      objects: [
+        {
+          id: 'probe-camera',
+          type: 'camera',
+          name: 'Probe camera',
+          parentId: null,
+          transform: { position: [0, 2, 5], rotation: [-0.35, 0, 0], scale: [1, 1, 1] },
+          visible: true,
+          locked: false,
+          camera: {
+            projection: 'perspective',
+            focalLength,
+            fov,
+            sensorWidth: 36,
+            sensorHeight: 24,
+            near: 0.1,
+            far: 200,
+            aspect: null,
+          },
+        },
+        {
+          id: 'probe-sphere',
+          type: 'primitive',
+          name: 'Probe sphere',
+          parentId: null,
+          transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+          visible: true,
+          locked: false,
+          geometry: { kind: 'sphere' },
+          material: { color: '#4dabf7' },
+        },
+        {
+          id: 'probe-ground',
+          type: 'primitive',
+          name: 'Probe ground',
+          parentId: null,
+          transform: { position: [0, -0.6, 0], rotation: [-Math.PI / 2, 0, 0], scale: [12, 12, 1] },
+          visible: true,
+          locked: false,
+          geometry: { kind: 'plane' },
+          material: { color: '#232734' },
+        },
+        {
+          id: 'probe-light',
+          type: 'light',
+          name: 'Probe light',
+          parentId: null,
+          transform: { position: [3, 4, 5], rotation: [0, 0, 0], scale: [1, 1, 1] },
+          visible: true,
+          locked: false,
+          light: { kind: 'directional', color: '#ffffff', intensity: 1.4 },
+        },
+      ],
+      tracks: [],
+      shots: [{
+        id: 'probe-shot',
+        name: 'Geometry probe',
+        cameraObjectId: 'probe-camera',
+        startTime: 0,
+        endTime: 1,
+      }],
+      assets: [],
+    };
+    localStorage.setItem('lumora.demo.last-export', JSON.stringify(project));
+  });
+  await page.reload();
+  await page.getByTestId('reopen-last-export').click();
+  await expect(page.getByTestId('tree-row-probe-sphere')).toBeVisible();
+  await page.getByTestId('open-export-workspace').click();
+  await expect(page.getByTestId('export-workspace')).toBeVisible();
+  const png720 = decodePng(await exportShotPng(page, /导出 Geometry probe.*PNG/));
   await page.getByLabel('分辨率').selectOption('480p');
-  const downloadPromise = page.waitForEvent('download');
-  await page.getByRole('button', { name: /导出 分镜 1.*PNG/ }).click();
-  const png = decodePng(await readDownload(await downloadPromise));
+  const png = decodePng(await exportShotPng(page, /导出 Geometry probe.*PNG/));
 
   expect({ width: png.width, height: png.height }).toEqual({ width: 854, height: 480 });
+  const silhouette720 = blueSphereSilhouetteAspect(png720);
+  const silhouette480 = blueSphereSilhouetteAspect(png);
+  expect(silhouette720).toBeGreaterThan(0.95);
+  expect(silhouette720).toBeLessThan(1.05);
+  expect(silhouette480).toBeGreaterThan(0.95);
+  expect(silhouette480).toBeLessThan(1.05);
+  expect(Math.abs(silhouette480 - silhouette720)).toBeLessThan(0.03);
   const edgeColorCount = (x: number) => new Set(
     Array.from({ length: png.height }, (_, y) => pngPixel(png, x, y).slice(0, 3).join(',')),
   ).size;
@@ -535,11 +763,15 @@ test('completes the new-project release flow without unhandled browser errors', 
   await page.getByTestId('open-export-workspace').click();
   await expect(page.getByTestId('export-summary')).toContainText('3 个分镜');
   await expect(page.getByTestId('export-summary')).toContainText('0.60 秒');
-  const { bytes, order } = await exportWebm(page);
-  expect(bytes.length).toBeGreaterThan(1_000);
-  expect([...bytes.subarray(0, 4)]).toEqual([0x1a, 0x45, 0xdf, 0xa3]);
-  expect(order).toEqual(['Shot 1', 'Shot 2', 'Shot 3']);
-  const metadata = await inspectWebm(page, bytes);
-  expect(Math.abs(metadata.duration - 0.6)).toBeLessThanOrEqual(0.15);
+  const quantizedDuration = 14 / 24;
+  expect(Math.abs(quantizedDuration - 0.6)).toBeLessThanOrEqual(0.5 / 24);
+  for (let run = 0; run < 3; run += 1) {
+    const { bytes, order } = await exportWebm(page);
+    expect(bytes.length).toBeGreaterThan(1_000);
+    expect([...bytes.subarray(0, 4)]).toEqual([0x1a, 0x45, 0xdf, 0xa3]);
+    expect(order).toEqual(['Shot 1', 'Shot 2', 'Shot 3']);
+    const metadata = await inspectWebm(page, bytes);
+    expect(Math.abs(metadata.duration - quantizedDuration)).toBeLessThanOrEqual(1 / 24);
+  }
   expect(browserErrors).toEqual([]);
 });

@@ -118,7 +118,10 @@ export function renderProjectFrameToCanvas(
 
   try {
     if (perspectiveCamera) {
-      perspectiveCamera.aspect = aspect;
+      // The fitted viewport is integer-sized. Projecting with its actual
+      // raster aspect prevents sub-pixel stretch (notably 854x480 vs 16:9)
+      // while fitViewport still preserves the project's intended framing.
+      perspectiveCamera.aspect = viewport.width / viewport.height;
       perspectiveCamera.updateProjectionMatrix();
     }
     renderer.setRenderTarget(target);

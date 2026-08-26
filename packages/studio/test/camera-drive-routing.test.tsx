@@ -61,14 +61,14 @@ vi.mock('@react-three/drei', () => ({
   TransformControls: () => null,
 }));
 
-function drivableProject(uri: string): Project {
+function drivableProject(uri: string, includeDisabledOverwriteTrack = false): Project {
   const sample = createSampleProject();
   return {
     ...sample,
     uri,
-    tracks: sample.tracks.map((track) =>
-      track.objectId === 'sample-camera' ? { ...track, disabled: true } : track,
-    ),
+    tracks: sample.tracks
+      .filter((track) => track.objectId !== 'sample-camera' || includeDisabledOverwriteTrack)
+      .map((track) => track.objectId === 'sample-camera' ? { ...track, disabled: true } : track),
   };
 }
 
@@ -76,14 +76,14 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function mountStudio(uri: string): Promise<{
+async function mountStudio(uri: string, includeDisabledOverwriteTrack = false): Promise<{
   handle: React.RefObject<LumoraStudioHandle | null>;
   root: HTMLElement;
   scene: THREE.Group;
 }> {
   const handle = createRef<LumoraStudioHandle>();
   const before = r3fHarness.scenes.length;
-  render(<LumoraStudio ref={handle} initialProject={drivableProject(uri)} />);
+  render(<LumoraStudio ref={handle} initialProject={drivableProject(uri, includeDisabledOverwriteTrack)} />);
   await waitFor(() => expect(handle.current?.runtime.editor.getProject()?.uri).toBe(uri));
   await waitFor(() => expect(r3fHarness.scenes.length).toBeGreaterThan(before));
   const roots = screen.getAllByTestId('lumora-studio');
@@ -240,7 +240,7 @@ describe('camera drive keyboard routing', () => {
   });
 
   it('overwrite confirmation clears existing momentum and blocks drive keys from portal controls', async () => {
-    const studio = await mountStudio('lumora://drive-modal');
+    const studio = await mountStudio('lumora://drive-modal', true);
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
     const camera = findNode(studio.scene, 'sample-camera')!;
     await act(async () => delay(60));

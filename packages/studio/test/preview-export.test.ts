@@ -12,6 +12,7 @@ import type {
   MediaRecorderLike,
   PreviewExportPlan,
   PreviewRecordingDependencies,
+  PreviewRecordingOptions,
 } from '../src/export/preview-export';
 
 function sampleProject(): Project {
@@ -322,7 +323,9 @@ describe('recordPreviewWebm', () => {
     expect(rendered[0]!.sourceTime).toBe(0);
     expect(rendered[3]!.sourceTime).toBe(0.125);
     expect(progress).toEqual([1, 2, 3, 4, 5, 6]);
-    expect(harness.track.requestFrame).toHaveBeenCalledTimes(6);
+    // Six content frames cover timestamps 0..5/fps. A duplicate terminal
+    // frame at 6/fps gives the WebM muxer an explicit quantized end timestamp.
+    expect(harness.track.requestFrame).toHaveBeenCalledTimes(7);
     expect(harness.track.stop).toHaveBeenCalledTimes(1);
     expect(harness.recorder.stop).toHaveBeenCalledTimes(1);
   });
@@ -344,9 +347,35 @@ describe('recordPreviewWebm', () => {
       { dependencies: harness.deps },
     );
 
-    expect(elapsed).toBeCloseTo(250, 5);
-    expect(harness.deps.waitForFrame).toHaveBeenCalledTimes(6);
-    expect(vi.mocked(harness.deps.waitForFrame).mock.calls[0]![0]).toBeCloseTo(1000 / 24 - 10, 5);
+    // The first 10ms render occurs before WebM timestamps begin; from the
+    // first request to the terminal request the quantized timeline is 250ms.
+    expect(elapsed).toBeCloseTo(260, 5);
+    expect(harness.deps.waitForFrame).toHaveBeenCalledTimes(7);
+    expect(vi.mocked(harness.deps.waitForFrame).mock.calls[0]![0]).toBeCloseTo(1000 / 24, 5);
+    expect(vi.mocked(harness.deps.waitForFrame).mock.calls.at(-1)![0]).toBe(0);
+  });
+
+  it('does not request a frame after the operation becomes stale while renderFrame awaits', async () => {
+    const harness = recorderHarness();
+    let operationCurrent = true;
+    const validityOption = {
+      isOperationCurrent: () => operationCurrent,
+    } as unknown as PreviewRecordingOptions;
+
+    await expect(
+      recordPreviewWebm(
+        shortPlan(),
+        async () => {
+          await Promise.resolve();
+          operationCurrent = false;
+          return true;
+        },
+        { dependencies: harness.deps, ...validityOption },
+      ),
+    ).rejects.toMatchObject({ code: 'cancelled' } satisfies Partial<PreviewExportError>);
+
+    expect(harness.track.requestFrame).not.toHaveBeenCalled();
+    expect(harness.track.stop).toHaveBeenCalledTimes(1);
   });
 
   it('fails before recording when captureStream(0) does not expose requestFrame', async () => {
@@ -475,6 +504,12 @@ describe('recordPreviewWebm', () => {
 
     expect(outcome).toMatchObject({ code: 'encoder-failed' } satisfies Partial<PreviewExportError>);
     expect(harness.track.stop).toHaveBeenCalledTimes(1);
+
+    const retryHarness = recorderHarness();
+    await expect(
+      recordPreviewWebm(shortPlan(), () => true, { dependencies: retryHarness.deps }),
+    ).resolves.toMatchObject({ type: 'video/webm;codecs=vp8' });
+    expect(retryHarness.track.stop).toHaveBeenCalledTimes(1);
   });
 
   it('reports capture failure and still releases encoder resources', async () => {

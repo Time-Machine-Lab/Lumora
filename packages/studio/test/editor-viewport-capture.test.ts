@@ -88,6 +88,7 @@ describe('captureProjectFrame', () => {
   it('fills both 854x480 edge columns for exact 16:9 content', () => {
     const { renderer, raw } = createRenderer();
     const target = document.createElement('canvas');
+    const camera = new THREE.PerspectiveCamera(45, 4 / 3);
     let renderedPixels: Uint8ClampedArray | null = null;
     let viewport = { x: 0, y: 0, width: 0, height: 0 };
     raw.setViewport.mockImplementation((x: number | THREE.Vector4, y?: number, width?: number, height?: number) => {
@@ -103,6 +104,9 @@ describe('captureProjectFrame', () => {
         }
       },
     );
+    raw.render.mockImplementation((_scene, activeCamera) => {
+      expect((activeCamera as THREE.PerspectiveCamera).aspect).toBeCloseTo(854 / 480, 8);
+    });
     vi.spyOn(target, 'getContext').mockReturnValue({
       createImageData: (width: number, height: number) => ({
         width,
@@ -115,12 +119,13 @@ describe('captureProjectFrame', () => {
     expect(renderProjectFrameToCanvas(
       renderer,
       new THREE.Scene(),
-      new THREE.PerspectiveCamera(),
+      camera,
       target,
       { width: 854, height: 480, aspect: 16 / 9 },
     )).toBe(true);
 
     expect(raw.setViewport).toHaveBeenCalledWith(0, 0, 854, 480);
+    expect(camera.aspect).toBe(4 / 3);
     const row = 240;
     expect(Array.from(renderedPixels!.slice(row * 854 * 4, row * 854 * 4 + 4))).toEqual([200, 120, 80, 255]);
     const rightEdge = (row * 854 + 853) * 4;

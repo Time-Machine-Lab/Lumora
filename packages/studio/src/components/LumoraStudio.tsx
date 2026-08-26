@@ -419,6 +419,13 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     const unregisterRoot = registerStudioKeyboardRoot(root);
     const onKey = (event: KeyboardEvent) => {
       if (!isKeyboardEventForStudio(root, event)) return;
+      const nativeTarget = event.target as HTMLElement | null;
+      if (event.key === ' ' && nativeTarget?.tagName === 'BUTTON') {
+        // Space activates focused native buttons on keyup. The global playback
+        // shortcut must not cancel that default action, whether export is open
+        // already or the toolbar button is about to open it.
+        return;
+      }
       if (exportOpen && isStudioEditingShortcut(event)) {
         if (preservesNativeExportShortcut(event)) {
           if (event.key === ' ') event.stopImmediatePropagation();

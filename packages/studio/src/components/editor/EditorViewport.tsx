@@ -449,9 +449,9 @@ function CameraProxy({ cameraRef }: { cameraRef: React.MutableRefObject<THREE.Ca
 
 /**
  * 数值位姿读取钩子（e2e AC1/AC3 数值断言）：把各相机节点当前的 position /
- * rotation / focalLength 序列化进隐藏 span 的 textContent，播放、暂停、项目
- * 变更时刷新（无需 React 状态，零重渲染成本）。订阅注册在 PlaybackDriver
- * 之后，同一次事件里读到的是已应用轨道求值的位姿。
+ * rotation / focalLength 序列化进隐藏 span 的 textContent。开发环境逐帧刷新，
+ * 让浏览器测试也能观察连续驾驶；不使用 React 状态，因此不会触发重渲染。
+ * 事件订阅注册在 PlaybackDriver 之后，同一次事件里读到已应用轨道求值的位姿。
  */
 function CameraPoseReadout({
   session,
@@ -490,7 +490,14 @@ function CameraPoseReadout({
       editor.events.on('project:changed', refresh),
     ];
     refresh();
+    let animationFrame = 0;
+    const refreshEachFrame = () => {
+      refresh();
+      animationFrame = requestAnimationFrame(refreshEachFrame);
+    };
+    animationFrame = requestAnimationFrame(refreshEachFrame);
     return () => {
+      cancelAnimationFrame(animationFrame);
       for (const sub of subs) sub.dispose();
     };
   }, [session, editor, rootRef]);

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { RefObject } from 'react';
 import type { Project, ShotClipData } from '@lumora/core';
 import type { StudioRuntime } from '../../runtime/studio-runtime';
@@ -42,6 +42,18 @@ type ExportStatus =
   | { kind: 'success'; message: string }
   | { kind: 'cancelled'; message: string }
   | { kind: 'error'; message: string };
+
+type ExportOperationKind = 'manifest' | 'png' | 'webm' | 'plugin';
+
+interface ExportOperationToken {
+  uri: string;
+  sessionGeneration: number;
+  operationGeneration: number;
+  kind: ExportOperationKind;
+  exporterId?: string;
+  pluginId?: string;
+  exporterRegistrationGeneration?: number;
+}
 
 const RESOLUTION_SIZE: Record<PreviewResolution, { width: number; height: number }> = {
   '720p': { width: 1280, height: 720 },
@@ -93,28 +105,115 @@ export function ExportWorkspace({
   const [fps, setFps] = useState<PreviewFrameRate>(24);
   const [status, setStatus] = useState<ExportStatus>({ kind: 'idle' });
   const [progress, setProgress] = useState(0);
-  const [pluginBusy, setPluginBusy] = useState<string | null>(null);
+  const [activeOperation, setActiveOperation] = useState<ExportOperationToken | null>(null);
+  const operationGenerationRef = useRef(0);
+  const exporterRegistrationGenerationsRef = useRef(new Map<string, number>());
+  const activeOperationRef = useRef<ExportOperationToken | null>(null);
+  const mountedRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const primaryRef = useRef<HTMLButtonElement>(null);
   const boundSessionToken = projectSessionToken ?? runtime.editor.getSessionToken();
 
-  const isWorkspaceCurrent = () => {
+  const isWorkspaceSessionCurrent = (token?: ExportOperationToken) => {
     const current = runtime.editor.getProject();
-    return runtime.editor.isCurrentSession(boundSessionToken) &&
-      (current === null || current.uri === project.uri);
+    const sessionGeneration = token?.sessionGeneration ?? boundSessionToken;
+    const uri = token?.uri ?? project.uri;
+    return runtime.editor.isCurrentSession(sessionGeneration) &&
+      (current === null || current.uri === uri);
   };
 
   const staleTaskError = () => new PreviewExportError('cancelled', '项目会话已变更，导出已取消');
 
+  const isOperationOwner = (token: ExportOperationToken) =>
+    activeOperationRef.current?.operationGeneration === token.operationGeneration;
+
+  const isOperationCurrent = (token: ExportOperationToken) => {
+    if (!mountedRef.current || !isOperationOwner(token) || !isWorkspaceSessionCurrent(token)) return false;
+    if (token.kind !== 'plugin') return true;
+    if (
+      (exporterRegistrationGenerationsRef.current.get(token.pluginId!) ?? 0) !==
+      token.exporterRegistrationGeneration
+    ) return false;
+    return runtime.host.contributions.getExporters().some(
+      (exporter) => exporter.id === token.exporterId && exporter.pluginId === token.pluginId,
+    );
+  };
+
+  const assertOperationCurrent = (token: ExportOperationToken) => {
+    if (!isOperationCurrent(token)) throw staleTaskError();
+  };
+
+  const beginOperation = (
+    kind: ExportOperationKind,
+    exporter?: { id: string; pluginId: string },
+  ): ExportOperationToken | null => {
+    if (!mountedRef.current || activeOperationRef.current || !isWorkspaceSessionCurrent()) return null;
+    const token: ExportOperationToken = {
+      uri: project.uri,
+      sessionGeneration: boundSessionToken,
+      operationGeneration: operationGenerationRef.current + 1,
+      kind,
+      ...(exporter ? {
+        exporterId: exporter.id,
+        pluginId: exporter.pluginId,
+        exporterRegistrationGeneration:
+          exporterRegistrationGenerationsRef.current.get(exporter.pluginId) ?? 0,
+      } : {}),
+    };
+    operationGenerationRef.current = token.operationGeneration;
+    activeOperationRef.current = token;
+    setActiveOperation(token);
+    return token;
+  };
+
+  const completeOperation = (token: ExportOperationToken, nextStatus?: ExportStatus) => {
+    if (!isOperationOwner(token)) return;
+    activeOperationRef.current = null;
+    if (!mountedRef.current) return;
+    setActiveOperation(null);
+    if (nextStatus) setStatus(nextStatus);
+  };
+
+  const invalidateActiveOperation = useCallback((nextStatus?: ExportStatus) => {
+    operationGenerationRef.current += 1;
+    activeOperationRef.current = null;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    if (!mountedRef.current) return;
+    setActiveOperation(null);
+    if (nextStatus) setStatus(nextStatus);
+  }, []);
+
   useEffect(() => {
+    mountedRef.current = true;
     closeRef.current?.focus();
-    return () => abortRef.current?.abort();
+    return () => {
+      mountedRef.current = false;
+      operationGenerationRef.current += 1;
+      activeOperationRef.current = null;
+      abortRef.current?.abort();
+      abortRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
     if (status.kind === 'cancelled' || status.kind === 'error') primaryRef.current?.focus();
   }, [status.kind]);
+
+  useEffect(() => {
+    const subscription = runtime.events.on('contribution:changed', ({ pluginId }) => {
+      const generations = exporterRegistrationGenerationsRef.current;
+      generations.set(pluginId, (generations.get(pluginId) ?? 0) + 1);
+      const operation = activeOperationRef.current;
+      if (operation?.kind === 'plugin' && operation.pluginId === pluginId) {
+        invalidateActiveOperation({ kind: 'cancelled', message: '插件导出器已变更，导出已取消' });
+      }
+    });
+    return () => {
+      void subscription.dispose();
+    };
+  }, [runtime.events, invalidateActiveOperation]);
 
   const selectedShotIds = useMemo(
     () => (range === 'all' ? project.shots.map((shot) => shot.id) : [range]),
@@ -128,27 +227,36 @@ export function ExportWorkspace({
     (total, shot) => total + Math.max(0, shot.endTime - shot.startTime),
     0,
   );
-  const running = status.kind === 'running';
   const exporters = runtime.host.contributions.getExporters();
+  const busy = activeOperation !== null;
+  const running = activeOperation?.kind === 'webm';
   const aspect = project.settings.aspect[0] / project.settings.aspect[1];
 
   const exportManifest = () => {
+    const token = beginOperation('manifest');
+    if (!token) return;
+    let nextStatus: ExportStatus;
     try {
-      if (!isWorkspaceCurrent()) throw staleTaskError();
+      assertOperationCurrent(token);
       const manifest = buildStoryboardManifest(project, selectedShotIds);
-      if (!isWorkspaceCurrent()) throw staleTaskError();
+      assertOperationCurrent(token);
       downloadBlob(
         new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' }),
         `${safeFilename(project.name)}-storyboard.json`,
       );
-      setStatus({ kind: 'success', message: '分镜清单已导出' });
+      assertOperationCurrent(token);
+      nextStatus = { kind: 'success', message: '分镜清单已导出' };
     } catch (error) {
-      setStatus({ kind: 'error', message: `清单导出失败：${resultMessage(error)}` });
+      nextStatus = error instanceof PreviewExportError && error.code === 'cancelled'
+        ? { kind: 'cancelled', message: error.message }
+        : { kind: 'error', message: `清单导出失败：${resultMessage(error)}` };
+    } finally {
+      completeOperation(token, nextStatus!);
     }
   };
 
   const exportPng = (shot: ShotClipData) => {
-    if (!isWorkspaceCurrent()) {
+    if (!isWorkspaceSessionCurrent()) {
       setStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
       return;
     }
@@ -160,35 +268,47 @@ export function ExportWorkspace({
       setStatus({ kind: 'error', message: `分镜「${shot.name}」未绑定活动场景中的有效机位` });
       return;
     }
+    const token = beginOperation('png');
+    if (!token) return;
     const previousTime = session.timeline.getTime();
-    session.pause();
-    session.seek((shot.startTime + shot.endTime) / 2, false);
+    let nextStatus: ExportStatus;
     try {
-      if (!isWorkspaceCurrent()) throw staleTaskError();
+      assertOperationCurrent(token);
+      session.pause();
+      assertOperationCurrent(token);
+      session.seek((shot.startTime + shot.endTime) / 2, false);
+      assertOperationCurrent(token);
       const canvas = document.createElement('canvas');
       const size = RESOLUTION_SIZE[resolution];
       if (!exportFrameRef.current?.(shot.cameraObjectId!, canvas, { ...size, aspect })) {
         throw new Error('无法渲染指定分辨率画面');
       }
-      if (!isWorkspaceCurrent()) throw staleTaskError();
+      assertOperationCurrent(token);
       const dataUrl = canvas.toDataURL('image/png');
-      if (!isWorkspaceCurrent()) throw staleTaskError();
+      assertOperationCurrent(token);
       clickDownload(dataUrl, `${safeFilename(project.name)}-${safeFilename(shot.name)}.png`);
-      setStatus({ kind: 'success', message: `已导出「${shot.name}」PNG` });
+      assertOperationCurrent(token);
+      nextStatus = { kind: 'success', message: `已导出「${shot.name}」PNG` };
     } catch (error) {
       if (error instanceof PreviewExportError && error.code === 'cancelled') {
-        setStatus({ kind: 'cancelled', message: error.message });
+        nextStatus = { kind: 'cancelled', message: error.message };
       } else {
-        setStatus({ kind: 'error', message: `PNG 导出失败：${resultMessage(error)}` });
+        nextStatus = { kind: 'error', message: `PNG 导出失败：${resultMessage(error)}` };
       }
     } finally {
-      if (isWorkspaceCurrent()) session.seek(previousTime, false);
+      if (isOperationCurrent(token)) {
+        session.seek(previousTime, false);
+        if (!isOperationCurrent(token)) {
+          nextStatus = { kind: 'cancelled', message: '项目会话已变更，导出已取消' };
+        }
+      }
+      completeOperation(token, nextStatus!);
     }
   };
 
   const exportWebm = async () => {
-    if (!support.supported || running) return;
-    if (!isWorkspaceCurrent()) {
+    if (!support.supported || activeOperationRef.current) return;
+    if (!isWorkspaceSessionCurrent()) {
       setStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
       return;
     }
@@ -211,64 +331,81 @@ export function ExportWorkspace({
       return;
     }
 
+    const token = beginOperation('webm');
+    if (!token) return;
     const previousTime = session.timeline.getTime();
     const controller = new AbortController();
     abortRef.current = controller;
-    session.pause();
-    setProgress(0);
-    setStatus({ kind: 'running', message: '正在导出 0%' });
+    let nextStatus: ExportStatus;
     try {
+      assertOperationCurrent(token);
+      session.pause();
+      assertOperationCurrent(token);
+      setProgress(0);
+      setStatus({ kind: 'running', message: '正在导出 0%' });
       const blob = await recordPreviewWebm(
         result.plan,
         ({ canvas, shot, sourceTime, width, height }) => {
-          if (controller.signal.aborted || !isWorkspaceCurrent()) throw staleTaskError();
+          assertOperationCurrent(token);
           session.seek(sourceTime, false);
-          if (controller.signal.aborted || !isWorkspaceCurrent()) throw staleTaskError();
+          assertOperationCurrent(token);
           const rendered = exportFrameRef.current?.(shot.cameraObjectId!, canvas, { width, height, aspect }) ?? false;
-          if (controller.signal.aborted || !isWorkspaceCurrent()) throw staleTaskError();
+          assertOperationCurrent(token);
           return rendered;
         },
         {
           signal: controller.signal,
+          isOperationCurrent: () => isOperationCurrent(token),
           dependencies: recordingDependencies,
           onProgress: (event) => {
-            if (!isWorkspaceCurrent()) return;
+            if (!isOperationCurrent(token)) return;
             const percentage = Math.round(event.ratio * 100);
             setProgress(percentage);
             setStatus({ kind: 'running', message: `正在导出 ${percentage}% · ${event.shotName}` });
           },
         },
       );
-      if (controller.signal.aborted || !isWorkspaceCurrent()) throw staleTaskError();
+      assertOperationCurrent(token);
       downloadBlob(blob, `${safeFilename(project.name)}-${resolution}-${fps}fps.webm`);
+      assertOperationCurrent(token);
       setProgress(100);
-      setStatus({ kind: 'success', message: '导出完成' });
+      nextStatus = { kind: 'success', message: '导出完成' };
     } catch (error) {
       if (error instanceof PreviewExportError && error.code === 'cancelled') {
-        setStatus({ kind: 'cancelled', message: '导出已取消' });
+        nextStatus = { kind: 'cancelled', message: '导出已取消' };
       } else {
-        setStatus({ kind: 'error', message: `WebM 导出失败：${resultMessage(error)}` });
+        nextStatus = { kind: 'error', message: `WebM 导出失败：${resultMessage(error)}` };
       }
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
-      if (isWorkspaceCurrent()) {
+      if (isOperationCurrent(token)) {
         session.pause();
-        session.seek(previousTime, false);
+        if (isOperationCurrent(token)) {
+          session.seek(previousTime, false);
+          if (!isOperationCurrent(token)) {
+            nextStatus = { kind: 'cancelled', message: '项目会话已变更，导出已取消' };
+          }
+        } else {
+          nextStatus = { kind: 'cancelled', message: '项目会话已变更，导出已取消' };
+        }
       }
+      completeOperation(token, nextStatus!);
     }
   };
 
   const runPluginExporter = async (exporter: (typeof exporters)[number]) => {
-    if (running || pluginBusy) return;
-    if (!isWorkspaceCurrent()) {
+    if (activeOperationRef.current) return;
+    if (!isWorkspaceSessionCurrent()) {
       setStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
       return;
     }
-    setPluginBusy(exporter.id);
-    setStatus({ kind: 'idle' });
+    const token = beginOperation('plugin', exporter);
+    if (!token) return;
+    let nextStatus: ExportStatus;
+    setStatus({ kind: 'running', message: `正在运行 ${exporter.name}` });
     try {
       const result = await exporter.export(project);
-      if (!isWorkspaceCurrent()) throw staleTaskError();
+      assertOperationCurrent(token);
       if (
         !result ||
         typeof result !== 'object' ||
@@ -278,17 +415,18 @@ export function ExportWorkspace({
       ) {
         throw new Error('导出器返回了无效结果');
       }
-      if (!isWorkspaceCurrent()) throw staleTaskError();
+      assertOperationCurrent(token);
       downloadBlob(new Blob([result.data], { type: result.mime }), safeFilename(result.fileName));
-      setStatus({ kind: 'success', message: `${exporter.name}导出完成` });
+      assertOperationCurrent(token);
+      nextStatus = { kind: 'success', message: `${exporter.name}导出完成` };
     } catch (error) {
       if (error instanceof PreviewExportError && error.code === 'cancelled') {
-        setStatus({ kind: 'cancelled', message: error.message });
+        nextStatus = { kind: 'cancelled', message: error.message };
       } else {
-        setStatus({ kind: 'error', message: `${exporter.name}失败：${resultMessage(error)}` });
+        nextStatus = { kind: 'error', message: `${exporter.name}失败：${resultMessage(error)}` };
       }
     } finally {
-      setPluginBusy(null);
+      completeOperation(token, nextStatus!);
     }
   };
 
@@ -306,7 +444,10 @@ export function ExportWorkspace({
           type="button"
           className="lumora-button"
           disabled={running}
-          onClick={onClose}
+          onClick={() => {
+            invalidateActiveOperation();
+            onClose();
+          }}
         >
           关闭导出
         </button>
@@ -317,7 +458,7 @@ export function ExportWorkspace({
           <div
             className="lumora-export__operation-controls"
             data-testid="export-operation-controls"
-            aria-busy={running}
+            aria-busy={busy}
           >
           <h3>预览视频</h3>
           <label>
@@ -325,7 +466,7 @@ export function ExportWorkspace({
             <select
               aria-label="导出范围"
               value={range}
-              disabled={running}
+              disabled={busy}
               onChange={(event) => setRange(event.target.value)}
             >
               <option value="all">全部分镜</option>
@@ -339,7 +480,7 @@ export function ExportWorkspace({
             <select
               aria-label="分辨率"
               value={resolution}
-              disabled={running}
+              disabled={busy}
               onChange={(event) => setResolution(event.target.value as PreviewResolution)}
             >
               <option value="720p">1280 × 720</option>
@@ -351,7 +492,7 @@ export function ExportWorkspace({
             <select
               aria-label="帧率"
               value={String(fps)}
-              disabled={running}
+              disabled={busy}
               onChange={(event) => setFps(Number(event.target.value) as PreviewFrameRate)}
             >
               <option value="24">24 fps</option>
@@ -377,7 +518,7 @@ export function ExportWorkspace({
               disabled={
                 !support.supported ||
                 !captureReady ||
-                running ||
+                busy ||
                 session.state.recording ||
                 selectedShots.length === 0
               }
@@ -397,7 +538,7 @@ export function ExportWorkspace({
             <button
               type="button"
               className="lumora-button"
-              disabled={running || selectedShots.length === 0}
+              disabled={busy || selectedShots.length === 0}
               onClick={exportManifest}
             >
               导出清单
@@ -412,10 +553,12 @@ export function ExportWorkspace({
                   key={exporter.id}
                   type="button"
                   className="lumora-button"
-                  disabled={running || pluginBusy !== null}
+                  disabled={busy}
                   onClick={() => void runPluginExporter(exporter)}
                 >
-                  {pluginBusy === exporter.id ? `正在运行 ${exporter.name}` : `运行 ${exporter.name}`}
+                  {activeOperation?.kind === 'plugin' && activeOperation.exporterId === exporter.id
+                    ? `正在运行 ${exporter.name}`
+                    : `运行 ${exporter.name}`}
                 </button>
               ))}
             </div>
@@ -448,7 +591,7 @@ export function ExportWorkspace({
                 <button
                   type="button"
                   className="lumora-button"
-                  disabled={running || session.state.recording || !captureReady || !shot.cameraObjectId}
+                  disabled={busy || session.state.recording || !captureReady || !shot.cameraObjectId}
                   aria-label={`导出 ${shot.name} PNG`}
                   onClick={() => exportPng(shot)}
                 >

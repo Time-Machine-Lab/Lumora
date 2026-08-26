@@ -110,6 +110,7 @@ export interface PreviewRecordingDependencies {
 export interface PreviewRecordingOptions {
   signal?: AbortSignal;
   onProgress?: (progress: PreviewExportProgress) => void;
+  isOperationCurrent?: () => boolean;
   dependencies?: PreviewRecordingDependencies;
   finalizationTimeoutMs?: number;
 }
@@ -313,7 +314,10 @@ export async function recordPreviewWebm(
   const now = dependencies.now ?? (() => globalThis.performance.now());
   const signal = options.signal;
   const finalizationTimeoutMs = options.finalizationTimeoutMs ?? DEFAULT_RECORDER_FINALIZATION_TIMEOUT_MS;
-  if (signal?.aborted) throw abortError();
+  const ensureOperationCurrent = () => {
+    if (signal?.aborted || options.isOperationCurrent?.() === false) throw abortError();
+  };
+  ensureOperationCurrent();
 
   const canvas = dependencies.createCanvas();
   canvas.width = plan.width;
@@ -361,13 +365,15 @@ export async function recordPreviewWebm(
         '当前浏览器不支持逐帧画布捕获，无法可靠导出 WebM',
       );
     }
+    ensureOperationCurrent();
     recorder.start();
-    const recordingStartedAt = now();
+    ensureOperationCurrent();
     const frameDuration = 1000 / plan.fps;
+    let firstFrameRequestedAt: number | null = null;
     let completedFrames = 0;
     for (const shot of plan.shots) {
       for (let shotFrame = 0; shotFrame < shot.frameCount; shotFrame += 1) {
-        if (signal?.aborted) throw abortError();
+        ensureOperationCurrent();
         if (recorderFailure) throw recorderFailure;
         const sourceTime = shot.startTime + shotFrame / plan.fps;
         const rendered = await renderFrame({
@@ -379,11 +385,14 @@ export async function recordPreviewWebm(
           width: plan.width,
           height: plan.height,
         });
-        if (signal?.aborted) throw abortError();
+        ensureOperationCurrent();
         if (!rendered) {
           throw new PreviewExportError('capture-failed', `无法渲染分镜「${shot.name}」`);
         }
+        const requestedAt = now();
         track.requestFrame();
+        if (firstFrameRequestedAt === null) firstFrameRequestedAt = requestedAt;
+        ensureOperationCurrent();
         completedFrames += 1;
         options.onProgress?.({
           completedFrames,
@@ -392,10 +401,12 @@ export async function recordPreviewWebm(
           shotId: shot.id,
           shotName: shot.name,
         });
+        ensureOperationCurrent();
         const targetElapsed = completedFrames * frameDuration;
-        const remaining = Math.max(0, targetElapsed - (now() - recordingStartedAt));
+        const remaining = Math.max(0, targetElapsed - (now() - firstFrameRequestedAt));
         await dependencies.waitForFrame(remaining, signal);
-        if (now() - recordingStartedAt - targetElapsed > frameDuration * 2) {
+        ensureOperationCurrent();
+        if (now() - firstFrameRequestedAt - targetElapsed > frameDuration * 2) {
           throw new PreviewExportError(
             'timing-failed',
             '浏览器未能维持所选帧率，已停止导出以避免生成时长漂移的 WebM',
@@ -403,8 +414,17 @@ export async function recordPreviewWebm(
         }
       }
     }
+    // Content frames are timestamped 0..(N-1)/fps. Re-request the unchanged
+    // canvas at N/fps so Chromium's WebM muxer receives an explicit quantized
+    // end timestamp instead of ending the file at the final content timestamp.
+    ensureOperationCurrent();
+    track.requestFrame();
+    ensureOperationCurrent();
+    await dependencies.waitForFrame(0, signal);
+    ensureOperationCurrent();
     if (recorderFailure) throw recorderFailure;
     recorder.stop();
+    ensureOperationCurrent();
     const finalization = await new Promise<RecorderOutcome>((resolve, reject) => {
       if (signal?.aborted) {
         reject(abortError());
@@ -429,8 +449,8 @@ export async function recordPreviewWebm(
       signal?.addEventListener('abort', onAbort, { once: true });
       void recorderOutcome.then((outcome) => finish(() => resolve(outcome)));
     });
+    ensureOperationCurrent();
     if (finalization.type === 'error') throw finalization.error;
-    if (signal?.aborted) throw abortError();
     if (chunks.length === 0) {
       throw new PreviewExportError('encoder-failed', 'WebM 编码器未产生有效数据');
     }

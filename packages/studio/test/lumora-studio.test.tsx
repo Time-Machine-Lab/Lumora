@@ -98,6 +98,28 @@ describe('LumoraStudio', () => {
     expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri);
   });
 
+  it('preserves native Space and Enter activation on the closed export button', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://export-native-key', 'Export native key');
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    const trigger = await screen.findByTestId('open-export-workspace');
+    await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri));
+    const playBefore = screen.getByTestId('timeline-play').textContent;
+    const hostKeydown = vi.fn();
+    window.addEventListener('keydown', hostKeydown);
+
+    try {
+      trigger.focus();
+      expect(fireEvent.keyDown(trigger, { key: ' ' })).toBe(true);
+      expect(hostKeydown).toHaveBeenCalledTimes(1);
+      expect(screen.queryByTestId('export-workspace')).not.toBeInTheDocument();
+      expect(screen.getByTestId('timeline-play')).toHaveTextContent(playBefore ?? '');
+      expect(fireEvent.keyDown(trigger, { key: 'Enter' })).toBe(true);
+    } finally {
+      window.removeEventListener('keydown', hostKeydown);
+    }
+  });
+
   it('isolates editor shortcuts while the export workspace is open and idle', async () => {
     let driveDefaultPrevented = false;
     const observeDriveKey = (event: KeyboardEvent) => {
@@ -114,6 +136,7 @@ describe('LumoraStudio', () => {
     const editor = handle.current!.runtime.editor;
     act(() => editor.setSelection(['sample-camera']));
     const undo = vi.spyOn(editor, 'undo').mockReturnValue({ ok: true });
+    const redo = vi.spyOn(editor, 'redo').mockReturnValue({ ok: true });
     const duplicate = vi.spyOn(editor, 'duplicateSelection').mockReturnValue({ ok: true });
     const remove = vi.spyOn(editor, 'deleteSelection').mockReturnValue({ ok: true });
     const playBefore = screen.getByTestId('timeline-play').textContent;
@@ -122,14 +145,18 @@ describe('LumoraStudio', () => {
     const target = await screen.findByRole('button', { name: '关闭导出' });
     fireEvent.keyDown(target, { key: 'K', ctrlKey: true, shiftKey: true });
     fireEvent.keyDown(target, { key: 'z', ctrlKey: true });
+    fireEvent.keyDown(target, { key: 'z', ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(target, { key: 'y', ctrlKey: true });
     fireEvent.keyDown(target, { key: 'd', ctrlKey: true });
     fireEvent.keyDown(target, { key: 'Delete' });
+    fireEvent.keyDown(target, { key: 'Backspace' });
     fireEvent.keyDown(target, { key: ' ' });
     fireEvent.keyDown(target, { key: 'w', code: 'KeyW' });
     fireEvent.keyDown(target, { key: 'Escape' });
 
     expect(screen.queryByTestId('command-palette')).not.toBeInTheDocument();
     expect(undo).not.toHaveBeenCalled();
+    expect(redo).not.toHaveBeenCalled();
     expect(duplicate).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
     expect(driveDefaultPrevented).toBe(true);
