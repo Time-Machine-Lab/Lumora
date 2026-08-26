@@ -702,6 +702,12 @@
   background: #171a22;
 }
 
+.lumora-export__operation-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+
 .lumora-export__settings label {
   display: grid;
   gap: 6px;

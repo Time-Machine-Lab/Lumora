@@ -85,6 +85,48 @@ describe('captureProjectFrame', () => {
     expect(camera.aspect).toBe(4 / 3);
   });
 
+  it('fills both 854x480 edge columns for exact 16:9 content', () => {
+    const { renderer, raw } = createRenderer();
+    const target = document.createElement('canvas');
+    let renderedPixels: Uint8ClampedArray | null = null;
+    let viewport = { x: 0, y: 0, width: 0, height: 0 };
+    raw.setViewport.mockImplementation((x: number | THREE.Vector4, y?: number, width?: number, height?: number) => {
+      if (typeof x === 'number') viewport = { x, y: y!, width: width!, height: height! };
+    });
+    raw.readRenderTargetPixels.mockImplementation(
+      (_target, _x, _y, width, height, pixels) => {
+        for (let row = viewport.y; row < viewport.y + viewport.height; row += 1) {
+          for (let column = viewport.x; column < viewport.x + viewport.width; column += 1) {
+            const offset = (row * width + column) * 4;
+            pixels.set([200, 120, 80, 255], offset);
+          }
+        }
+      },
+    );
+    vi.spyOn(target, 'getContext').mockReturnValue({
+      createImageData: (width: number, height: number) => ({
+        width,
+        height,
+        data: new Uint8ClampedArray(width * height * 4),
+      }),
+      putImageData: (image: ImageData) => { renderedPixels = image.data; },
+    } as never);
+
+    expect(renderProjectFrameToCanvas(
+      renderer,
+      new THREE.Scene(),
+      new THREE.PerspectiveCamera(),
+      target,
+      { width: 854, height: 480, aspect: 16 / 9 },
+    )).toBe(true);
+
+    expect(raw.setViewport).toHaveBeenCalledWith(0, 0, 854, 480);
+    const row = 240;
+    expect(Array.from(renderedPixels!.slice(row * 854 * 4, row * 854 * 4 + 4))).toEqual([200, 120, 80, 255]);
+    const rightEdge = (row * 854 + 853) * 4;
+    expect(Array.from(renderedPixels!.slice(rightEdge, rightEdge + 4))).toEqual([200, 120, 80, 255]);
+  });
+
   it('letterboxes a 4:3 project inside a 16:9 export frame', () => {
     const { renderer, raw } = createRenderer();
     const target = document.createElement('canvas');

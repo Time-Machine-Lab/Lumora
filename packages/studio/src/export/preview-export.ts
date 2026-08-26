@@ -8,6 +8,7 @@ export type PreviewExportErrorCode =
   | 'invalid-shot'
   | 'unsupported'
   | 'capture-failed'
+  | 'timing-failed'
   | 'cancelled'
   | 'encoder-failed';
 
@@ -110,7 +111,10 @@ export interface PreviewRecordingOptions {
   signal?: AbortSignal;
   onProgress?: (progress: PreviewExportProgress) => void;
   dependencies?: PreviewRecordingDependencies;
+  finalizationTimeoutMs?: number;
 }
+
+export const DEFAULT_RECORDER_FINALIZATION_TIMEOUT_MS = 5_000;
 
 const MIME_CANDIDATES = [
   'video/webm;codecs=vp9',
@@ -162,6 +166,12 @@ function selectedShots(project: Project, shotIds: readonly string[]): ShotClipDa
   return project.shots.filter((shot) => selected.has(shot.id));
 }
 
+export function isActiveSceneCamera(project: Project, cameraObjectId: string | null): boolean {
+  if (!cameraObjectId) return false;
+  const camera = project.objects.find((object) => object.id === cameraObjectId);
+  return camera?.type === 'camera' && getReachableIds(project, project.activeSceneId).has(camera.id);
+}
+
 export function createPreviewExportPlan(
   project: Project,
   options: PreviewExportOptions,
@@ -179,12 +189,10 @@ export function createPreviewExportPlan(
   }
 
   const planned: PreviewExportShot[] = [];
-  const activeSceneObjects = getReachableIds(project, project.activeSceneId);
+  let cumulativeDuration = 0;
+  let allocatedFrames = 0;
   for (const shot of shots) {
-    const camera = shot.cameraObjectId
-      ? project.objects.find((object) => object.id === shot.cameraObjectId)
-      : null;
-    if (!camera || camera.type !== 'camera' || !activeSceneObjects.has(camera.id)) {
+    if (!isActiveSceneCamera(project, shot.cameraObjectId)) {
       return {
         ok: false,
         code: 'invalid-shot',
@@ -203,14 +211,22 @@ export function createPreviewExportPlan(
         message: `分镜「${shot.name}」的时间范围无效`,
       };
     }
-    planned.push({
-      ...shot,
-      frameCount: Math.max(1, Math.round((shot.endTime - shot.startTime) * options.fps)),
-    });
+    cumulativeDuration += shot.endTime - shot.startTime;
+    const cumulativeBoundary = Math.round(cumulativeDuration * options.fps);
+    const frameCount = cumulativeBoundary - allocatedFrames;
+    if (frameCount < 1) {
+      return {
+        ok: false,
+        code: 'invalid-shot',
+        message: `分镜「${shot.name}」时长不足以在所选帧率下分配画面`,
+      };
+    }
+    planned.push({ ...shot, frameCount });
+    allocatedFrames = cumulativeBoundary;
   }
 
-  const duration = planned.reduce((total, shot) => total + shot.endTime - shot.startTime, 0);
-  const totalFrames = planned.reduce((total, shot) => total + shot.frameCount, 0);
+  const duration = cumulativeDuration;
+  const totalFrames = allocatedFrames;
   return {
     ok: true,
     plan: {
@@ -296,6 +312,7 @@ export async function recordPreviewWebm(
   const dependencies = options.dependencies ?? defaultRecordingDependencies();
   const now = dependencies.now ?? (() => globalThis.performance.now());
   const signal = options.signal;
+  const finalizationTimeoutMs = options.finalizationTimeoutMs ?? DEFAULT_RECORDER_FINALIZATION_TIMEOUT_MS;
   if (signal?.aborted) throw abortError();
 
   const canvas = dependencies.createCanvas();
@@ -324,20 +341,29 @@ export async function recordPreviewWebm(
 
   const chunks: Blob[] = [];
   let recorderFailure: PreviewExportError | null = null;
-  const stopped = new Promise<void>((resolve) => {
+  type RecorderOutcome = { type: 'stopped' } | { type: 'error'; error: PreviewExportError };
+  const recorderOutcome = new Promise<RecorderOutcome>((resolve) => {
     recorder.ondataavailable = (event) => {
       if (event.data.size > 0) chunks.push(event.data);
     };
     recorder.onerror = () => {
       recorderFailure = new PreviewExportError('encoder-failed', 'WebM 编码器运行失败');
+      resolve({ type: 'error', error: recorderFailure });
     };
-    recorder.onstop = () => resolve();
+    recorder.onstop = () => resolve({ type: 'stopped' });
   });
 
   try {
+    const track = stream.getVideoTracks()[0] as (MediaStreamTrack & { requestFrame?: () => void }) | undefined;
+    if (!track || typeof track.requestFrame !== 'function') {
+      throw new PreviewExportError(
+        'unsupported',
+        '当前浏览器不支持逐帧画布捕获，无法可靠导出 WebM',
+      );
+    }
     recorder.start();
     const recordingStartedAt = now();
-    const track = stream.getVideoTracks()[0] as (MediaStreamTrack & { requestFrame?: () => void }) | undefined;
+    const frameDuration = 1000 / plan.fps;
     let completedFrames = 0;
     for (const shot of plan.shots) {
       for (let shotFrame = 0; shotFrame < shot.frameCount; shotFrame += 1) {
@@ -357,7 +383,7 @@ export async function recordPreviewWebm(
         if (!rendered) {
           throw new PreviewExportError('capture-failed', `无法渲染分镜「${shot.name}」`);
         }
-        track?.requestFrame?.();
+        track.requestFrame();
         completedFrames += 1;
         options.onProgress?.({
           completedFrames,
@@ -366,15 +392,45 @@ export async function recordPreviewWebm(
           shotId: shot.id,
           shotName: shot.name,
         });
-        const targetElapsed = completedFrames * (1000 / plan.fps);
+        const targetElapsed = completedFrames * frameDuration;
         const remaining = Math.max(0, targetElapsed - (now() - recordingStartedAt));
         await dependencies.waitForFrame(remaining, signal);
+        if (now() - recordingStartedAt - targetElapsed > frameDuration * 2) {
+          throw new PreviewExportError(
+            'timing-failed',
+            '浏览器未能维持所选帧率，已停止导出以避免生成时长漂移的 WebM',
+          );
+        }
       }
     }
     if (recorderFailure) throw recorderFailure;
     recorder.stop();
-    await stopped;
-    if (recorderFailure) throw recorderFailure;
+    const finalization = await new Promise<RecorderOutcome>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(abortError());
+        return;
+      }
+      let settled = false;
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        globalThis.clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        callback();
+      };
+      const onAbort = () => finish(() => reject(abortError()));
+      const timer = globalThis.setTimeout(
+        () => finish(() => reject(new PreviewExportError(
+          'encoder-failed',
+          'WebM 编码器收尾超时，请重试',
+        ))),
+        Math.max(1, finalizationTimeoutMs),
+      );
+      signal?.addEventListener('abort', onAbort, { once: true });
+      void recorderOutcome.then((outcome) => finish(() => resolve(outcome)));
+    });
+    if (finalization.type === 'error') throw finalization.error;
+    if (signal?.aborted) throw abortError();
     if (chunks.length === 0) {
       throw new PreviewExportError('encoder-failed', 'WebM 编码器未产生有效数据');
     }

@@ -48,6 +48,34 @@ function invokeCloseError(
   }
 }
 
+function isStudioEditingShortcut(event: KeyboardEvent): boolean {
+  const key = event.key.toLowerCase();
+  return (
+    key === ' ' ||
+    key === 'delete' ||
+    key === 'backspace' ||
+    key === '1' ||
+    key === '2' ||
+    key === '3' ||
+    ((event.ctrlKey || event.metaKey) && (key === 'k' || key === 'z' || key === 'y' || key === 'd')) ||
+    DRIVE_KEY_CODES.has(event.code)
+  );
+}
+
+function preservesNativeExportShortcut(event: KeyboardEvent): boolean {
+  const target = event.target as HTMLElement | null;
+  if (!target) return false;
+  if (
+    target.tagName === 'INPUT' ||
+    target.tagName === 'TEXTAREA' ||
+    target.tagName === 'SELECT' ||
+    target.isContentEditable
+  ) {
+    return true;
+  }
+  return event.key === ' ' && target.tagName === 'BUTTON';
+}
+
 export interface LumoraStudioProps {
   /** 挂载时注册的插件描述符；注册按声明顺序串行执行 */
   plugins?: PluginDescriptor[];
@@ -142,19 +170,6 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     // 捕获阶段处理先于全局冒泡处理器，stopImmediatePropagation 使其不可达。
     // 应用快捷键统一小写匹配：Ctrl+Shift+K 的 key 为大写 K，未小写化时泄漏到
     // 命令面板开关（复审阻断 4）
-    const isAppShortcut = (event: KeyboardEvent) => {
-      const key = event.key.toLowerCase();
-      return (
-        key === 'delete' ||
-        key === 'backspace' ||
-        key === '1' ||
-        key === '2' ||
-        key === '3' ||
-        ((event.ctrlKey || event.metaKey) &&
-          (key === 'k' || key === 'z' || key === 'y' || key === 'd')) ||
-        DRIVE_KEY_CODES.has(event.code)
-      );
-    };
     const onKeyDownCapture = (event: KeyboardEvent) => {
       // Escape 无条件取消，先于「模态外」分支判定：焦点逃逸到对话框外后
       // Escape 不得被 outside 分支吞掉（复审阻断 4）
@@ -199,7 +214,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         }
         return;
       }
-      if (isAppShortcut(event)) {
+      if (isStudioEditingShortcut(event)) {
         event.preventDefault();
         event.stopImmediatePropagation();
         return;
@@ -378,6 +393,19 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     };
   }, [runtime, cache, close]);
 
+  useEffect(() => {
+    if (!exportOpen) return;
+    const root = rootRef.current;
+    if (!root) return;
+    const onKeyDownCapture = (event: KeyboardEvent) => {
+      if (!isKeyboardEventForStudio(root, event) || !isStudioEditingShortcut(event)) return;
+      if (!preservesNativeExportShortcut(event)) event.preventDefault();
+    };
+    // Mark editor-only shortcuts before viewport listeners can consume drive keys.
+    window.addEventListener('keydown', onKeyDownCapture, true);
+    return () => window.removeEventListener('keydown', onKeyDownCapture, true);
+  }, [exportOpen]);
+
   // 编辑器快捷键：撤销/重做/复制/删除/取消选择/Gizmo 模式。
   // 按实例作用域（R8-9）：多个 Studio 实例共存时共享 window 监听，
   // 无焦点包含校验则每个实例都执行全部快捷键（一个实例内按 Delete
@@ -390,6 +418,15 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     const unregisterRoot = registerStudioKeyboardRoot(root);
     const onKey = (event: KeyboardEvent) => {
       if (!isKeyboardEventForStudio(root, event)) return;
+      if (exportOpen && isStudioEditingShortcut(event)) {
+        if (preservesNativeExportShortcut(event)) {
+          if (event.key === ' ') event.stopImmediatePropagation();
+          return;
+        }
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
       // 已由内层处理（对话框/下拉等 stopPropagation 的兜底）：全局键处理不得越权执行
       if (event.defaultPrevented) return;
       const key = event.key.toLowerCase();
@@ -453,7 +490,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       window.removeEventListener('keydown', onKey);
       unregisterRoot();
     };
-  }, [runtime]);
+  }, [runtime, exportOpen]);
 
   return (
     <>
@@ -565,9 +602,10 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         )}
         {exportOpen && project && (
           <ExportWorkspace
-            key={project.uri}
+            key={`${project.uri}:${runtime.editor.getSessionToken()}`}
             runtime={runtime}
             project={project}
+            projectSessionToken={runtime.editor.getSessionToken()}
             session={session}
             captureRef={captureRef}
             exportFrameRef={exportFrameRef}

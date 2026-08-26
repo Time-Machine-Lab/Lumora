@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test';
 import type { Download, Page } from '@playwright/test';
 import { MINIMAL_GLB } from './helpers/glb';
+import { decodePng, pngPixel } from './helpers/png';
 
 interface VideoMetadata {
   duration: number;
@@ -135,7 +136,7 @@ test('exports three ordered shots as a playable 720p/24fps WebM', async ({ page 
   const metadata = await inspectWebm(page, bytes);
   expect(metadata.width).toBe(1280);
   expect(metadata.height).toBe(720);
-  expect(metadata.duration).toBeCloseTo(4.5, 0);
+  expect(Math.abs(metadata.duration - 4.5)).toBeLessThanOrEqual(0.15);
   expect(metadata.decodedPixelCount).toBeGreaterThan(1280 * 720 * 0.9);
 });
 
@@ -242,6 +243,162 @@ test('cancels recording, releases media tracks, and returns to an editable proje
   await page.getByTestId('add-object').click();
   await page.getByTestId('add-立方体').click();
   await expect(rows).toHaveCount(before + 1);
+});
+
+test('isolates editor shortcuts while export is idle and while recording', async ({ page }) => {
+  await page.goto('/');
+  await page.getByTestId('open-sample-project').click();
+  await expect(page.getByTestId('tree-row-sample-camera')).toBeVisible();
+  await page.getByTestId('tree-row-sample-camera').click();
+  const rows = page.locator('.lumora-tree-row');
+  const rowCount = await rows.count();
+  const cameraPosition = page.locator('[data-testid^="inspector-axis-"]');
+  const cameraPositionBefore = await cameraPosition.evaluateAll((inputs) => (
+    inputs.map((input) => (input as HTMLInputElement).value)
+  ));
+  const playBefore = await page.getByTestId('timeline-play').textContent();
+  await page.getByTestId('open-export-workspace').click();
+
+  const pressEditorShortcuts = async () => {
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.press('Control+Shift+K');
+    await page.keyboard.press('Control+Z');
+    await page.keyboard.press('Control+D');
+    await page.keyboard.press('Delete');
+    await page.keyboard.press('Space');
+    await page.keyboard.down('w');
+    await page.waitForTimeout(150);
+    await page.keyboard.up('w');
+  };
+
+  await pressEditorShortcuts();
+  await expect(page.getByTestId('command-palette')).toHaveCount(0);
+  await expect(rows).toHaveCount(rowCount);
+  await expect(page.getByTestId('tree-row-sample-camera')).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByTestId('timeline-play')).toHaveText(playBefore ?? '');
+  expect(await cameraPosition.evaluateAll((inputs) => (
+    inputs.map((input) => (input as HTMLInputElement).value)
+  ))).toEqual(cameraPositionBefore);
+
+  await page.getByRole('button', { name: '导出 WebM' }).click();
+  await expect(page.getByLabel('导出进度')).not.toHaveJSProperty('value', 0);
+  await pressEditorShortcuts();
+  await expect(page.getByTestId('command-palette')).toHaveCount(0);
+  await expect(rows).toHaveCount(rowCount);
+  await expect(page.getByTestId('tree-row-sample-camera')).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByTestId('timeline-play')).toHaveText(playBefore ?? '');
+  expect(await cameraPosition.evaluateAll((inputs) => (
+    inputs.map((input) => (input as HTMLInputElement).value)
+  ))).toEqual(cameraPositionBefore);
+  await page.getByRole('button', { name: '取消导出' }).click();
+  await expect(page.getByRole('status')).toContainText('导出已取消');
+});
+
+test('cancels at 100% finalization without downloading and remains retryable', async ({ page }) => {
+  await page.addInitScript(() => {
+    class FinalizationRecorder {
+      static isTypeSupported(mimeType: string): boolean {
+        return mimeType.startsWith('video/webm');
+      }
+
+      state: RecordingState = 'inactive';
+      ondataavailable: ((event: BlobEvent) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      onstop: ((event: Event) => void) | null = null;
+
+      start(): void {
+        this.state = 'recording';
+      }
+
+      stop(): void {
+        if (this.state === 'inactive') return;
+        this.state = 'inactive';
+        this.ondataavailable?.(new BlobEvent('dataavailable', { data: new Blob(['partial-webm']) }));
+        // Deliberately omit onstop so AbortSignal must win the finalization race.
+      }
+    }
+    Object.defineProperty(globalThis, 'MediaRecorder', {
+      configurable: true,
+      value: FinalizationRecorder,
+    });
+  });
+  let downloads = 0;
+  page.on('download', () => downloads += 1);
+  await openSampleExport(page);
+  await page.getByLabel('导出范围').selectOption('sample-shot-1');
+
+  const runAndCancel = async () => {
+    await page.getByRole('button', { name: '导出 WebM' }).click();
+    await expect(page.getByLabel('导出进度')).toHaveJSProperty('value', 100);
+    await page.getByRole('button', { name: '取消导出' }).click();
+    await expect(page.getByRole('status')).toContainText('导出已取消');
+    await expect(page.getByRole('button', { name: '导出 WebM' })).toBeFocused();
+  };
+
+  await runAndCancel();
+  await runAndCancel();
+  expect(downloads).toBe(0);
+});
+
+test('fails explicitly when timer throttling misses the real-time frame deadline', async ({ page }) => {
+  await page.addInitScript(() => {
+    const scope = globalThis as typeof globalThis & { __lumoraThrottleExport?: boolean };
+    const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
+    globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) =>
+      nativeSetTimeout(
+        handler,
+        scope.__lumoraThrottleExport && (timeout ?? 0) < 100 ? (timeout ?? 0) + 120 : timeout,
+        ...args,
+      )) as typeof globalThis.setTimeout;
+  });
+  let downloads = 0;
+  page.on('download', () => downloads += 1);
+  await openSampleExport(page);
+  await page.getByLabel('导出范围').selectOption('sample-shot-1');
+  await page.evaluate(() => {
+    (globalThis as typeof globalThis & { __lumoraThrottleExport?: boolean }).__lumoraThrottleExport = true;
+  });
+
+  await page.getByRole('button', { name: '导出 WebM' }).click();
+  await expect(page.getByRole('alert')).toContainText('未能维持所选帧率');
+  await expect(page.getByRole('button', { name: '导出 WebM' })).toBeFocused();
+  expect(downloads).toBe(0);
+});
+
+test('invalidates an old export when the same project URI is reopened', async ({ page }) => {
+  await page.goto('/');
+  await page.getByTestId('open-sample-project').click();
+  const projectDownload = page.waitForEvent('download');
+  await page.getByTestId('toolbar-com.lumora.mock.toolbar.export').click();
+  await projectDownload;
+  await page.getByTestId('open-export-workspace').click();
+  await expect(page.getByTestId('export-workspace')).toBeVisible();
+  let previewDownloads = 0;
+  page.on('download', () => previewDownloads += 1);
+
+  await page.getByRole('button', { name: '导出 WebM' }).click();
+  await expect(page.getByLabel('导出进度')).not.toHaveJSProperty('value', 0);
+  await page.getByTestId('reopen-last-export').click();
+
+  await expect(page.getByTestId('export-workspace')).toHaveCount(0);
+  await expect(page.getByTestId('tree-row-sample-camera')).toBeVisible();
+  await page.waitForTimeout(250);
+  expect(previewDownloads).toBe(0);
+});
+
+test('exports a full-width 854x480 PNG with populated edge pixels', async ({ page }) => {
+  await openSampleExport(page);
+  await page.getByLabel('分辨率').selectOption('480p');
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: /导出 分镜 1.*PNG/ }).click();
+  const png = decodePng(await readDownload(await downloadPromise));
+
+  expect({ width: png.width, height: png.height }).toEqual({ width: 854, height: 480 });
+  const edgeColorCount = (x: number) => new Set(
+    Array.from({ length: png.height }, (_, y) => pngPixel(png, x, y).slice(0, 3).join(',')),
+  ).size;
+  expect(edgeColorCount(0)).toBeGreaterThan(1);
+  expect(edgeColorCount(853)).toBeGreaterThan(1);
 });
 
 test('keeps the export workspace usable at desktop and mobile viewports', async ({ page }, testInfo) => {
@@ -382,6 +539,6 @@ test('completes the new-project release flow without unhandled browser errors', 
   expect([...bytes.subarray(0, 4)]).toEqual([0x1a, 0x45, 0xdf, 0xa3]);
   expect(order).toEqual(['Shot 1', 'Shot 2', 'Shot 3']);
   const metadata = await inspectWebm(page, bytes);
-  expect(metadata.duration).toBeCloseTo(0.6, 0);
+  expect(Math.abs(metadata.duration - 0.6)).toBeLessThanOrEqual(0.15);
   expect(browserErrors).toEqual([]);
 });

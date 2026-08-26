@@ -57,6 +57,12 @@ function fitViewport(
   aspect: number,
 ): { x: number; y: number; width: number; height: number } {
   const outputAspect = width / height;
+  // 854x480 is the conventional integer 480p representation of 16:9. The
+  // exact ratio differs by less than one output pixel, so letterboxing would
+  // create a visible one-sided column without preserving meaningful geometry.
+  if (Math.abs(width - height * aspect) <= 1 || Math.abs(height - width / aspect) <= 1) {
+    return { x: 0, y: 0, width, height };
+  }
   if (aspect >= outputAspect) {
     const fittedHeight = Math.min(height, Math.max(1, Math.round(width / aspect)));
     return { x: 0, y: Math.floor((height - fittedHeight) / 2), width, height: fittedHeight };

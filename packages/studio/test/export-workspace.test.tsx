@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { createSampleProject } from '@lumora/core';
 import type { PluginDescriptor, Project } from '@lumora/core';
 import { createStudioRuntime } from '../src/runtime/studio-runtime';
@@ -191,6 +191,37 @@ describe('ExportWorkspace', () => {
     expect(HTMLAnchorElement.prototype.click).not.toHaveBeenCalled();
   });
 
+  it('rejects PNG capture when the shot camera is outside the active scene', () => {
+    const runtime = createStudioRuntime();
+    const base = createSampleProject();
+    const project: Project = {
+      ...base,
+      scenes: [
+        { ...base.scenes[0]!, rootObjectIds: base.scenes[0]!.rootObjectIds.filter((id) => id !== 'sample-camera') },
+        { id: 'inactive', name: 'Inactive', rootObjectIds: ['sample-camera'], activeCameraId: 'sample-camera' },
+      ],
+    };
+    const { session } = sessionHarness();
+    const exportFrame = vi.fn(() => true);
+
+    render(
+      <ExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: exportFrame }}
+        support={SUPPORTED}
+        onClose={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /导出 分镜 1.*PNG/i }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('有效机位');
+    expect(exportFrame).not.toHaveBeenCalled();
+    expect(HTMLAnchorElement.prototype.click).not.toHaveBeenCalled();
+  });
+
   it('shows unsupported codec state before encoding and creates no recorder', () => {
     const runtime = createStudioRuntime();
     const project = createSampleProject();
@@ -277,6 +308,46 @@ describe('ExportWorkspace', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it('does not capture, download, or restore the playhead after the project session changes', async () => {
+    const runtime = createStudioRuntime();
+    await runtime.openProject(projectWithShortShots());
+    const project = runtime.getProject()!;
+    const { session, seek } = sessionHarness();
+    let releaseFrame!: () => void;
+    let waits = 0;
+    const recorder = recorderDependencies({
+      wait: () => {
+        waits += 1;
+        if (waits !== 1) return Promise.resolve();
+        return new Promise<void>((resolve) => { releaseFrame = resolve; });
+      },
+    });
+    const renderFrame = vi.fn(() => true);
+
+    render(
+      <ExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: renderFrame }}
+        support={SUPPORTED}
+        recordingDependencies={recorder.dependencies}
+        onClose={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: '导出 WebM' }));
+    await waitFor(() => expect(renderFrame).toHaveBeenCalledTimes(1));
+
+    act(() => runtime.editor.openProject(createSampleProject(project.uri, 'Reopened session')));
+    releaseFrame();
+
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('已取消'));
+    expect(renderFrame).toHaveBeenCalledTimes(1);
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+    expect(seek).not.toHaveBeenLastCalledWith(0.5, false);
+  });
+
   it('cancels an in-flight export and releases its media track', async () => {
     const runtime = createStudioRuntime();
     const project = projectWithShortShots();
@@ -306,6 +377,42 @@ describe('ExportWorkspace', () => {
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('已取消'));
     expect(recorder.track.stop).toHaveBeenCalledTimes(1);
     expect(URL.createObjectURL).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: '导出 WebM' })).toHaveFocus();
+  });
+
+  it('keeps the live status outside the busy controls and restores WebM focus after failure', async () => {
+    const runtime = createStudioRuntime();
+    const project = projectWithShortShots();
+    const { session } = sessionHarness();
+    let release!: () => void;
+    const recorder = recorderDependencies({
+      wait: () => new Promise<void>((resolve) => { release = resolve; }),
+    });
+    const renderFrame = vi.fn(() => true);
+
+    render(
+      <ExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: renderFrame }}
+        support={SUPPORTED}
+        recordingDependencies={recorder.dependencies}
+        onClose={vi.fn()}
+      />,
+    );
+    const primary = screen.getByRole('button', { name: '导出 WebM' });
+    fireEvent.click(primary);
+
+    const controls = await screen.findByTestId('export-operation-controls');
+    expect(controls).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByTestId('export-workspace')).not.toHaveAttribute('aria-busy');
+    expect(controls).not.toContainElement(screen.getByRole('status'));
+    renderFrame.mockReturnValue(false);
+    release();
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('WebM 导出失败'));
+    expect(primary).toHaveFocus();
   });
 
   it('isolates a plugin exporter failure and preserves the current project', async () => {

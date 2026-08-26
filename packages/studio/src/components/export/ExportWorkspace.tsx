@@ -10,6 +10,7 @@ import {
   buildStoryboardManifest,
   createPreviewExportPlan,
   detectWebmSupport,
+  isActiveSceneCamera,
   recordPreviewWebm,
 } from '../../export/preview-export';
 import type {
@@ -25,6 +26,7 @@ export type ExportFrameCapture = ProjectFrameCapture;
 export interface ExportWorkspaceProps {
   runtime: StudioRuntime;
   project: Project;
+  projectSessionToken?: number;
   session: TimelineSession;
   captureRef: RefObject<ThumbnailCapture | null>;
   exportFrameRef: RefObject<ExportFrameCapture | null>;
@@ -76,6 +78,7 @@ function resultMessage(error: unknown): string {
 export function ExportWorkspace({
   runtime,
   project,
+  projectSessionToken,
   session,
   exportFrameRef,
   captureReady = true,
@@ -93,11 +96,25 @@ export function ExportWorkspace({
   const [pluginBusy, setPluginBusy] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const primaryRef = useRef<HTMLButtonElement>(null);
+  const boundSessionToken = projectSessionToken ?? runtime.editor.getSessionToken();
+
+  const isWorkspaceCurrent = () => {
+    const current = runtime.editor.getProject();
+    return runtime.editor.isCurrentSession(boundSessionToken) &&
+      (current === null || current.uri === project.uri);
+  };
+
+  const staleTaskError = () => new PreviewExportError('cancelled', '项目会话已变更，导出已取消');
 
   useEffect(() => {
     closeRef.current?.focus();
     return () => abortRef.current?.abort();
   }, []);
+
+  useEffect(() => {
+    if (status.kind === 'cancelled' || status.kind === 'error') primaryRef.current?.focus();
+  }, [status.kind]);
 
   const selectedShotIds = useMemo(
     () => (range === 'all' ? project.shots.map((shot) => shot.id) : [range]),
@@ -117,7 +134,9 @@ export function ExportWorkspace({
 
   const exportManifest = () => {
     try {
+      if (!isWorkspaceCurrent()) throw staleTaskError();
       const manifest = buildStoryboardManifest(project, selectedShotIds);
+      if (!isWorkspaceCurrent()) throw staleTaskError();
       downloadBlob(
         new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' }),
         `${safeFilename(project.name)}-storyboard.json`,
@@ -129,35 +148,50 @@ export function ExportWorkspace({
   };
 
   const exportPng = (shot: ShotClipData) => {
+    if (!isWorkspaceCurrent()) {
+      setStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
+      return;
+    }
     if (session.state.recording) {
       setStatus({ kind: 'error', message: '请先结束时间线录制再导出画面' });
       return;
     }
-    if (!shot.cameraObjectId) {
-      setStatus({ kind: 'error', message: `分镜「${shot.name}」未绑定机位` });
+    if (!isActiveSceneCamera(project, shot.cameraObjectId)) {
+      setStatus({ kind: 'error', message: `分镜「${shot.name}」未绑定活动场景中的有效机位` });
       return;
     }
     const previousTime = session.timeline.getTime();
     session.pause();
     session.seek((shot.startTime + shot.endTime) / 2, false);
     try {
+      if (!isWorkspaceCurrent()) throw staleTaskError();
       const canvas = document.createElement('canvas');
       const size = RESOLUTION_SIZE[resolution];
-      if (!exportFrameRef.current?.(shot.cameraObjectId, canvas, { ...size, aspect })) {
+      if (!exportFrameRef.current?.(shot.cameraObjectId!, canvas, { ...size, aspect })) {
         throw new Error('无法渲染指定分辨率画面');
       }
+      if (!isWorkspaceCurrent()) throw staleTaskError();
       const dataUrl = canvas.toDataURL('image/png');
+      if (!isWorkspaceCurrent()) throw staleTaskError();
       clickDownload(dataUrl, `${safeFilename(project.name)}-${safeFilename(shot.name)}.png`);
       setStatus({ kind: 'success', message: `已导出「${shot.name}」PNG` });
     } catch (error) {
-      setStatus({ kind: 'error', message: `PNG 导出失败：${resultMessage(error)}` });
+      if (error instanceof PreviewExportError && error.code === 'cancelled') {
+        setStatus({ kind: 'cancelled', message: error.message });
+      } else {
+        setStatus({ kind: 'error', message: `PNG 导出失败：${resultMessage(error)}` });
+      }
     } finally {
-      session.seek(previousTime, false);
+      if (isWorkspaceCurrent()) session.seek(previousTime, false);
     }
   };
 
   const exportWebm = async () => {
     if (!support.supported || running) return;
+    if (!isWorkspaceCurrent()) {
+      setStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
+      return;
+    }
     if (session.state.recording) {
       setStatus({ kind: 'error', message: '请先结束时间线录制再导出画面' });
       return;
@@ -187,19 +221,25 @@ export function ExportWorkspace({
       const blob = await recordPreviewWebm(
         result.plan,
         ({ canvas, shot, sourceTime, width, height }) => {
+          if (controller.signal.aborted || !isWorkspaceCurrent()) throw staleTaskError();
           session.seek(sourceTime, false);
-          return exportFrameRef.current?.(shot.cameraObjectId!, canvas, { width, height, aspect }) ?? false;
+          if (controller.signal.aborted || !isWorkspaceCurrent()) throw staleTaskError();
+          const rendered = exportFrameRef.current?.(shot.cameraObjectId!, canvas, { width, height, aspect }) ?? false;
+          if (controller.signal.aborted || !isWorkspaceCurrent()) throw staleTaskError();
+          return rendered;
         },
         {
           signal: controller.signal,
           dependencies: recordingDependencies,
           onProgress: (event) => {
+            if (!isWorkspaceCurrent()) return;
             const percentage = Math.round(event.ratio * 100);
             setProgress(percentage);
             setStatus({ kind: 'running', message: `正在导出 ${percentage}% · ${event.shotName}` });
           },
         },
       );
+      if (controller.signal.aborted || !isWorkspaceCurrent()) throw staleTaskError();
       downloadBlob(blob, `${safeFilename(project.name)}-${resolution}-${fps}fps.webm`);
       setProgress(100);
       setStatus({ kind: 'success', message: '导出完成' });
@@ -210,18 +250,25 @@ export function ExportWorkspace({
         setStatus({ kind: 'error', message: `WebM 导出失败：${resultMessage(error)}` });
       }
     } finally {
-      abortRef.current = null;
-      session.pause();
-      session.seek(previousTime, false);
+      if (abortRef.current === controller) abortRef.current = null;
+      if (isWorkspaceCurrent()) {
+        session.pause();
+        session.seek(previousTime, false);
+      }
     }
   };
 
   const runPluginExporter = async (exporter: (typeof exporters)[number]) => {
     if (running || pluginBusy) return;
+    if (!isWorkspaceCurrent()) {
+      setStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
+      return;
+    }
     setPluginBusy(exporter.id);
     setStatus({ kind: 'idle' });
     try {
       const result = await exporter.export(project);
+      if (!isWorkspaceCurrent()) throw staleTaskError();
       if (
         !result ||
         typeof result !== 'object' ||
@@ -231,17 +278,22 @@ export function ExportWorkspace({
       ) {
         throw new Error('导出器返回了无效结果');
       }
+      if (!isWorkspaceCurrent()) throw staleTaskError();
       downloadBlob(new Blob([result.data], { type: result.mime }), safeFilename(result.fileName));
       setStatus({ kind: 'success', message: `${exporter.name}导出完成` });
     } catch (error) {
-      setStatus({ kind: 'error', message: `${exporter.name}失败：${resultMessage(error)}` });
+      if (error instanceof PreviewExportError && error.code === 'cancelled') {
+        setStatus({ kind: 'cancelled', message: error.message });
+      } else {
+        setStatus({ kind: 'error', message: `${exporter.name}失败：${resultMessage(error)}` });
+      }
     } finally {
       setPluginBusy(null);
     }
   };
 
   return (
-    <section className="lumora-export" data-testid="export-workspace" aria-busy={running}>
+    <section className="lumora-export" data-testid="export-workspace">
       <header className="lumora-export__header">
         <div>
           <h2>导出</h2>
@@ -262,6 +314,11 @@ export function ExportWorkspace({
 
       <div className="lumora-export__layout">
         <div className="lumora-export__settings">
+          <div
+            className="lumora-export__operation-controls"
+            data-testid="export-operation-controls"
+            aria-busy={running}
+          >
           <h3>预览视频</h3>
           <label>
             <span>导出范围</span>
@@ -314,6 +371,7 @@ export function ExportWorkspace({
           )}
           <div className="lumora-export__actions">
             <button
+              ref={primaryRef}
               type="button"
               className="lumora-button lumora-button--active"
               disabled={
@@ -346,15 +404,6 @@ export function ExportWorkspace({
             </button>
           </div>
 
-          {status.kind !== 'idle' && (
-            <p
-              className={`lumora-export__status lumora-export__status--${status.kind}`}
-              role={status.kind === 'error' ? 'alert' : 'status'}
-            >
-              {status.message}
-            </p>
-          )}
-
           {exporters.length > 0 && (
             <div className="lumora-export__plugins">
               <h3>插件导出器</h3>
@@ -370,6 +419,16 @@ export function ExportWorkspace({
                 </button>
               ))}
             </div>
+          )}
+          </div>
+
+          {status.kind !== 'idle' && (
+            <p
+              className={`lumora-export__status lumora-export__status--${status.kind}`}
+              role={status.kind === 'error' ? 'alert' : 'status'}
+            >
+              {status.message}
+            </p>
           )}
         </div>
 
