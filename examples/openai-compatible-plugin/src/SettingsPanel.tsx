@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { AiProviderErrorCode, EventMap, TypedEventEmitter } from '@lumora/core';
 import {
   normalizeChatCompletionsEndpoint,
@@ -46,12 +46,15 @@ export function OpenAiSettingsPanel({ pluginId, events, configStore, lifecycleSi
   const [apiKey, setApiKey] = useState(initial.apiKey);
   const [testing, setTesting] = useState(false);
   const [feedback, setFeedback] = useState<Feedback>(null);
+  const lastSnapshot = useRef(initial);
 
   useEffect(() => configStore.subscribe(() => {
     const snapshot = configStore.getSnapshot();
-    setEndpoint(snapshot.endpoint);
-    setModel(snapshot.model);
+    const previous = lastSnapshot.current;
+    if (snapshot.endpoint !== previous.endpoint) setEndpoint(snapshot.endpoint);
+    if (snapshot.model !== previous.model) setModel(snapshot.model);
     setApiKey(snapshot.apiKey);
+    lastSnapshot.current = snapshot;
   }), [configStore]);
 
   const validatedForm = () => ({

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent as 
 import {
   STORYBOARD_CAMERA_MOVEMENTS,
   STORYBOARD_SHOT_SIZES,
+  AiProviderRequestError,
   createShotClip,
   type AiProviderErrorData,
   type Project,
@@ -22,6 +23,21 @@ interface StoryboardWorkspaceProps {
 }
 
 type WorkspaceTab = 'draft' | 'adopted';
+
+function trustedSubmissionError(error: unknown): AiProviderErrorData | undefined {
+  try {
+    if (!(error instanceof AiProviderRequestError)) return undefined;
+    return {
+      code: error.code,
+      message: error.message,
+      retryable: error.retryable,
+      costKnown: error.costKnown,
+      ...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
+    };
+  } catch {
+    return undefined;
+  }
+}
 
 const SHOT_SIZE_LABELS: Record<StoryboardShotSize, string> = {
   'extreme-wide': '大远景',
@@ -373,11 +389,11 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
       } else if (completed.error) {
         setError(completed.error);
       }
-    } catch {
+    } catch (submissionError) {
       if (requestGenerationRef.current !== generation) return;
       taskIdRef.current = null;
       setTaskId(null);
-      setError({
+      setError(trustedSubmissionError(submissionError) ?? {
         code: 'invalid_request',
         message: 'Unable to submit the generation task.',
         retryable: false,

@@ -64,6 +64,42 @@ describe('OpenAI-compatible settings panel', () => {
     expect(emit).toHaveBeenCalledWith('contribution:changed', { pluginId: 'com.lumora.openai.compatible' });
   });
 
+  it.each(['pointer', 'keyboard'] as const)('clears only the key through %s activation while preserving dirty drafts', (activation) => {
+    configStore.save({
+      endpoint: 'https://saved.example/v1',
+      model: 'saved-model',
+      apiKey: 'sk-runtime-draft-marker',
+    });
+    renderPanel();
+    const endpoint = screen.getByTestId('openai-endpoint');
+    const model = screen.getByTestId('openai-model');
+    const clear = screen.getByRole('button', { name: /Key$/ });
+    fireEvent.change(endpoint, { target: { value: 'https://dirty.example/v1' } });
+    fireEvent.change(model, { target: { value: 'dirty-model' } });
+
+    if (activation === 'keyboard') {
+      clear.focus();
+      fireEvent.keyDown(clear, { key: 'Enter', code: 'Enter' });
+      fireEvent.click(clear, { detail: 0 });
+      fireEvent.keyUp(clear, { key: 'Enter', code: 'Enter' });
+    } else {
+      fireEvent.click(clear);
+    }
+
+    expect(endpoint).toHaveValue('https://dirty.example/v1');
+    expect(model).toHaveValue('dirty-model');
+    expect(screen.getByTestId('openai-api-key')).toHaveValue('');
+    expect(configStore.getSnapshot()).toEqual({
+      endpoint: 'https://saved.example/v1/chat/completions',
+      model: 'saved-model',
+      apiKey: '',
+    });
+    const persisted = localStorage.getItem(`settings-panel:${OPENAI_COMPATIBLE_STORAGE_KEY}`);
+    expect(persisted).not.toContain('sk-runtime-draft-marker');
+    expect(persisted).not.toContain('dirty.example');
+    expect(persisted).not.toContain('dirty-model');
+  });
+
   it('shows immediate sanitized connection feedback', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       choices: [{ message: { content: 'OK' } }],

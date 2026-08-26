@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AI_STORYBOARD_GENERATE_CAPABILITY,
+  AiProviderRequestError,
   createBlankProject,
   type Manifest,
   type PluginDescriptor,
@@ -392,6 +393,26 @@ describe('StoryboardWorkspace', () => {
     expect(alert).toHaveTextContent('invalid_request: Unable to submit the generation task.');
     expect(alert).not.toHaveTextContent('PRIVATE_STUDIO_SUBMISSION_RESPONSE');
     expect(alert).not.toHaveTextContent('PRIVATE_STUDIO_SUBMISSION_CAUSE');
+  });
+
+  it('preserves a trusted host submission error code and message', async () => {
+    const ref = await mountWorkspace();
+    vi.spyOn(ref.current!.runtime.host.services.ai, 'submitStoryboard').mockImplementationOnce(() => {
+      throw new AiProviderRequestError({
+        code: 'provider_unavailable',
+        message: 'PRIVATE_PROVIDER_CATALOG_DETAIL',
+        retryable: false,
+        costKnown: false,
+      });
+    });
+    fireEvent.change(screen.getByTestId('storyboard-concept'), {
+      target: { value: 'A complete concept long enough to verify trusted host errors.' },
+    });
+    fireEvent.click(screen.getByTestId('storyboard-generate'));
+
+    const alert = await screen.findByTestId('storyboard-error');
+    expect(alert).toHaveTextContent('provider_unavailable: The AI provider is unavailable.');
+    expect(alert).not.toHaveTextContent('PRIVATE_PROVIDER_CATALOG_DETAIL');
   });
 
   it('marks a successful draft stale after the brief changes and disables adoption', async () => {

@@ -176,6 +176,169 @@ describe('PluginHost', () => {
     await host.dispose();
   });
 
+  it('projects Generic Chat messages before crossing the provider boundary', async () => {
+    const received: unknown[] = [];
+    const host = new PluginHost();
+    await host.register(descriptor(
+      { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+      async () => ({
+        default: {
+          activate: (context) => context.contribute({
+            aiProviders: [{
+              kind: 'aiProvider',
+              id: 'com.example.projected.chat',
+              name: 'Projected Chat',
+              models: ['model-a'],
+              chat: async function* (request) {
+                received.push(request.messages);
+                yield 'ok';
+              },
+            }],
+          }),
+        },
+      }),
+    ));
+    const message: Record<string, unknown> = {
+      role: 'user',
+      content: 'hello',
+      secret: 'PRIVATE_CHAT_FIELD',
+      counter: 1n,
+    };
+    message.circular = message;
+
+    for await (const _chunk of host.services.ai.chat('com.example.projected.chat', {
+      model: 'model-a',
+      messages: [message] as never,
+    })) {
+      // Consume the stream so boundary validation and dispatch execute.
+    }
+
+    expect(received).toEqual([[{ role: 'user', content: 'hello' }]]);
+    await host.dispose();
+  });
+
+  it.each([
+    ['unsupported role', () => [{ role: 'tool', content: 'hello' }]],
+    ['non-string content', () => [{ role: 'user', content: 7 }]],
+    ['non-array messages', () => ({ role: 'user', content: 'hello' })],
+    ['throwing iterator', () => new Proxy([{ role: 'user', content: 'hello' }], {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) throw new Error('PRIVATE_CHAT_ITERATOR');
+        return Reflect.get(target, property, receiver);
+      },
+    })],
+    ['over-yielding iterator', () => Object.assign([{ role: 'user', content: 'hello' }], {
+      *[Symbol.iterator]() {
+        yield { role: 'user', content: 'hello' };
+        yield { role: 'assistant', content: 'unexpected' };
+      },
+    })],
+    ['under-yielding iterator', () => Object.assign([
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'world' },
+    ], {
+      *[Symbol.iterator]() {
+        yield { role: 'user', content: 'hello' };
+      },
+    })],
+  ] as const)('rejects Generic Chat messages with %s before provider dispatch', async (_name, messages) => {
+    let dispatches = 0;
+    const host = new PluginHost();
+    await host.register(descriptor(
+      { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+      async () => ({
+        default: {
+          activate: (context) => context.contribute({
+            aiProviders: [{
+              kind: 'aiProvider',
+              id: 'com.example.invalid-message.chat',
+              name: 'Invalid Message Chat',
+              models: ['model-a'],
+              chat: async function* () {
+                dispatches += 1;
+                yield 'unexpected';
+              },
+            }],
+          }),
+        },
+      }),
+    ));
+    const consume = async () => {
+      for await (const _chunk of host.services.ai.chat('com.example.invalid-message.chat', {
+        model: 'model-a',
+        messages: messages() as never,
+      })) {
+        // Consume the stream so boundary validation executes.
+      }
+    };
+
+    await expect(consume()).rejects.toMatchObject({
+      code: 'invalid_request',
+      message: 'The AI request is invalid.',
+      retryable: false,
+    });
+    await expect(consume()).rejects.not.toThrow(/PRIVATE_CHAT_ITERATOR/);
+    expect(dispatches).toBe(0);
+    await host.dispose();
+  });
+
+  it.each([
+    ['resolver throw', () => { throw new Error('PRIVATE_CHAT_RESOLVER'); }],
+    ['empty catalog', () => []],
+    ['oversized catalog', () => Array.from({ length: 101 }, (_, index) => `model-${index}`)],
+    ['invalid entry', () => ['model-a', 7]],
+    ['duplicate entry', () => ['model-a', 'model-a']],
+    ['throwing iterator', () => new Proxy(['model-a'], {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) throw new Error('PRIVATE_CHAT_CATALOG_ITERATOR');
+        return Reflect.get(target, property, receiver);
+      },
+    })],
+  ] as const)('maps a dynamic Chat %s to a sanitized provider_unavailable error', async (_name, catalog) => {
+    let dispatches = 0;
+    const host = new PluginHost();
+    await host.register(descriptor(
+      { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+      async () => ({
+        default: {
+          activate: (context) => context.contribute({
+            aiProviders: [{
+              kind: 'aiProvider',
+              id: 'com.example.invalid-catalog.chat',
+              name: 'Invalid Catalog Chat',
+              models: () => catalog() as never,
+              chat: async function* () {
+                dispatches += 1;
+                yield 'unexpected';
+              },
+            }],
+          }),
+        },
+      }),
+    ));
+    let rejection: unknown;
+
+    try {
+      for await (const _chunk of host.services.ai.chat('com.example.invalid-catalog.chat', {
+        model: 'model-a',
+        messages: [],
+      })) {
+        // Consume the stream so catalog resolution executes.
+      }
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(rejection).toMatchObject({
+      code: 'provider_unavailable',
+      message: 'The AI provider is unavailable.',
+      retryable: false,
+    });
+    expect(String(rejection)).not.toMatch(/PRIVATE_CHAT_/);
+    expect(dispatches).toBe(0);
+    await host.dispose();
+  });
+
   it('rejects malformed storyboard capability metadata atomically', async () => {
     const host = new PluginHost({ hostVersion: '0.1.0' });
     const sensitiveCapability = 'sk-live-1234567890abcdef';

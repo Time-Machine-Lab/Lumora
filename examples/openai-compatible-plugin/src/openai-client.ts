@@ -23,6 +23,7 @@ interface RequestOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_CHAT_MESSAGES = 100;
 
 function providerError(
   code: AiProviderErrorCode,
@@ -84,6 +85,28 @@ function normalizedConfig(config: OpenAiRuntimeConfig): OpenAiRuntimeConfig {
   }
 }
 
+function projectChatMessages(messages: unknown): ReadonlyArray<AiChatMessage> {
+  try {
+    if (!Array.isArray(messages)) throw new Error();
+    const expectedLength = messages.length;
+    if (!Number.isSafeInteger(expectedLength) || expectedLength > MAX_CHAT_MESSAGES) throw new Error();
+    const projected: AiChatMessage[] = [];
+    for (const message of messages) {
+      if (projected.length >= expectedLength) throw new Error();
+      if (typeof message !== 'object' || message === null) throw new Error();
+      const role = (message as { role?: unknown }).role;
+      const content = (message as { content?: unknown }).content;
+      if (role !== 'user' && role !== 'assistant' && role !== 'system') throw new Error();
+      if (typeof content !== 'string') throw new Error();
+      projected.push({ role, content });
+    }
+    if (projected.length !== expectedLength) throw new Error();
+    return projected;
+  } catch {
+    throw providerError('invalid_request');
+  }
+}
+
 function readResponseJson(response: Response, signal: AbortSignal): Promise<unknown> {
   if (signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
   return new Promise<unknown>((resolve, reject) => {
@@ -101,6 +124,7 @@ export async function requestOpenAiChat(
   options: RequestOptions = {},
 ): Promise<string> {
   const config = normalizedConfig(configInput);
+  const projectedMessages = projectChatMessages(messages);
   const fetchImpl = options.fetchImpl ?? fetch;
   const controller = new AbortController();
   const externalSignals = [options.signal, options.lifecycleSignal].filter((signal): signal is AbortSignal => !!signal);
@@ -132,7 +156,7 @@ export async function requestOpenAiChat(
       headers,
       body: JSON.stringify({
         model: config.model,
-        messages,
+        messages: projectedMessages,
         temperature: 0.2,
         ...(options.maxTokens === undefined ? {} : { max_tokens: options.maxTokens }),
       }),
@@ -144,10 +168,11 @@ export async function requestOpenAiChat(
     let envelope: unknown;
     try {
       envelope = await readResponseJson(response, controller.signal);
-    } catch {
+    } catch (error) {
       if (externallyAborted) throw providerError('cancelled');
       if (timedOut) throw providerError('timeout', true);
-      throw providerError('schema_invalid');
+      if (error instanceof SyntaxError) throw providerError('schema_invalid');
+      throw providerError('network_error', true);
     }
     if (externallyAborted) throw providerError('cancelled');
     if (timedOut) throw providerError('timeout', true);

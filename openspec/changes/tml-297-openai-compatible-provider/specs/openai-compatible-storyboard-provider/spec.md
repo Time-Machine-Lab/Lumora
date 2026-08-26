@@ -11,6 +11,14 @@ The OpenAI-compatible provider SHALL expose a discoverable settings panel where 
 - **WHEN** model A was active, the user saves model B, and a generic Chat request is submitted
 - **THEN** model B is accepted and sent unchanged, while stale model A is rejected before any network request
 
+#### Scenario: Generic Chat projects untrusted messages
+- **WHEN** a runtime Chat message contains valid `role` and `content` values plus extra, cyclic, or non-JSON fields
+- **THEN** the provider receives and serializes only a fresh `{ role, content }` object, while invalid roles, content, arrays, or iterators fail before provider dispatch as sanitized `invalid_request`
+
+#### Scenario: A dynamic model catalog is unavailable
+- **WHEN** either a Chat or Storyboard catalog resolver throws or returns an empty, oversized, malformed, duplicate, or non-iterable catalog
+- **THEN** submission fails as sanitized `provider_unavailable`, no provider request runs, and Studio preserves that trusted host code and message
+
 #### Scenario: User enters an unsafe endpoint
 - **WHEN** the endpoint is invalid, uses remote HTTP, contains credentials, query parameters, or a fragment
 - **THEN** save and connection test are rejected before a network request with actionable configuration feedback
@@ -37,6 +45,10 @@ The provider SHALL allow an empty API key. A non-empty key SHALL be held only in
 #### Scenario: Two host instances save different settings
 - **WHEN** two Host or Studio instances on the same origin save different endpoint/model/key values and one plugin is disabled and enabled
 - **THEN** each instance restores only its own endpoint/model, neither key is persisted, and one instance's lifecycle does not cancel the other
+
+#### Scenario: User clears a key with unsaved setting drafts
+- **WHEN** a runtime key exists, the user edits endpoint or model without saving, and activates Clear Key by pointer or keyboard
+- **THEN** only the runtime key is cleared, both unsaved input drafts remain unchanged, and persistence and exports still contain no key
 
 ### Requirement: Browser direct connection feedback
 The settings panel SHALL state that the endpoint must permit the current browser origin through CORS and SHALL provide an immediate connection test. The test SHALL distinguish invalid configuration, authentication failure, unsupported endpoint/model, browser network/CORS failure, timeout, rate limit, provider unavailability, and invalid Chat Completions response structure without exposing response bodies.
@@ -78,6 +90,14 @@ The provider SHALL make exactly one HTTP attempt per user submission and SHALL m
 #### Scenario: Provider returns a private failure body
 - **WHEN** any non-success response body contains private provider or credential data
 - **THEN** the client does not consume the body and no task, event, log, or UI text contains that data
+
+#### Scenario: Success body contains invalid JSON syntax
+- **WHEN** headers report success but `response.json()` rejects with a JSON `SyntaxError`
+- **THEN** the request fails once as non-retryable `schema_invalid` without exposing the body
+
+#### Scenario: Success body transport fails
+- **WHEN** headers report success but the body stream, connection, or decoder fails for a non-syntax reason
+- **THEN** the request fails once as retryable `network_error` without exposing native transport details
 
 #### Scenario: User cancels generation
 - **WHEN** the host abort signal fires before response completion

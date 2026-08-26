@@ -188,10 +188,12 @@ describe('OpenAI-compatible plugin lifecycle', () => {
 
   it('keeps a cancelled task and project unchanged when an abort-ignoring body succeeds late', async () => {
     let resolveBody!: (value: unknown) => void;
+    let markBodyReadSettled!: () => void;
+    const bodyReadSettled = new Promise<void>((resolve) => { markBodyReadSettled = resolve; });
     const response = completion(JSON.stringify(VALID_DRAFT));
     vi.spyOn(response, 'json').mockImplementation(() => new Promise((resolve) => {
       resolveBody = resolve;
-    }));
+    }).finally(markBodyReadSettled));
     vi.stubGlobal('fetch', vi.fn(async () => response));
     const fixture = pluginFixture();
     const host = new PluginHost({ hostVersion: '0.1.0', pluginSettingsStorage: fixture.pluginSettingsStorage });
@@ -210,9 +212,14 @@ describe('OpenAI-compatible plugin lifecycle', () => {
       error: { code: 'cancelled' },
     });
     resolveBody({ choices: [{ message: { content: JSON.stringify(VALID_DRAFT) } }] });
-    await Promise.resolve();
+    await bodyReadSettled;
 
-    expect(host.services.ai.getGenerationTask(submitted.id)).toMatchObject({ status: 'cancelled' });
+    const completed = host.services.ai.getGenerationTask(submitted.id);
+    expect(completed).toMatchObject({
+      status: 'cancelled',
+      error: { code: 'cancelled' },
+    });
+    expect(completed).not.toHaveProperty('draft');
     expect(host.getProject()).toEqual(project);
     await host.dispose();
   });

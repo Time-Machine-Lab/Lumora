@@ -300,6 +300,49 @@ describe('AI storyboard capability', () => {
     expect(generate).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ['resolver throw', () => { throw new Error('PRIVATE_STORYBOARD_RESOLVER'); }],
+    ['empty catalog', () => []],
+    ['oversized catalog', () => Array.from({ length: 101 }, (_, index) => ({
+      id: `model-${index}`,
+      name: `Model ${index}`,
+      cost: { kind: 'unknown', note: 'No estimate' },
+    }))],
+    ['invalid entry', () => [{ id: '', name: 'Invalid', cost: { kind: 'unknown', note: 'No estimate' } }]],
+    ['duplicate entry', () => [
+      { id: 'model-a', name: 'Model A', cost: { kind: 'unknown', note: 'No estimate' } },
+      { id: 'model-a', name: 'Model A duplicate', cost: { kind: 'unknown', note: 'No estimate' } },
+    ]],
+    ['throwing iterator', () => new Proxy([{
+      id: 'model-a',
+      name: 'Model A',
+      cost: { kind: 'unknown', note: 'No estimate' },
+    }], {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) throw new Error('PRIVATE_STORYBOARD_CATALOG_ITERATOR');
+        return Reflect.get(target, property, receiver);
+      },
+    })],
+  ] as const)('maps a dynamic Storyboard %s to a sanitized provider_unavailable error', (_name, catalog) => {
+    const generate = vi.fn(async () => VALID_PAYLOAD);
+    const ai = servicesWithDynamicModel(() => catalog() as never, generate);
+    let rejection: unknown;
+
+    try {
+      ai.submitStoryboard('com.example.dynamic-storyboard', { model: 'model-a', brief: BRIEF });
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(rejection).toMatchObject({
+      code: 'provider_unavailable',
+      message: 'The AI provider is unavailable.',
+      retryable: false,
+    });
+    expect(String(rejection)).not.toMatch(/PRIVATE_STORYBOARD_/);
+    expect(generate).not.toHaveBeenCalled();
+  });
+
   it('excludes providers with malformed storyboard metadata from discovery', () => {
     const ai = servicesWithMalformedMetadata();
 

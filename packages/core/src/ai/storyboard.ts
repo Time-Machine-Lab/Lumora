@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { resolveProviderModelCatalog } from './model-catalog';
 
 export const AI_STORYBOARD_GENERATE_CAPABILITY = 'ai.storyboard.generate' as const;
 export const AI_REFERENCE_IMAGE_GENERATE_CAPABILITY = 'ai.image.reference.generate' as const;
@@ -275,8 +276,11 @@ export function parseAiStoryboardCapability(value: unknown): AiStoryboardCapabil
 }
 
 export function resolveStoryboardModels(capability: AiStoryboardCapability): ReadonlyArray<StoryboardModelDescriptor> {
-  const models = typeof capability.models === 'function' ? capability.models() : capability.models;
-  return storyboardModelListSchema.parse(models);
+  return resolveProviderModelCatalog(
+    capability.models,
+    (model) => storyboardModelDescriptorSchema.parse(model),
+    (model) => model.id,
+  );
 }
 
 const GENERIC_PROVIDER_ERROR_MESSAGE = 'The AI provider request failed.';

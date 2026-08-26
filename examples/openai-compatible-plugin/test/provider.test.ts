@@ -82,6 +82,60 @@ describe('OpenAI-compatible Chat Completions client', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
+  it('projects messages to exact role and content fields before serialization', async () => {
+    const fetchImpl = vi.fn<OpenAiFetch>(async () => completion('Connection OK'));
+    const message: Record<string, unknown> = {
+      role: 'user',
+      content: 'ping',
+      secret: 'PRIVATE_MESSAGE_FIELD',
+      counter: 1n,
+    };
+    message.circular = message;
+
+    await expect(requestOpenAiChat(CONFIG, [message] as never, { fetchImpl })).resolves.toBe('Connection OK');
+
+    const body = JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body));
+    expect(body.messages).toEqual([{ role: 'user', content: 'ping' }]);
+    expect(String(fetchImpl.mock.calls[0]?.[1]?.body)).not.toContain('PRIVATE_MESSAGE_FIELD');
+  });
+
+  it.each([
+    ['unsupported role', () => [{ role: 'tool', content: 'ping' }]],
+    ['non-string content', () => [{ role: 'user', content: 7 }]],
+    ['non-array messages', () => ({ role: 'user', content: 'ping' })],
+    ['throwing iterator', () => new Proxy([{ role: 'user', content: 'ping' }], {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) throw new Error('PRIVATE_MESSAGE_ITERATOR');
+        return Reflect.get(target, property, receiver);
+      },
+    })],
+    ['over-yielding iterator', () => Object.assign([{ role: 'user', content: 'ping' }], {
+      *[Symbol.iterator]() {
+        yield { role: 'user', content: 'ping' };
+        yield { role: 'assistant', content: 'unexpected' };
+      },
+    })],
+    ['under-yielding iterator', () => Object.assign([
+      { role: 'user', content: 'ping' },
+      { role: 'assistant', content: 'pong' },
+    ], {
+      *[Symbol.iterator]() {
+        yield { role: 'user', content: 'ping' };
+      },
+    })],
+  ] as const)('rejects %s as invalid_request before fetch', async (_name, messages) => {
+    const fetchImpl = vi.fn<OpenAiFetch>(async () => completion('should not run'));
+    const outcome = requestOpenAiChat(CONFIG, messages() as never, { fetchImpl });
+
+    await expect(outcome).rejects.toMatchObject({
+      code: 'invalid_request',
+      message: 'The AI request is invalid.',
+      retryable: false,
+    });
+    await expect(outcome).rejects.not.toThrow(/PRIVATE_MESSAGE_ITERATOR/);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it.each([
     [401, 'authentication_failed'],
     [403, 'authentication_failed'],
@@ -117,10 +171,27 @@ describe('OpenAI-compatible Chat Completions client', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
-  it('maps malformed success envelopes and content to schema_invalid', async () => {
+  it('maps invalid response JSON syntax to non-retryable schema_invalid', async () => {
     await expect(requestOpenAiChat(CONFIG, [{ role: 'user', content: 'ping' }], {
       fetchImpl: vi.fn(async () => new Response('{not-json', { status: 200 })),
-    })).rejects.toMatchObject({ code: 'schema_invalid' });
+    })).rejects.toMatchObject({ code: 'schema_invalid', retryable: false });
+  });
+
+  it('maps response body transport failures to retryable network_error without leaking details', async () => {
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        controller.error(new Error('PRIVATE_BODY_STREAM_FAILURE'));
+      },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    const outcome = requestOpenAiChat(CONFIG, [{ role: 'user', content: 'ping' }], {
+      fetchImpl: vi.fn(async () => response),
+    });
+
+    await expect(outcome).rejects.toMatchObject({ code: 'network_error', retryable: true });
+    await expect(outcome).rejects.not.toThrow(/PRIVATE_BODY_STREAM_FAILURE/);
+  });
+
+  it('maps malformed success envelopes and content to schema_invalid', async () => {
 
     await expect(requestOpenAiChat(CONFIG, [{ role: 'user', content: 'ping' }], {
       fetchImpl: vi.fn(async () => new Response(JSON.stringify({ choices: [] }), { status: 200 })),
@@ -160,20 +231,15 @@ describe('OpenAI-compatible Chat Completions client', () => {
   ] as const)('preserves %s while the response body is still being read', async (_label, trigger, code) => {
     const caller = new AbortController();
     const lifecycle = new AbortController();
-    let rejectBody!: (reason: unknown) => void;
     let resolveBody!: (value: unknown) => void;
+    let markBodyReadSettled!: () => void;
+    const bodyReadSettled = new Promise<void>((resolve) => { markBodyReadSettled = resolve; });
     const response = completion(JSON.stringify(VALID_DRAFT));
-    const body = new Promise<unknown>((resolve, reject) => {
+    const body = new Promise<unknown>((resolve) => {
       resolveBody = resolve;
-      rejectBody = reject;
-    });
+    }).finally(markBodyReadSettled);
     vi.spyOn(response, 'json').mockImplementation(() => body);
-    const fetchImpl = vi.fn<OpenAiFetch>(async (_url, init) => {
-      init?.signal?.addEventListener('abort', () => {
-        rejectBody(new DOMException('Body stream aborted', 'AbortError'));
-      }, { once: true });
-      return response;
-    });
+    const fetchImpl = vi.fn<OpenAiFetch>(async () => response);
     const outcome = requestOpenAiChat(CONFIG, [{ role: 'user', content: 'ping' }], {
       fetchImpl,
       signal: caller.signal,
@@ -188,16 +254,18 @@ describe('OpenAI-compatible Chat Completions client', () => {
 
     await rejection;
     resolveBody({ choices: [{ message: { content: JSON.stringify(VALID_DRAFT) } }] });
-    await Promise.resolve();
+    await bodyReadSettled;
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it('settles a body-stage deadline before an abort-ignoring late success arrives', async () => {
     let resolveBody!: (value: unknown) => void;
+    let markBodyReadSettled!: () => void;
+    const bodyReadSettled = new Promise<void>((resolve) => { markBodyReadSettled = resolve; });
     const response = completion(JSON.stringify(VALID_DRAFT));
     vi.spyOn(response, 'json').mockImplementation(() => new Promise((resolve) => {
       resolveBody = resolve;
-    }));
+    }).finally(markBodyReadSettled));
 
     const outcome = requestOpenAiChat(CONFIG, [{ role: 'user', content: 'ping' }], {
       fetchImpl: vi.fn(async () => response),
@@ -206,7 +274,7 @@ describe('OpenAI-compatible Chat Completions client', () => {
 
     await expect(outcome).rejects.toMatchObject({ code: 'timeout' });
     resolveBody({ choices: [{ message: { content: JSON.stringify(VALID_DRAFT) } }] });
-    await Promise.resolve();
+    await bodyReadSettled;
     expect(response.json).toHaveBeenCalledTimes(1);
   });
 

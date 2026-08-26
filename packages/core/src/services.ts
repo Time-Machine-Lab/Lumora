@@ -1,5 +1,6 @@
 import { ZodError } from 'zod';
 import type { Asset, AiChatModelCatalog, AiChatRequest, ExportResult } from './contributions/types';
+import { resolveProviderModelCatalog } from './ai/model-catalog';
 import type { Project } from './scene/types';
 import { deepFreeze } from './scene/immutable';
 import {
@@ -50,16 +51,52 @@ interface RegisteredAiProvider {
 }
 
 function resolveChatModels(catalog: AiChatModelCatalog): ReadonlyArray<string> {
-  const models = typeof catalog === 'function' ? catalog() : catalog;
-  if (!Array.isArray(models) || models.length > 100) throw new Error('AI Chat 模型目录不可用');
-  const resolved = models.map((model) => {
-    if (typeof model !== 'string' || !model.trim() || model.length > 160) {
-      throw new Error('AI Chat 模型目录不可用');
+  try {
+    return resolveProviderModelCatalog(
+      catalog,
+      (model) => {
+        if (typeof model !== 'string' || !model.trim() || model.length > 160) throw new Error();
+        return model;
+      },
+      (model) => model,
+    );
+  } catch {
+    throw new AiProviderRequestError({
+      code: 'provider_unavailable',
+      message: 'The AI provider is unavailable.',
+      retryable: false,
+      costKnown: false,
+    });
+  }
+}
+
+const MAX_CHAT_MESSAGES = 100;
+
+function projectChatMessages(request: AiChatRequest): AiChatRequest['messages'] {
+  try {
+    if (!Array.isArray(request.messages)) throw new Error();
+    const expectedLength = request.messages.length;
+    if (!Number.isSafeInteger(expectedLength) || expectedLength > MAX_CHAT_MESSAGES) throw new Error();
+    const messages: AiChatRequest['messages'] = [];
+    for (const message of request.messages) {
+      if (messages.length >= expectedLength) throw new Error();
+      if (typeof message !== 'object' || message === null) throw new Error();
+      const role = (message as { role?: unknown }).role;
+      const content = (message as { content?: unknown }).content;
+      if (role !== 'user' && role !== 'assistant' && role !== 'system') throw new Error();
+      if (typeof content !== 'string') throw new Error();
+      messages.push({ role, content });
     }
-    return model;
-  });
-  if (new Set(resolved).size !== resolved.length) throw new Error('AI Chat 模型目录不可用');
-  return resolved;
+    if (messages.length !== expectedLength) throw new Error();
+    return messages;
+  } catch {
+    throw new AiProviderRequestError({
+      code: 'invalid_request',
+      message: 'The AI request is invalid.',
+      retryable: false,
+      costKnown: false,
+    });
+  }
 }
 
 interface ServiceRegistry {
@@ -410,7 +447,8 @@ export function createPluginServices(
         if (!models.includes(requestedModel)) {
           throw new Error(`模型 "${requestedModel}" 不受支持，可用: ${models.join(', ')}`);
         }
-        yield* provider.chat({ ...request, model: requestedModel });
+        const messages = projectChatMessages(request);
+        yield* provider.chat({ ...request, model: requestedModel, messages });
       },
       listStoryboardProviders: () => storyboardTasks.listProviders(),
       submitStoryboard: (providerId, request) => storyboardTasks.submit(providerId, request),

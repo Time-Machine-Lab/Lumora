@@ -259,6 +259,34 @@ test('configures an OpenAI-compatible endpoint and keeps its runtime key out of 
   await expect(page.getByTestId('openai-api-key')).toHaveValue('');
 });
 
+test('clears the runtime key from the keyboard without replacing unsaved endpoint or model drafts', async ({ page }) => {
+  const apiKey = 'sk-e2e-clear-key-marker';
+  await page.getByTestId('panel-tab-com.lumora.openai.compatible.settings').click();
+  await page.getByTestId('openai-endpoint').fill('https://saved.example/v1');
+  await page.getByTestId('openai-model').fill('saved-model');
+  await page.getByTestId('openai-api-key').fill(apiKey);
+  await page.getByRole('button', { name: '保存设置' }).click();
+  await expect(page.getByRole('status')).toContainText('已保存');
+
+  await page.getByTestId('openai-endpoint').fill('https://dirty.example/v1');
+  await page.getByTestId('openai-model').fill('dirty-model');
+  await page.getByRole('button', { name: /Key$/ }).focus();
+  await page.keyboard.press('Enter');
+
+  await expect(page.getByTestId('openai-endpoint')).toHaveValue('https://dirty.example/v1');
+  await expect(page.getByTestId('openai-model')).toHaveValue('dirty-model');
+  await expect(page.getByTestId('openai-api-key')).toHaveValue('');
+  const persistedText = await page.evaluate(() => JSON.stringify(localStorage));
+  expect(persistedText).toContain('saved-model');
+  expect(persistedText).not.toContain('dirty-model');
+  expect(persistedText).not.toContain(apiKey);
+
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByTestId('toolbar-com.lumora.mock.toolbar.export').click();
+  const exportedText = await readDownload(await downloadPromise);
+  expect(exportedText).not.toContain(apiKey);
+});
+
 test('uses a changed endpoint and model on the next empty-key generation', async ({ page }) => {
   const firstOrigin = 'http://127.0.0.1:48767';
   const secondOrigin = 'http://127.0.0.1:48768';
