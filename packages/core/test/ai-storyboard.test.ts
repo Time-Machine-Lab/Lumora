@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import * as core from '../src/index';
-import { createPluginServices } from '../src/services';
-import type { AiService, GenerationTask, StoryboardProviderInfo } from '../src/index';
+import { createPluginServices, waitForStoryboardTaskExecution } from '../src/services';
+import type { AiService, GenerationTask, PluginServices, StoryboardProviderInfo } from '../src/index';
 
 function assertReadonlyAiContracts(
   task: GenerationTask,
@@ -86,6 +86,13 @@ function servicesWith(
   generate: (request: { signal: AbortSignal }) => Promise<unknown>,
   costKind: 'known' | 'unknown' = 'unknown',
 ): AiService {
+  return pluginServicesWith(generate, costKind).ai;
+}
+
+function pluginServicesWith(
+  generate: (request: { signal: AbortSignal }) => Promise<unknown>,
+  costKind: 'known' | 'unknown' = 'unknown',
+): PluginServices {
   const registry = {
     getAssetLoaders: () => [],
     getExporters: () => [],
@@ -112,7 +119,7 @@ function servicesWith(
       },
     ],
   };
-  return createPluginServices(registry, () => null).ai;
+  return createPluginServices(registry, () => null);
 }
 
 function servicesWithMalformedMetadata() {
@@ -622,6 +629,39 @@ describe('AI storyboard capability', () => {
 
     expect(outcome).not.toBe('still-running');
     expect(outcome).toMatchObject({ status: 'cancelled', error: { code: 'cancelled' } });
+  });
+
+  it('exposes an internal completion point for an abort-ignoring provider execution', async () => {
+    let releaseProvider!: (value: unknown) => void;
+    const services = pluginServicesWith(async () => new Promise<unknown>((resolve) => {
+      releaseProvider = resolve;
+    }));
+    const submitted = services.ai.submitStoryboard('com.example.storyboard', {
+      model: 'storyboard-1',
+      brief: BRIEF,
+    });
+    const applicationSettled = waitForStoryboardTaskExecution(services, submitted.id);
+    let observedApplicationSettlement = false;
+    void applicationSettled.then(() => {
+      observedApplicationSettlement = true;
+    });
+
+    expect(services.ai.cancelGenerationTask(submitted.id)).toBe(true);
+    await expect(services.ai.waitForGenerationTask(submitted.id)).resolves.toMatchObject({
+      status: 'cancelled',
+      error: { code: 'cancelled' },
+    });
+    expect(observedApplicationSettlement).toBe(false);
+
+    releaseProvider(VALID_PAYLOAD);
+    await applicationSettled;
+
+    expect(observedApplicationSettlement).toBe(true);
+    expect(services.ai.getGenerationTask(submitted.id)).toMatchObject({
+      status: 'cancelled',
+      error: { code: 'cancelled' },
+    });
+    expect(services.ai.getGenerationTask(submitted.id)).not.toHaveProperty('draft');
   });
 
   it('bounds completed task history while keeping recent terminal tasks waitable', async () => {

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createSampleProject,
   PluginHost,
@@ -6,10 +6,12 @@ import {
   type Manifest,
   type PluginSettingsStorage,
 } from '@lumora/core';
+import { waitForStoryboardTaskExecution } from '../../../packages/core/src/services';
 import manifest from '../lumora.plugin.json';
 import { createOpenAiCompatiblePlugin, OPENAI_COMPATIBLE_PROVIDER_ID } from '../src/index';
 import { ProviderConfigStore } from '../src/config';
 import type { OpenAiFetch } from '../src/openai-client';
+import { createControlledBodyStageResponse } from './body-stage-response';
 
 const BRIEF: CreativeBrief = {
   concept: 'A courier crosses a rain-soaked neon market to deliver a mysterious case.',
@@ -68,6 +70,10 @@ describe('OpenAI-compatible plugin lifecycle', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.unstubAllGlobals();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('uses the newly configured custom model for the next host task and draft lineage', async () => {
@@ -186,43 +192,55 @@ describe('OpenAI-compatible plugin lifecycle', () => {
     await host.dispose();
   });
 
-  it('keeps a cancelled task and project unchanged when an abort-ignoring body succeeds late', async () => {
-    let resolveBody!: (value: unknown) => void;
-    let markBodyReadSettled!: () => void;
-    const bodyReadSettled = new Promise<void>((resolve) => { markBodyReadSettled = resolve; });
-    const response = completion(JSON.stringify(VALID_DRAFT));
-    vi.spyOn(response, 'json').mockImplementation(() => new Promise((resolve) => {
-      resolveBody = resolve;
-    }).finally(markBodyReadSettled));
-    vi.stubGlobal('fetch', vi.fn(async () => response));
-    const fixture = pluginFixture();
-    const host = new PluginHost({ hostVersion: '0.1.0', pluginSettingsStorage: fixture.pluginSettingsStorage });
-    const project = createSampleProject();
-    host.setProject(project);
-    await host.register(fixture.descriptor);
-    const submitted = host.services.ai.submitStoryboard(OPENAI_COMPATIBLE_PROVIDER_ID, {
-      model: 'gpt-4o-mini',
-      brief: BRIEF,
-    });
-    await vi.waitFor(() => expect(response.json).toHaveBeenCalledTimes(1));
+  it.each([
+    ['caller abort', 'caller', 'cancelled', 'cancelled'],
+    ['plugin lifecycle abort', 'lifecycle', 'cancelled', 'cancelled'],
+    ['deadline', 'deadline', 'failed', 'timeout'],
+  ] as const)(
+    'keeps the terminal task and project unchanged after a %s body-stage late success',
+    async (_label, trigger, status, code) => {
+      if (trigger === 'deadline') vi.useFakeTimers();
+      const bodyStage = createControlledBodyStageResponse({
+        choices: [{ message: { content: JSON.stringify(VALID_DRAFT) } }],
+      });
+      vi.stubGlobal('fetch', bodyStage.fetchImpl);
+      const fixture = pluginFixture();
+      const host = new PluginHost({ hostVersion: '0.1.0', pluginSettingsStorage: fixture.pluginSettingsStorage });
+      const project = createSampleProject();
+      const projectBefore = structuredClone(project);
+      host.setProject(project);
+      const info = await host.register(fixture.descriptor);
+      const submitted = host.services.ai.submitStoryboard(OPENAI_COMPATIBLE_PROVIDER_ID, {
+        model: 'gpt-4o-mini',
+        brief: BRIEF,
+      });
+      const applicationSettled = waitForStoryboardTaskExecution(host.services, submitted.id);
+      await bodyStage.bodyReadStarted;
 
-    expect(host.services.ai.cancelGenerationTask(submitted.id)).toBe(true);
-    await expect(host.services.ai.waitForGenerationTask(submitted.id)).resolves.toMatchObject({
-      status: 'cancelled',
-      error: { code: 'cancelled' },
-    });
-    resolveBody({ choices: [{ message: { content: JSON.stringify(VALID_DRAFT) } }] });
-    await bodyReadSettled;
+      if (trigger === 'caller') {
+        expect(host.services.ai.cancelGenerationTask(submitted.id)).toBe(true);
+      } else if (trigger === 'lifecycle') {
+        await host.disable(info.instanceId);
+      } else {
+        await vi.advanceTimersByTimeAsync(30_000);
+        vi.useRealTimers();
+      }
 
-    const completed = host.services.ai.getGenerationTask(submitted.id);
-    expect(completed).toMatchObject({
-      status: 'cancelled',
-      error: { code: 'cancelled' },
-    });
-    expect(completed).not.toHaveProperty('draft');
-    expect(host.getProject()).toEqual(project);
-    await host.dispose();
-  });
+      const terminal = await host.services.ai.waitForGenerationTask(submitted.id);
+      expect(terminal).toMatchObject({ status, error: { code } });
+      expect(terminal).not.toHaveProperty('draft');
+      expect(host.getProject()).toEqual(projectBefore);
+
+      bodyStage.releaseBody();
+      await Promise.all([bodyStage.readerCleanupSettled, applicationSettled]);
+
+      const completed = host.services.ai.getGenerationTask(submitted.id);
+      expect(completed).toMatchObject({ status, error: { code } });
+      expect(completed).not.toHaveProperty('draft');
+      expect(host.getProject()).toEqual(projectBefore);
+      await host.dispose();
+    },
+  );
 
   it('isolates credentials and lifecycle cancellation between simultaneous hosts', async () => {
     const first = pluginFixture();

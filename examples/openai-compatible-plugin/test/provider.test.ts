@@ -7,6 +7,7 @@ import {
   type OpenAiFetch,
   type OpenAiRuntimeConfig,
 } from '../src/openai-client';
+import { createControlledBodyStageResponse } from './body-stage-response';
 
 const CONFIG: OpenAiRuntimeConfig = {
   endpoint: 'https://compatible.example/v1/chat/completions',
@@ -231,51 +232,31 @@ describe('OpenAI-compatible Chat Completions client', () => {
   ] as const)('preserves %s while the response body is still being read', async (_label, trigger, code) => {
     const caller = new AbortController();
     const lifecycle = new AbortController();
-    let resolveBody!: (value: unknown) => void;
-    let markBodyReadSettled!: () => void;
-    const bodyReadSettled = new Promise<void>((resolve) => { markBodyReadSettled = resolve; });
-    const response = completion(JSON.stringify(VALID_DRAFT));
-    const body = new Promise<unknown>((resolve) => {
-      resolveBody = resolve;
-    }).finally(markBodyReadSettled);
-    vi.spyOn(response, 'json').mockImplementation(() => body);
-    const fetchImpl = vi.fn<OpenAiFetch>(async () => response);
+    const bodyStage = createControlledBodyStageResponse({
+      choices: [{ message: { content: JSON.stringify(VALID_DRAFT) } }],
+    });
     const outcome = requestOpenAiChat(CONFIG, [{ role: 'user', content: 'ping' }], {
-      fetchImpl,
+      fetchImpl: bodyStage.fetchImpl,
       signal: caller.signal,
       lifecycleSignal: lifecycle.signal,
       timeoutMs: trigger === 'deadline' ? 5 : 1_000,
     });
-    const rejection = expect(outcome).rejects.toMatchObject({ code });
-    await vi.waitFor(() => expect(response.json).toHaveBeenCalledTimes(1));
+    const terminal = outcome.then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+
+    await bodyStage.bodyReadStarted;
 
     if (trigger === 'caller') caller.abort();
     if (trigger === 'lifecycle') lifecycle.abort();
 
-    await rejection;
-    resolveBody({ choices: [{ message: { content: JSON.stringify(VALID_DRAFT) } }] });
-    await bodyReadSettled;
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-  });
+    expect(await terminal).toMatchObject({ status: 'rejected', error: { code } });
+    bodyStage.releaseBody();
+    await bodyStage.readerCleanupSettled;
 
-  it('settles a body-stage deadline before an abort-ignoring late success arrives', async () => {
-    let resolveBody!: (value: unknown) => void;
-    let markBodyReadSettled!: () => void;
-    const bodyReadSettled = new Promise<void>((resolve) => { markBodyReadSettled = resolve; });
-    const response = completion(JSON.stringify(VALID_DRAFT));
-    vi.spyOn(response, 'json').mockImplementation(() => new Promise((resolve) => {
-      resolveBody = resolve;
-    }).finally(markBodyReadSettled));
-
-    const outcome = requestOpenAiChat(CONFIG, [{ role: 'user', content: 'ping' }], {
-      fetchImpl: vi.fn(async () => response),
-      timeoutMs: 5,
-    });
-
-    await expect(outcome).rejects.toMatchObject({ code: 'timeout' });
-    resolveBody({ choices: [{ message: { content: JSON.stringify(VALID_DRAFT) } }] });
-    await bodyReadSettled;
-    expect(response.json).toHaveBeenCalledTimes(1);
+    expect(await terminal).toMatchObject({ status: 'rejected', error: { code } });
+    expect(bodyStage.fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it('tests the current connection through the same sanitized protocol path', async () => {

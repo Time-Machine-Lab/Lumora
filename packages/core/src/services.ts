@@ -163,6 +163,7 @@ class StoryboardTaskService {
   private readonly registry: ServiceRegistry;
   private readonly tasks = new Map<string, GenerationTask>();
   private readonly controls = new Map<string, TaskControl>();
+  private readonly executions = new Map<string, Promise<void>>();
 
   constructor(registry: ServiceRegistry) {
     this.registry = registry;
@@ -244,7 +245,12 @@ class StoryboardTaskService {
       finish = resolve;
     });
     this.controls.set(id, { controller, completion, finish });
-    void this.execute(storyboard, task, controller);
+    const execution = this.execute(storyboard, task, controller);
+    this.executions.set(id, execution);
+    const forgetExecution = () => {
+      if (this.executions.get(id) === execution) this.executions.delete(id);
+    };
+    void execution.then(forgetExecution, forgetExecution);
     return publicTaskSnapshot(this.tasks.get(id)!);
   }
 
@@ -268,6 +274,10 @@ class StoryboardTaskService {
       );
     }
     return control.completion.then(publicTaskSnapshot);
+  }
+
+  waitForExecution(taskIdValue: string): Promise<void> {
+    return this.executions.get(taskIdValue) ?? Promise.resolve();
   }
 
   cancel(taskIdValue: string): boolean {
@@ -407,6 +417,11 @@ class StoryboardTaskService {
 }
 
 const taskServices = new WeakMap<PluginServices, StoryboardTaskService>();
+
+/** Internal completion point for host-level tests and lifecycle coordination. */
+export function waitForStoryboardTaskExecution(services: PluginServices, taskId: string): Promise<void> {
+  return taskServices.get(services)?.waitForExecution(taskId) ?? Promise.resolve();
+}
 
 export function cancelStoryboardTasksForProvider(services: PluginServices, providerId: string): void {
   taskServices.get(services)?.cancelProvider(providerId);

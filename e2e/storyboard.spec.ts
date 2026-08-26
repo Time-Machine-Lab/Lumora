@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
 import type { Download, Page } from '@playwright/test';
+import { startBodyStageServer } from './helpers/body-stage-server';
 
 async function readDownload(download: Download): Promise<string> {
   const stream = await download.createReadStream();
@@ -46,6 +47,107 @@ const COMPATIBLE_DRAFT = {
     { title: 'Case reveal', shotSize: 'close-up', movement: 'static', durationSeconds: 4, prompt: 'Reveal the protected case.' },
   ],
 };
+
+interface BrowserBodyStageState {
+  headersReceived: boolean;
+  bodyReadStarted: boolean;
+  readerCleanupSettled: boolean;
+  applicationSettled: boolean;
+}
+
+async function installBodyStageObserver(page: Page, requestUrl: string, terminalCode: string): Promise<void> {
+  await page.evaluate(({ targetUrl, code }) => {
+    const scope = globalThis as typeof globalThis & { __lumoraBodyStage?: BrowserBodyStageState };
+    const state: BrowserBodyStageState = {
+      headersReceived: false,
+      bodyReadStarted: false,
+      readerCleanupSettled: false,
+      applicationSettled: false,
+    };
+    scope.__lumoraBodyStage = state;
+    const observeApplication = () => {
+      const error = document.querySelector<HTMLElement>('[data-testid="storyboard-error"]');
+      state.applicationSettled = state.readerCleanupSettled && error?.textContent?.includes(code) === true;
+    };
+    new MutationObserver(observeApplication).observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    globalThis.fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url !== targetUrl) return originalFetch(input, init);
+      const signal = init?.signal;
+      if (!signal) throw new Error('Expected the production request signal.');
+      const removeEventListener = signal.removeEventListener.bind(signal);
+      Object.defineProperty(signal, 'removeEventListener', {
+        configurable: true,
+        value: (
+          type: string,
+          callback: EventListenerOrEventListenerObject,
+          options?: EventListenerOptions | boolean,
+        ) => {
+          removeEventListener(type, callback, options);
+          if (state.bodyReadStarted && type === 'abort') {
+            state.readerCleanupSettled = true;
+            observeApplication();
+          }
+        },
+      });
+      const response = await originalFetch(input, init);
+      state.headersReceived = true;
+      const readJson = response.json.bind(response);
+      Object.defineProperty(response, 'json', {
+        configurable: true,
+        value: () => {
+          state.bodyReadStarted = true;
+          return readJson();
+        },
+      });
+      return response;
+    };
+  }, { targetUrl: requestUrl, code: terminalCode });
+}
+
+async function browserBodyStageState(page: Page): Promise<BrowserBodyStageState | undefined> {
+  return page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraBodyStage?: BrowserBodyStageState }
+  ).__lumoraBodyStage);
+}
+
+async function browserPersistenceSnapshot(page: Page): Promise<string> {
+  return page.evaluate(async () => {
+    const local = Array.from({ length: localStorage.length }, (_, index) => {
+      const key = localStorage.key(index)!;
+      return [key, localStorage.getItem(key)] as const;
+    }).sort(([left], [right]) => left.localeCompare(right));
+    const indexed: Array<{ database: string; stores: Array<{ name: string; values: unknown[] }> }> = [];
+    const databases = (await indexedDB.databases())
+      .filter((info): info is IDBDatabaseInfo & { name: string } => typeof info.name === 'string')
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const info of databases) {
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(info.name);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const stores: Array<{ name: string; values: unknown[] }> = [];
+      for (const name of Array.from(database.objectStoreNames).sort()) {
+        const transaction = database.transaction(name, 'readonly');
+        const values = await new Promise<unknown[]>((resolve, reject) => {
+          const request = transaction.objectStore(name).getAll();
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+        stores.push({ name, values });
+      }
+      database.close();
+      indexed.push({ database: info.name, stores });
+    }
+    return JSON.stringify({ local, indexed });
+  });
+}
 
 test.beforeEach(async ({ page }) => {
   await page.goto('/');
@@ -406,47 +508,45 @@ test('maps compatible endpoint failures once each without changing the project',
   }
 });
 
-test('cancels an in-flight compatible request without accepting its late success', async ({ page }) => {
-  const endpointOrigin = 'http://127.0.0.1:48770';
-  let attempts = 0;
-  let release!: () => void;
-  let markRouteSettled!: () => void;
-  const gate = new Promise<void>((resolve) => { release = resolve; });
-  const routeSettled = new Promise<void>((resolve) => { markRouteSettled = resolve; });
-  await page.route(`${endpointOrigin}/**`, async (route) => {
-    if (route.request().method() === 'OPTIONS') {
-      await route.fulfill({
-        status: 204,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Headers': 'authorization, content-type',
-          'Access-Control-Allow-Methods': 'POST, OPTIONS',
-        },
-      });
-      return;
-    }
-    attempts += 1;
-    await gate;
-    try {
-      await route.fulfill({
-        status: 200,
-        headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ choices: [{ message: { content: JSON.stringify(COMPATIBLE_DRAFT) } }] }),
-      }).catch(() => undefined);
-    } finally {
-      markRouteSettled();
-    }
+test('keeps cancelled state after a real body-stage late success', async ({ page }) => {
+  const responseBody = JSON.stringify({
+    choices: [{ message: { content: JSON.stringify(COMPATIBLE_DRAFT) } }],
   });
+  const server = await startBodyStageServer(responseBody);
+  try {
+    await installBodyStageObserver(page, server.requestUrl, 'cancelled');
+    await configureOpenAi(page, `${server.origin}/v1`, 'cancel-model');
+    await openOpenAiStoryboard(page, 'cancel-model');
+    const persistenceBefore = await browserPersistenceSnapshot(page);
 
-  await configureOpenAi(page, `${endpointOrigin}/v1`, 'cancel-model');
-  await openOpenAiStoryboard(page, 'cancel-model');
-  await page.getByTestId('storyboard-generate').click();
-  await expect.poll(() => attempts).toBe(1);
-  await page.getByTestId('storyboard-cancel').click();
-  await expect(page.getByTestId('storyboard-error')).toContainText('cancelled');
-  release();
-  await routeSettled;
-  await expect(page.getByText('Compatible endpoint storyboard')).toHaveCount(0);
+    await page.getByTestId('storyboard-generate').click();
+    await server.headersFlushed;
+    await expect.poll(() => browserBodyStageState(page)).toMatchObject({
+      headersReceived: true,
+      bodyReadStarted: true,
+    });
+
+    await page.getByTestId('storyboard-cancel').click();
+    await expect(page.getByTestId('storyboard-error')).toContainText('cancelled');
+    await server.clientDisconnected;
+    server.releaseBody();
+    const [serverCompletion] = await Promise.all([
+      server.responseCompleted,
+      expect.poll(() => browserBodyStageState(page)).toMatchObject({
+        readerCleanupSettled: true,
+        applicationSettled: true,
+      }),
+    ]);
+
+    expect(serverCompletion).toEqual({ writeAttempted: true, responseClosed: true });
+    expect(server.attempts()).toBe(1);
+    await expect(page.getByText('Compatible endpoint storyboard')).toHaveCount(0);
+    await expect(page.getByTestId('storyboard-draft-shot')).toHaveCount(0);
+    expect(await browserPersistenceSnapshot(page)).toBe(persistenceBefore);
+  } finally {
+    server.releaseBody();
+    await server.close();
+  }
   await page.getByRole('button', { name: '关闭 AI 分镜工作台' }).click();
   await expect(page.locator('[data-testid^="shot-block-"]')).toHaveCount(3);
 });
