@@ -111,6 +111,64 @@ interface TaskControl {
   finish(task: GenerationTask): void;
 }
 
+interface ExecutionWaiter {
+  completion: Promise<void>;
+  finish(): void;
+}
+
+export interface StoryboardTaskExecutionObserver {
+  readonly pendingCount: number;
+  waitFor(taskId: string): Promise<void>;
+  dispose(): void;
+}
+
+class StoryboardTaskExecutionObserverState implements StoryboardTaskExecutionObserver {
+  private readonly executions = new Map<string, ExecutionWaiter>();
+  private release: ((observer: StoryboardTaskExecutionObserverState) => void) | undefined;
+  readonly generation: number;
+
+  constructor(
+    generation: number,
+    release: (observer: StoryboardTaskExecutionObserverState) => void,
+  ) {
+    this.generation = generation;
+    this.release = release;
+  }
+
+  get pendingCount(): number {
+    return this.executions.size;
+  }
+
+  track(taskIdValue: string): void {
+    let finish!: () => void;
+    const completion = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    this.executions.set(taskIdValue, { completion, finish });
+  }
+
+  settle(taskIdValue: string): void {
+    const execution = this.executions.get(taskIdValue);
+    if (!execution) return;
+    this.executions.delete(taskIdValue);
+    execution.finish();
+  }
+
+  waitFor(taskIdValue: string): Promise<void> {
+    return this.executions.get(taskIdValue)?.completion ?? Promise.resolve();
+  }
+
+  dispose(): void {
+    const release = this.release;
+    if (!release) return;
+    this.release = undefined;
+    release(this);
+    const executions = [...this.executions.values()];
+    this.executions.clear();
+    for (const execution of executions) execution.finish();
+  }
+}
+
 const MAX_RETAINED_GENERATION_TASKS = 100;
 
 function isTerminalTask(task: GenerationTask): boolean {
@@ -163,7 +221,8 @@ class StoryboardTaskService {
   private readonly registry: ServiceRegistry;
   private readonly tasks = new Map<string, GenerationTask>();
   private readonly controls = new Map<string, TaskControl>();
-  private readonly executions = new Map<string, Promise<void>>();
+  private observer: StoryboardTaskExecutionObserverState | undefined;
+  private observerGeneration = 0;
 
   constructor(registry: ServiceRegistry) {
     this.registry = registry;
@@ -245,12 +304,13 @@ class StoryboardTaskService {
       finish = resolve;
     });
     this.controls.set(id, { controller, completion, finish });
-    const execution = this.execute(storyboard, task, controller);
-    this.executions.set(id, execution);
-    const forgetExecution = () => {
-      if (this.executions.get(id) === execution) this.executions.delete(id);
-    };
-    void execution.then(forgetExecution, forgetExecution);
+    const observer = this.observer;
+    if (!observer) {
+      void this.execute(storyboard, task, controller);
+    } else {
+      observer.track(id);
+      void this.executeObserved(storyboard, task, controller, observer.generation).catch(() => undefined);
+    }
     return publicTaskSnapshot(this.tasks.get(id)!);
   }
 
@@ -276,8 +336,14 @@ class StoryboardTaskService {
     return control.completion.then(publicTaskSnapshot);
   }
 
-  waitForExecution(taskIdValue: string): Promise<void> {
-    return this.executions.get(taskIdValue) ?? Promise.resolve();
+  installObserver(): StoryboardTaskExecutionObserver {
+    if (this.observer) throw new Error('A storyboard task execution observer is already installed.');
+    this.observerGeneration += 1;
+    const observer = new StoryboardTaskExecutionObserverState(this.observerGeneration, (installed) => {
+      if (this.observer === installed) this.observer = undefined;
+    });
+    this.observer = observer;
+    return observer;
   }
 
   cancel(taskIdValue: string): boolean {
@@ -301,8 +367,23 @@ class StoryboardTaskService {
     for (const task of [...this.tasks.values()]) {
       if (!isTerminalTask(task)) this.cancel(task.id);
     }
+    this.observer?.dispose();
     this.controls.clear();
     this.tasks.clear();
+  }
+
+  private async executeObserved(
+    capability: AiStoryboardCapability,
+    initialTask: GenerationTask,
+    controller: AbortController,
+    observerGeneration: number,
+  ): Promise<void> {
+    try {
+      await this.execute(capability, initialTask, controller);
+    } finally {
+      const observer = this.observer;
+      if (observer?.generation === observerGeneration) observer.settle(initialTask.id);
+    }
   }
 
   private async execute(
@@ -418,9 +499,13 @@ class StoryboardTaskService {
 
 const taskServices = new WeakMap<PluginServices, StoryboardTaskService>();
 
-/** Internal completion point for host-level tests and lifecycle coordination. */
-export function waitForStoryboardTaskExecution(services: PluginServices, taskId: string): Promise<void> {
-  return taskServices.get(services)?.waitForExecution(taskId) ?? Promise.resolve();
+/** Internal test-only completion observer; intentionally absent from the package entrypoint. */
+export function installStoryboardTaskExecutionObserver(
+  services: PluginServices,
+): StoryboardTaskExecutionObserver {
+  const tasks = taskServices.get(services);
+  if (!tasks) throw new Error('Cannot observe an unknown or disposed PluginServices instance.');
+  return tasks.installObserver();
 }
 
 export function cancelStoryboardTasksForProvider(services: PluginServices, providerId: string): void {

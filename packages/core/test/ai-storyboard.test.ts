@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import * as core from '../src/index';
-import { createPluginServices, waitForStoryboardTaskExecution } from '../src/services';
+import {
+  createPluginServices,
+  disposePluginServices,
+  installStoryboardTaskExecutionObserver,
+} from '../src/services';
 import type { AiService, GenerationTask, PluginServices, StoryboardProviderInfo } from '../src/index';
 
 function assertReadonlyAiContracts(
@@ -636,11 +640,12 @@ describe('AI storyboard capability', () => {
     const services = pluginServicesWith(async () => new Promise<unknown>((resolve) => {
       releaseProvider = resolve;
     }));
+    const observer = installStoryboardTaskExecutionObserver(services);
     const submitted = services.ai.submitStoryboard('com.example.storyboard', {
       model: 'storyboard-1',
       brief: BRIEF,
     });
-    const applicationSettled = waitForStoryboardTaskExecution(services, submitted.id);
+    const applicationSettled = observer.waitFor(submitted.id);
     let observedApplicationSettlement = false;
     void applicationSettled.then(() => {
       observedApplicationSettlement = true;
@@ -662,6 +667,106 @@ describe('AI storyboard capability', () => {
       error: { code: 'cancelled' },
     });
     expect(services.ai.getGenerationTask(submitted.id)).not.toHaveProperty('draft');
+    expect(observer.pendingCount).toBe(0);
+    observer.dispose();
+  });
+
+  it('does not retain unobserved executions and isolates observers by services instance', async () => {
+    const neverSettles = async () => new Promise<unknown>(() => undefined);
+    const observedServices = pluginServicesWith(neverSettles);
+    const otherServices = pluginServicesWith(neverSettles);
+    const executionReactions = vi.spyOn(Promise.prototype, 'then');
+
+    const unobservedTasks = Array.from({ length: 4 }, () => {
+      const submitted = observedServices.ai.submitStoryboard('com.example.storyboard', {
+        model: 'storyboard-1',
+        brief: BRIEF,
+      });
+      expect(observedServices.ai.cancelGenerationTask(submitted.id)).toBe(true);
+      return observedServices.ai.waitForGenerationTask(submitted.id);
+    });
+    expect(executionReactions).not.toHaveBeenCalled();
+    executionReactions.mockRestore();
+    await expect(Promise.all(unobservedTasks)).resolves.toEqual(
+      expect.arrayContaining(Array.from({ length: 4 }, () => expect.objectContaining({ status: 'cancelled' }))),
+    );
+
+    const observer = installStoryboardTaskExecutionObserver(observedServices);
+    expect(observer.pendingCount).toBe(0);
+
+    const submitted = observedServices.ai.submitStoryboard('com.example.storyboard', {
+      model: 'storyboard-1',
+      brief: BRIEF,
+    });
+    const applicationSettled = observer.waitFor(submitted.id);
+    expect(observer.pendingCount).toBe(1);
+
+    const otherObserver = installStoryboardTaskExecutionObserver(otherServices);
+    expect(otherObserver.pendingCount).toBe(0);
+    expect(observedServices.ai.cancelGenerationTask(submitted.id)).toBe(true);
+    await expect(observedServices.ai.waitForGenerationTask(submitted.id)).resolves.toMatchObject({
+      status: 'cancelled',
+    });
+    expect(observer.pendingCount).toBe(1);
+
+    observer.dispose();
+    observer.dispose();
+    await applicationSettled;
+    expect(observer.pendingCount).toBe(0);
+    otherObserver.dispose();
+  });
+
+  it('rejects duplicate installation and ignores late settlement from a disposed observer generation', async () => {
+    const releases: Array<(value: unknown) => void> = [];
+    const services = pluginServicesWith(async () => new Promise<unknown>((resolve) => {
+      releases.push(resolve);
+    }));
+    const firstObserver = installStoryboardTaskExecutionObserver(services);
+    expect(() => installStoryboardTaskExecutionObserver(services)).toThrow(/already installed/i);
+
+    const firstTask = services.ai.submitStoryboard('com.example.storyboard', {
+      model: 'storyboard-1',
+      brief: BRIEF,
+    });
+    const firstSettlement = firstObserver.waitFor(firstTask.id);
+    expect(firstObserver.pendingCount).toBe(1);
+    firstObserver.dispose();
+    await firstSettlement;
+    expect(firstObserver.pendingCount).toBe(0);
+
+    const secondObserver = installStoryboardTaskExecutionObserver(services);
+    expect(secondObserver.pendingCount).toBe(0);
+    releases[0]!(VALID_PAYLOAD);
+    await expect(services.ai.waitForGenerationTask(firstTask.id)).resolves.toMatchObject({ status: 'succeeded' });
+    expect(secondObserver.pendingCount).toBe(0);
+
+    const secondTask = services.ai.submitStoryboard('com.example.storyboard', {
+      model: 'storyboard-1',
+      brief: BRIEF,
+    });
+    const secondSettlement = secondObserver.waitFor(secondTask.id);
+    expect(secondObserver.pendingCount).toBe(1);
+    releases[1]!(VALID_PAYLOAD);
+    await secondSettlement;
+    expect(secondObserver.pendingCount).toBe(0);
+    secondObserver.dispose();
+  });
+
+  it('clears observer entries and waiters when plugin services are disposed', async () => {
+    const services = pluginServicesWith(async () => new Promise<unknown>(() => undefined));
+    const observer = installStoryboardTaskExecutionObserver(services);
+    const submitted = services.ai.submitStoryboard('com.example.storyboard', {
+      model: 'storyboard-1',
+      brief: BRIEF,
+    });
+    const applicationSettled = observer.waitFor(submitted.id);
+    expect(observer.pendingCount).toBe(1);
+
+    disposePluginServices(services);
+
+    await applicationSettled;
+    expect(observer.pendingCount).toBe(0);
+    await expect(observer.waitFor(submitted.id)).resolves.toBeUndefined();
   });
 
   it('bounds completed task history while keeping recent terminal tasks waitable', async () => {

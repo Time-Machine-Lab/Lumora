@@ -6,7 +6,7 @@ import {
   type Manifest,
   type PluginSettingsStorage,
 } from '@lumora/core';
-import { waitForStoryboardTaskExecution } from '../../../packages/core/src/services';
+import { installStoryboardTaskExecutionObserver } from '../../../packages/core/src/services';
 import manifest from '../lumora.plugin.json';
 import { createOpenAiCompatiblePlugin, OPENAI_COMPATIBLE_PROVIDER_ID } from '../src/index';
 import { ProviderConfigStore } from '../src/config';
@@ -210,11 +210,12 @@ describe('OpenAI-compatible plugin lifecycle', () => {
       const projectBefore = structuredClone(project);
       host.setProject(project);
       const info = await host.register(fixture.descriptor);
+      const observer = installStoryboardTaskExecutionObserver(host.services);
       const submitted = host.services.ai.submitStoryboard(OPENAI_COMPATIBLE_PROVIDER_ID, {
         model: 'gpt-4o-mini',
         brief: BRIEF,
       });
-      const applicationSettled = waitForStoryboardTaskExecution(host.services, submitted.id);
+      const applicationSettled = observer.waitFor(submitted.id);
       await bodyStage.bodyReadStarted;
 
       if (trigger === 'caller') {
@@ -238,6 +239,8 @@ describe('OpenAI-compatible plugin lifecycle', () => {
       expect(completed).toMatchObject({ status, error: { code } });
       expect(completed).not.toHaveProperty('draft');
       expect(host.getProject()).toEqual(projectBefore);
+      expect(observer.pendingCount).toBe(0);
+      observer.dispose();
       await host.dispose();
     },
   );
