@@ -68,6 +68,15 @@ const EMPTY_SERVICES: PluginServices = {
         }),
       };
     },
+    listStoryboardProviders: () => [],
+    submitStoryboard: () => {
+      throw new Error('当前运行环境未配置插件服务');
+    },
+    getGenerationTask: () => undefined,
+    waitForGenerationTask: async () => {
+      throw new Error('当前运行环境未配置插件服务');
+    },
+    cancelGenerationTask: () => false,
   },
   exporters: {
     run: async () => {

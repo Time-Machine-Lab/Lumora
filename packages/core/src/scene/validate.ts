@@ -1,5 +1,6 @@
 import { SCENE_OBJECT_TYPES } from './types';
 import type { AssetData, Project, SceneObjectData, TrackData, TransformData, Vec3 } from './types';
+import { STORYBOARD_CAMERA_MOVEMENTS, STORYBOARD_SHOT_SIZES } from '../ai/storyboard';
 
 /** 完整 schema + 有限数值校验：候选状态在提交/打开前必须通过（M1，TML-57 第五轮）。 */
 
@@ -257,7 +258,17 @@ export function validateProjectSchema(project: unknown): string | null {
   const shotIds = new Set<string>();
   for (const shot of p.shots) {
     if (!shot || typeof shot !== 'object') return '分镜条目非法';
-    const s = shot as { id?: unknown; name?: unknown; cameraObjectId?: unknown; startTime?: unknown; endTime?: unknown };
+    const s = shot as {
+      id?: unknown;
+      name?: unknown;
+      cameraObjectId?: unknown;
+      startTime?: unknown;
+      endTime?: unknown;
+      shotSize?: unknown;
+      movement?: unknown;
+      prompt?: unknown;
+      aiSource?: unknown;
+    };
     if (!isString(s.id) || s.id.length === 0 || shotIds.has(s.id)) return '分镜 id 非法或重复';
     shotIds.add(s.id);
     if (!isString(s.name)) return '分镜 name 非法';
@@ -267,6 +278,41 @@ export function validateProjectSchema(project: unknown): string | null {
     }
     if (typeof s.endTime !== 'number' || !Number.isFinite(s.endTime) || s.endTime <= s.startTime) {
       return '分镜 endTime 非法（需大于 startTime）';
+    }
+    if (
+      s.shotSize !== undefined &&
+      (typeof s.shotSize !== 'string' || !(STORYBOARD_SHOT_SIZES as readonly string[]).includes(s.shotSize))
+    ) {
+      return '分镜 shotSize 非法';
+    }
+    if (
+      s.movement !== undefined &&
+      (typeof s.movement !== 'string' || !(STORYBOARD_CAMERA_MOVEMENTS as readonly string[]).includes(s.movement))
+    ) {
+      return '分镜 movement 非法';
+    }
+    if (s.prompt !== undefined && (typeof s.prompt !== 'string' || s.prompt.trim().length === 0 || s.prompt.length > 4_000)) {
+      return '分镜 prompt 非法';
+    }
+    if (s.aiSource !== undefined) {
+      if (!s.aiSource || typeof s.aiSource !== 'object' || Array.isArray(s.aiSource)) return '分镜 aiSource 非法';
+      const source = s.aiSource as { providerId?: unknown; model?: unknown; draftId?: unknown };
+      const sourceKeys = Object.keys(source);
+      const expectedSourceKeys = ['providerId', 'model', 'draftId'];
+      const isValidSourceId = (value: unknown) =>
+        typeof value === 'string' && value.length > 0 && value.length <= 256 && value === value.trim();
+      if (
+        sourceKeys.length !== expectedSourceKeys.length ||
+        sourceKeys.some((key) => !expectedSourceKeys.includes(key)) ||
+        !isValidSourceId(source.providerId) ||
+        !isValidSourceId(source.model) ||
+        !isValidSourceId(source.draftId)
+      ) {
+        return '分镜 aiSource 非法';
+      }
+      if (s.shotSize === undefined || s.movement === undefined || s.prompt === undefined) {
+        return 'AI 分镜缺少 shotSize/movement/prompt';
+      }
     }
   }
   if (!Array.isArray(p.assets)) return 'assets 缺失';

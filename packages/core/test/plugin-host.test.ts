@@ -11,6 +11,40 @@ import type {
 import type { Command, CommandContext } from '../src/commands/command-registry';
 import { createSampleProject } from '../src/scene/sample-project';
 import type { Manifest } from '../src/manifest/validate';
+import type { AiStoryboardCapability } from '../src/ai/storyboard';
+import type { AiProviderContribution } from '../src/contributions/types';
+import type { Disposable } from '../src/disposable';
+import type { EventMap, PluginDiagnostic } from '../src/events/event-map';
+
+function assertReadonlyPluginStateEvent(event: EventMap['plugin:state-changed']): void {
+  // @ts-expect-error plugin state event DTOs are immutable by contract.
+  event.state = 'active';
+  if (event.error) {
+    // @ts-expect-error published diagnostics are immutable by contract.
+    event.error.message = 'mutated';
+  }
+}
+
+void assertReadonlyPluginStateEvent;
+
+function assertReadonlyPluginInfo(info: PluginInfo): void {
+  // @ts-expect-error plugin info snapshots are immutable by contract.
+  info.state = 'active';
+  const diagnostic = info.error!;
+  const message: string = diagnostic.message;
+  void message;
+  // @ts-expect-error plugin diagnostics are a single object, never a list.
+  const diagnostics: ReadonlyArray<PluginDiagnostic> = diagnostic;
+  void diagnostics;
+  // @ts-expect-error plugin diagnostics are immutable by contract.
+  diagnostic.message = 'mutated';
+  // @ts-expect-error plugin diagnostics cannot be replaced by callers.
+  info.error = undefined;
+  // @ts-expect-error contribution lists are readonly snapshots.
+  info.contributes.push('panel');
+}
+
+void assertReadonlyPluginInfo;
 
 const VALID_MANIFEST: Manifest = {
   schemaVersion: '1',
@@ -57,7 +91,934 @@ function descriptor(manifest: Record<string, unknown> = VALID_MANIFEST, entry?: 
   return { manifest: manifest as PluginDescriptor['manifest'], entry };
 }
 
+function expectPublicPluginDiagnostic(value: unknown, message: string): void {
+  expect(value).toEqual({ message });
+  expect(Array.isArray(value)).toBe(false);
+  expect(Object.keys(value as PluginDiagnostic)).toEqual(['message']);
+  expect(value).not.toHaveProperty('stack');
+  expect(value).not.toHaveProperty('cause');
+  expect(Object.isFrozen(value)).toBe(true);
+}
+
 describe('PluginHost', () => {
+  it('keeps plugin settings scoped to one host and restores them after disable and enable', async () => {
+    const firstActivations: Array<string | null> = [];
+    const secondActivations: Array<string | null> = [];
+    const settingsDescriptor = (savedValue: string, activations: Array<string | null>) => descriptor(
+      VALID_MANIFEST,
+      async () => ({
+        default: {
+          activate: (context) => {
+            activations.push(context.settings.get('provider-config'));
+            if (context.settings.get('provider-config') === null) {
+              context.settings.set('provider-config', savedValue);
+            }
+          },
+        },
+      }),
+    );
+    const firstHost = new PluginHost();
+    const secondHost = new PluginHost();
+
+    const first = await firstHost.register(settingsDescriptor('host-a', firstActivations));
+    await secondHost.register(settingsDescriptor('host-b', secondActivations));
+    await firstHost.disable(first.instanceId);
+    await firstHost.enable(first.instanceId);
+
+    expect(firstActivations).toEqual([null, 'host-a']);
+    expect(secondActivations).toEqual([null]);
+    await firstHost.dispose();
+    await secondHost.dispose();
+  });
+
+  it('resolves the latest Chat model catalog and dispatches the validated request model', async () => {
+    let currentModel = 'model-a';
+    const sentModels: string[] = [];
+    const host = new PluginHost();
+    await host.register(descriptor(
+      { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+      async () => ({
+        default: {
+          activate: (context) => context.contribute({
+            aiProviders: [{
+              kind: 'aiProvider',
+              id: 'com.example.dynamic.chat',
+              name: 'Dynamic Chat',
+              models: () => [currentModel],
+              chat: async function* (request) {
+                sentModels.push(request.model);
+                yield request.model;
+              },
+            }],
+          }),
+        },
+      }),
+    ));
+
+    currentModel = 'model-b';
+    const chunks: string[] = [];
+    for await (const chunk of host.services.ai.chat('com.example.dynamic.chat', {
+      model: 'model-b',
+      messages: [],
+    })) chunks.push(chunk);
+
+    expect(chunks).toEqual(['model-b']);
+    expect(sentModels).toEqual(['model-b']);
+    await expect((async () => {
+      for await (const _chunk of host.services.ai.chat('com.example.dynamic.chat', {
+        model: 'model-a',
+        messages: [],
+      })) {
+        // Consume the stream so validation and dispatch both execute.
+      }
+    })()).rejects.toThrow(/model-a/);
+    expect(sentModels).toEqual(['model-b']);
+    await host.dispose();
+  });
+
+  it('projects Generic Chat messages before crossing the provider boundary', async () => {
+    const received: unknown[] = [];
+    const host = new PluginHost();
+    await host.register(descriptor(
+      { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+      async () => ({
+        default: {
+          activate: (context) => context.contribute({
+            aiProviders: [{
+              kind: 'aiProvider',
+              id: 'com.example.projected.chat',
+              name: 'Projected Chat',
+              models: ['model-a'],
+              chat: async function* (request) {
+                received.push(request.messages);
+                yield 'ok';
+              },
+            }],
+          }),
+        },
+      }),
+    ));
+    const message: Record<string, unknown> = {
+      role: 'user',
+      content: 'hello',
+      secret: 'PRIVATE_CHAT_FIELD',
+      counter: 1n,
+    };
+    message.circular = message;
+
+    for await (const _chunk of host.services.ai.chat('com.example.projected.chat', {
+      model: 'model-a',
+      messages: [message] as never,
+    })) {
+      // Consume the stream so boundary validation and dispatch execute.
+    }
+
+    expect(received).toEqual([[{ role: 'user', content: 'hello' }]]);
+    await host.dispose();
+  });
+
+  it.each([
+    ['unsupported role', () => [{ role: 'tool', content: 'hello' }]],
+    ['non-string content', () => [{ role: 'user', content: 7 }]],
+    ['non-array messages', () => ({ role: 'user', content: 'hello' })],
+    ['throwing iterator', () => new Proxy([{ role: 'user', content: 'hello' }], {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) throw new Error('PRIVATE_CHAT_ITERATOR');
+        return Reflect.get(target, property, receiver);
+      },
+    })],
+    ['over-yielding iterator', () => Object.assign([{ role: 'user', content: 'hello' }], {
+      *[Symbol.iterator]() {
+        yield { role: 'user', content: 'hello' };
+        yield { role: 'assistant', content: 'unexpected' };
+      },
+    })],
+    ['under-yielding iterator', () => Object.assign([
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'world' },
+    ], {
+      *[Symbol.iterator]() {
+        yield { role: 'user', content: 'hello' };
+      },
+    })],
+  ] as const)('rejects Generic Chat messages with %s before provider dispatch', async (_name, messages) => {
+    let dispatches = 0;
+    const host = new PluginHost();
+    await host.register(descriptor(
+      { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+      async () => ({
+        default: {
+          activate: (context) => context.contribute({
+            aiProviders: [{
+              kind: 'aiProvider',
+              id: 'com.example.invalid-message.chat',
+              name: 'Invalid Message Chat',
+              models: ['model-a'],
+              chat: async function* () {
+                dispatches += 1;
+                yield 'unexpected';
+              },
+            }],
+          }),
+        },
+      }),
+    ));
+    const consume = async () => {
+      for await (const _chunk of host.services.ai.chat('com.example.invalid-message.chat', {
+        model: 'model-a',
+        messages: messages() as never,
+      })) {
+        // Consume the stream so boundary validation executes.
+      }
+    };
+
+    await expect(consume()).rejects.toMatchObject({
+      code: 'invalid_request',
+      message: 'The AI request is invalid.',
+      retryable: false,
+    });
+    await expect(consume()).rejects.not.toThrow(/PRIVATE_CHAT_ITERATOR/);
+    expect(dispatches).toBe(0);
+    await host.dispose();
+  });
+
+  it.each([
+    ['resolver throw', () => { throw new Error('PRIVATE_CHAT_RESOLVER'); }],
+    ['empty catalog', () => []],
+    ['oversized catalog', () => Array.from({ length: 101 }, (_, index) => `model-${index}`)],
+    ['invalid entry', () => ['model-a', 7]],
+    ['duplicate entry', () => ['model-a', 'model-a']],
+    ['throwing iterator', () => new Proxy(['model-a'], {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) throw new Error('PRIVATE_CHAT_CATALOG_ITERATOR');
+        return Reflect.get(target, property, receiver);
+      },
+    })],
+  ] as const)('maps a dynamic Chat %s to a sanitized provider_unavailable error', async (_name, catalog) => {
+    let dispatches = 0;
+    const host = new PluginHost();
+    await host.register(descriptor(
+      { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+      async () => ({
+        default: {
+          activate: (context) => context.contribute({
+            aiProviders: [{
+              kind: 'aiProvider',
+              id: 'com.example.invalid-catalog.chat',
+              name: 'Invalid Catalog Chat',
+              models: () => catalog() as never,
+              chat: async function* () {
+                dispatches += 1;
+                yield 'unexpected';
+              },
+            }],
+          }),
+        },
+      }),
+    ));
+    let rejection: unknown;
+
+    try {
+      for await (const _chunk of host.services.ai.chat('com.example.invalid-catalog.chat', {
+        model: 'model-a',
+        messages: [],
+      })) {
+        // Consume the stream so catalog resolution executes.
+      }
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(rejection).toMatchObject({
+      code: 'provider_unavailable',
+      message: 'The AI provider is unavailable.',
+      retryable: false,
+    });
+    expect(String(rejection)).not.toMatch(/PRIVATE_CHAT_/);
+    expect(dispatches).toBe(0);
+    await host.dispose();
+  });
+
+  it('rejects malformed storyboard capability metadata atomically', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const sensitiveCapability = 'sk-live-1234567890abcdef';
+    const failedEventErrors: unknown[] = [];
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'failed') failedEventErrors.push(event.error);
+    });
+    const malformedStoryboard = {
+      capability: sensitiveCapability,
+      models: [{ id: 'broken', name: 'Broken model' }],
+      generate: async () => ({}),
+    } as unknown as AiStoryboardCapability;
+
+    const info = await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, contributes: ['panel', 'aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => context.contribute({
+              panels: [
+                { kind: 'panel', id: 'com.example.plugin.before-invalid-ai', title: 'Should roll back', component: () => null },
+              ],
+              aiProviders: [{
+                kind: 'aiProvider',
+                id: 'com.example.plugin.invalid-ai',
+                name: 'Invalid storyboard provider',
+                models: [],
+                chat: async function* () {},
+                storyboard: malformedStoryboard,
+              }],
+            }),
+          },
+        }),
+      ),
+    );
+
+    expect(info.state).toBe('failed');
+    expect(info.reason).toContain('激活失败');
+    expect(info.reason).not.toContain('storyboard.capability:invalid_literal');
+    expect(info.reason).not.toContain(sensitiveCapability);
+    expect(JSON.stringify(info.error)).not.toContain(sensitiveCapability);
+    expect(JSON.stringify(failedEventErrors)).not.toContain(sensitiveCapability);
+    expect(host.contributions.count()).toBe(0);
+    expect(host.contributions.getPanels()).toEqual([]);
+    expect(host.contributions.getAiProviders()).toEqual([]);
+  });
+
+  it('publishes a failed terminal state when an activation throws a hostile value', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const states: PluginState[] = [];
+    host.events.on('plugin:state-changed', (event) => states.push(event.state));
+    const hostile = new Proxy({}, {
+      getOwnPropertyDescriptor: () => {
+        throw new Error('descriptor trap');
+      },
+      getPrototypeOf: () => {
+        throw new Error('prototype trap');
+      },
+    });
+    let rejection: unknown;
+
+    const info = await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => {
+            throw hostile;
+          },
+        },
+      })),
+    ).catch((error: unknown) => {
+      rejection = error;
+      return host.getPlugin('com.example.plugin')!;
+    });
+
+    expect(rejection).toBeUndefined();
+    expect(info.state).toBe('failed');
+    expect(states.at(-1)).toBe('failed');
+    expect(info.error).toEqual({ message: '插件激活失败。' });
+    expect(info.error === hostile).toBe(false);
+  });
+
+  it('publishes bounded redacted activation errors without retaining the original object', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const privateTail = 'PRIVATE_ACTIVATION_TAIL';
+    const originalError = new Error(`apiKey="prefix\\", ${privateTail}${'x'.repeat(2_500)}"`);
+    let failedEventError: unknown;
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'failed') failedEventError = event.error;
+    });
+
+    const info = await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => {
+            throw originalError;
+          },
+        },
+      })),
+    );
+
+    expect(info.state).toBe('failed');
+    expect(info.reason).not.toContain(privateTail);
+    expect(info.reason?.length).toBeLessThanOrEqual(2_000);
+    expect(info.error).toEqual({ message: '插件激活失败。' });
+    expect(info.error).not.toBe(originalError);
+    expect((info.error as PluginDiagnostic).message).not.toContain(privateTail);
+    expect((info.error as PluginDiagnostic).message.length).toBeLessThanOrEqual(2_000);
+    expect(failedEventError).toEqual({ message: '插件激活失败。' });
+    expect(failedEventError).not.toBe(originalError);
+    expect((failedEventError as PluginDiagnostic).message).not.toContain(privateTail);
+    expect((failedEventError as PluginDiagnostic).message.length).toBeLessThanOrEqual(2_000);
+  });
+
+  it('publishes one diagnostic object for an entry load failure across events and snapshots', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    let failedEventError: PluginDiagnostic | undefined;
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'failed') failedEventError = event.error;
+    });
+
+    const registered = await host.register(
+      descriptor(VALID_MANIFEST, async () => {
+        throw new Error('PRIVATE_ENTRY_LOAD_FAILURE');
+      }),
+    );
+
+    const polled = host.getPlugin('com.example.plugin')!;
+    const listed = host.listPlugins()[0]!;
+    expect(failedEventError).toEqual(registered.error);
+    expect(polled.error).toEqual(registered.error);
+    expect(listed.error).toEqual(registered.error);
+    expectPublicPluginDiagnostic(failedEventError, '入口模块加载失败');
+    expectPublicPluginDiagnostic(registered.error, '入口模块加载失败');
+    expectPublicPluginDiagnostic(polled.error, '入口模块加载失败');
+    expectPublicPluginDiagnostic(listed.error, '入口模块加载失败');
+  });
+
+  it('publishes only host-owned plugin summaries without retaining message, response, or cause', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const privateMarker = 'PRIVATE_PLUGIN_PROVIDER_RESPONSE';
+    const originalError = new Error(privateMarker, {
+      cause: new Error(`cause:${privateMarker}`),
+    });
+    Object.assign(originalError, { responseBody: `response:${privateMarker}` });
+    let failedEvent: EventMap['plugin:state-changed'] | undefined;
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'failed') failedEvent = event;
+    });
+
+    const info = await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => {
+            throw originalError;
+          },
+        },
+      })),
+    );
+
+    expect(info.reason).toBe('插件激活失败。');
+    expect(info.error).toEqual({ message: '插件激活失败。' });
+    expect(Object.keys(info.error as PluginDiagnostic)).toEqual(['message']);
+    expect(info.error).not.toHaveProperty('stack');
+    expect(info.error).not.toHaveProperty('cause');
+    expect(failedEvent?.error).toEqual({ message: '插件激活失败。' });
+    expect(Object.keys(failedEvent?.error ?? {})).toEqual(['message']);
+    expect(failedEvent?.error).not.toHaveProperty('stack');
+    expect(failedEvent?.error).not.toHaveProperty('cause');
+    expect(Object.isFrozen(info)).toBe(true);
+    expect(Object.isFrozen(info.error)).toBe(true);
+    expect(Object.isFrozen(info.contributes)).toBe(true);
+    expect(Object.isFrozen(failedEvent)).toBe(true);
+    expect(Object.isFrozen(failedEvent?.error)).toBe(true);
+    const pluginList = host.listPlugins();
+    const listed = pluginList[0]!;
+    const polled = host.getPlugin('com.example.plugin')!;
+    expect(Object.isFrozen(pluginList)).toBe(true);
+    expect(Object.isFrozen(listed)).toBe(true);
+    expect(Object.isFrozen(polled)).toBe(true);
+    expect(listed.error).toEqual(info.error);
+    expect(polled.error).toEqual(info.error);
+    expect(JSON.stringify(info)).not.toContain(privateMarker);
+    expect(JSON.stringify(failedEvent)).not.toContain(privateMarker);
+  });
+
+  it('publishes one diagnostic object for a single deactivation failure across events and snapshots', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const privateTail = 'PRIVATE_DEACTIVATION_TAIL';
+    const originalError = new Error(`accessToken="prefix\\"; ${privateTail}${'x'.repeat(2_500)}"`);
+    let disabledEventError: PluginDiagnostic | undefined;
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'disabled') disabledEventError = event.error;
+    });
+    await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => undefined,
+          deactivate: () => {
+            throw originalError;
+          },
+        },
+      })),
+    );
+
+    await host.disable('com.example.plugin');
+
+    const info = host.getPlugin('com.example.plugin')!;
+    const listed = host.listPlugins()[0]!;
+    expect(info.state).toBe('disabled');
+    expect(info.reason).toBe('插件停用失败。');
+    expect(info.reason).not.toContain(privateTail);
+    expect(info.reason?.length).toBeLessThanOrEqual(2_000);
+    expect(disabledEventError).toEqual(info.error);
+    expect(listed.error).toEqual(info.error);
+    expectPublicPluginDiagnostic(info.error, '插件停用失败。');
+    expectPublicPluginDiagnostic(disabledEventError, '插件停用失败。');
+    expectPublicPluginDiagnostic(listed.error, '插件停用失败。');
+    expect(info.error).not.toBe(originalError);
+    expect(info.error?.message).not.toContain(privateTail);
+    expect(info.error?.message.length).toBeLessThanOrEqual(2_000);
+    expect(Object.isFrozen(info)).toBe(true);
+    expect(Object.isFrozen(info.contributes)).toBe(true);
+  });
+
+  it('summarizes deactivation hook and owned disposable failures as one isolated diagnostic', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const privateMarker = 'PRIVATE_DOUBLE_DEACTIVATION_FAILURE';
+    const hookError = new Error(`hook:${privateMarker}`, { cause: new Error(`hook-cause:${privateMarker}`) });
+    const disposableError = new Error(`dispose:${privateMarker}`, { cause: new Error(`dispose-cause:${privateMarker}`) });
+    let secondListenerError: PluginDiagnostic | undefined;
+
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state !== 'disabled' || !event.error) return;
+      Reflect.set(event.error, 'message', privateMarker);
+      Reflect.set(event, 'error', { message: privateMarker });
+    });
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'disabled') secondListenerError = event.error;
+    });
+
+    await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => ({
+            dispose: () => {
+              throw disposableError;
+            },
+          }),
+          deactivate: () => {
+            throw hookError;
+          },
+        },
+      })),
+    );
+
+    await host.disable('com.example.plugin');
+
+    const info = host.getPlugin('com.example.plugin')!;
+    const listed = host.listPlugins()[0]!;
+    expect(secondListenerError).toEqual(info.error);
+    expect(listed.error).toEqual(info.error);
+    expectPublicPluginDiagnostic(secondListenerError, '插件停用失败。');
+    expectPublicPluginDiagnostic(info.error, '插件停用失败。');
+    expectPublicPluginDiagnostic(listed.error, '插件停用失败。');
+    expect(JSON.stringify({ secondListenerError, info, listed })).not.toContain(privateMarker);
+    expect(() => {
+      (info.error as { message: string }).message = privateMarker;
+    }).toThrow(TypeError);
+    expect(() => {
+      (info as { error?: PluginDiagnostic }).error = { message: privateMarker };
+    }).toThrow(TypeError);
+
+    const fresh = host.getPlugin('com.example.plugin')!;
+    expect(fresh.error).not.toBe(info.error);
+    expectPublicPluginDiagnostic(fresh.error, '插件停用失败。');
+    expect(fresh.error?.message).not.toContain(privateMarker);
+  });
+
+  it('retains one diagnostic when direct deactivation hook and owned disposable cleanup both fail', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const privateMarker = 'PRIVATE_DIRECT_DEACTIVATION_FAILURE';
+    const hookError = new Error(`hook:${privateMarker}`, { cause: new Error(`hook-cause:${privateMarker}`) });
+    const disposableError = new Error(`dispose:${privateMarker}`, {
+      cause: new Error(`dispose-cause:${privateMarker}`),
+    });
+    const deactivate = vi.fn(() => {
+      throw hookError;
+    });
+    const dispose = vi.fn(() => {
+      throw disposableError;
+    });
+    let inactiveEvent: EventMap['plugin:state-changed'] | undefined;
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'inactive') inactiveEvent = event;
+    });
+
+    await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => ({ dispose }),
+          deactivate,
+        },
+      })),
+    );
+
+    await host.deactivate('com.example.plugin');
+
+    const info = host.getPlugin('com.example.plugin')!;
+    const pluginList = host.listPlugins();
+    const listed = pluginList[0]!;
+    expect(deactivate).toHaveBeenCalledTimes(1);
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(inactiveEvent?.state).toBe('inactive');
+    expect(inactiveEvent?.error).toEqual(info.error);
+    expect(listed.error).toEqual(info.error);
+    expect(info.reason).toBe('插件停用失败。');
+    expectPublicPluginDiagnostic(inactiveEvent?.error, '插件停用失败。');
+    expectPublicPluginDiagnostic(info.error, '插件停用失败。');
+    expectPublicPluginDiagnostic(listed.error, '插件停用失败。');
+    expect(Object.isFrozen(inactiveEvent)).toBe(true);
+    expect(Object.isFrozen(info)).toBe(true);
+    expect(Object.isFrozen(pluginList)).toBe(true);
+    expect(Object.isFrozen(listed)).toBe(true);
+    expect(JSON.stringify({ inactiveEvent, info, listed })).not.toContain(privateMarker);
+  });
+
+  it('clears a previous cleanup diagnostic after a later successful direct deactivation', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    let failCleanup = true;
+    const deactivate = vi.fn(() => {
+      if (failCleanup) throw new Error('private hook failure');
+    });
+    const dispose = vi.fn(() => {
+      if (failCleanup) throw new Error('private disposable failure');
+    });
+    let inactiveEvent: EventMap['plugin:state-changed'] | undefined;
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state === 'inactive') inactiveEvent = event;
+    });
+
+    await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => ({ dispose }),
+          deactivate,
+        },
+      })),
+    );
+    await host.disable('com.example.plugin');
+    expectPublicPluginDiagnostic(host.getPlugin('com.example.plugin')?.error, '插件停用失败。');
+
+    failCleanup = false;
+    await host.enable('com.example.plugin');
+    await host.deactivate('com.example.plugin');
+
+    const info = host.getPlugin('com.example.plugin')!;
+    const listed = host.listPlugins()[0]!;
+    expect(deactivate).toHaveBeenCalledTimes(2);
+    expect(dispose).toHaveBeenCalledTimes(2);
+    expect(inactiveEvent?.state).toBe('inactive');
+    expect(inactiveEvent?.error).toBeUndefined();
+    expect(info.error).toBeUndefined();
+    expect(info.reason).toBeUndefined();
+    expect(listed.error).toBeUndefined();
+    expect(listed.reason).toBeUndefined();
+  });
+
+  it('isolates published activation errors from caller mutation', async () => {
+    const activationHost = new PluginHost({ hostVersion: '0.1.0' });
+    const activationInfo = await activationHost.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => {
+            throw new Error('activation failed');
+          },
+        },
+      })),
+    );
+    expect(() => {
+      (activationInfo.error as { message: string }).message = 'apiKey=INJECTED_ACTIVATION_SECRET';
+    }).toThrow(TypeError);
+
+    const freshActivationInfo = activationHost.getPlugin('com.example.plugin')!;
+    expect(freshActivationInfo.error).not.toBe(activationInfo.error);
+    expect((freshActivationInfo.error as PluginDiagnostic).message).not.toContain('INJECTED_ACTIVATION_SECRET');
+  });
+
+  it('isolates state event payloads and errors between listeners and onAny', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const injectedMessage = 'apiKey=INJECTED_EVENT_LISTENER_SECRET';
+    let secondListenerState: PluginState | undefined;
+    let secondListenerMessage: string | undefined;
+    let anyListenerState: PluginState | undefined;
+    let anyListenerMessage: string | undefined;
+
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state !== 'failed') return;
+      Reflect.set(event.error as PluginDiagnostic, 'message', injectedMessage);
+      Reflect.set(event, 'state', 'active');
+      Reflect.set(event, 'error', new Error(injectedMessage));
+    });
+    host.events.on('plugin:state-changed', (event) => {
+      if (event.state !== 'failed') return;
+      secondListenerState = event.state;
+      secondListenerMessage = (event.error as PluginDiagnostic).message;
+    });
+    host.events.onAny((eventName, payload) => {
+      if (eventName !== 'plugin:state-changed') return;
+      const event = payload as { state: PluginState; error?: unknown };
+      if (event.state !== 'failed') return;
+      anyListenerState = event.state;
+      anyListenerMessage = (event.error as PluginDiagnostic).message;
+    });
+
+    const info = await host.register(
+      descriptor(VALID_MANIFEST, async () => ({
+        default: {
+          activate: () => {
+            throw new Error('activation failed');
+          },
+        },
+      })),
+    );
+
+    expect(secondListenerState).toBe('failed');
+    expect(secondListenerMessage).not.toContain('INJECTED_EVENT_LISTENER_SECRET');
+    expect(anyListenerState).toBe('failed');
+    expect(anyListenerMessage).not.toContain('INJECTED_EVENT_LISTENER_SECRET');
+    expect(info.state).toBe('failed');
+    expect(info.reason).not.toContain('INJECTED_EVENT_LISTENER_SECRET');
+    expect((info.error as PluginDiagnostic).message).not.toContain('INJECTED_EVENT_LISTENER_SECRET');
+  });
+
+  it('cancels running storyboard tasks when their provider plugin is disabled', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const providerId = 'com.example.plugin.storyboard';
+    await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => context.contribute({
+              aiProviders: [{
+                kind: 'aiProvider',
+                id: providerId,
+                name: 'Storyboard provider',
+                models: [],
+                chat: async function* () {},
+                storyboard: {
+                  capability: 'ai.storyboard.generate',
+                  models: [{ id: 'slow', name: 'Slow', cost: { kind: 'unknown', note: 'Unknown' } }],
+                  generate: async () => new Promise<unknown>(() => undefined),
+                },
+              }],
+            }),
+          },
+        }),
+      ),
+    );
+    const task = host.services.ai.submitStoryboard(providerId, {
+      model: 'slow',
+      brief: { concept: 'A complete storyboard concept for lifecycle testing.', targetDurationSeconds: 2, shotCount: 1 },
+    });
+
+    await host.disable('com.example.plugin');
+    const outcome = await Promise.race([
+      host.services.ai.waitForGenerationTask(task.id),
+      new Promise<'still-running'>((resolve) => setTimeout(() => resolve('still-running'), 25)),
+    ]);
+
+    expect(outcome).not.toBe('still-running');
+    expect(outcome).toMatchObject({ status: 'cancelled', error: { code: 'cancelled' } });
+  });
+
+  it('cancels running storyboard tasks when the provider contribution handle is disposed early', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const providerId = 'com.example.plugin.disposable-storyboard';
+    let contribution: Disposable | undefined;
+    await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => {
+              contribution = context.contribute({
+                aiProviders: [{
+                  kind: 'aiProvider',
+                  id: providerId,
+                  name: 'Disposable storyboard provider',
+                  models: [],
+                  chat: async function* () {},
+                  storyboard: {
+                    capability: 'ai.storyboard.generate',
+                    models: [{ id: 'slow', name: 'Slow', cost: { kind: 'unknown', note: 'Unknown' } }],
+                    generate: async () => new Promise<unknown>(() => undefined),
+                  },
+                }],
+              });
+            },
+          },
+        }),
+      ),
+    );
+    const task = host.services.ai.submitStoryboard(providerId, {
+      model: 'slow',
+      brief: { concept: 'A complete early disposal lifecycle test.', targetDurationSeconds: 2, shotCount: 1 },
+    });
+
+    await contribution?.dispose();
+    const outcome = await Promise.race([
+      host.services.ai.waitForGenerationTask(task.id),
+      new Promise<'still-running'>((resolve) => setTimeout(() => resolve('still-running'), 25)),
+    ]);
+
+    expect(host.services.ai.listStoryboardProviders()).toEqual([]);
+    expect(outcome).not.toBe('still-running');
+    expect(outcome).toMatchObject({ status: 'cancelled', error: { code: 'cancelled' } });
+  });
+
+  it('snapshots provider identity so deactivate cannot move registration or admit a task under a changed id', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const providerId = 'com.example.plugin.stable-storyboard';
+    const changedProviderId = 'com.example.plugin.changed-storyboard';
+    let changedIdTask: ReturnType<typeof host.services.ai.submitStoryboard> | undefined;
+    let changedIdError: unknown;
+    const provider: AiProviderContribution = {
+      kind: 'aiProvider',
+      id: providerId,
+      name: 'Stable identity storyboard provider',
+      models: [],
+      chat: async function* () {},
+      storyboard: {
+        capability: 'ai.storyboard.generate',
+        models: [{ id: 'slow', name: 'Slow', cost: { kind: 'unknown', note: 'Unknown' } }],
+        generate: async () => new Promise<unknown>(() => undefined),
+      },
+    };
+    await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => context.contribute({ aiProviders: [provider] }),
+            deactivate: () => {
+              provider.id = changedProviderId;
+              try {
+                changedIdTask = host.services.ai.submitStoryboard(changedProviderId, {
+                  model: 'slow',
+                  brief: { concept: 'A complete changed identity lifecycle test.', targetDurationSeconds: 2, shotCount: 1 },
+                });
+              } catch (error) {
+                changedIdError = error;
+              }
+            },
+          },
+        }),
+      ),
+    );
+
+    await host.disable('com.example.plugin');
+
+    expect(changedIdTask).toBeUndefined();
+    expect(changedIdError).toBeInstanceOf(Error);
+    expect(host.services.ai.listStoryboardProviders()).toEqual([]);
+    expect(host.contributions.getAiProviders()).toEqual([]);
+  });
+
+  it('reads a provider id once so a stateful getter cannot overwrite another provider', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const victimProviderId = 'com.example.provider.victim';
+    const hostileProviderId = 'com.example.provider.hostile';
+    await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, id: 'com.example.victim', contributes: ['aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => context.contribute({
+              aiProviders: [{
+                kind: 'aiProvider',
+                id: victimProviderId,
+                name: 'Victim provider',
+                models: [],
+                chat: async function* () {},
+              }],
+            }),
+          },
+        }),
+      ),
+    );
+    let idReads = 0;
+    const hostileProvider = {
+      kind: 'aiProvider',
+      name: 'Hostile provider',
+      models: [],
+      chat: async function* () {},
+    } as unknown as AiProviderContribution;
+    Object.defineProperty(hostileProvider, 'id', {
+      enumerable: true,
+      get: () => {
+        idReads += 1;
+        return idReads <= 2 ? hostileProviderId : victimProviderId;
+      },
+    });
+
+    const info = await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, id: 'com.example.hostile', contributes: ['aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => context.contribute({ aiProviders: [hostileProvider] }),
+          },
+        }),
+      ),
+    );
+
+    expect(info.reason).toBeUndefined();
+    expect(info.state).toBe('active');
+    expect(idReads).toBe(1);
+    expect(host.contributions.getAiProviders().map((provider) => provider.id).sort()).toEqual([
+      hostileProviderId,
+      victimProviderId,
+    ]);
+  });
+
+  it('cancels storyboard tasks admitted while provider deactivation is awaiting', async () => {
+    const host = new PluginHost({ hostVersion: '0.1.0' });
+    const providerId = 'com.example.plugin.deactivating-storyboard';
+    let releaseDeactivate!: () => void;
+    let markDeactivateStarted!: () => void;
+    const deactivateGate = new Promise<void>((resolve) => {
+      releaseDeactivate = resolve;
+    });
+    const deactivateStarted = new Promise<void>((resolve) => {
+      markDeactivateStarted = resolve;
+    });
+    await host.register(
+      descriptor(
+        { ...VALID_MANIFEST, contributes: ['aiProvider'] },
+        async () => ({
+          default: {
+            activate: (context) => context.contribute({
+              aiProviders: [{
+                kind: 'aiProvider',
+                id: providerId,
+                name: 'Deactivating storyboard provider',
+                models: [],
+                chat: async function* () {},
+                storyboard: {
+                  capability: 'ai.storyboard.generate',
+                  models: [{ id: 'slow', name: 'Slow', cost: { kind: 'unknown', note: 'Unknown' } }],
+                  generate: async () => new Promise<unknown>(() => undefined),
+                },
+              }],
+            }),
+            deactivate: async () => {
+              markDeactivateStarted();
+              await deactivateGate;
+            },
+          },
+        }),
+      ),
+    );
+
+    const disabling = host.disable('com.example.plugin');
+    await deactivateStarted;
+    const lateTask = host.services.ai.submitStoryboard(providerId, {
+      model: 'slow',
+      brief: { concept: 'A complete late storyboard lifecycle test.', targetDurationSeconds: 2, shotCount: 1 },
+    });
+    releaseDeactivate();
+    await disabling;
+    const outcome = await Promise.race([
+      host.services.ai.waitForGenerationTask(lateTask.id),
+      new Promise<'still-running'>((resolve) => setTimeout(() => resolve('still-running'), 25)),
+    ]);
+
+    expect(outcome).not.toBe('still-running');
+    expect(outcome).toMatchObject({ status: 'cancelled', error: { code: 'cancelled' } });
+  });
+
   it('注册并激活插件：六类贡献项全部就位，状态序列正确', async () => {
     const host = new PluginHost({ hostVersion: '0.1.0' });
     const states: string[] = [];
@@ -317,7 +1278,7 @@ describe('PluginHost', () => {
       })),
     );
     expect(info.state).toBe('failed');
-    expect(info.reason).toContain('id 重复');
+    expect(info.reason).toBe('插件激活失败。');
     expect(host.contributions.getPanels()).toHaveLength(1);
   });
 
@@ -386,7 +1347,7 @@ describe('PluginHost', () => {
       })),
     );
     expect(info.state).toBe('failed');
-    expect(info.reason).toContain('在 bundle 内重复');
+    expect(info.reason).toBe('插件激活失败。');
     // 非法 bundle 中即便含合法项也不得部分生效
     expect(host.contributions.count()).toBe(0);
     expect(host.commands.count()).toBe(0);
@@ -408,7 +1369,7 @@ describe('PluginHost', () => {
       })),
     );
     expect(info.state).toBe('failed');
-    expect(info.reason).toContain('在 bundle 内重复');
+    expect(info.reason).toBe('插件激活失败。');
     expect(host.commands.count()).toBe(0);
   });
 
@@ -989,7 +1950,7 @@ describe('PluginHost', () => {
     // 重新启用：重新加载，失败正常进入 failed 并给出原因
     await host.enable('com.example.plugin');
     expect(host.getPlugin('com.example.plugin')?.state).toBe('failed');
-    expect(host.getPlugin('com.example.plugin')?.reason).toContain('加载爆炸');
+    expect(host.getPlugin('com.example.plugin')?.reason).toBe('入口模块加载失败');
     expect(entry).toHaveBeenCalledTimes(2);
   });
 

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "1",
+  "id": "com.lumora.openai.compatible",
+  "name": "OpenAI 兼容 Provider",
+  "version": "0.1.0",
+  "description": "可配置端点和模型的 OpenAI 兼容文本 Provider",
+  "author": "Lumora Team",
+  "entry": "./dist/index.js",
+  "engine": { "lumora": ">=0.1.0" },
+  "contributes": ["panel", "aiProvider"],
+  "enabled": true
+}

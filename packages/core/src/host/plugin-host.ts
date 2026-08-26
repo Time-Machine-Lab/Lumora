@@ -2,12 +2,17 @@ import { DisposableSet, type Disposable } from '../disposable';
 import { CommandRegistry, PluginCommands, type CommandContext } from '../commands/command-registry';
 import { ContributionRegistry } from '../contributions/contribution-registry';
 import { TypedEventEmitter } from '../events/typed-event-emitter';
-import type { EventMap } from '../events/event-map';
+import type { EventMap, PluginDiagnostic } from '../events/event-map';
 import { checkEngineCompatibility } from '../manifest/engine';
 import { validateManifest } from '../manifest/validate';
 import type { Manifest } from '../manifest/validate';
 import { deepFreeze } from '../scene/immutable';
-import { createPluginServices, type PluginServices } from '../services';
+import {
+  cancelStoryboardTasksForProvider,
+  createPluginServices,
+  disposePluginServices,
+  type PluginServices,
+} from '../services';
 import type { Project } from '../scene/types';
 import type {
   PluginContext,
@@ -16,12 +21,76 @@ import type {
   PluginEventBus,
   PluginInfo,
   PluginModule,
+  PluginSettingsStorage,
   PluginState,
 } from './types';
 
 export interface PluginHostOptions {
   hostVersion?: string;
   onError?: (error: unknown) => void;
+  /** 此 `PluginHost` 实例专属的非敏感插件设置后端；缺省为隔离的内存实现。 */
+  pluginSettingsStorage?: PluginSettingsStorage;
+}
+
+class MemoryPluginSettingsStorage implements PluginSettingsStorage {
+  private readonly plugins = new Map<string, Map<string, string>>();
+
+  get(pluginInstanceId: string, key: string): string | null {
+    return this.plugins.get(pluginInstanceId)?.get(key) ?? null;
+  }
+
+  set(pluginInstanceId: string, key: string, value: string): void {
+    let settings = this.plugins.get(pluginInstanceId);
+    if (!settings) {
+      settings = new Map();
+      this.plugins.set(pluginInstanceId, settings);
+    }
+    settings.set(key, value);
+  }
+
+  remove(pluginInstanceId: string, key: string): void {
+    const settings = this.plugins.get(pluginInstanceId);
+    settings?.delete(key);
+    if (settings?.size === 0) this.plugins.delete(pluginInstanceId);
+  }
+}
+
+const PLUGIN_MANIFEST_INVALID_MESSAGE = 'Manifest 非法';
+const PLUGIN_ENGINE_INCOMPATIBLE_MESSAGE = '不满足插件引擎要求';
+const PLUGIN_ENTRY_MISSING_MESSAGE = '未提供入口模块加载器';
+const PLUGIN_DEFINITION_MISSING_MESSAGE = '入口模块未导出插件定义';
+const PLUGIN_ENTRY_LOAD_FAILED_MESSAGE = '入口模块加载失败';
+const PLUGIN_ACTIVATION_FAILED_MESSAGE = '插件激活失败。';
+const PLUGIN_DEACTIVATION_FAILED_MESSAGE = '插件停用失败。';
+const PLUGIN_OPERATION_FAILED_MESSAGE = '插件操作失败。';
+
+const PUBLIC_PLUGIN_DIAGNOSTIC_MESSAGES = new Set([
+  PLUGIN_MANIFEST_INVALID_MESSAGE,
+  PLUGIN_ENGINE_INCOMPATIBLE_MESSAGE,
+  PLUGIN_ENTRY_MISSING_MESSAGE,
+  PLUGIN_DEFINITION_MISSING_MESSAGE,
+  PLUGIN_ENTRY_LOAD_FAILED_MESSAGE,
+  PLUGIN_ACTIVATION_FAILED_MESSAGE,
+  PLUGIN_DEACTIVATION_FAILED_MESSAGE,
+  PLUGIN_OPERATION_FAILED_MESSAGE,
+]);
+
+function publicPluginDiagnosticMessage(value: unknown): string {
+  if (typeof value === 'string') {
+    return PUBLIC_PLUGIN_DIAGNOSTIC_MESSAGES.has(value) ? value : PLUGIN_OPERATION_FAILED_MESSAGE;
+  }
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) {
+    return PLUGIN_OPERATION_FAILED_MESSAGE;
+  }
+  try {
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, 'message');
+    const message = descriptor && 'value' in descriptor ? descriptor.value : undefined;
+    return typeof message === 'string' && PUBLIC_PLUGIN_DIAGNOSTIC_MESSAGES.has(message)
+      ? message
+      : PLUGIN_OPERATION_FAILED_MESSAGE;
+  } catch {
+    return PLUGIN_OPERATION_FAILED_MESSAGE;
+  }
 }
 
 /**
@@ -115,6 +184,12 @@ interface PluginRecord {
   /** 生命周期代际：每次发布生命周期操作（停用/销毁/激活失败）时递增，用于废弃在途加载/激活/门面 */
   generation: number;
   info(): PluginInfo;
+}
+
+function projectPluginDiagnostic(record: Pick<PluginRecord, 'reason' | 'error'>): PluginDiagnostic | undefined {
+  const error = record.reason ?? record.error;
+  if (error === undefined) return undefined;
+  return deepFreeze({ message: publicPluginDiagnosticMessage(error) });
 }
 
 /** 插件可见的事件总线：订阅归入尝试暂存集合，随停用整体移除；代际失效后订阅被拒绝 */
@@ -211,6 +286,7 @@ export class PluginHost {
 
   private readonly plugins = new Map<string, PluginRecord>();
   private readonly onError: (error: unknown) => void;
+  private readonly pluginSettingsStorage: PluginSettingsStorage;
   private project: Project | null = null;
   private disposedFlag = false;
   /** 销毁的真实清理完成点：publish-first 登记，所有并发/二次 dispose 等待同一清理 */
@@ -225,6 +301,7 @@ export class PluginHost {
       ((error) => {
         console.error('[lumora:host] 未捕获的宿主错误:', error);
       });
+    this.pluginSettingsStorage = options.pluginSettingsStorage ?? new MemoryPluginSettingsStorage();
     // 宿主自身就绪后再构造命令/贡献项/服务：onError 与惰性 services 才能正确注入
     this.commands = new CommandRegistry({
       events: this.events,
@@ -234,7 +311,11 @@ export class PluginHost {
       // 命令回调（when/execute）收到 owner/代际绑定的命令与事件门面；停用后旧 context 彻底失效
       contextFor: (ownerId) => this.createCommandContext(ownerId),
     });
-    this.contributions = new ContributionRegistry({ events: this.events, commands: this.commands });
+    this.contributions = new ContributionRegistry({
+      events: this.events,
+      commands: this.commands,
+      onAiProviderRemoved: (providerId) => cancelStoryboardTasksForProvider(this.services, providerId),
+    });
     this.services = createPluginServices(this.contributions, () => this.project);
   }
 
@@ -246,8 +327,8 @@ export class PluginHost {
     this.project = project;
   }
 
-  listPlugins(): PluginInfo[] {
-    return [...this.plugins.values()].map((record) => record.info());
+  listPlugins(): ReadonlyArray<PluginInfo> {
+    return deepFreeze([...this.plugins.values()].map((record) => record.info()));
   }
 
   /** 按 instanceId 查询插件（合法 Manifest 的 instanceId 与 manifest id 相同） */
@@ -480,6 +561,7 @@ export class PluginHost {
     const disposals = records.map((record) => this.deactivateRecord(record, 'inactive'));
     await Promise.all(disposals);
     this.plugins.clear();
+    disposePluginServices(this.services);
     this.contributions.dispose();
     this.commands.dispose();
     this.events.dispose();
@@ -571,14 +653,14 @@ export class PluginHost {
     }
 
     let reason: string | undefined = !validation.ok
-      ? `Manifest 非法: ${validation.errors.join('；')}`
+      ? PLUGIN_MANIFEST_INVALID_MESSAGE
       : undefined;
     let ready = reason === undefined;
     if (ready && manifest) {
       const engine = checkEngineCompatibility(manifest, this.hostVersion);
       if (!engine.ok) {
         ready = false;
-        reason = engine.reason;
+        reason = PLUGIN_ENGINE_INCOMPATIBLE_MESSAGE;
       }
     }
 
@@ -615,17 +697,17 @@ export class PluginHost {
       gate: null,
       lifecycle: null,
       lifecycleTarget: null,
-      info() {
-        return {
+      info: () => {
+        return deepFreeze({
           instanceId: record.key,
           id: record.id,
           name: record.name,
           version: record.version,
           state: record.state,
-          error: record.error,
+          error: projectPluginDiagnostic(record),
           reason: record.reason,
           contributes: [...(record.manifest.contributes ?? [])],
-        };
+        });
       },
     };
     return record;
@@ -682,7 +764,7 @@ export class PluginHost {
       // 发布加载终态 failed 前按 identity 摘除旧 loading operation：
       // failed 事件内同步重试 enable() 必须创建独立加载，不得共享即将结束的失败加载而 silent success
       if (record.loading === operation) record.loading = null;
-      this.fail(record, '未提供入口模块加载器（descriptor.entry）');
+      this.fail(record, PLUGIN_ENTRY_MISSING_MESSAGE);
       return;
     }
     try {
@@ -694,18 +776,18 @@ export class PluginHost {
       if (!definition) {
         // 同上的 loading 摘除：加载结果无效发布 failed 前，failed 事件内重试须独立加载
         if (record.loading === operation) record.loading = null;
-        this.fail(record, '入口模块未导出插件定义（缺少 default 或 activate）');
+        this.fail(record, PLUGIN_DEFINITION_MISSING_MESSAGE);
         return;
       }
       record.definition = definition;
-    } catch (error) {
+    } catch {
       // 晚到的加载失败同样绑定代际：不得把已停用/禁用的插件改写为 failed；
       // 发布 failed 前按 identity 摘除旧 loading operation —— failed 事件内同步重试的
       // enable() 必须启动独立加载（loadDefinition 不再共享旧操作），否则旧加载完成后
       // 重试在 record.state === 'failed' 处静默成功、插件实际仍失败（loader 不再调用）
       if (this.disposedFlag || record.generation !== generation || record.loading !== operation) return;
       if (record.loading === operation) record.loading = null;
-      this.fail(record, `入口模块加载失败: ${this.errorMessage(error)}`, error);
+      this.fail(record, PLUGIN_ENTRY_LOAD_FAILED_MESSAGE);
     }
   }
 
@@ -795,16 +877,16 @@ export class PluginHost {
     let hook: Promise<Disposable | void> | Disposable | void;
     try {
       hook = record.definition.activate(this.createContext(record, attempt, gate));
-    } catch (error) {
-      await this.failActivation(record, attempt, completion, error);
+    } catch {
+      await this.failActivation(record, attempt, completion);
       return;
     }
 
     let result: Disposable | void;
     try {
       result = await hook;
-    } catch (error) {
-      await this.failActivation(record, attempt, completion, error);
+    } catch {
+      await this.failActivation(record, attempt, completion);
       return;
     }
     if (this.disposedFlag || record.activation !== attempt) {
@@ -857,7 +939,6 @@ export class PluginHost {
     record: PluginRecord,
     attempt: ActivationAttempt,
     completion: Deferred<void>,
-    error: unknown,
   ): Promise<void> {
     if (this.disposedFlag) {
       // 销毁已接管：先解析本尝试唯一完成点（驱动已发布的生命周期清理，避免环形
@@ -881,10 +962,11 @@ export class PluginHost {
     // 当前尝试：先发布失败生命周期（任何回滚 await 之前），再解析唯一完成点驱动
     // 生命周期内的回滚清理；最后等待回滚终态（failed，或清理事件内 disable 合并的
     // disabled），并收敛终态事件内重入启动的新激活
+    const publicError = new Error(PLUGIN_ACTIVATION_FAILED_MESSAGE);
     const failure = this.publishLifecycle(record, {
       state: 'failed',
-      reason: `激活失败: ${this.errorMessage(error)}`,
-      error,
+      reason: PLUGIN_ACTIVATION_FAILED_MESSAGE,
+      error: publicError,
     });
     completion.resolve();
     try {
@@ -941,6 +1023,13 @@ export class PluginHost {
     record.gate = null;
     record.state = 'deactivating';
     this.emitState(record, 'deactivating');
+    const ownedProviderIds = new Set<string>();
+    for (const provider of this.contributions.getAiProviders()) {
+      if (provider.pluginId !== record.id) continue;
+      ownedProviderIds.add(provider.id);
+      cancelStoryboardTasksForProvider(this.services, provider.id);
+    }
+    let hasNewCleanupError = false;
 
     try {
       if (attempt) {
@@ -973,8 +1062,10 @@ export class PluginHost {
         // 换新集合，插件再次启用时不会被已销毁的集合吞掉资源
         record.owned = new DisposableSet();
         if (errors.length > 0) {
-          record.error = errors;
-          record.reason = `停用时出错: ${errors.map((e) => this.errorMessage(e)).join('；')}`;
+          hasNewCleanupError = true;
+          const publicErrors = errors.map(() => new Error(PLUGIN_DEACTIVATION_FAILED_MESSAGE));
+          record.error = publicErrors;
+          record.reason = PLUGIN_DEACTIVATION_FAILED_MESSAGE;
         }
       } else if (originalState === 'failed') {
         // failed 插件（校验/加载/激活失败）：幂等清理残留资源，保留失败原因（可重新启用重试）
@@ -984,6 +1075,10 @@ export class PluginHost {
           // 清理失败不掩盖停用
         }
         record.owned = new DisposableSet();
+      }
+      // Contributions are gone, so cancel requests admitted while an async deactivate hook awaited.
+      for (const providerId of ownedProviderIds) {
+        cancelStoryboardTasksForProvider(this.services, providerId);
       }
       // 发布终态事件前让旧操作完整 detach：终态事件内的重入（enable 重新激活、
       // failed 后再次停用等）将发布全新的操作/尝试，而不是合并进已消费完 target
@@ -1004,7 +1099,7 @@ export class PluginHost {
           record.state = 'disabled';
         } else {
           record.state = 'inactive';
-          if (originalState !== 'failed') {
+          if (originalState !== 'failed' && !hasNewCleanupError) {
             record.error = undefined;
             record.reason = undefined;
           }
@@ -1012,14 +1107,14 @@ export class PluginHost {
         return;
       }
       if (target.state === 'failed') {
-        this.fail(record, target.reason ?? '激活失败', target.error);
+        this.fail(record, target.reason ?? PLUGIN_ACTIVATION_FAILED_MESSAGE);
       } else if (target.state === 'disabled') {
         record.state = 'disabled';
         this.emitState(record, 'disabled');
       } else {
         record.state = 'inactive';
         // 停用保留失败原因（failed 插件可重新启用重试）；其余场景清理残留错误信息
-        if (originalState !== 'failed') {
+        if (originalState !== 'failed' && !hasNewCleanupError) {
           record.error = undefined;
           record.reason = undefined;
         }
@@ -1063,6 +1158,20 @@ export class PluginHost {
       // 只读/执行能力面：插件不得绕过生命周期直接注册命令
       commands: gate.commands,
       services: this.services,
+      settings: {
+        get: (key) => {
+          if (!this.isGateAlive(record, attempt)) throw new Error('插件已停用或宿主已销毁，无法读取设置');
+          return this.pluginSettingsStorage.get(record.key, key);
+        },
+        set: (key, value) => {
+          if (!this.isGateAlive(record, attempt)) throw new Error('插件已停用或宿主已销毁，无法保存设置');
+          this.pluginSettingsStorage.set(record.key, key, value);
+        },
+        remove: (key) => {
+          if (!this.isGateAlive(record, attempt)) throw new Error('插件已停用或宿主已销毁，无法删除设置');
+          this.pluginSettingsStorage.remove(record.key, key);
+        },
+      },
       contribute: (bundle) => {
         if (this.disposedFlag || record.generation !== attempt.generation) {
           throw new Error('插件已停用或宿主已销毁，无法提交贡献项');
@@ -1129,22 +1238,24 @@ export class PluginHost {
     );
   }
 
-  private fail(record: PluginRecord, reason: string, error?: unknown): void {
+  private fail(record: PluginRecord, reason: string): void {
+    const publicReason = publicPluginDiagnosticMessage(reason);
     record.state = 'failed';
-    record.reason = reason;
-    record.error = error ?? new Error(reason);
+    record.reason = publicReason;
+    record.error = new Error(publicReason);
     this.emitState(record, 'failed');
   }
 
   private emitState(record: PluginRecord, state: PluginState): void {
-    this.events.emit('plugin:state-changed', {
+    const payload = deepFreeze({
       // instanceId：稳定唯一的记录标识，事件关联与寻址（disable/enable）使用它；
       // pluginId 仅作 Manifest 展示（缺 id 时为 '<unknown>'），不得用于寻址
       instanceId: record.key,
       pluginId: record.id,
       state,
-      error: record.error ?? record.reason,
+      error: projectPluginDiagnostic(record),
     });
+    this.events.emit('plugin:state-changed', payload);
   }
 
   /** 按 instanceId 寻址记录（合法 Manifest 的 instanceId 与 manifest id 相同） */
@@ -1154,9 +1265,6 @@ export class PluginHost {
     return record;
   }
 
-  private errorMessage(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
-  }
 }
 
 function normalizePluginModule(module: PluginModule): PluginDefinition | undefined {

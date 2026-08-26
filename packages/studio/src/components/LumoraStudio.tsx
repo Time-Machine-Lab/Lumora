@@ -1,9 +1,10 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import { forwardRef, useCallback, useEffect, useId, useImperativeHandle, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { ReactNode } from 'react';
 import type { PluginDescriptor, Project } from '@lumora/core';
 import { createStudioRuntime } from '../runtime/studio-runtime';
 import type { StudioRuntime } from '../runtime/studio-runtime';
+import { BrowserPluginSettingsStorage } from '../runtime/browser-plugin-settings';
 import { useSceneEditor } from '../hooks/use-scene-editor';
 import { useTimelineSession } from '../hooks/use-timeline-session';
 import type { StorageBackend } from '../persistence/project-storage';
@@ -15,6 +16,7 @@ import { EditorViewport } from './editor/EditorViewport';
 import { TimelinePanel } from './editor/TimelinePanel';
 import { ObjectTree } from './editor/ObjectTree';
 import { PropertiesPanel } from './editor/PropertiesPanel';
+import { StoryboardWorkspace } from './storyboard/StoryboardWorkspace';
 import { ToastHost, showToast } from './editor/toasts';
 import { ContentCache } from './editor/content-cache';
 import { DRIVE_KEY_CODES } from './editor/camera-drive';
@@ -60,6 +62,11 @@ export interface LumoraStudioProps {
   scene?: (project: Project | null) => ReactNode;
   /** 本地存储后端（缺省 indexeddb；opfs = Origin Private File System） */
   storage?: StorageBackend;
+  /**
+   * 非敏感插件设置的 Studio 实例命名空间。嵌入方需要跨卸载/重载恢复设置时应提供稳定值；
+   * 缺省使用 React 实例 id，保证同页多个 Studio 不共享设置。
+   */
+  pluginSettingsNamespace?: string;
   className?: string;
 }
 
@@ -78,12 +85,33 @@ export interface LumoraStudioHandle {
  * - 卸载时释放全部资源：停用插件、移除订阅、销毁事件总线、资源缓存与 WebGL 场景
  */
 export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(function LumoraStudio(
-  { plugins = [], hostVersion, initialProject, onError, onCloseError, scene, storage, className },
+  {
+    plugins = [],
+    hostVersion,
+    initialProject,
+    onError,
+    onCloseError,
+    scene,
+    storage,
+    pluginSettingsNamespace,
+    className,
+  },
   ref,
 ) {
+  const generatedPluginSettingsNamespace = useId();
+  const pluginSettingsStorageRef = useRef<BrowserPluginSettingsStorage | null>(null);
+  if (!pluginSettingsStorageRef.current) {
+    pluginSettingsStorageRef.current = new BrowserPluginSettingsStorage(
+      pluginSettingsNamespace ?? generatedPluginSettingsNamespace,
+    );
+  }
   const runtimeRef = useRef<StudioRuntime | null>(null);
   if (!runtimeRef.current) {
-    runtimeRef.current = createStudioRuntime({ hostVersion, onError });
+    runtimeRef.current = createStudioRuntime({
+      hostVersion,
+      onError,
+      pluginSettingsStorage: pluginSettingsStorageRef.current,
+    });
   }
   const runtime = runtimeRef.current;
   const editorState = useSceneEditor(runtime.editor);
@@ -203,7 +231,18 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
 
   const [pluginManagerOpen, setPluginManagerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [storyboardOpen, setStoryboardOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const closeWorkspace = () => setStoryboardOpen(false);
+    const opened = runtime.events.on('project:opened', closeWorkspace);
+    const closed = runtime.events.on('project:closed', closeWorkspace);
+    return () => {
+      opened.dispose();
+      closed.dispose();
+    };
+  }, [runtime.events]);
 
   // 第三十轮严重 6：统一卸载屏障 —— 卸载 cleanup 与宿主显式卸载共用同一通道。
   // 释放失败（冲刷失败 / 未解决恢复 fork）时运行时保留未 teardown，缓存也不
@@ -349,6 +388,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       // 命令面板开关先于输入守卫处理：面板打开时焦点在其搜索输入框内，Ctrl+K 仍需能关闭
       if ((event.ctrlKey || event.metaKey) && key === 'k') {
         event.preventDefault();
+        setStoryboardOpen(false);
         setPaletteOpen((open) => !open);
         return;
       }
@@ -422,10 +462,23 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
           project={project}
           editorState={editorState}
           cache={cache}
-          onTogglePlugins={() => setPluginManagerOpen((open) => !open)}
-          onTogglePalette={() => setPaletteOpen((open) => !open)}
+          storyboardOpen={storyboardOpen}
+          onToggleStoryboard={() => {
+            setPluginManagerOpen(false);
+            setPaletteOpen(false);
+            setStoryboardOpen((open) => !open);
+          }}
+          onTogglePlugins={() => {
+            setStoryboardOpen(false);
+            setPluginManagerOpen((open) => !open);
+          }}
+          onTogglePalette={() => {
+            setStoryboardOpen(false);
+            setPaletteOpen((open) => !open);
+          }}
         />
-        <div className="lumora-studio__body">
+        <div className="lumora-studio__stage">
+        <div className="lumora-studio__body" inert={storyboardOpen || undefined}>
           <div className="lumora-studio__sidebar">
             <ObjectTree
               editor={runtime.editor}
@@ -480,6 +533,15 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
             project={project}
             selection={editorState.selection}
           />
+        </div>
+        {storyboardOpen && project && (
+          <StoryboardWorkspace
+            key={project.uri}
+            runtime={runtime}
+            project={project}
+            onClose={() => setStoryboardOpen(false)}
+          />
+        )}
         </div>
         <ToastHost />
         {pluginManagerOpen && <PluginManager runtime={runtime} onClose={() => setPluginManagerOpen(false)} />}

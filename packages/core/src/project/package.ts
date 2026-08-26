@@ -220,7 +220,18 @@ export const PUBLIC_CAMERA_FIELDS = [
 ] as const;
 export const PUBLIC_TRACK_FIELDS = ['id', 'name', 'objectId', 'targetPath', 'disabled', 'keyframes'] as const;
 export const PUBLIC_KEYFRAME_FIELDS = ['time', 'value', 'interpolation'] as const;
-export const PUBLIC_SHOT_FIELDS = ['id', 'name', 'cameraObjectId', 'startTime', 'endTime'] as const;
+export const PUBLIC_SHOT_FIELDS = [
+  'id',
+  'name',
+  'cameraObjectId',
+  'startTime',
+  'endTime',
+  'shotSize',
+  'movement',
+  'prompt',
+  'aiSource',
+] as const;
+export const PUBLIC_AI_SOURCE_FIELDS = ['providerId', 'model', 'draftId'] as const;
 export const PUBLIC_ASSET_FIELDS = [
   'id',
   'kind',
@@ -309,6 +320,14 @@ function projectTrackDto(value: unknown): unknown {
   if (isPlainRecord(out) && Array.isArray(out.keyframes)) {
     out.keyframes = out.keyframes.map((frame) => projectDto(frame, PUBLIC_KEYFRAME_FIELDS));
   }
+  return out;
+}
+
+function projectShotDto(value: unknown): unknown {
+  const out = projectDto(value, PUBLIC_SHOT_FIELDS);
+  if (!isPlainRecord(out)) return out;
+  const source = projectDto(out.aiSource, PUBLIC_AI_SOURCE_FIELDS);
+  if (isPlainRecord(source)) out.aiSource = source;
   return out;
 }
 
@@ -1359,7 +1378,7 @@ export function buildProjectPackage(project: Project, options: PackageBuildOptio
   if (Array.isArray(stripped.scenes)) stripped.scenes = stripped.scenes.map((scene) => projectDto(scene, PUBLIC_SCENE_FIELDS));
   if (Array.isArray(stripped.objects)) stripped.objects = stripped.objects.map((object) => projectObjectDto(object));
   if (Array.isArray(stripped.tracks)) stripped.tracks = stripped.tracks.map((track) => projectTrackDto(track));
-  if (Array.isArray(stripped.shots)) stripped.shots = stripped.shots.map((shot) => projectDto(shot, PUBLIC_SHOT_FIELDS));
+  if (Array.isArray(stripped.shots)) stripped.shots = stripped.shots.map((shot) => projectShotDto(shot));
 
   // 无原型字典：资产 id 是导入包可携带的任意字符串（含 '__proto__'），
   // 普通 {} 的赋值会走原型 setter 丢字节/污染原型（导入→导出→导入字节丢失）

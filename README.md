@@ -110,6 +110,44 @@ export default definePlugin({
 });
 ```
 
+### AI 分镜供应商
+
+`aiProvider` 可在聊天能力之外声明 `ai.storyboard.generate`。宿主将创意简报提交为可取消任务，严格校验供应商响应，再把结构化草案交给用户编辑和采用；校验失败、超时、限流与取消都不会写入项目，也不会自动重试。费用提示必须明确区分已知和未知，供应商错误不得包含凭据或原始敏感响应。
+
+```ts
+import { AI_STORYBOARD_GENERATE_CAPABILITY, definePlugin } from '@lumora/plugin-sdk';
+
+export default definePlugin({
+  activate(context) {
+    return context.contribute({
+      aiProviders: [{
+        kind: 'aiProvider',
+        id: 'com.example.storyboard',
+        name: 'Example Storyboard',
+        models: [],
+        async *chat() {},
+        storyboard: {
+          capability: AI_STORYBOARD_GENERATE_CAPABILITY,
+          models: [{
+            id: 'storyboard-v1',
+            name: 'Storyboard v1',
+            cost: { kind: 'unknown', note: '由供应商账单确定' },
+          }],
+          async generate(request) {
+            // 返回 { title, summary, shots[] }；request.signal 用于取消。
+            return callProvider(request);
+          },
+        },
+      }],
+    });
+  },
+});
+```
+
+`examples/mock-plugin` 提供完全离线、确定性的 `Success`、`Timeout`、`Rate limit`、`Invalid schema` 与 `Slow / cancellable` 模型，可在 Studio 的「AI 分镜」工作台直接验证成功、错误和取消路径。生产供应商、模型、区域与凭据接入仍需单独决策；当前实现不硬编码真实厂商，也不包含生产密钥。SDK 同时预留可选的 `ai.image.reference.generate` 能力接口，但 Mock 插件未实现参考图供应商。
+
+**Q-001（明确限制）**：首个正式一方 AI Provider、生产模型/区域以及凭据存储与注入策略仍待产品和架构确认；此决策不阻塞当前 Provider 中立接口与离线 Mock 闭环集成。
+
 ### 生命周期与错误隔离
 
 - 状态机：`registered → loading → activating → active`，任一步失败进入 `failed` 并记录明确原因；`active` 可 `deactivate`/`disable` 后 `enable` 重新激活。

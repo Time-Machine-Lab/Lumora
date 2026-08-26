@@ -14,6 +14,8 @@ interface ToolbarProps {
   project: Project | null;
   editorState: EditorState;
   cache: ContentCache;
+  storyboardOpen: boolean;
+  onToggleStoryboard: () => void;
   onTogglePlugins: () => void;
   onTogglePalette: () => void;
 }
@@ -23,6 +25,8 @@ export function Toolbar({
   project,
   editorState,
   cache,
+  storyboardOpen,
+  onToggleStoryboard,
   onTogglePlugins,
   onTogglePalette,
 }: ToolbarProps) {
@@ -46,7 +50,7 @@ export function Toolbar({
   };
 
   return (
-    <header className="lumora-toolbar" data-testid="lumora-toolbar">
+    <header className="lumora-toolbar" data-testid="lumora-toolbar" inert={storyboardOpen || undefined}>
       <span className="lumora-toolbar__brand">Lumora Studio</span>
       <div className="lumora-toolbar__actions">
         <ProjectMenu runtime={runtime} project={project} />
@@ -117,6 +121,16 @@ export function Toolbar({
           onClick={() => dirInputRef.current?.click()}
         >
           导入模型目录
+        </button>
+        <button
+          type="button"
+          className={`lumora-button${storyboardOpen ? ' lumora-button--active' : ''}`}
+          data-testid="open-storyboard-workspace"
+          aria-pressed={storyboardOpen}
+          disabled={!project}
+          onClick={onToggleStoryboard}
+        >
+          AI 分镜
         </button>
         <input
           ref={fileInputRef}

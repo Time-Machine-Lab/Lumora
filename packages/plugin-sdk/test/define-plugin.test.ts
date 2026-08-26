@@ -1,6 +1,25 @@
 import { describe, expect, it } from 'vitest';
 import { defineManifest, definePlugin } from '../src/define-plugin';
-import type { PluginDefinition } from '../src/index';
+import type { EventMap, PluginDefinition, PluginInfo } from '../src/index';
+
+function assertSinglePluginDiagnostic(
+  info: PluginInfo,
+  event: EventMap['plugin:state-changed'],
+): void {
+  const infoMessage: string | undefined = info.error?.message;
+  const eventMessage: string | undefined = event.error?.message;
+  void infoMessage;
+  void eventMessage;
+  if (info.error) {
+    // @ts-expect-error public diagnostics are readonly.
+    info.error.message = 'mutated';
+    // @ts-expect-error public diagnostics are objects, not arrays.
+    const firstDiagnostic = info.error[0];
+    void firstDiagnostic;
+  }
+}
+
+void assertSinglePluginDiagnostic;
 
 const VALID = {
   schemaVersion: '1',

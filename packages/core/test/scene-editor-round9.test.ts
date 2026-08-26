@@ -49,6 +49,7 @@ const PUBLIC_API_LIST = [
   'addObject',
   'addScene',
   'addShot',
+  'addShots',
   'addTrack',
   'beginTransform',
   'clearSelection',

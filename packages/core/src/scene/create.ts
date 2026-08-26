@@ -150,6 +150,7 @@ export function createShotClip(
   cameraObjectId: string | null,
   name?: string,
   segment: { startTime: number; endTime: number } = { startTime: 0, endTime: 1 },
+  metadata: Pick<ShotClipData, 'shotSize' | 'movement' | 'prompt' | 'aiSource'> = {},
 ): ShotClipData {
   return {
     id: genId('shot'),
@@ -157,5 +158,6 @@ export function createShotClip(
     cameraObjectId,
     startTime: segment.startTime,
     endTime: segment.endTime,
+    ...metadata,
   };
 }

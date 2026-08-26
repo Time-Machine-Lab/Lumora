@@ -5,7 +5,7 @@ export type { Disposable, DisposeFn } from './disposable';
 // 事件总线
 export { TypedEventEmitter } from './events/typed-event-emitter';
 export type { EventHandler, TypedEventEmitterOptions } from './events/typed-event-emitter';
-export type { EventMap } from './events/event-map';
+export type { EventMap, PluginDiagnostic, PluginStateChangedEvent } from './events/event-map';
 
 // 场景数据模型（Project v3）
 export { createSampleProject } from './scene/sample-project';
@@ -177,6 +177,7 @@ export type { Command, CommandContext, CommandResult, CommandRegistryOptions } f
 export { CONTRIBUTION_KINDS } from './contributions/types';
 export type {
   AiChatMessage,
+  AiChatModelCatalog,
   AiChatRequest,
   AiProviderContribution,
   Asset,
@@ -199,6 +200,41 @@ export type { ContributionRegistryOptions } from './contributions/contribution-r
 export { createPluginServices } from './services';
 export type { AiService, AssetService, ExporterService, PluginServices } from './services';
 
+// AI storyboard generation
+export {
+  AI_REFERENCE_IMAGE_GENERATE_CAPABILITY,
+  AI_STORYBOARD_GENERATE_CAPABILITY,
+  AiProviderRequestError,
+  STORYBOARD_CAMERA_MOVEMENTS,
+  STORYBOARD_SHOT_SIZES,
+  normalizeAiProviderError,
+  parseCreativeBrief,
+  parseStoryboardDraftPayload,
+  redactAiDiagnosticText,
+} from './ai/storyboard';
+export type {
+  AiCostEstimate,
+  AiProviderErrorCode,
+  AiProviderErrorData,
+  AiReferenceImageCapability,
+  AiReferenceImageRequest,
+  AiReferenceImageResult,
+  AiStoryboardCapability,
+  CreativeBrief,
+  GenerationTask,
+  GenerationTaskStatus,
+  StoryboardCameraMovement,
+  StoryboardDraft,
+  StoryboardDraftPayload,
+  StoryboardDraftShot,
+  StoryboardDraftShotPayload,
+  StoryboardGenerateRequest,
+  StoryboardModelDescriptor,
+  StoryboardModelCatalog,
+  StoryboardProviderInfo,
+  StoryboardShotSize,
+} from './ai/storyboard';
+
 // 插件宿主
 export { PluginHost } from './host/plugin-host';
 export type { PluginHostOptions } from './host/plugin-host';
@@ -211,5 +247,7 @@ export type {
   PluginEventBus,
   PluginInfo,
   PluginModule,
+  PluginSettings,
+  PluginSettingsStorage,
   PluginState,
 } from './host/types';

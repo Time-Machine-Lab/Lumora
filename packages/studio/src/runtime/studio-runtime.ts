@@ -1,11 +1,12 @@
 import { PluginHost, SceneEditor } from '@lumora/core';
-import type { EventMap, Project } from '@lumora/core';
+import type { EventMap, PluginSettingsStorage, Project } from '@lumora/core';
 import { ProjectPersistence } from '../persistence/project-persistence';
 import type { ProjectStorage, StorageBackend } from '../persistence/project-storage';
 
 export interface StudioRuntimeOptions {
   hostVersion?: string;
   onError?: (error: unknown) => void;
+  pluginSettingsStorage?: PluginSettingsStorage;
 }
 
 /**
@@ -58,6 +59,7 @@ export function createStudioRuntime(options: StudioRuntimeOptions = {}): StudioR
   const host = new PluginHost({
     hostVersion: options.hostVersion,
     onError: options.onError,
+    pluginSettingsStorage: options.pluginSettingsStorage,
   });
   const editor = new SceneEditor();
   const persistence = new ProjectPersistence(editor);

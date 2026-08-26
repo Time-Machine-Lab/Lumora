@@ -1,5 +1,16 @@
-import { definePlugin } from '@lumora/plugin-sdk';
-import type { AiChatRequest, Asset, ExportResult, Project } from '@lumora/plugin-sdk';
+import {
+  AI_STORYBOARD_GENERATE_CAPABILITY,
+  AiProviderRequestError,
+  definePlugin,
+} from '@lumora/plugin-sdk';
+import type {
+  AiChatRequest,
+  Asset,
+  ExportResult,
+  Project,
+  StoryboardDraftPayload,
+  StoryboardGenerateRequest,
+} from '@lumora/plugin-sdk';
 import { MockAiChatPanel } from './panels/MockAiChatPanel';
 import { MockConsolePanel } from './panels/MockConsolePanel';
 
@@ -10,6 +21,83 @@ async function* mockChat(request: AiChatRequest): AsyncIterable<string> {
     if (request.signal?.aborted) return;
     yield reply[i];
     await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        reject(new DOMException('Aborted', 'AbortError'));
+      },
+      { once: true },
+    );
+  });
+}
+
+function buildMockStoryboard(request: StoryboardGenerateRequest): StoryboardDraftPayload {
+  const { brief } = request;
+  const shotSizes = ['wide', 'medium', 'close-up'] as const;
+  const movements = ['dolly-in', 'tracking', 'static'] as const;
+  const durationSeconds = Math.min(600, Math.max(0.1, brief.targetDurationSeconds / brief.shotCount));
+  const shots = Array.from({ length: brief.shotCount }, (_, index) => {
+    const suffix = ` Shot ${index + 1} of ${brief.shotCount}; ${brief.visualStyle ?? 'cinematic naturalism'}.`;
+    const concept = brief.concept.slice(0, Math.max(0, 4_000 - suffix.length)).trimEnd();
+    return {
+      title: `Shot ${index + 1}`,
+      shotSize: shotSizes[index % shotSizes.length]!,
+      movement: movements[index % movements.length]!,
+      durationSeconds,
+      prompt: `${concept}${suffix}`,
+    };
+  });
+  return {
+    title: 'Offline storyboard draft',
+    summary: `A ${brief.shotCount}-shot plan for a ${brief.targetDurationSeconds}-second sequence.`,
+    shots,
+  };
+}
+
+async function generateMockStoryboard(request: StoryboardGenerateRequest): Promise<unknown> {
+  switch (request.model) {
+    case 'mock-storyboard-timeout':
+      await abortableDelay(5, request.signal);
+      throw new AiProviderRequestError({
+        code: 'timeout',
+        message: 'The offline provider simulated a timeout.',
+        retryable: true,
+        costKnown: false,
+      });
+    case 'mock-storyboard-rate-limit':
+      throw new AiProviderRequestError({
+        code: 'rate_limited',
+        message: 'The offline provider simulated a rate limit.',
+        retryable: true,
+        retryAfterMs: 3_000,
+        costKnown: false,
+      });
+    case 'mock-storyboard-schema-error':
+      return { title: 'Invalid offline payload', shots: [{ title: 'Missing fields' }] };
+    case 'mock-storyboard-slow':
+      await abortableDelay(30_000, request.signal);
+      return buildMockStoryboard(request);
+    case 'mock-storyboard-success':
+      await abortableDelay(20, request.signal);
+      return buildMockStoryboard(request);
+    default:
+      throw new AiProviderRequestError({
+        code: 'model_unsupported',
+        message: `Unsupported offline storyboard model: ${request.model}`,
+        retryable: false,
+        costKnown: false,
+      });
   }
 }
 
@@ -123,6 +211,37 @@ const definition = definePlugin({
           name: 'Mock AI',
           models: ['mock-1'],
           chat: mockChat,
+          storyboard: {
+            capability: AI_STORYBOARD_GENERATE_CAPABILITY,
+            models: [
+              {
+                id: 'mock-storyboard-success',
+                name: 'Success',
+                cost: { kind: 'known', amount: 0, currency: 'USD', note: 'Offline mock; no charge.' },
+              },
+              {
+                id: 'mock-storyboard-timeout',
+                name: 'Timeout',
+                cost: { kind: 'unknown', note: 'Failure cost is intentionally unknown.' },
+              },
+              {
+                id: 'mock-storyboard-rate-limit',
+                name: 'Rate limit',
+                cost: { kind: 'unknown', note: 'Failure cost is intentionally unknown.' },
+              },
+              {
+                id: 'mock-storyboard-schema-error',
+                name: 'Invalid schema',
+                cost: { kind: 'unknown', note: 'Failure cost is intentionally unknown.' },
+              },
+              {
+                id: 'mock-storyboard-slow',
+                name: 'Slow / cancellable',
+                cost: { kind: 'unknown', note: 'Cancel this request to test abort handling.' },
+              },
+            ],
+            generate: generateMockStoryboard,
+          },
         },
       ],
       exporters: [

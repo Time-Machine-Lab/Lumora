@@ -200,7 +200,21 @@ describe('buildProjectPackage：私有数据默认排除（FR-011 / NFR-008）',
         },
       ],
       shots: [
-        { id: genId('shot'), name: '开场', cameraObjectId: 'sample-camera', startTime: 0, endTime: 1.5 },
+        {
+          id: genId('shot'),
+          name: '开场',
+          cameraObjectId: 'sample-camera',
+          startTime: 0,
+          endTime: 1.5,
+          shotSize: 'wide' as const,
+          movement: 'dolly-in' as const,
+          prompt: 'A wide establishing shot.',
+          aiSource: {
+            providerId: 'com.example.storyboard',
+            model: 'storyboard-1',
+            draftId: 'draft-1',
+          },
+        },
         { id: genId('shot'), name: '特写', cameraObjectId: null, startTime: 1.5, endTime: 3 },
       ],
     };
@@ -214,6 +228,42 @@ describe('buildProjectPackage：私有数据默认排除（FR-011 / NFR-008）',
     expect(disabledTrack).toBeDefined();
     expect(disabledTrack!.disabled).toBe(true);
     expect(disabledTrack!.keyframes).toEqual(withTimeline.tracks[withTimeline.tracks.length - 1]!.keyframes);
+  });
+
+  it('projects AI provenance through its exact public DTO without credential-shaped extras', async () => {
+    const project = await buildFixtureProject();
+    const source = {
+      providerId: 'com.example.storyboard',
+      model: 'storyboard-1',
+      draftId: 'draft-1',
+      apiKey: 'sk-should-never-persist',
+    };
+    const enriched = {
+      ...project,
+      shots: [{
+        id: genId('shot'),
+        name: 'AI shot',
+        cameraObjectId: null,
+        startTime: 0,
+        endTime: 2,
+        shotSize: 'medium' as const,
+        movement: 'static' as const,
+        prompt: 'A clean product close-up.',
+        aiSource: source,
+      }],
+    } as Project;
+
+    const serialized = serializeProjectPackage(buildProjectPackage(enriched));
+    expect(serialized).not.toContain('apiKey');
+    expect(serialized).not.toContain('sk-should-never-persist');
+    const result = await parseProjectPackage(serialized);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.project.shots[0]?.aiSource).toEqual({
+      providerId: 'com.example.storyboard',
+      model: 'storyboard-1',
+      draftId: 'draft-1',
+    });
   });
 });
 

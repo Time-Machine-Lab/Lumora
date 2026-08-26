@@ -18,6 +18,7 @@ import {
 import { deepFreeze } from '../scene/immutable';
 import { validateProjectSchema, validateProjectStructure, validateSceneObjectData } from '../scene/validate';
 import { isSceneObject } from '../scene/types';
+import { STORYBOARD_CAMERA_MOVEMENTS, STORYBOARD_SHOT_SIZES } from '../ai/storyboard';
 import type { AssetData, Project, SceneObjectData, ShotClipData, TrackData, TrackKeyframeData, TransformData } from '../scene/types';
 import { TypedEventEmitter } from '../events/typed-event-emitter';
 
@@ -932,6 +933,27 @@ export class SceneEditor {
 
   // ---------- 分镜剪辑（历史可撤销） ----------
 
+  /** 批量新建分镜：整批克隆、校验并作为一个历史步骤提交，任一项非法则不写入。 */
+  addShots(shots: ShotClipData[], label = '批量新建分镜'): Result<string[]> {
+    const baseline = this.beginIngress();
+    if (!baseline) return failure('未打开项目');
+    const project = baseline.project!;
+    const owned = this.own(shots);
+    const reentered = this.guardReentry(baseline);
+    if (reentered) return reentered;
+    if (owned.length === 0) return failure('分镜批次不能为空');
+    const ids = new Set(project.shots.map((shot) => shot.id));
+    for (const shot of owned) {
+      const problem = this.validateShot(project, shot);
+      if (problem) return failure(problem);
+      if (ids.has(shot.id)) return failure('分镜 id 重复');
+      ids.add(shot.id);
+    }
+    const result = this.commit(baseline, { ...project, shots: [...project.shots, ...owned] }, label);
+    if (!result.ok) return result;
+    return { ok: true, value: owned.map((shot) => shot.id) };
+  }
+
   /** 新建分镜：绑定机位（可空）+ 时间线区段；机位非空时必须为已存在的相机对象 */
   addShot(shot: ShotClipData): Result<string> {
     const baseline = this.beginIngress();
@@ -1030,6 +1052,21 @@ export class SceneEditor {
     if (shot.cameraObjectId !== null) {
       const camera = findObject(project, shot.cameraObjectId);
       if (!camera || camera.type !== 'camera') return '分镜绑定机位不存在或不是相机';
+    }
+    if (
+      shot.shotSize !== undefined &&
+      !(STORYBOARD_SHOT_SIZES as readonly string[]).includes(shot.shotSize)
+    ) return '分镜 shotSize 非法';
+    if (
+      shot.movement !== undefined &&
+      !(STORYBOARD_CAMERA_MOVEMENTS as readonly string[]).includes(shot.movement)
+    ) return '分镜 movement 非法';
+    if (shot.prompt !== undefined && (shot.prompt.trim().length === 0 || shot.prompt.length > 4_000)) {
+      return '分镜 prompt 非法';
+    }
+    if (shot.aiSource !== undefined) {
+      if (!shot.aiSource.providerId || !shot.aiSource.model || !shot.aiSource.draftId) return '分镜 aiSource 非法';
+      if (!shot.shotSize || !shot.movement || !shot.prompt) return 'AI 分镜缺少 shotSize/movement/prompt';
     }
     return null;
   }
