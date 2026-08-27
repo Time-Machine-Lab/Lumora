@@ -21,6 +21,7 @@ import { ExportWorkspace } from './export/ExportWorkspace';
 import type { ExportFrameCapture } from './export/ExportWorkspace';
 import { ToastHost, showToast } from './editor/toasts';
 import { ContentCache } from './editor/content-cache';
+import { LiveTransformStore } from './editor/live-transform-store';
 import { DRIVE_KEY_CODES } from './editor/camera-drive';
 import { isKeyboardEventForStudio, registerStudioKeyboardRoot } from './studio-keyboard-scope';
 import '../lumora.css';
@@ -247,6 +248,9 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   if (!cacheRef.current) cacheRef.current = new ContentCache();
   const cache = cacheRef.current;
   const cacheDisposedRef = useRef(false);
+  const liveTransformStoreRef = useRef<LiveTransformStore | null>(null);
+  if (!liveTransformStoreRef.current) liveTransformStoreRef.current = new LiveTransformStore();
+  const liveTransformStore = liveTransformStoreRef.current;
 
   const [pluginManagerOpen, setPluginManagerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -574,6 +578,8 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
                   onCaptureReady={handleCaptureReady}
                   onRenderContentChange={handleRenderContentChange}
                   keyboardScopeRef={rootRef}
+                  driveEnabled={!exportOpen}
+                  liveTransformStore={liveTransformStore}
                 />
               )}
               {!project && (
@@ -598,6 +604,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
             editor={runtime.editor}
             project={project}
             selection={editorState.selection}
+            liveTransformStore={liveTransformStore}
           />
         </div>
         {storyboardOpen && project && (

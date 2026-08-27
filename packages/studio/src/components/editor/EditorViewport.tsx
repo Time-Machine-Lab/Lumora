@@ -24,6 +24,7 @@ import { captureProjectFrame, renderProjectFrameToCanvas } from './frame-capture
 import type { ProjectFrameCapture } from './frame-capture';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
 import { isKeyboardEventForStudio } from '../studio-keyboard-scope';
+import type { LiveTransformStore } from './live-transform-store';
 
 interface EditorViewportProps {
   editor: SceneEditor;
@@ -45,6 +46,10 @@ interface EditorViewportProps {
   onRenderContentChange?: () => void;
   /** Owning Studio root used to isolate window-level camera-drive keys. */
   keyboardScopeRef?: React.RefObject<HTMLElement | null>;
+  /** Whether keyboard camera drive input is currently available. */
+  driveEnabled?: boolean;
+  /** Selected live THREE-node transform exposed through the visible inspector. */
+  liveTransformStore?: LiveTransformStore;
 }
 
 /** 沿父链找到最近的对象 id（GLB 内容网格挂在模型组下，需要向上追溯）。
@@ -74,6 +79,8 @@ export function EditorViewport({
   onCaptureReady,
   onRenderContentChange,
   keyboardScopeRef,
+  driveEnabled = true,
+  liveTransformStore,
 }: EditorViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<THREE.Group | null>(null);
@@ -98,7 +105,7 @@ export function EditorViewport({
     return object && object.type === 'camera' ? object.id : null;
   }, [project, selection]);
 
-  useCameraDrive(session, drivenCameraId, rootRef, editor, keyboardScopeRef);
+  useCameraDrive(session, drivenCameraId, rootRef, editor, keyboardScopeRef, driveEnabled);
 
   // 录制采样源：视口把机位节点映射为通道样本（录制期间节点由驾驶/静止接管）
   useEffect(() => {
@@ -246,6 +253,13 @@ export function EditorViewport({
           rootRef={rootRef}
           aspect={aspect}
         />
+        {liveTransformStore && (
+          <LiveTransformBridge
+            objectId={drivenCameraId}
+            rootRef={rootRef}
+            store={liveTransformStore}
+          />
+        )}
       </Canvas>
       {session && (
         <>
@@ -264,6 +278,34 @@ export function EditorViewport({
   );
 }
 
+function LiveTransformBridge({
+  objectId,
+  rootRef,
+  store,
+}: {
+  objectId: string | null;
+  rootRef: React.RefObject<THREE.Group | null>;
+  store: LiveTransformStore;
+}) {
+  useEffect(() => {
+    if (!objectId) store.clear();
+    return () => {
+      if (objectId) store.clear(objectId);
+    };
+  }, [objectId, store]);
+  useFrame(() => {
+    if (!objectId) return;
+    const root = rootRef.current;
+    const node = root ? findNode(root, objectId) : null;
+    if (!node) {
+      store.clear(objectId);
+      return;
+    }
+    store.publish(objectId, [node.position.x, node.position.y, node.position.z]);
+  });
+  return null;
+}
+
 /**
  * 键鼠机位驾驶（TML-52）：选中机位且非播放态时启用（录制中强制可驾驶），
  * rAF 每帧把按键意图积分到节点。脱离驾驶（取消选中/开始回放/录制暂停）时
@@ -279,11 +321,14 @@ function useCameraDrive(
   rootRef: React.RefObject<THREE.Group | null>,
   editor: SceneEditor,
   keyboardScopeRef?: React.RefObject<HTMLElement | null>,
+  driveEnabled = true,
 ) {
   const cameraIdRef = useRef<string | null>(null);
   cameraIdRef.current = drivenCameraId;
   const sessionRef = useRef(session);
   sessionRef.current = session;
+  const driveEnabledRef = useRef(driveEnabled);
+  driveEnabledRef.current = driveEnabled;
 
   useEffect(() => {
     if (!session) return;
@@ -310,12 +355,13 @@ function useCameraDrive(
         drive.attach(node);
         attachedId = cameraId;
         attachedNode = node;
+        for (const code of heldKeys) drive.press(code);
       }
       return true;
     };
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented) return;
+      if (event.defaultPrevented || !driveEnabledRef.current) return;
       const keyboardRoot = keyboardScopeRef?.current;
       if (keyboardRoot && !isKeyboardEventForStudio(keyboardRoot, event)) return;
       const target = event.target as HTMLElement | null;
@@ -330,10 +376,8 @@ function useCameraDrive(
       }
       if (DRIVE_KEY_CODES.has(event.code)) {
         if (cameraIdRef.current) event.preventDefault();
-        if (attachCurrentCamera()) {
-          heldKeys.add(event.code);
-          drive.press(event.code);
-        }
+        heldKeys.add(event.code);
+        if (attachCurrentCamera()) drive.press(event.code);
       }
     };
     const onKeyUp = (event: KeyboardEvent) => {
@@ -390,6 +434,11 @@ function useCameraDrive(
     const loop = (now: number) => {
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
+      if (!driveEnabledRef.current) {
+        clearDrive();
+        raf = requestAnimationFrame(loop);
+        return;
+      }
       const st = sessionRef.current?.state;
       const cameraId = cameraIdRef.current;
       // 可驾驶：选中机位 && 录制未暂停 && （暂停 || 录制中）&& 无启用轨道（录制中无视轨道；

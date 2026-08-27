@@ -124,6 +124,43 @@ describe('camera drive keyboard routing', () => {
     expect(cameraB.position.distanceTo(beforeB)).toBeLessThan(1e-9);
   });
 
+  it('applies a held drive key when the selected camera node becomes available after keydown', async () => {
+    const studio = await mountStudio('lumora://drive-late-node');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    const parent = camera.parent!;
+    const before = camera.position.clone();
+    parent.remove(camera);
+
+    fireEvent.keyDown(studio.root, { key: 's', code: 'KeyS' });
+    await act(async () => delay(30));
+    parent.add(camera);
+    await act(async () => delay(120));
+    fireEvent.keyUp(studio.root, { key: 's', code: 'KeyS' });
+
+    expect(camera.position.distanceTo(before)).toBeGreaterThan(0.01);
+  });
+
+  it('freezes a held camera drive key when the export workspace opens', async () => {
+    const studio = await mountStudio('lumora://drive-export-freeze');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    const staticPosition = camera.position.clone();
+
+    fireEvent.keyDown(studio.root, { key: 's', code: 'KeyS' });
+    await act(async () => delay(120));
+    expect(camera.position.distanceTo(staticPosition)).toBeGreaterThan(0.01);
+
+    fireEvent.click(within(studio.root).getByTestId('open-export-workspace'));
+    await waitFor(() => expect(within(studio.root).getByTestId('export-workspace')).toBeVisible());
+    const frozenPosition = camera.position.clone();
+    expect(frozenPosition.distanceTo(staticPosition)).toBeGreaterThan(0.01);
+    await act(async () => delay(120));
+    fireEvent.keyUp(studio.root, { key: 's', code: 'KeyS' });
+
+    expect(camera.position.distanceTo(frozenPosition)).toBeLessThan(1e-9);
+  });
+
   it('a drive key release inside Studio A is consumed only by A', async () => {
     const a = await mountStudio('lumora://drive-keyup-a');
     await mountStudio('lumora://drive-keyup-b');

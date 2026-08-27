@@ -1,6 +1,7 @@
 import { defineConfig } from '@playwright/test';
 
 const port = Number(process.env.PLAYWRIGHT_PREVIEW_PORT ?? 5202);
+const edgeExecutablePath = process.env.PLAYWRIGHT_EDGE_PATH?.trim();
 
 export default defineConfig({
   testDir: './e2e',
@@ -15,7 +16,9 @@ export default defineConfig({
       name: 'edge-preview',
       use: {
         browserName: 'chromium',
-        channel: 'msedge',
+        ...(edgeExecutablePath
+          ? { launchOptions: { executablePath: edgeExecutablePath } }
+          : { channel: 'msedge' as const }),
         baseURL: `http://127.0.0.1:${port}`,
         viewport: { width: 1280, height: 800 },
       },

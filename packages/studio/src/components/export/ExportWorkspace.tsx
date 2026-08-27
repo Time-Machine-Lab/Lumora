@@ -48,6 +48,11 @@ type ExportStatus =
 
 type ExportOperationKind = 'manifest' | 'png' | 'webm' | 'plugin';
 
+interface LiveAnnouncement {
+  id: number;
+  status: ExportStatus;
+}
+
 interface ExportOperationToken {
   uri: string;
   sessionGeneration: number;
@@ -125,7 +130,10 @@ export function ExportWorkspace({
     support: CHECKING_WEBM_SUPPORT,
   }));
   const [status, setStatus] = useState<ExportStatus>({ kind: 'idle' });
-  const [liveStatus, setLiveStatus] = useState<ExportStatus>({ kind: 'idle' });
+  const [liveAnnouncement, setLiveAnnouncement] = useState<LiveAnnouncement>({
+    id: 0,
+    status: { kind: 'idle' },
+  });
   const [progress, setProgress] = useState(0);
   const [activeOperation, setActiveOperation] = useState<ExportOperationToken | null>(null);
   const operationGenerationRef = useRef(0);
@@ -139,6 +147,7 @@ export function ExportWorkspace({
   const pendingFocusOriginRef = useRef<HTMLButtonElement | null>(null);
   const focusTimerRef = useRef<number | null>(null);
   const runningAnnouncementBucketRef = useRef(-1);
+  const announcementIdRef = useRef(0);
   const support = supportOverride ?? (
     detectedSupport.checkKey === supportCheckKey
       ? detectedSupport.support
@@ -197,10 +206,15 @@ export function ExportWorkspace({
     );
   };
 
+  const announceStatus = useCallback((nextStatus: ExportStatus) => {
+    announcementIdRef.current += 1;
+    setLiveAnnouncement({ id: announcementIdRef.current, status: nextStatus });
+  }, []);
+
   const publishStatus = useCallback((nextStatus: ExportStatus) => {
     setStatus(nextStatus);
-    if (nextStatus.kind !== 'idle' && nextStatus.kind !== 'running') setLiveStatus(nextStatus);
-  }, []);
+    if (nextStatus.kind !== 'idle' && nextStatus.kind !== 'running') announceStatus(nextStatus);
+  }, [announceStatus]);
 
   const assertOperationCurrent = (token: ExportOperationToken) => {
     if (!isOperationCurrent(token)) throw staleTaskError();
@@ -329,6 +343,7 @@ export function ExportWorkspace({
   const busy = activeOperation !== null;
   const running = activeOperation?.kind === 'webm';
   const aspect = project.settings.aspect[0] / project.settings.aspect[1];
+  const liveStatus = liveAnnouncement.status;
   const politeLiveMessage = liveStatus.kind === 'error'
     ? ''
     : liveStatus.kind === 'idle'
@@ -454,7 +469,7 @@ export function ExportWorkspace({
       runningAnnouncementBucketRef.current = 0;
       const initialStatus: ExportStatus = { kind: 'running', message: '正在导出 0%' };
       setStatus(initialStatus);
-      setLiveStatus(initialStatus);
+      announceStatus(initialStatus);
       const blob = await recordPreviewWebm(
         result.plan,
         async ({ canvas, shot, sourceTime, width, height }) => {
@@ -479,7 +494,7 @@ export function ExportWorkspace({
             const announcementBucket = Math.min(75, Math.floor(percentage / 25) * 25);
             if (announcementBucket > runningAnnouncementBucketRef.current) {
               runningAnnouncementBucketRef.current = announcementBucket;
-              setLiveStatus({ kind: 'running', message: `正在导出 ${announcementBucket}%` });
+              announceStatus({ kind: 'running', message: `正在导出 ${announcementBucket}%` });
             }
           },
         },
@@ -529,7 +544,7 @@ export function ExportWorkspace({
     let nextStatus: ExportStatus;
     const runningStatus: ExportStatus = { kind: 'running', message: `正在运行 ${exporter.name}` };
     setStatus(runningStatus);
-    setLiveStatus(runningStatus);
+    announceStatus(runningStatus);
     try {
       const result = await exporter.export(project);
       assertOperationCurrent(token);
@@ -716,7 +731,11 @@ export function ExportWorkspace({
             aria-live="polite"
             aria-atomic="true"
           >
-            {politeLiveMessage}
+            {politeLiveMessage && (
+              <span key={liveAnnouncement.id} data-live-announcement-id={liveAnnouncement.id}>
+                {politeLiveMessage}
+              </span>
+            )}
           </p>
           {liveStatus.kind === 'error' && (
             <p
@@ -726,7 +745,9 @@ export function ExportWorkspace({
               aria-live="assertive"
               aria-atomic="true"
             >
-              {liveStatus.message}
+              <span key={liveAnnouncement.id} data-live-announcement-id={liveAnnouncement.id}>
+                {liveStatus.message}
+              </span>
             </p>
           )}
         </div>

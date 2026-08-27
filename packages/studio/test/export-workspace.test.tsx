@@ -657,6 +657,30 @@ describe('ExportWorkspace', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it('restores focus to the initiating button after a clean first WebM success', async () => {
+    const runtime = createStudioRuntime();
+    const project = projectWithShortShots();
+    const { session } = sessionHarness();
+    render(
+      <ExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        support={SUPPORTED}
+        recordingDependencies={encoderDependencies().dependencies}
+        onClose={vi.fn()}
+      />,
+    );
+    const primary = screen.getByRole('button', { name: '导出 WebM' });
+
+    fireEvent.click(primary);
+
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('导出完成'));
+    await waitFor(() => expect(primary).toHaveFocus());
+  });
+
   it('keeps visual progress continuous while live announcements use bounded milestones', async () => {
     const runtime = createStudioRuntime();
     const project = createSampleProject();
@@ -704,6 +728,73 @@ describe('ExportWorkspace', () => {
     });
     await waitFor(() => expect(liveStatus).toHaveTextContent('导出完成'));
     await waitFor(() => expect(announcements.filter((message) => message === '导出完成')).toHaveLength(1));
+    observer.disconnect();
+  });
+
+  it('mutates the live region for every repeated identical manifest success', async () => {
+    const runtime = createStudioRuntime();
+    const project = projectWithShortShots();
+    const { session } = sessionHarness();
+    render(
+      <ExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        support={SUPPORTED}
+        onClose={vi.fn()}
+      />,
+    );
+    const button = screen.getByRole('button', { name: '导出清单' });
+    fireEvent.click(button);
+    const liveStatus = screen.getByTestId('export-live-status');
+    await waitFor(() => expect(liveStatus).toHaveTextContent('分镜清单已导出'));
+
+    const mutations: string[] = [];
+    const observer = new MutationObserver(() => mutations.push(liveStatus.textContent?.trim() ?? ''));
+    observer.observe(liveStatus, { childList: true, characterData: true, subtree: true });
+    fireEvent.click(button);
+    await waitFor(() => expect(mutations).toEqual(['分镜清单已导出']));
+    fireEvent.click(button);
+    await waitFor(() => expect(mutations).toEqual(['分镜清单已导出', '分镜清单已导出']));
+    observer.disconnect();
+  });
+
+  it('mutates the assertive region for every repeated identical invalid-camera preflight error', async () => {
+    const runtime = createStudioRuntime();
+    const base = projectWithShortShots();
+    const project: Project = {
+      ...base,
+      shots: base.shots.map((shot, index) => (
+        index === 0 ? { ...shot, cameraObjectId: 'missing-camera' } : shot
+      )),
+    };
+    const { session } = sessionHarness();
+    render(
+      <ExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        support={SUPPORTED}
+        onClose={vi.fn()}
+      />,
+    );
+    const button = screen.getByRole('button', { name: /导出 分镜 1.*PNG/ });
+    fireEvent.click(button);
+    const liveAlert = await screen.findByTestId('export-live-alert');
+    expect(liveAlert).toHaveTextContent('未绑定活动场景中的有效机位');
+
+    const mutations: string[] = [];
+    const observer = new MutationObserver(() => mutations.push(liveAlert.textContent?.trim() ?? ''));
+    observer.observe(liveAlert, { childList: true, characterData: true, subtree: true });
+    fireEvent.click(button);
+    await waitFor(() => expect(mutations).toHaveLength(1));
+    fireEvent.click(button);
+    await waitFor(() => expect(mutations).toHaveLength(2));
+    expect(new Set(mutations).size).toBe(1);
     observer.disconnect();
   });
 

@@ -197,8 +197,12 @@ async function probeWebm(bytes: Buffer, outputPath: string): Promise<WebmProbe> 
   return JSON.parse(stdout) as WebmProbe;
 }
 
-async function persistTimingProbe(page: Page, sourceDuration: number): Promise<void> {
-  await page.evaluate((duration) => {
+async function persistTimingProbe(
+  page: Page,
+  sourceDuration: number,
+  cameraObjectId = 'probe-camera',
+): Promise<void> {
+  await page.evaluate(({ duration, shotCameraObjectId }) => {
     const focalLength = 50;
     const fov = (2 * Math.atan(24 / 2 / focalLength) * 180) / Math.PI;
     const project = {
@@ -214,6 +218,11 @@ async function persistTimingProbe(page: Page, sourceDuration: number): Promise<v
         name: 'Probe scene',
         rootObjectIds: ['probe-camera', 'probe-cube', 'probe-light'],
         activeCameraId: 'probe-camera',
+      }, {
+        id: 'inactive-scene',
+        name: 'Inactive scene',
+        rootObjectIds: ['inactive-camera'],
+        activeCameraId: 'inactive-camera',
       }],
       objects: [
         {
@@ -222,6 +231,25 @@ async function persistTimingProbe(page: Page, sourceDuration: number): Promise<v
           name: 'Probe camera',
           parentId: null,
           transform: { position: [0, 0, 5], rotation: [0, 0, 0], scale: [1, 1, 1] },
+          visible: true,
+          locked: false,
+          camera: {
+            projection: 'perspective',
+            focalLength,
+            fov,
+            sensorWidth: 36,
+            sensorHeight: 24,
+            near: 0.1,
+            far: 200,
+            aspect: null,
+          },
+        },
+        {
+          id: 'inactive-camera',
+          type: 'camera',
+          name: 'Inactive camera',
+          parentId: null,
+          transform: { position: [2, 1, 6], rotation: [0, 0, 0], scale: [1, 1, 1] },
           visible: true,
           locked: false,
           camera: {
@@ -261,14 +289,14 @@ async function persistTimingProbe(page: Page, sourceDuration: number): Promise<v
       shots: [{
         id: 'probe-shot',
         name: 'Timing probe',
-        cameraObjectId: 'probe-camera',
+        cameraObjectId: shotCameraObjectId,
         startTime: 0,
         endTime: duration,
       }],
       assets: [],
     };
     localStorage.setItem('lumora.demo.last-export', JSON.stringify(project));
-  }, sourceDuration);
+  }, { duration: sourceDuration, shotCameraObjectId: cameraObjectId });
 }
 
 async function persistVisualOrderProbe(page: Page): Promise<void> {
@@ -526,12 +554,25 @@ async function observeExportLiveAnnouncements(page: Page): Promise<void> {
     scope.__lumoraLiveAnnouncements = [];
     const workspace = document.querySelector('[data-testid="export-workspace"]');
     if (!workspace) throw new Error('Export workspace is not mounted');
-    new MutationObserver(() => {
+    new MutationObserver((records) => {
+      const touchesLiveRegion = records.some((record) => {
+        const target = record.target instanceof Element ? record.target : record.target.parentElement;
+        if (target?.closest('[data-testid="export-live-status"], [data-testid="export-live-alert"]')) {
+          return true;
+        }
+        return [...record.addedNodes, ...record.removedNodes].some((node) => (
+          node instanceof Element && (
+            node.matches('[data-testid="export-live-status"], [data-testid="export-live-alert"]') ||
+            node.querySelector('[data-testid="export-live-status"], [data-testid="export-live-alert"]') !== null
+          )
+        ));
+      });
+      if (!touchesLiveRegion) return;
       const polite = workspace.querySelector('[data-testid="export-live-status"]')?.textContent?.trim() ?? '';
       const assertive = workspace.querySelector('[data-testid="export-live-alert"]')?.textContent?.trim() ?? '';
       const message = assertive || polite;
       const announcements = scope.__lumoraLiveAnnouncements!;
-      if (message && announcements.at(-1) !== message) announcements.push(message);
+      if (message) announcements.push(message);
     }).observe(workspace, { childList: true, characterData: true, subtree: true });
   });
 }
@@ -664,6 +705,74 @@ test('keeps per-frame visual progress while live status uses bounded milestones'
   ]);
   expect(running.length).toBeLessThan(evidence.progressValues.length);
   expect(evidence.announcements.filter((message) => message === '导出完成')).toHaveLength(1);
+});
+
+test('emits raw live-region mutations for repeated identical manifest PNG and WebM successes', async ({ page }) => {
+  await instrumentWebCodecs(page);
+  await openSampleExport(page);
+  await page.getByLabel('导出范围').selectOption('sample-shot-1');
+  await page.getByLabel('分辨率').selectOption('480p');
+  await observeExportLiveAnnouncements(page);
+
+  for (let index = 0; index < 2; index += 1) {
+    const download = page.waitForEvent('download');
+    await page.getByRole('button', { name: '导出清单' }).click();
+    await download;
+    await expect.poll(async () => (
+      await exportLiveAnnouncements(page)
+    ).filter((message) => message === '分镜清单已导出').length).toBe(index + 1);
+  }
+
+  const pngSuccess = '已导出「分镜 1 · 开场全景」PNG';
+  for (let index = 0; index < 2; index += 1) {
+    const download = page.waitForEvent('download');
+    await page.getByRole('button', { name: /导出 分镜 1.*PNG/ }).click();
+    await download;
+    await expect.poll(async () => (
+      await exportLiveAnnouncements(page)
+    ).filter((message) => message === pngSuccess).length).toBe(index + 1);
+  }
+
+  for (let index = 0; index < 2; index += 1) {
+    const download = page.waitForEvent('download');
+    await page.getByRole('button', { name: '导出 WebM' }).click();
+    await download;
+    await expect.poll(async () => (
+      await exportLiveAnnouncements(page)
+    ).filter((message) => message === '导出完成').length).toBe(index + 1);
+  }
+});
+
+test('emits raw live-region mutations for repeated identical preflight errors', async ({ page }) => {
+  await instrumentWebCodecs(page);
+  await page.goto('/');
+  await persistTimingProbe(page, 0.1, 'inactive-camera');
+  await page.getByTestId('reopen-last-export').click();
+  await expect(page.getByTestId('tree-row-probe-cube')).toBeVisible();
+  await page.getByTestId('open-export-workspace').click();
+  await observeExportLiveAnnouncements(page);
+
+  let webmError = '';
+  for (let index = 0; index < 2; index += 1) {
+    await page.getByRole('button', { name: '导出 WebM' }).click();
+    const alert = page.getByTestId('export-live-alert');
+    await expect(alert).toBeVisible();
+    webmError ||= (await alert.textContent())?.trim() ?? '';
+    await expect.poll(async () => (
+      await exportLiveAnnouncements(page)
+    ).filter((message) => message === webmError).length).toBe(index + 1);
+  }
+
+  let pngError = '';
+  for (let index = 0; index < 2; index += 1) {
+    await page.getByRole('button', { name: /导出 Timing probe PNG/ }).click();
+    const alert = page.getByTestId('export-live-alert');
+    await expect(alert).toContainText('未绑定活动场景中的有效机位');
+    pngError ||= (await alert.textContent())?.trim() ?? '';
+    await expect.poll(async () => (
+      await exportLiveAnnouncements(page)
+    ).filter((message) => message === pngError).length).toBe(index + 1);
+  }
 });
 
 test('announces WebM cancellation exactly once', async ({ page }) => {
@@ -1128,7 +1237,23 @@ test('closes a configure-failed encoder and remains retryable', async ({ page })
   expect(downloads).toBe(1);
 });
 
-test('isolates editor shortcuts while export is idle and while encoding', async ({ page }) => {
+test('restores focus to the initiating button after the first WebM success', async ({ page }) => {
+  await instrumentWebCodecs(page);
+  await openSampleExport(page);
+  await page.getByLabel('导出范围').selectOption('sample-shot-1');
+  await page.getByLabel('分辨率').selectOption('480p');
+  const primary = page.getByRole('button', { name: '导出 WebM' });
+
+  const download = page.waitForEvent('download');
+  await primary.click();
+  await download;
+
+  await expect(page.getByRole('status')).toContainText('导出完成');
+  await expect(primary).toBeEnabled();
+  await expect(primary).toBeFocused();
+});
+
+test('proves live camera drive sensitivity before isolating editor shortcuts while export is idle and encoding', async ({ page }) => {
   await instrumentWebCodecs(page, 'pending');
   await page.goto('/');
   await page.getByTestId('open-sample-project').click();
@@ -1136,9 +1261,22 @@ test('isolates editor shortcuts while export is idle and while encoding', async 
   await page.getByTestId('tree-row-sample-camera-2').click();
   const rows = page.locator('.lumora-tree-row');
   const rowCount = await rows.count();
-  const cameraPositionBefore = await inspectorPosition(page);
+  const cameraPositionBeforeDrive = await inspectorPosition(page);
   const playBefore = await page.getByTestId('timeline-play').textContent();
-  await page.getByTestId('open-export-workspace').click();
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+  await page.keyboard.down('w');
+  try {
+    await expect.poll(() => inspectorPosition(page)).not.toEqual(cameraPositionBeforeDrive);
+    await page.getByTestId('open-export-workspace').click();
+    await expect(page.getByTestId('export-workspace')).toBeVisible();
+    const frozenPosition = await inspectorPosition(page);
+    expect(frozenPosition).not.toEqual(cameraPositionBeforeDrive);
+    await page.waitForTimeout(150);
+    expect(await inspectorPosition(page)).toEqual(frozenPosition);
+  } finally {
+    await page.keyboard.up('w');
+  }
+  const cameraPositionBefore = await inspectorPosition(page);
 
   const pressEditorShortcuts = async () => {
     await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());

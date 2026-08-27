@@ -19,7 +19,7 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "lint": "eslint .",
     "e2e": "playwright test",
-    "e2e:preview": "playwright test --config playwright.preview.config.ts",
+    "e2e:preview": "node scripts/check-preview-prerequisites.mjs && playwright test --config playwright.preview.config.ts",
     "e2e:install": "playwright install chromium",
     "licenses:generate": "node scripts/generate-third-party-notices.mjs",
     "smoke:pack": "node scripts/smoke-pack.mjs",

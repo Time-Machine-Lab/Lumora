@@ -10,7 +10,7 @@ async function openSampleExport(page: Page) {
   await expect(page.getByTestId('export-workspace')).toBeVisible();
 }
 
-test('host event log is keyboard reachable, named, visibly focused, and scrollable', async ({ page }) => {
+test('host event log preserves native PageDown and Space scrolling without toggling Studio playback', async ({ page }) => {
   await page.goto('/');
   await page.getByTestId('open-sample-project').click();
   await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
@@ -36,6 +36,14 @@ test('host event log is keyboard reachable, named, visibly focused, and scrollab
   const initialScrollTop = await log.evaluate((element) => element.scrollTop);
   await page.keyboard.press('PageDown');
   await expect.poll(() => log.evaluate((element) => element.scrollTop)).toBeGreaterThan(initialScrollTop);
+
+  await log.evaluate((element) => {
+    element.scrollTop = 0;
+  });
+  const playBefore = await page.getByTestId('timeline-play').textContent();
+  await page.keyboard.press('Space');
+  await expect.poll(() => log.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  await expect(page.getByTestId('timeline-play')).toHaveText(playBefore ?? '');
 });
 
 for (const viewport of [

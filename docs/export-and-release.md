@@ -46,6 +46,15 @@ MP4 不是 MVP 内置能力。需要 MP4 时，由嵌入宿主或 exporter 插�
 
 兼容测试使用 3 个持久化重开后仍视觉可区分的机位，验证 EBML 文件头、非零文件、目标分辨率、可解码画面、逐段画面顺序、packet/末 PTS/容器时长、精确 VP8 配置预检、长导出任务队列取消、最大 `encodeQueueSize <= 4`、取消不下载、编码器关闭和取消后的继续编辑。Safari 不能在 Windows CI 上作可信替代，必须在 macOS 真机人工签署降级结果。
 
+### 生产 Preview 自动化前置条件
+
+`npm run e2e:preview` 使用生产构建、系统 Microsoft Edge 和 `ffprobe`。命令会先运行 `scripts/check-preview-prerequisites.mjs`，在启动 Vite 或执行产品断言前检查以下依赖，并在缺失时给出安装或 PATH 修复说明：
+
+1. 系统 Microsoft Edge 可由 Playwright 的 `msedge` channel 启动；非标准安装可通过 `PLAYWRIGHT_EDGE_PATH` 指向实际可执行文件。预检会按与生产 Preview 配置相同的方式实际启动该浏览器，并要求 user agent 包含 `Edg/`，因此目录、普通文件和其他 Chromium 浏览器都不会被误判为 Edge。
+2. FFmpeg 的 `ffprobe` 可从 `PATH` 直接运行；真实 WebM packet、末 PTS 和容器 duration 断言依赖它。
+
+可单独运行 `node scripts/check-preview-prerequisites.mjs` 诊断 runner。仓库不分发 Edge 或 FFmpeg，干净 runner 必须在执行生产 Preview 门禁前安装这两项系统依赖。
+
 ## 主流程验收
 
 `e2e/export.spec.ts` 从空浏览器上下文执行以下流程：
@@ -102,6 +111,7 @@ Q-003 确认前，性能项状态必须保持“待设备决策”，不能用�
 - [ ] `npm run test`
 - [ ] `npm run build`
 - [ ] `npm run e2e`
+- [ ] `npm run e2e:preview`（前置检查通过后，在系统 Edge 上运行生产构建用例）
 - [ ] `npm run smoke:pack`
 - [ ] `npm run licenses:generate` 后工作区无意外差异，且无 `UNKNOWN` 许可证
 
