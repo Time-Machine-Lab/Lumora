@@ -661,6 +661,7 @@ test('reports missing WebCodecs before encoding or downloading a file', async ({
       supportChecks: 0,
       supportConfigs: [],
       captureStreams: 0,
+      progressValues: [],
     };
     const originalCaptureStream = HTMLCanvasElement.prototype.captureStream;
     Object.defineProperty(HTMLCanvasElement.prototype, 'captureStream', {
@@ -741,33 +742,41 @@ test('cancels a long native WebCodecs export before all frames with a bounded qu
     encoderEncodes: number;
     progress: number;
     progressWrites: number;
+    positiveProgressWrites: number;
+    lastProgressWrite: number | undefined;
   }>((resolve, reject) => {
     const startedAt = performance.now();
     const poll = () => {
       const scope = globalThis as typeof globalThis & {
         __lumoraExportInstrumentation: ExportInstrumentation;
       };
-      if (scope.__lumoraExportInstrumentation.encoderEncodes > 0) {
-        setTimeout(() => {
-          const cancel = [...document.querySelectorAll<HTMLButtonElement>('button')]
-            .find((button) => button.textContent?.trim() === '取消导出');
-          const progress = document.querySelector<HTMLProgressElement>('[aria-label="导出进度"]');
-          if (!cancel || !progress) {
-            reject(new Error('Export controls disappeared before the timer task ran'));
-            return;
-          }
-          const snapshot = {
-            encoderEncodes: scope.__lumoraExportInstrumentation.encoderEncodes,
-            progress: progress.value,
-            progressWrites: scope.__lumoraExportInstrumentation.progressValues.length,
-          };
-          cancel.click();
-          resolve(snapshot);
-        }, 0);
+      const instrumentation = scope.__lumoraExportInstrumentation;
+      const cancel = [...document.querySelectorAll<HTMLButtonElement>('button')]
+        .find((button) => button.textContent?.trim() === '取消导出');
+      const progress = document.querySelector<HTMLProgressElement>('[aria-label="导出进度"]');
+      const positiveProgressWrites = instrumentation.progressValues.filter((value) => value > 0).length;
+      const lastProgressWrite = instrumentation.progressValues.at(-1);
+      if (
+        instrumentation.encoderEncodes > 0
+        && cancel
+        && progress
+        && progress.value > 0
+        && positiveProgressWrites > 0
+        && lastProgressWrite === progress.value
+      ) {
+        const snapshot = {
+          encoderEncodes: instrumentation.encoderEncodes,
+          progress: progress.value,
+          progressWrites: instrumentation.progressValues.length,
+          positiveProgressWrites,
+          lastProgressWrite,
+        };
+        cancel.click();
+        resolve(snapshot);
         return;
       }
       if (performance.now() - startedAt > 5_000) {
-        reject(new Error('Encoding did not begin before the cancellation deadline'));
+        reject(new Error('Encoding and committed DOM progress did not begin before the cancellation deadline'));
         return;
       }
       setTimeout(poll, 0);
@@ -790,6 +799,9 @@ test('cancels a long native WebCodecs export before all frames with a bounded qu
   const afterMacroTask = await readCancellationState();
 
   expect(cancellation.encoderEncodes).toBeGreaterThan(0);
+  expect(cancellation.progress).toBeGreaterThan(0);
+  expect(cancellation.positiveProgressWrites).toBeGreaterThan(0);
+  expect(cancellation.lastProgressWrite).toBe(cancellation.progress);
   expect(settled.instrumentation.encoderEncodes).toBe(cancellation.encoderEncodes);
   expect(afterMacroTask.instrumentation.encoderEncodes).toBe(cancellation.encoderEncodes);
   expect(settled.instrumentation.progressValues).toHaveLength(cancellation.progressWrites);
@@ -809,6 +821,8 @@ test('cancels a long native WebCodecs export before all frames with a bounded qu
       encodedAtCancellation: cancellation.encoderEncodes,
       encodedFramesWhenSettled: instrumentation.encoderEncodes,
       progressAtCancellation: cancellation.progress,
+      positiveProgressWritesAtCancellation: cancellation.positiveProgressWrites,
+      lastProgressWriteAtCancellation: cancellation.lastProgressWrite,
       progressAfterMacroTask: afterMacroTask.instrumentation.progressValues.at(-1),
       progressWritesAtCancellation: cancellation.progressWrites,
       progressWritesAfterMacroTask: afterMacroTask.instrumentation.progressValues.length,
