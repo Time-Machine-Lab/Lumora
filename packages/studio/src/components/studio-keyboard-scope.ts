@@ -12,7 +12,6 @@ const NATIVE_KEYBOARD_CONTROL_SELECTOR = [
   'input',
   'textarea',
   'select',
-  'button',
   'option',
   'a[href]',
   'area[href]',
@@ -30,6 +29,8 @@ function isClosestElement(value: unknown): value is ClosestElement {
 export function preservesNativeKeyboardSemantics(event: Event): boolean {
   const source = event.composedPath()[0];
   if (!isClosestElement(source)) return false;
+  const key = 'key' in event ? event.key : undefined;
+  if (source.closest('button')) return key !== 'Escape';
   if (source.closest(NATIVE_KEYBOARD_CONTROL_SELECTOR)) return true;
 
   const editable = source.closest('[contenteditable]');

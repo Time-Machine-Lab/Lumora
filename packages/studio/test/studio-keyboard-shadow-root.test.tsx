@@ -166,15 +166,18 @@ describe('Studio keyboard routing across ShadowRoot boundaries', () => {
     const playBefore = play.textContent;
     const contentEditable = document.createElement('div');
     contentEditable.setAttribute('contenteditable', 'true');
-    contentEditable.tabIndex = 0;
+    const contentEditableChild = document.createElement('span');
+    contentEditableChild.tabIndex = 0;
+    contentEditable.append(contentEditableChild);
     const controls = [
       document.createElement('input'),
       document.createElement('textarea'),
       document.createElement('select'),
       document.createElement('button'),
-      contentEditable,
+      contentEditableChild,
     ];
-    controls.forEach((control) => studio.root.append(control));
+    controls.slice(0, -1).forEach((control) => studio.root.append(control));
+    studio.root.append(contentEditable);
 
     for (const control of controls) {
       control.focus();
@@ -185,6 +188,7 @@ describe('Studio keyboard routing across ShadowRoot boundaries', () => {
           event = dispatchComposedKey(control, 'keydown', { key, code: key });
         });
         expect(event.defaultPrevented, `${control.tagName}:${key}`).toBe(false);
+        expect(editor.getSelection(), `${control.tagName}:${key}`).toEqual(['sample-camera']);
       }
       let space!: KeyboardEvent;
       act(() => {
@@ -192,43 +196,47 @@ describe('Studio keyboard routing across ShadowRoot boundaries', () => {
       });
       expect(space.defaultPrevented, `${control.tagName}:Space`).toBe(false);
       for (const code of ['KeyW', 'KeyA', 'KeyS', 'KeyD']) {
+        const before = camera.position.clone();
         let event!: KeyboardEvent;
         act(() => {
           event = dispatchComposedKey(control, 'keydown', {
             key: code.slice(-1).toLowerCase(),
             code,
           });
+        });
+        expect(event.defaultPrevented, `${control.tagName}:${code}`).toBe(false);
+        await act(async () => delay(80));
+        act(() => {
           dispatchComposedKey(control, 'keyup', {
             key: code.slice(-1).toLowerCase(),
             code,
           });
         });
-        expect(event.defaultPrevented, `${control.tagName}:${code}`).toBe(false);
+        expect(camera.position.distanceTo(before), `${control.tagName}:${code}`).toBeLessThan(1e-9);
+        expect(editor.getSelection(), `${control.tagName}:${code}`).toEqual(['sample-camera']);
       }
-    }
-
-    const input = controls[0]!;
-    for (const code of ['KeyW', 'KeyA', 'KeyS', 'KeyD']) {
-      const before = camera.position.clone();
-      act(() => {
-        dispatchComposedKey(input, 'keydown', {
-          key: code.slice(-1).toLowerCase(),
-          code,
-        });
-      });
-      await act(async () => delay(80));
-      act(() => {
-        dispatchComposedKey(input, 'keyup', {
-          key: code.slice(-1).toLowerCase(),
-          code,
-        });
-      });
-      expect(camera.position.distanceTo(before), code).toBeLessThan(1e-9);
+      expect(play, `${control.tagName}:Space`).toHaveTextContent(playBefore ?? '');
     }
 
     expect(deleteSelection).not.toHaveBeenCalled();
     expect(editor.getSelection()).toEqual(['sample-camera']);
     expect(play).toHaveTextContent(playBefore ?? '');
+  });
+
+  it('clears the editor selection when Escape originates from a button in the ShadowRoot Studio', async () => {
+    const studio = await mountShadowStudio('lumora://shadow-button-escape');
+    const editor = studio.handle.current!.runtime.editor;
+    act(() => editor.setSelection(['sample-cube']));
+    const clearSelection = vi.spyOn(editor, 'clearSelection');
+    const play = within(studio.root).getByTestId('timeline-play');
+    play.focus();
+
+    act(() => {
+      dispatchComposedKey(play, 'keydown', { key: 'Escape', code: 'Escape' });
+    });
+
+    expect(clearSelection).toHaveBeenCalledTimes(1);
+    expect(editor.getSelection()).toEqual([]);
   });
 
   it.each(['Space', 'Enter'])('keeps ShadowRoot export-button %s activation native without toggling playback', async (key) => {
@@ -339,6 +347,7 @@ describe('Studio keyboard routing across ShadowRoot boundaries', () => {
     });
 
     expect(editor.getSelection()).toEqual(['sample-cube']);
+    expect(editor.getProject()?.objects.some((object) => object.id === 'sample-cube')).toBe(true);
     expect(within(studio.root).queryByTestId('command-palette')).not.toBeInTheDocument();
   });
 
@@ -365,5 +374,7 @@ describe('Studio keyboard routing across ShadowRoot boundaries', () => {
     });
 
     expect(deleteSelection).toHaveBeenCalledTimes(1);
+    expect(editor.getProject()?.objects.some((object) => object.id === 'sample-cube')).toBe(false);
+    expect(editor.getSelection()).not.toContain('sample-cube');
   });
 });

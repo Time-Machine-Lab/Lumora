@@ -33,6 +33,32 @@ test.beforeEach(async ({ page }) => {
   await expect(page.getByTestId('tree-row-sample-group')).toBeVisible();
 });
 
+async function moveReactRootIntoOpenShadowRoot(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const reactRoot = document.getElementById('root');
+    if (!reactRoot) throw new Error('React root is missing');
+    const host = document.createElement('div');
+    host.dataset.testid = 'e2e-shadow-host';
+    document.body.append(host);
+    host.attachShadow({ mode: 'open' }).append(reactRoot);
+  });
+}
+
+for (const rootMode of ['light DOM', 'open ShadowRoot'] as const) {
+  test(`button Escape clears selection in ${rootMode}`, async ({ page }) => {
+    if (rootMode === 'open ShadowRoot') await moveReactRootIntoOpenShadowRoot(page);
+    await page.getByTestId('tree-row-sample-cube').click();
+    await expect(page.locator('.lumora-tree-row--selected')).toHaveCount(1);
+    const button = page.getByTestId('timeline-play');
+    await button.focus();
+
+    await button.press('Escape');
+
+    await expect(page.locator('.lumora-tree-row--selected')).toHaveCount(0);
+    await expect(page.getByTestId('inspector-empty')).toHaveText('未选择对象');
+  });
+}
+
 test('对象树选择联动属性面板；数值变换提交后数据与撤销恢复一致（AC1）', async ({ page }) => {
   await page.getByTestId('tree-row-sample-cube').click();
   await expect(page.getByTestId('inspector-name')).toHaveValue('立方体');

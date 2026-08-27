@@ -121,6 +121,23 @@ describe('LumoraStudio', () => {
     }
   });
 
+  it('clears the editor selection when Escape originates from a light-DOM button', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://button-escape', 'Button Escape');
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri));
+    const editor = handle.current!.runtime.editor;
+    act(() => editor.setSelection(['sample-cube']));
+    const clearSelection = vi.spyOn(editor, 'clearSelection');
+    const play = screen.getByTestId('timeline-play');
+
+    play.focus();
+    fireEvent.keyDown(play, { key: 'Escape', code: 'Escape' });
+
+    expect(clearSelection).toHaveBeenCalledTimes(1);
+    expect(editor.getSelection()).toEqual([]);
+  });
+
   it('isolates editor shortcuts while the export workspace is open and idle', async () => {
     let driveDefaultPrevented = false;
     const observeDriveKey = (event: KeyboardEvent) => {

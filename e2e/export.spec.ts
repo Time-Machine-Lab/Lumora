@@ -504,6 +504,17 @@ async function openSampleExport(page: Page): Promise<void> {
   await expect(page.getByTestId('export-workspace')).toBeVisible();
 }
 
+async function moveReactRootIntoOpenShadowRoot(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const reactRoot = document.getElementById('root');
+    if (!reactRoot) throw new Error('React root is missing');
+    const host = document.createElement('div');
+    host.dataset.testid = 'e2e-shadow-host';
+    document.body.append(host);
+    host.attachShadow({ mode: 'open' }).append(reactRoot);
+  });
+}
+
 async function observeExportShotOrder(page: Page): Promise<void> {
   await page.evaluate(() => {
     const scope = globalThis as typeof globalThis & {
@@ -629,6 +640,33 @@ test('opens export with the native Space button action without toggling playback
     globalThis as typeof globalThis & { __lumoraHostShortcutCount?: number }
   ).__lumoraHostShortcutCount)).toBe(0);
 });
+
+for (const key of ['Space', 'Enter'] as const) {
+  test(`opens export exactly once with native ${key} inside a real open ShadowRoot`, async ({ page }) => {
+    await page.goto('/');
+    await page.getByTestId('open-sample-project').click();
+    await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
+    await moveReactRootIntoOpenShadowRoot(page);
+    const trigger = page.getByTestId('open-export-workspace');
+    const playBefore = await page.getByTestId('timeline-play').textContent();
+    await trigger.evaluate((button) => {
+      const scope = globalThis as typeof globalThis & { __lumoraShadowExportClicks?: number };
+      scope.__lumoraShadowExportClicks = 0;
+      button.addEventListener('click', () => {
+        scope.__lumoraShadowExportClicks! += 1;
+      });
+    });
+
+    await trigger.focus();
+    await trigger.press(key);
+
+    await expect(page.getByTestId('export-workspace')).toBeVisible();
+    expect(await page.evaluate(() => (
+      globalThis as typeof globalThis & { __lumoraShadowExportClicks?: number }
+    ).__lumoraShadowExportClicks)).toBe(1);
+    await expect(page.getByTestId('timeline-play')).toHaveText(playBefore ?? '');
+  });
+}
 
 test('keeps Enter and Space export activations from a later host window listener', async ({ page }) => {
   await instrumentWebCodecs(page, 'pending');
