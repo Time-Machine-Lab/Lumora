@@ -27,6 +27,7 @@ interface ExportInstrumentation {
   supportChecks: number;
   supportConfigs: VideoEncoderConfig[];
   captureStreams: number;
+  progressValues: number[];
 }
 
 interface WebmProbe {
@@ -57,8 +58,28 @@ async function instrumentWebCodecs(
       supportChecks: 0,
       supportConfigs: [],
       captureStreams: 0,
+      progressValues: [],
     };
     scope.__lumoraExportInstrumentation = instrumentation;
+
+    const progressValue = Object.getOwnPropertyDescriptor(HTMLProgressElement.prototype, 'value');
+    if (progressValue?.get && progressValue.set) {
+      Object.defineProperty(HTMLProgressElement.prototype, 'value', {
+        ...progressValue,
+        get: progressValue.get,
+        set(value: number) {
+          instrumentation.progressValues.push(Number(value));
+          progressValue.set!.call(this, value);
+        },
+      });
+    }
+    const nativeSetAttribute = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function setAttribute(name: string, value: string) {
+      nativeSetAttribute.call(this, name, value);
+      if (this instanceof HTMLProgressElement && name.toLowerCase() === 'value') {
+        instrumentation.progressValues.push(this.value);
+      }
+    };
 
     const originalCaptureStream = HTMLCanvasElement.prototype.captureStream;
     if (originalCaptureStream) {
@@ -716,7 +737,11 @@ test('cancels a long native WebCodecs export before all frames with a bounded qu
   await page.getByRole('button', { name: '导出 WebM' }).click();
   await expect(page.getByRole('button', { name: '取消导出' })).toBeVisible();
 
-  const encodedAtCancellation = await page.evaluate(() => new Promise<number>((resolve, reject) => {
+  const cancellation = await page.evaluate(() => new Promise<{
+    encoderEncodes: number;
+    progress: number;
+    progressWrites: number;
+  }>((resolve, reject) => {
     const startedAt = performance.now();
     const poll = () => {
       const scope = globalThis as typeof globalThis & {
@@ -726,13 +751,18 @@ test('cancels a long native WebCodecs export before all frames with a bounded qu
         setTimeout(() => {
           const cancel = [...document.querySelectorAll<HTMLButtonElement>('button')]
             .find((button) => button.textContent?.trim() === '取消导出');
-          if (!cancel) {
-            reject(new Error('Cancel control disappeared before the timer task ran'));
+          const progress = document.querySelector<HTMLProgressElement>('[aria-label="导出进度"]');
+          if (!cancel || !progress) {
+            reject(new Error('Export controls disappeared before the timer task ran'));
             return;
           }
-          const encoded = scope.__lumoraExportInstrumentation.encoderEncodes;
+          const snapshot = {
+            encoderEncodes: scope.__lumoraExportInstrumentation.encoderEncodes,
+            progress: progress.value,
+            progressWrites: scope.__lumoraExportInstrumentation.progressValues.length,
+          };
           cancel.click();
-          resolve(encoded);
+          resolve(snapshot);
         }, 0);
         return;
       }
@@ -747,11 +777,28 @@ test('cancels a long native WebCodecs export before all frames with a bounded qu
 
   await expect(page.getByRole('status')).toContainText('导出已取消');
   await expect(page.getByRole('button', { name: '导出 WebM' })).toBeEnabled();
-  const instrumentation = await page.evaluate(() => (
-    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
-  ).__lumoraExportInstrumentation);
-  expect(encodedAtCancellation).toBeGreaterThan(0);
-  expect(instrumentation.encoderEncodes).toBeLessThan(8 * 24);
+  const readCancellationState = () => page.evaluate(() => {
+    const scope = globalThis as typeof globalThis & {
+      __lumoraExportInstrumentation: ExportInstrumentation;
+    };
+    return {
+      instrumentation: scope.__lumoraExportInstrumentation,
+    };
+  });
+  const settled = await readCancellationState();
+  await page.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+  const afterMacroTask = await readCancellationState();
+
+  expect(cancellation.encoderEncodes).toBeGreaterThan(0);
+  expect(settled.instrumentation.encoderEncodes).toBe(cancellation.encoderEncodes);
+  expect(afterMacroTask.instrumentation.encoderEncodes).toBe(cancellation.encoderEncodes);
+  expect(settled.instrumentation.progressValues).toHaveLength(cancellation.progressWrites);
+  expect(afterMacroTask.instrumentation.progressValues).toHaveLength(cancellation.progressWrites);
+  expect(settled.instrumentation.progressValues.at(-1)).toBe(cancellation.progress);
+  expect(afterMacroTask.instrumentation.progressValues.at(-1)).toBe(cancellation.progress);
+  await expect(page.getByRole('status')).toContainText('导出已取消');
+  expect(afterMacroTask.instrumentation.encoderEncodes).toBeLessThan(8 * 24);
+  const instrumentation = afterMacroTask.instrumentation;
   expect(instrumentation.maxEncodeQueueSize).toBeLessThanOrEqual(4);
   expect(instrumentation.encoderConstructions).toBe(1);
   expect(instrumentation.encoderCloses).toBe(1);
@@ -759,8 +806,12 @@ test('cancels a long native WebCodecs export before all frames with a bounded qu
   await testInfo.attach('long-export-backpressure-evidence', {
     body: Buffer.from(JSON.stringify({
       sourceFrames: 8 * 24,
-      encodedAtCancellation,
+      encodedAtCancellation: cancellation.encoderEncodes,
       encodedFramesWhenSettled: instrumentation.encoderEncodes,
+      progressAtCancellation: cancellation.progress,
+      progressAfterMacroTask: afterMacroTask.instrumentation.progressValues.at(-1),
+      progressWritesAtCancellation: cancellation.progressWrites,
+      progressWritesAfterMacroTask: afterMacroTask.instrumentation.progressValues.length,
       maxEncodeQueueSize: instrumentation.maxEncodeQueueSize,
       encoderConstructions: instrumentation.encoderConstructions,
       encoderCloses: instrumentation.encoderCloses,
@@ -855,6 +906,53 @@ test('ignores a stale VP8 preflight result after the selected resolution changes
   expect(instrumentation.supportConfigs.slice(0, initialChecks).every((config) => config.width === 1280)).toBe(true);
   expect(instrumentation.supportConfigs.at(-1)?.width).toBe(854);
   expect(instrumentation.encoderConstructions).toBe(0);
+});
+
+test('keeps an unsupported VP8 config disabled when a stale config later reports support', async ({ page }) => {
+  await instrumentWebCodecs(page, 'native', 'deferred');
+  let downloads = 0;
+  page.on('download', () => downloads += 1);
+  await openSampleExport(page);
+  await expect(page.getByRole('status')).toContainText('正在检查 VP8');
+  await expect.poll(async () => page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation.supportChecks)).toBeGreaterThan(0);
+  const initialChecks = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation.supportChecks);
+
+  await page.getByLabel('分辨率').selectOption('480p');
+  await expect.poll(async () => page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation.supportChecks)).toBe(initialChecks + 1);
+  await page.evaluate((index) => (
+    globalThis as typeof globalThis & {
+      __lumoraResolveSupportCheck(index: number, supported: boolean): void;
+    }
+  ).__lumoraResolveSupportCheck(index, false), initialChecks);
+  await expect(page.getByRole('alert')).toContainText('不支持当前分辨率');
+  await expect(page.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
+
+  await page.evaluate((count) => {
+    const scope = globalThis as typeof globalThis & {
+      __lumoraResolveSupportCheck(index: number, supported: boolean): void;
+    };
+    for (let index = 0; index < count; index += 1) {
+      scope.__lumoraResolveSupportCheck(index, true);
+    }
+  }, initialChecks);
+  await page.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+  await expect(page.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
+  await expect(page.getByRole('alert')).toContainText('不支持当前分辨率');
+  const instrumentation = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation);
+  expect(instrumentation.supportConfigs.slice(0, initialChecks).every((config) => config.width === 1280)).toBe(true);
+  expect(instrumentation.supportConfigs.at(-1)?.width).toBe(854);
+  expect(instrumentation.encoderConstructions).toBe(0);
+  expect(instrumentation.encoderConfigures).toBe(0);
+  expect(instrumentation.encoderEncodes).toBe(0);
+  expect(downloads).toBe(0);
 });
 
 test('closes a configure-failed encoder and remains retryable', async ({ page }) => {

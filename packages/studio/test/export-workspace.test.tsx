@@ -68,11 +68,16 @@ function encoderDependencies(options: { flush?: () => Promise<Blob> } = {}) {
     flush: ReturnType<typeof vi.fn>;
     close: ReturnType<typeof vi.fn>;
   };
+  const configure = vi.fn();
+  const createEncoder = vi.fn(() => {
+    configure();
+    return encoder;
+  });
   const dependencies: PreviewRecordingDependencies = {
     createCanvas: () => canvas,
-    createEncoder: () => encoder,
+    createEncoder,
   };
-  return { dependencies, encoder, encodedFrames };
+  return { dependencies, encoder, encodedFrames, createEncoder, configure };
 }
 
 function readBlob(blob: Blob): Promise<string> {
@@ -398,6 +403,50 @@ describe('ExportWorkspace', () => {
     }));
   });
 
+  it('keeps the current unsupported config disabled when an old config later reports support', async () => {
+    const runtime = createStudioRuntime();
+    const project = createSampleProject();
+    const { session } = sessionHarness();
+    const recorder = encoderDependencies();
+    const firstCheck = deferred<{ supported: boolean }>();
+    const secondCheck = deferred<{ supported: boolean }>();
+    const isConfigSupported = vi.fn()
+      .mockReturnValueOnce(firstCheck.promise)
+      .mockReturnValueOnce(secondCheck.promise);
+
+    render(
+      <AsyncExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        supportProbe={{ hasVideoEncoder: true, hasVideoFrame: true, isConfigSupported }}
+        recordingDependencies={recorder.dependencies}
+        onClose={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(isConfigSupported).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByLabelText('分辨率'), { target: { value: '480p' } });
+    await waitFor(() => expect(isConfigSupported).toHaveBeenCalledTimes(2));
+
+    secondCheck.resolve({ supported: false });
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('不支持当前分辨率'));
+    firstCheck.resolve({ supported: true });
+    await act(async () => firstCheck.promise);
+
+    expect(screen.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
+    expect(screen.getByRole('alert')).toHaveTextContent('不支持当前分辨率');
+    expect(isConfigSupported).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      width: 854,
+      height: 480,
+    }));
+    expect(recorder.createEncoder).not.toHaveBeenCalled();
+    expect(recorder.configure).not.toHaveBeenCalled();
+    expect(recorder.encoder.encodeFrame).not.toHaveBeenCalled();
+    expect(HTMLAnchorElement.prototype.click).not.toHaveBeenCalled();
+  });
+
   it('disables WebM synchronously when a supported selection changes', async () => {
     const runtime = createStudioRuntime();
     const project = createSampleProject();
@@ -487,6 +536,63 @@ describe('ExportWorkspace', () => {
 
     expect(screen.getByRole('button', { name: '导出 WebM' })).toBeEnabled();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('keeps a replacement session unsupported when the old session later reports support', async () => {
+    const runtime = createStudioRuntime();
+    await runtime.openProject(createSampleProject('lumora://vp8-session', 'Initial'));
+    const initial = runtime.getProject()!;
+    const firstToken = runtime.editor.getSessionToken();
+    const { session } = sessionHarness();
+    const recorder = encoderDependencies();
+    const firstCheck = deferred<{ supported: boolean }>();
+    const secondCheck = deferred<{ supported: boolean }>();
+    const isConfigSupported = vi.fn()
+      .mockReturnValueOnce(firstCheck.promise)
+      .mockReturnValueOnce(secondCheck.promise);
+
+    const view = render(
+      <AsyncExportWorkspace
+        runtime={runtime}
+        project={initial}
+        projectSessionToken={firstToken}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        supportProbe={{ hasVideoEncoder: true, hasVideoFrame: true, isConfigSupported }}
+        recordingDependencies={recorder.dependencies}
+        onClose={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(isConfigSupported).toHaveBeenCalledTimes(1));
+
+    act(() => runtime.editor.openProject(createSampleProject(initial.uri, 'Replacement')));
+    const replacement = runtime.getProject()!;
+    view.rerender(
+      <AsyncExportWorkspace
+        runtime={runtime}
+        project={replacement}
+        projectSessionToken={runtime.editor.getSessionToken()}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        supportProbe={{ hasVideoEncoder: true, hasVideoFrame: true, isConfigSupported }}
+        recordingDependencies={recorder.dependencies}
+        onClose={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(isConfigSupported).toHaveBeenCalledTimes(2));
+    secondCheck.resolve({ supported: false });
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('不支持当前分辨率'));
+    firstCheck.resolve({ supported: true });
+    await act(async () => firstCheck.promise);
+
+    expect(screen.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
+    expect(screen.getByRole('alert')).toHaveTextContent('不支持当前分辨率');
+    expect(recorder.createEncoder).not.toHaveBeenCalled();
+    expect(recorder.configure).not.toHaveBeenCalled();
+    expect(recorder.encoder.encodeFrame).not.toHaveBeenCalled();
+    expect(HTMLAnchorElement.prototype.click).not.toHaveBeenCalled();
   });
 
   it('downloads a privacy-safe manifest for the selected range', async () => {
