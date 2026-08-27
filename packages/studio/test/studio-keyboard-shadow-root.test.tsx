@@ -7,10 +7,6 @@ import type { Project } from '@lumora/core';
 import { LumoraStudio } from '../src/components/LumoraStudio';
 import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
 import { findNode } from '../src/components/editor/scene-builder';
-import {
-  isKeyboardEventForStudio,
-  registerStudioKeyboardRoot,
-} from '../src/components/studio-keyboard-scope';
 
 const r3fHarness = vi.hoisted(() => ({ scenes: [] as THREE.Group[] }));
 
@@ -126,7 +122,9 @@ describe('Studio keyboard routing across ShadowRoot boundaries', () => {
   it('routes editing, deletion, and camera drive keys from the focused ShadowRoot Studio', async () => {
     const studio = await mountShadowStudio('lumora://shadow-keyboard');
     const editor = studio.handle.current!.runtime.editor;
-    const focusTarget = within(studio.root).getByTestId('timeline-play');
+    const focusTarget = document.createElement('div');
+    focusTarget.tabIndex = -1;
+    studio.root.append(focusTarget);
     focusTarget.focus();
     expect(studio.shadowRoot.activeElement).toBe(focusTarget);
     expect(document.activeElement).toBe(studio.host);
@@ -156,6 +154,135 @@ describe('Studio keyboard routing across ShadowRoot boundaries', () => {
     });
 
     expect(camera.position.distanceTo(before)).toBeGreaterThan(0.01);
+  });
+
+  it('preserves native editing and drive keys for controls inside the ShadowRoot Studio', async () => {
+    const studio = await mountShadowStudio('lumora://shadow-native-controls');
+    const editor = studio.handle.current!.runtime.editor;
+    act(() => editor.setSelection(['sample-camera']));
+    const deleteSelection = vi.spyOn(editor, 'deleteSelection');
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    const play = within(studio.root).getByTestId('timeline-play');
+    const playBefore = play.textContent;
+    const contentEditable = document.createElement('div');
+    contentEditable.setAttribute('contenteditable', 'true');
+    contentEditable.tabIndex = 0;
+    const controls = [
+      document.createElement('input'),
+      document.createElement('textarea'),
+      document.createElement('select'),
+      document.createElement('button'),
+      contentEditable,
+    ];
+    controls.forEach((control) => studio.root.append(control));
+
+    for (const control of controls) {
+      control.focus();
+      expect(studio.shadowRoot.activeElement).toBe(control);
+      for (const key of ['Delete', 'Backspace']) {
+        let event!: KeyboardEvent;
+        act(() => {
+          event = dispatchComposedKey(control, 'keydown', { key, code: key });
+        });
+        expect(event.defaultPrevented, `${control.tagName}:${key}`).toBe(false);
+      }
+      let space!: KeyboardEvent;
+      act(() => {
+        space = dispatchComposedKey(control, 'keydown', { key: ' ', code: 'Space' });
+      });
+      expect(space.defaultPrevented, `${control.tagName}:Space`).toBe(false);
+      for (const code of ['KeyW', 'KeyA', 'KeyS', 'KeyD']) {
+        let event!: KeyboardEvent;
+        act(() => {
+          event = dispatchComposedKey(control, 'keydown', {
+            key: code.slice(-1).toLowerCase(),
+            code,
+          });
+          dispatchComposedKey(control, 'keyup', {
+            key: code.slice(-1).toLowerCase(),
+            code,
+          });
+        });
+        expect(event.defaultPrevented, `${control.tagName}:${code}`).toBe(false);
+      }
+    }
+
+    const input = controls[0]!;
+    for (const code of ['KeyW', 'KeyA', 'KeyS', 'KeyD']) {
+      const before = camera.position.clone();
+      act(() => {
+        dispatchComposedKey(input, 'keydown', {
+          key: code.slice(-1).toLowerCase(),
+          code,
+        });
+      });
+      await act(async () => delay(80));
+      act(() => {
+        dispatchComposedKey(input, 'keyup', {
+          key: code.slice(-1).toLowerCase(),
+          code,
+        });
+      });
+      expect(camera.position.distanceTo(before), code).toBeLessThan(1e-9);
+    }
+
+    expect(deleteSelection).not.toHaveBeenCalled();
+    expect(editor.getSelection()).toEqual(['sample-camera']);
+    expect(play).toHaveTextContent(playBefore ?? '');
+  });
+
+  it.each(['Space', 'Enter'])('keeps ShadowRoot export-button %s activation native without toggling playback', async (key) => {
+    const studio = await mountShadowStudio(`lumora://shadow-button-${key.toLowerCase()}`);
+    const trigger = within(studio.root).getByTestId('open-export-workspace');
+    const play = within(studio.root).getByTestId('timeline-play');
+    const playBefore = play.textContent;
+    trigger.focus();
+
+    const keydown = dispatchComposedKey(trigger, 'keydown', {
+      key: key === 'Space' ? ' ' : key,
+      code: key,
+    });
+    dispatchComposedKey(trigger, 'keyup', {
+      key: key === 'Space' ? ' ' : key,
+      code: key,
+    });
+    expect(keydown.defaultPrevented).toBe(false);
+    await act(async () => trigger.click());
+
+    expect(within(studio.root).getByTestId('export-workspace')).toBeInTheDocument();
+    expect(play).toHaveTextContent(playBefore ?? '');
+  });
+
+  it('preserves ShadowRoot input keys while export shortcut capture is active', async () => {
+    const studio = await mountShadowStudio('lumora://shadow-export-input');
+    const editor = studio.handle.current!.runtime.editor;
+    act(() => editor.setSelection(['sample-camera']));
+    const deleteSelection = vi.spyOn(editor, 'deleteSelection');
+    const trigger = within(studio.root).getByTestId('open-export-workspace');
+    await act(async () => trigger.click());
+    expect(within(studio.root).getByTestId('export-workspace')).toBeInTheDocument();
+    const play = within(studio.root).getByTestId('timeline-play');
+    const playBefore = play.textContent;
+    const input = document.createElement('input');
+    studio.root.append(input);
+    input.focus();
+
+    for (const [key, code] of [
+      ['Delete', 'Delete'],
+      ['Backspace', 'Backspace'],
+      [' ', 'Space'],
+      ['w', 'KeyW'],
+    ]) {
+      let event!: KeyboardEvent;
+      act(() => {
+        event = dispatchComposedKey(input, 'keydown', { key, code });
+      });
+      expect(event.defaultPrevented, code).toBe(false);
+    }
+
+    expect(deleteSelection).not.toHaveBeenCalled();
+    expect(editor.getSelection()).toEqual(['sample-camera']);
+    expect(play).toHaveTextContent(playBefore ?? '');
   });
 
   it('lets only the nearest registered root handle an event from a nested Studio', async () => {
@@ -215,18 +342,28 @@ describe('Studio keyboard routing across ShadowRoot boundaries', () => {
     expect(within(studio.root).queryByTestId('command-palette')).not.toBeInTheDocument();
   });
 
-  it('uses the registered root ownerDocument for the single-Studio body fallback', () => {
-    const ownerDocument = document.implementation.createHTMLDocument('embedded');
-    const root = ownerDocument.createElement('div');
-    ownerDocument.body.append(root);
-    const unregister = registerStudioKeyboardRoot(root);
-    const event = new Event('keydown', { bubbles: true, cancelable: true });
-    ownerDocument.body.dispatchEvent(event);
+  it.each([
+    ['ownerDocument', (root: HTMLElement) => root.ownerDocument as EventTarget],
+    ['ownerDocument.body', (root: HTMLElement) => root.ownerDocument.body as EventTarget],
+  ])('keeps the single-Studio %s fallback behavior through the window listener', async (_name, target) => {
+    const handle = createRef<LumoraStudioHandle>();
+    const view = render(
+      <LumoraStudio
+        ref={handle}
+        initialProject={createSampleProject('lumora://document-fallback', 'Document fallback')}
+        scene={() => <div />}
+      />,
+    );
+    await waitFor(() => expect(handle.current?.runtime.editor.getProject()).not.toBeNull());
+    const editor = handle.current!.runtime.editor;
+    const root = within(view.container).getByTestId('lumora-studio');
+    act(() => editor.setSelection(['sample-cube']));
+    const deleteSelection = vi.spyOn(editor, 'deleteSelection');
 
-    try {
-      expect(isKeyboardEventForStudio(root, event)).toBe(true);
-    } finally {
-      unregister();
-    }
+    act(() => {
+      dispatchComposedKey(target(root), 'keydown', { key: 'Delete', code: 'Delete' });
+    });
+
+    expect(deleteSelection).toHaveBeenCalledTimes(1);
   });
 });

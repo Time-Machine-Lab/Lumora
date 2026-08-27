@@ -23,7 +23,11 @@ import { ToastHost, showToast } from './editor/toasts';
 import { ContentCache } from './editor/content-cache';
 import { LiveTransformStore } from './editor/live-transform-store';
 import { DRIVE_KEY_CODES } from './editor/camera-drive';
-import { isKeyboardEventForStudio, registerStudioKeyboardRoot } from './studio-keyboard-scope';
+import {
+  isKeyboardEventForStudio,
+  preservesNativeKeyboardSemantics,
+  registerStudioKeyboardRoot,
+} from './studio-keyboard-scope';
 import '../lumora.css';
 
 /**
@@ -62,20 +66,6 @@ function isStudioEditingShortcut(event: KeyboardEvent): boolean {
     ((event.ctrlKey || event.metaKey) && (key === 'k' || key === 'z' || key === 'y' || key === 'd')) ||
     DRIVE_KEY_CODES.has(event.code)
   );
-}
-
-function preservesNativeExportShortcut(event: KeyboardEvent): boolean {
-  const target = event.target as HTMLElement | null;
-  if (!target) return false;
-  if (
-    target.tagName === 'INPUT' ||
-    target.tagName === 'TEXTAREA' ||
-    target.tagName === 'SELECT' ||
-    target.isContentEditable
-  ) {
-    return true;
-  }
-  return event.key === ' ' && target.tagName === 'BUTTON';
 }
 
 export interface LumoraStudioProps {
@@ -404,7 +394,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     if (!root) return;
     const onKeyDownCapture = (event: KeyboardEvent) => {
       if (!isKeyboardEventForStudio(root, event) || !isStudioEditingShortcut(event)) return;
-      if (!preservesNativeExportShortcut(event)) event.preventDefault();
+      if (!preservesNativeKeyboardSemantics(event)) event.preventDefault();
     };
     // Mark editor-only shortcuts before viewport listeners can consume drive keys.
     window.addEventListener('keydown', onKeyDownCapture, true);
@@ -423,18 +413,8 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     const unregisterRoot = registerStudioKeyboardRoot(root);
     const onKey = (event: KeyboardEvent) => {
       if (!isKeyboardEventForStudio(root, event)) return;
-      const nativeTarget = event.target as HTMLElement | null;
-      if (event.key === ' ' && nativeTarget?.tagName === 'BUTTON') {
-        // Space activates focused native buttons on keyup. The global playback
-        // shortcut must not cancel that default action, whether export is open
-        // already or the toolbar button is about to open it.
-        return;
-      }
       if (exportOpen && isStudioEditingShortcut(event)) {
-        if (preservesNativeExportShortcut(event)) {
-          if (event.key === ' ') event.stopImmediatePropagation();
-          return;
-        }
+        if (preservesNativeKeyboardSemantics(event)) return;
         event.preventDefault();
         event.stopImmediatePropagation();
         return;
@@ -449,16 +429,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         setPaletteOpen((open) => !open);
         return;
       }
-      const target = event.target as HTMLElement | null;
-      if (
-        target &&
-        (target.tagName === 'INPUT' ||
-          target.tagName === 'TEXTAREA' ||
-          target.tagName === 'SELECT' ||
-          target.isContentEditable)
-      ) {
-        return;
-      }
+      if (preservesNativeKeyboardSemantics(event)) return;
       const editor = runtime.editor;
       if ((event.ctrlKey || event.metaKey) && key === 'z') {
         event.preventDefault();

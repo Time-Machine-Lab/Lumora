@@ -232,7 +232,9 @@ describe('camera drive keyboard routing', () => {
     await mountStudio('lumora://drive-body-keyup-b');
     act(() => a.handle.current!.runtime.editor.setSelection(['sample-camera']));
     const cameraA = findNode(a.scene, 'sample-camera')!;
-    const focusTarget = within(a.root).getByTestId('timeline-play');
+    const focusTarget = document.createElement('div');
+    focusTarget.tabIndex = 0;
+    a.root.append(focusTarget);
     await act(async () => delay(60));
 
     focusTarget.focus();

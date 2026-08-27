@@ -27,6 +27,7 @@ async function startRecording(page: Page): Promise<void> {
   await expect(page.getByTestId('overwrite-confirm')).toBeVisible();
   await page.getByText('覆盖录制').click();
   await expect(page.getByTestId('timeline-record')).toHaveText('■');
+  await page.getByTestId('lumora-viewport').focus();
 }
 
 /** 隐藏视口上的 DOM 覆盖层（工具条/辅助线），让 canvas 截图只含 WebGL 像素 */

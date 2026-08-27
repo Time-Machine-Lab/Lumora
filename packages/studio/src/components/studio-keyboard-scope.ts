@@ -3,6 +3,40 @@
  * Multiple or nested Studios admit only the nearest registered root in the event path. */
 const mountedStudioRoots = new Set<HTMLElement>();
 
+interface ClosestElement {
+  closest(selectors: string): ClosestElement | null;
+  getAttribute(name: string): string | null;
+}
+
+const NATIVE_KEYBOARD_CONTROL_SELECTOR = [
+  'input',
+  'textarea',
+  'select',
+  'button',
+  'option',
+  'a[href]',
+  'area[href]',
+  'summary',
+  'audio[controls]',
+  'video[controls]',
+].join(',');
+
+function isClosestElement(value: unknown): value is ClosestElement {
+  if (value === null || typeof value !== 'object') return false;
+  const candidate = value as { closest?: unknown; getAttribute?: unknown };
+  return typeof candidate.closest === 'function' && typeof candidate.getAttribute === 'function';
+}
+
+export function preservesNativeKeyboardSemantics(event: Event): boolean {
+  const source = event.composedPath()[0];
+  if (!isClosestElement(source)) return false;
+  if (source.closest(NATIVE_KEYBOARD_CONTROL_SELECTOR)) return true;
+
+  const editable = source.closest('[contenteditable]');
+  const editableValue = editable?.getAttribute('contenteditable');
+  return editableValue !== null && editableValue !== undefined && editableValue.toLowerCase() !== 'false';
+}
+
 export function stopActivationKeyPropagation(event: { key: string; stopPropagation(): void }): void {
   if (event.key === ' ' || event.key === 'Enter') event.stopPropagation();
 }

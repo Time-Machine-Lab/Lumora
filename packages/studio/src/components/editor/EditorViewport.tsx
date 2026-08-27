@@ -23,7 +23,10 @@ import { PlaybackDriver } from './PlaybackDriver';
 import { captureProjectFrame, renderProjectFrameToCanvas } from './frame-capture';
 import type { ProjectFrameCapture } from './frame-capture';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
-import { isKeyboardEventForStudio } from '../studio-keyboard-scope';
+import {
+  isKeyboardEventForStudio,
+  preservesNativeKeyboardSemantics,
+} from '../studio-keyboard-scope';
 import type { LiveTransformStore } from './live-transform-store';
 
 interface EditorViewportProps {
@@ -364,16 +367,7 @@ function useCameraDrive(
       if (event.defaultPrevented || !driveEnabledRef.current) return;
       const keyboardRoot = keyboardScopeRef?.current;
       if (keyboardRoot && !isKeyboardEventForStudio(keyboardRoot, event)) return;
-      const target = event.target as HTMLElement | null;
-      if (
-        target &&
-        (target.tagName === 'INPUT' ||
-          target.tagName === 'TEXTAREA' ||
-          target.tagName === 'SELECT' ||
-          target.isContentEditable)
-      ) {
-        return;
-      }
+      if (preservesNativeKeyboardSemantics(event)) return;
       if (DRIVE_KEY_CODES.has(event.code)) {
         if (cameraIdRef.current) event.preventDefault();
         heldKeys.add(event.code);

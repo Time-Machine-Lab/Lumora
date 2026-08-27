@@ -160,7 +160,7 @@ describe('LumoraStudio', () => {
     expect(redo).not.toHaveBeenCalled();
     expect(duplicate).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
-    expect(driveDefaultPrevented).toBe(true);
+    expect(driveDefaultPrevented).toBe(false);
     expect(editor.getSelection()).toEqual(['sample-camera']);
     expect(screen.getByTestId('timeline-play')).toHaveTextContent(playBefore ?? '');
   });
