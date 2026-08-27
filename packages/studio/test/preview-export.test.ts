@@ -9,10 +9,10 @@ import {
   recordPreviewWebm,
 } from '../src/export/preview-export';
 import type {
-  MediaRecorderLike,
+  PreviewEncodedFrame,
+  PreviewEncoderSession,
   PreviewExportPlan,
   PreviewRecordingDependencies,
-  PreviewRecordingOptions,
 } from '../src/export/preview-export';
 
 function sampleProject(): Project {
@@ -138,24 +138,20 @@ describe('preview export contract', () => {
     });
   });
 
-  it('detects browser and codec support without constructing a recorder', () => {
-    const isTypeSupported = vi.fn((mime: string) => mime.includes('vp8'));
+  it('detects WebCodecs support without constructing an encoder', () => {
     expect(
       detectWebmSupport({
-        hasMediaRecorder: true,
-        hasCanvasCaptureStream: true,
-        isTypeSupported,
+        hasVideoEncoder: true,
+        hasVideoFrame: true,
       }),
     ).toEqual({ supported: true, mimeType: 'video/webm;codecs=vp8' });
-    expect(isTypeSupported).toHaveBeenCalled();
 
     expect(
       detectWebmSupport({
-        hasMediaRecorder: false,
-        hasCanvasCaptureStream: true,
-        isTypeSupported,
+        hasVideoEncoder: false,
+        hasVideoFrame: true,
       }),
-    ).toEqual({ supported: false, reason: expect.stringContaining('MediaRecorder') });
+    ).toEqual({ supported: false, reason: expect.stringContaining('VideoEncoder') });
   });
 
   it('builds a structured storyboard manifest without assets or plugin settings', () => {
@@ -225,47 +221,49 @@ describe('preview export contract', () => {
   });
 });
 
-interface RecorderHarness {
-  recorder: MediaRecorderLike;
-  track: { requestFrame?: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn> };
-  stream: MediaStream;
+interface EncoderHarness {
+  encoder: PreviewEncoderSession & {
+    encodeFrame: ReturnType<typeof vi.fn>;
+    flush: ReturnType<typeof vi.fn>;
+    close: ReturnType<typeof vi.fn>;
+  };
+  encodedFrames: PreviewEncodedFrame[];
+  canvas: HTMLCanvasElement;
   deps: PreviewRecordingDependencies;
 }
 
-function recorderHarness(chunk = new Blob(['webm-bytes'], { type: 'video/webm' })): RecorderHarness {
-  const track = { requestFrame: vi.fn(), stop: vi.fn() };
-  const stream = {
-    getTracks: () => [track],
-    getVideoTracks: () => [track],
-  } as unknown as MediaStream;
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function encoderHarness(blob = new Blob(['webm-bytes'], { type: 'video/webm;codecs=vp8' })): EncoderHarness {
+  const encodedFrames: PreviewEncodedFrame[] = [];
   const canvas = {
     width: 0,
     height: 0,
-    captureStream: vi.fn(() => stream),
   } as unknown as HTMLCanvasElement;
-  const recorder: MediaRecorderLike = {
-    state: 'inactive',
-    ondataavailable: null,
-    onerror: null,
-    onstop: null,
-    start: vi.fn(function start(this: MediaRecorderLike) {
-      this.state = 'recording';
-    }),
-    stop: vi.fn(function stop(this: MediaRecorderLike) {
-      if (this.state === 'inactive') return;
-      this.state = 'inactive';
-      this.ondataavailable?.({ data: chunk } as BlobEvent);
-      this.onstop?.(new Event('stop'));
-    }),
+  const encoder = {
+    encodeFrame: vi.fn((_canvas, frame) => encodedFrames.push({ ...frame })),
+    flush: vi.fn(async () => blob),
+    close: vi.fn(),
+  } as PreviewEncoderSession & {
+    encodeFrame: ReturnType<typeof vi.fn>;
+    flush: ReturnType<typeof vi.fn>;
+    close: ReturnType<typeof vi.fn>;
   };
   return {
-    recorder,
-    track,
-    stream,
+    encoder,
+    encodedFrames,
+    canvas,
     deps: {
       createCanvas: () => canvas,
-      createRecorder: () => recorder,
-      waitForFrame: vi.fn(async () => undefined),
+      createEncoder: () => encoder,
     },
   };
 }
@@ -293,8 +291,8 @@ function shortPlan(): PreviewExportPlan {
 }
 
 describe('recordPreviewWebm', () => {
-  it('renders frames in shot order, reports monotonic progress, and releases media tracks', async () => {
-    const harness = recorderHarness();
+  it('renders frames in shot order, reports monotonic progress, and closes the encoder', async () => {
+    const harness = encoderHarness();
     const rendered: Array<{ shot: string; sourceTime: number }> = [];
     const progress: number[] = [];
 
@@ -323,44 +321,109 @@ describe('recordPreviewWebm', () => {
     expect(rendered[0]!.sourceTime).toBe(0);
     expect(rendered[3]!.sourceTime).toBe(0.125);
     expect(progress).toEqual([1, 2, 3, 4, 5, 6]);
-    // Six content frames cover timestamps 0..5/fps. A duplicate terminal
-    // frame at 6/fps gives the WebM muxer an explicit quantized end timestamp.
-    expect(harness.track.requestFrame).toHaveBeenCalledTimes(7);
-    expect(harness.track.stop).toHaveBeenCalledTimes(1);
-    expect(harness.recorder.stop).toHaveBeenCalledTimes(1);
+    expect(harness.encodedFrames).toHaveLength(7);
+    expect(harness.encodedFrames.map((frame) => frame.timestamp)).toEqual([
+      0, 41_667, 83_333, 125_000, 166_667, 208_333, 250_000,
+    ]);
+    expect(harness.encodedFrames[0]).toMatchObject({ duration: 41_667, keyFrame: true });
+    expect(harness.encodedFrames.at(-1)).toMatchObject({ timestamp: 250_000, keyFrame: false });
+    expect(harness.encoder.flush).toHaveBeenCalledTimes(1);
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
   });
 
-  it('holds the recorder to absolute frame deadlines instead of adding render overhead', async () => {
-    const harness = recorderHarness();
-    let elapsed = 0;
-    harness.deps.now = () => elapsed;
-    harness.deps.waitForFrame = vi.fn(async (milliseconds) => {
-      elapsed += milliseconds;
+  it('uses exact media timestamps independent of render execution time', async () => {
+    const harness = encoderHarness();
+    let renderCost = 0;
+
+    await recordPreviewWebm(shortPlan(), () => {
+      renderCost += 73;
+      return true;
+    }, { dependencies: harness.deps });
+
+    expect(renderCost).toBe(6 * 73);
+    expect(harness.encodedFrames.map((frame) => frame.timestamp)).toEqual([
+      0, 41_667, 83_333, 125_000, 166_667, 208_333, 250_000,
+    ]);
+  });
+
+  it('waits for encoder flush before returning and closing', async () => {
+    const harness = encoderHarness();
+    const flushed = deferred<Blob>();
+    harness.encoder.flush.mockImplementation(() => flushed.promise);
+
+    const recording = recordPreviewWebm(shortPlan(), () => true, { dependencies: harness.deps });
+    await vi.waitFor(() => expect(harness.encoder.flush).toHaveBeenCalledTimes(1));
+    expect(harness.encoder.close).not.toHaveBeenCalled();
+
+    flushed.resolve(new Blob(['webm'], { type: 'video/webm;codecs=vp8' }));
+    await expect(recording).resolves.toMatchObject({ type: 'video/webm;codecs=vp8' });
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels while encoder flush is pending', async () => {
+    const harness = encoderHarness();
+    const controller = new AbortController();
+    harness.encoder.flush.mockImplementation(() => {
+      controller.abort();
+      return new Promise<Blob>(() => undefined);
     });
 
-    await recordPreviewWebm(
-      shortPlan(),
-      () => {
-        elapsed += 10;
-        return true;
-      },
-      { dependencies: harness.deps },
-    );
+    await expect(recordPreviewWebm(shortPlan(), () => true, {
+      dependencies: harness.deps,
+      signal: controller.signal,
+    })).rejects.toMatchObject({ code: 'cancelled' } satisfies Partial<PreviewExportError>);
 
-    // The first 10ms render occurs before WebM timestamps begin; from the
-    // first request to the terminal request the quantized timeline is 250ms.
-    expect(elapsed).toBeCloseTo(260, 5);
-    expect(harness.deps.waitForFrame).toHaveBeenCalledTimes(7);
-    expect(vi.mocked(harness.deps.waitForFrame).mock.calls[0]![0]).toBeCloseTo(1000 / 24, 5);
-    expect(vi.mocked(harness.deps.waitForFrame).mock.calls.at(-1)![0]).toBe(0);
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
   });
 
-  it('does not request a frame after the operation becomes stale while renderFrame awaits', async () => {
-    const harness = recorderHarness();
+  it('cancels a pending encoder flush when operation ownership becomes stale', async () => {
+    const harness = encoderHarness();
     let operationCurrent = true;
-    const validityOption = {
+    harness.encoder.flush.mockImplementation(() => new Promise<Blob>(() => undefined));
+
+    const recording = recordPreviewWebm(shortPlan(), () => true, {
+      dependencies: harness.deps,
       isOperationCurrent: () => operationCurrent,
-    } as unknown as PreviewRecordingOptions;
+    });
+    await vi.waitFor(() => expect(harness.encoder.flush).toHaveBeenCalledTimes(1));
+    operationCurrent = false;
+
+    await expect(recording).rejects.toMatchObject(
+      { code: 'cancelled' } satisfies Partial<PreviewExportError>,
+    );
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('settles immediately when encoder flush fails', async () => {
+    const harness = encoderHarness();
+    harness.encoder.flush.mockRejectedValue(new Error('codec failed'));
+
+    await expect(
+      recordPreviewWebm(shortPlan(), () => true, { dependencies: harness.deps }),
+    ).rejects.toMatchObject({ code: 'encoder-failed' } satisfies Partial<PreviewExportError>);
+
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('times out a missing encoder flush and remains retryable', async () => {
+    const harness = encoderHarness();
+    harness.encoder.flush.mockImplementation(() => new Promise<Blob>(() => undefined));
+
+    await expect(recordPreviewWebm(shortPlan(), () => true, {
+      dependencies: harness.deps,
+      finalizationTimeoutMs: 5,
+    })).rejects.toMatchObject({ code: 'encoder-failed' } satisfies Partial<PreviewExportError>);
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
+
+    const retryHarness = encoderHarness();
+    await expect(
+      recordPreviewWebm(shortPlan(), () => true, { dependencies: retryHarness.deps }),
+    ).resolves.toMatchObject({ type: 'video/webm;codecs=vp8' });
+  });
+
+  it('does not encode a frame after the operation becomes stale while renderFrame awaits', async () => {
+    const harness = encoderHarness();
+    let operationCurrent = true;
 
     await expect(
       recordPreviewWebm(
@@ -370,50 +433,16 @@ describe('recordPreviewWebm', () => {
           operationCurrent = false;
           return true;
         },
-        { dependencies: harness.deps, ...validityOption },
+        { dependencies: harness.deps, isOperationCurrent: () => operationCurrent },
       ),
     ).rejects.toMatchObject({ code: 'cancelled' } satisfies Partial<PreviewExportError>);
 
-    expect(harness.track.requestFrame).not.toHaveBeenCalled();
-    expect(harness.track.stop).toHaveBeenCalledTimes(1);
+    expect(harness.encoder.encodeFrame).not.toHaveBeenCalled();
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
   });
 
-  it('fails before recording when captureStream(0) does not expose requestFrame', async () => {
-    const harness = recorderHarness();
-    harness.track.requestFrame = undefined;
-
-    await expect(
-      recordPreviewWebm(shortPlan(), () => true, { dependencies: harness.deps }),
-    ).rejects.toMatchObject({ code: 'unsupported' } satisfies Partial<PreviewExportError>);
-
-    expect(harness.recorder.start).not.toHaveBeenCalled();
-    expect(harness.track.stop).toHaveBeenCalledTimes(1);
-  });
-
-  it('fails explicitly after a sustained frame deadline miss instead of exporting drifted media', async () => {
-    const harness = recorderHarness();
-    let elapsed = 0;
-    harness.deps.now = () => elapsed;
-    harness.deps.waitForFrame = vi.fn(async (milliseconds) => {
-      elapsed += milliseconds;
-    });
-
-    await expect(
-      recordPreviewWebm(
-        shortPlan(),
-        () => {
-          elapsed += 60;
-          return true;
-        },
-        { dependencies: harness.deps },
-      ),
-    ).rejects.toMatchObject({ code: 'timing-failed' } satisfies Partial<PreviewExportError>);
-
-    expect(harness.track.stop).toHaveBeenCalledTimes(1);
-  });
-
-  it('cancels without a file and releases the recorder and stream', async () => {
-    const harness = recorderHarness();
+  it('cancels without a file and closes the encoder', async () => {
+    const harness = encoderHarness();
     const controller = new AbortController();
     let frames = 0;
 
@@ -429,18 +458,16 @@ describe('recordPreviewWebm', () => {
       ),
     ).rejects.toMatchObject({ code: 'cancelled' } satisfies Partial<PreviewExportError>);
 
-    expect(harness.recorder.stop).toHaveBeenCalledTimes(1);
-    expect(harness.track.stop).toHaveBeenCalledTimes(1);
+    expect(harness.encoder.flush).not.toHaveBeenCalled();
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
   });
 
-  it('honors cancellation during 100% recorder finalization and returns no blob', async () => {
-    const harness = recorderHarness();
+  it('honors cancellation during 100% encoder finalization and returns no blob', async () => {
+    const harness = encoderHarness();
     const controller = new AbortController();
-    harness.recorder.stop = vi.fn(function stop(this: MediaRecorderLike) {
-      this.state = 'inactive';
-      this.ondataavailable?.({ data: new Blob(['must-not-download']) } as BlobEvent);
+    harness.encoder.flush.mockImplementation(async () => {
       controller.abort();
-      this.onstop?.(new Event('stop'));
+      return new Blob(['must-not-download']);
     });
 
     await expect(
@@ -450,89 +477,41 @@ describe('recordPreviewWebm', () => {
       }),
     ).rejects.toMatchObject({ code: 'cancelled' } satisfies Partial<PreviewExportError>);
 
-    expect(harness.track.stop).toHaveBeenCalledTimes(1);
-  });
-
-  it('settles immediately on recorder error even when onstop never arrives', async () => {
-    const harness = recorderHarness();
-    harness.recorder.stop = vi.fn(function stop(this: MediaRecorderLike) {
-      this.state = 'inactive';
-      this.onerror?.(new Event('error'));
-    });
-    const recording = recordPreviewWebm(shortPlan(), () => true, { dependencies: harness.deps });
-    const settled = recording.then(
-      () => 'resolved' as const,
-      (error: unknown) => error,
-    );
-
-    const outcome = await Promise.race([
-      settled,
-      new Promise<'pending'>((resolve) => globalThis.setTimeout(() => resolve('pending'), 20)),
-    ]);
-    if (outcome === 'pending') {
-      harness.recorder.onstop?.(new Event('stop'));
-      await settled;
-    }
-
-    expect(outcome).toMatchObject({ code: 'encoder-failed' } satisfies Partial<PreviewExportError>);
-    expect(harness.track.stop).toHaveBeenCalledTimes(1);
-  });
-
-  it('times out bounded finalization when onstop is missing and remains retryable', async () => {
-    const harness = recorderHarness();
-    harness.recorder.stop = vi.fn(function stop(this: MediaRecorderLike) {
-      this.state = 'inactive';
-      this.ondataavailable?.({ data: new Blob(['partial']) } as BlobEvent);
-    });
-    const recording = recordPreviewWebm(shortPlan(), () => true, {
-      dependencies: harness.deps,
-      finalizationTimeoutMs: 5,
-    });
-    const settled = recording.then(
-      () => 'resolved' as const,
-      (error: unknown) => error,
-    );
-
-    const outcome = await Promise.race([
-      settled,
-      new Promise<'pending'>((resolve) => globalThis.setTimeout(() => resolve('pending'), 20)),
-    ]);
-    if (outcome === 'pending') {
-      harness.recorder.onstop?.(new Event('stop'));
-      await settled;
-    }
-
-    expect(outcome).toMatchObject({ code: 'encoder-failed' } satisfies Partial<PreviewExportError>);
-    expect(harness.track.stop).toHaveBeenCalledTimes(1);
-
-    const retryHarness = recorderHarness();
-    await expect(
-      recordPreviewWebm(shortPlan(), () => true, { dependencies: retryHarness.deps }),
-    ).resolves.toMatchObject({ type: 'video/webm;codecs=vp8' });
-    expect(retryHarness.track.stop).toHaveBeenCalledTimes(1);
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
   });
 
   it('reports capture failure and still releases encoder resources', async () => {
-    const harness = recorderHarness();
+    const harness = encoderHarness();
 
     await expect(
       recordPreviewWebm(shortPlan(), () => false, { dependencies: harness.deps }),
     ).rejects.toMatchObject({ code: 'capture-failed' } satisfies Partial<PreviewExportError>);
 
-    expect(harness.recorder.stop).toHaveBeenCalledTimes(1);
-    expect(harness.track.stop).toHaveBeenCalledTimes(1);
+    expect(harness.encoder.encodeFrame).not.toHaveBeenCalled();
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
   });
 
-  it('releases the capture stream when recorder construction fails', async () => {
-    const harness = recorderHarness();
-    harness.deps.createRecorder = vi.fn(() => {
-      throw new Error('recorder unavailable');
+  it('releases the canvas when encoder construction fails', async () => {
+    const harness = encoderHarness();
+    harness.deps.createEncoder = vi.fn(() => {
+      throw new Error('encoder unavailable');
     });
 
     await expect(
       recordPreviewWebm(shortPlan(), () => true, { dependencies: harness.deps }),
     ).rejects.toMatchObject({ code: 'encoder-failed' } satisfies Partial<PreviewExportError>);
 
-    expect(harness.track.stop).toHaveBeenCalledTimes(1);
+    expect(harness.canvas.width).toBe(1);
+    expect(harness.canvas.height).toBe(1);
+  });
+
+  it('rejects an empty muxer result and closes the encoder', async () => {
+    const harness = encoderHarness(new Blob([], { type: 'video/webm;codecs=vp8' }));
+
+    await expect(
+      recordPreviewWebm(shortPlan(), () => true, { dependencies: harness.deps }),
+    ).rejects.toMatchObject({ code: 'encoder-failed' } satisfies Partial<PreviewExportError>);
+
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
   });
 });

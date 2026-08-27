@@ -30,7 +30,7 @@ npm run smoke:pack   # 打包全部包，在临时工程以 tarball 安装并构
 
 打开项目后，通过工具栏的“导出”进入导出工作台。工作台支持按全部分镜或单个分镜导出 PNG、结构化 JSON 清单，以及 720p/480p、24/30fps 的 WebM 预览；视频导出前会校验分镜时间和绑定机位，并提供进度、取消和资源回收。
 
-- WebM 依赖浏览器的 `MediaRecorder`、`canvas.captureStream()` 和 VP8/VP9 编码能力；不支持时会在编码前禁用视频导出，PNG 与 JSON 清单仍可用。
+- WebM 依赖浏览器的 WebCodecs `VideoEncoder`、`VideoFrame` 和 VP8 编码能力；不支持时会在编码前禁用视频导出，PNG 与 JSON 清单仍可用。
 - MVP 不默认承诺 MP4。MP4 必须由宿主能力或 `exporter` 插件提供，不能把扩展名改为 `.mp4` 代替转码。
 - 导出清单不包含资产载荷、存储引用或 `pluginData`；插件导出器仍应自行执行凭据剥离。
 - 完整浏览器矩阵、嵌入/插件边界、性能基准方法和发布检查项见 [`docs/export-and-release.md`](docs/export-and-release.md)。第三方依赖清单见 [`docs/THIRD_PARTY_NOTICES.md`](docs/THIRD_PARTY_NOTICES.md)。

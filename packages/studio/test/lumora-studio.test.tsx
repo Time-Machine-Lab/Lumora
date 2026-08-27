@@ -111,10 +111,11 @@ describe('LumoraStudio', () => {
     try {
       trigger.focus();
       expect(fireEvent.keyDown(trigger, { key: ' ' })).toBe(true);
-      expect(hostKeydown).toHaveBeenCalledTimes(1);
+      expect(hostKeydown).not.toHaveBeenCalled();
       expect(screen.queryByTestId('export-workspace')).not.toBeInTheDocument();
       expect(screen.getByTestId('timeline-play')).toHaveTextContent(playBefore ?? '');
       expect(fireEvent.keyDown(trigger, { key: 'Enter' })).toBe(true);
+      expect(hostKeydown).not.toHaveBeenCalled();
     } finally {
       window.removeEventListener('keydown', hostKeydown);
     }

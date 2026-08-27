@@ -1,5 +1,6 @@
 import { getReachableIds } from '@lumora/core';
 import type { Project, ShotClipData } from '@lumora/core';
+import { ArrayBufferTarget, Muxer } from 'webm-muxer';
 
 export type PreviewResolution = '720p' | '480p';
 export type PreviewFrameRate = 24 | 30;
@@ -38,9 +39,8 @@ export type PreviewPlanResult =
   | { ok: false; code: 'no-shots' | 'invalid-shot' | 'unsupported'; message: string };
 
 export interface WebmSupportProbe {
-  hasMediaRecorder: boolean;
-  hasCanvasCaptureStream: boolean;
-  isTypeSupported(mimeType: string): boolean;
+  hasVideoEncoder: boolean;
+  hasVideoFrame: boolean;
 }
 
 export type WebmSupport =
@@ -91,20 +91,21 @@ export interface PreviewExportProgress {
   shotName: string;
 }
 
-export interface MediaRecorderLike {
-  state: RecordingState;
-  ondataavailable: ((event: BlobEvent) => void) | null;
-  onerror: ((event: Event) => void) | null;
-  onstop: ((event: Event) => void) | null;
-  start(timeslice?: number): void;
-  stop(): void;
+export interface PreviewEncodedFrame {
+  timestamp: number;
+  duration: number;
+  keyFrame: boolean;
+}
+
+export interface PreviewEncoderSession {
+  encodeFrame(canvas: HTMLCanvasElement, frame: PreviewEncodedFrame): void;
+  flush(): Promise<Blob>;
+  close(): void;
 }
 
 export interface PreviewRecordingDependencies {
   createCanvas(): HTMLCanvasElement;
-  createRecorder(stream: MediaStream, options: MediaRecorderOptions): MediaRecorderLike;
-  waitForFrame(milliseconds: number, signal?: AbortSignal): Promise<void>;
-  now?(): number;
+  createEncoder(plan: PreviewExportPlan): PreviewEncoderSession;
 }
 
 export interface PreviewRecordingOptions {
@@ -116,6 +117,7 @@ export interface PreviewRecordingOptions {
 }
 
 export const DEFAULT_RECORDER_FINALIZATION_TIMEOUT_MS = 5_000;
+const OPERATION_OWNERSHIP_POLL_MS = 16;
 
 const MIME_CANDIDATES = [
   'video/webm;codecs=vp9',
@@ -139,27 +141,20 @@ export class PreviewExportError extends Error {
 }
 
 function defaultSupportProbe(): WebmSupportProbe {
-  const recorder = globalThis.MediaRecorder;
-  const canvasPrototype = globalThis.HTMLCanvasElement?.prototype;
   return {
-    hasMediaRecorder: typeof recorder === 'function',
-    hasCanvasCaptureStream: typeof canvasPrototype?.captureStream === 'function',
-    isTypeSupported: (mimeType) =>
-      typeof recorder?.isTypeSupported === 'function' && recorder.isTypeSupported(mimeType),
+    hasVideoEncoder: typeof globalThis.VideoEncoder === 'function',
+    hasVideoFrame: typeof globalThis.VideoFrame === 'function',
   };
 }
 
 export function detectWebmSupport(probe: WebmSupportProbe = defaultSupportProbe()): WebmSupport {
-  if (!probe.hasMediaRecorder) {
-    return { supported: false, reason: '当前浏览器不支持 MediaRecorder，无法导出 WebM' };
+  if (!probe.hasVideoEncoder) {
+    return { supported: false, reason: '当前浏览器不支持 WebCodecs VideoEncoder，无法可靠导出 WebM' };
   }
-  if (!probe.hasCanvasCaptureStream) {
-    return { supported: false, reason: '当前浏览器不支持画布视频捕获，无法导出 WebM' };
+  if (!probe.hasVideoFrame) {
+    return { supported: false, reason: '当前浏览器不支持 WebCodecs VideoFrame，无法可靠导出 WebM' };
   }
-  for (const mimeType of MIME_CANDIDATES) {
-    if (probe.isTypeSupported(mimeType)) return { supported: true, mimeType };
-  }
-  return { supported: false, reason: '当前浏览器不支持 VP8/VP9 WebM 编码' };
+  return { supported: true, mimeType: MIME_CANDIDATES[1] };
 }
 
 function selectedShots(project: Project, shotIds: readonly string[]): ShotClipData[] {
@@ -279,29 +274,66 @@ function abortError(): PreviewExportError {
   return new PreviewExportError('cancelled', '预览导出已取消');
 }
 
-function waitForFrame(milliseconds: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(abortError());
-      return;
-    }
-    const timer = globalThis.setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, milliseconds);
-    const onAbort = () => {
-      globalThis.clearTimeout(timer);
-      reject(abortError());
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
 function defaultRecordingDependencies(): PreviewRecordingDependencies {
   return {
     createCanvas: () => document.createElement('canvas'),
-    createRecorder: (stream, options) => new MediaRecorder(stream, options) as unknown as MediaRecorderLike,
-    waitForFrame,
+    createEncoder: (plan) => {
+      const target = new ArrayBufferTarget();
+      const vp9 = plan.mimeType.toLowerCase().includes('vp9');
+      const muxer = new Muxer({
+        target,
+        video: {
+          codec: vp9 ? 'V_VP9' : 'V_VP8',
+          width: plan.width,
+          height: plan.height,
+          frameRate: plan.fps,
+        },
+        firstTimestampBehavior: 'strict',
+      });
+      let encoderFailure: Error | null = null;
+      const encoder = new VideoEncoder({
+        output: (chunk, metadata) => muxer.addVideoChunk(chunk, metadata),
+        error: (error) => {
+          encoderFailure = error;
+        },
+      });
+      encoder.configure({
+        codec: vp9 ? 'vp09.00.10.08' : 'vp8',
+        width: plan.width,
+        height: plan.height,
+        bitrate: plan.height >= 720 ? 6_000_000 : 3_000_000,
+        framerate: plan.fps,
+        latencyMode: 'quality',
+      });
+      return {
+        encodeFrame: (canvas, frame) => {
+          if (encoderFailure) throw encoderFailure;
+          const videoFrame = new VideoFrame(canvas, {
+            timestamp: frame.timestamp,
+            duration: frame.duration,
+          });
+          try {
+            encoder.encode(videoFrame, { keyFrame: frame.keyFrame });
+          } finally {
+            videoFrame.close();
+          }
+          if (encoderFailure) throw encoderFailure;
+        },
+        flush: async () => {
+          await encoder.flush();
+          if (encoderFailure) throw encoderFailure;
+          muxer.finalize();
+          return new Blob([target.buffer], { type: plan.mimeType });
+        },
+        close: () => {
+          try {
+            encoder.close();
+          } catch {
+            // An encoder error may already have closed the codec.
+          }
+        },
+      };
+    },
   };
 }
 
@@ -311,7 +343,6 @@ export async function recordPreviewWebm(
   options: PreviewRecordingOptions = {},
 ): Promise<Blob> {
   const dependencies = options.dependencies ?? defaultRecordingDependencies();
-  const now = dependencies.now ?? (() => globalThis.performance.now());
   const signal = options.signal;
   const finalizationTimeoutMs = options.finalizationTimeoutMs ?? DEFAULT_RECORDER_FINALIZATION_TIMEOUT_MS;
   const ensureOperationCurrent = () => {
@@ -322,59 +353,24 @@ export async function recordPreviewWebm(
   const canvas = dependencies.createCanvas();
   canvas.width = plan.width;
   canvas.height = plan.height;
-  if (typeof canvas.captureStream !== 'function') {
-    throw new PreviewExportError('unsupported', '当前浏览器不支持画布视频捕获');
-  }
-
-  let stream!: MediaStream;
-  let recorder: MediaRecorderLike;
+  let encoder: PreviewEncoderSession;
   try {
-    stream = canvas.captureStream(0);
-    recorder = dependencies.createRecorder(stream, {
-      mimeType: plan.mimeType,
-      videoBitsPerSecond: plan.height >= 720 ? 6_000_000 : 3_000_000,
-    });
-  } catch {
-    if (stream) {
-      for (const track of stream.getTracks()) track.stop();
-    }
+    encoder = dependencies.createEncoder(plan);
+  } catch (error) {
     canvas.width = 1;
     canvas.height = 1;
-    throw new PreviewExportError('encoder-failed', '无法初始化 WebM 编码器');
+    throw new PreviewExportError(
+      'encoder-failed',
+      error instanceof Error ? error.message : '无法初始化 WebM 编码器',
+    );
   }
 
-  const chunks: Blob[] = [];
-  let recorderFailure: PreviewExportError | null = null;
-  type RecorderOutcome = { type: 'stopped' } | { type: 'error'; error: PreviewExportError };
-  const recorderOutcome = new Promise<RecorderOutcome>((resolve) => {
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) chunks.push(event.data);
-    };
-    recorder.onerror = () => {
-      recorderFailure = new PreviewExportError('encoder-failed', 'WebM 编码器运行失败');
-      resolve({ type: 'error', error: recorderFailure });
-    };
-    recorder.onstop = () => resolve({ type: 'stopped' });
-  });
-
   try {
-    const track = stream.getVideoTracks()[0] as (MediaStreamTrack & { requestFrame?: () => void }) | undefined;
-    if (!track || typeof track.requestFrame !== 'function') {
-      throw new PreviewExportError(
-        'unsupported',
-        '当前浏览器不支持逐帧画布捕获，无法可靠导出 WebM',
-      );
-    }
-    ensureOperationCurrent();
-    recorder.start();
-    ensureOperationCurrent();
-    const frameDuration = 1000 / plan.fps;
-    let firstFrameRequestedAt: number | null = null;
+    const frameTimestamp = (index: number) => Math.round(index * 1_000_000 / plan.fps);
     let completedFrames = 0;
     for (const shot of plan.shots) {
       for (let shotFrame = 0; shotFrame < shot.frameCount; shotFrame += 1) {
         ensureOperationCurrent();
-        if (recorderFailure) throw recorderFailure;
         const sourceTime = shot.startTime + shotFrame / plan.fps;
         const rendered = await renderFrame({
           canvas,
@@ -389,9 +385,12 @@ export async function recordPreviewWebm(
         if (!rendered) {
           throw new PreviewExportError('capture-failed', `无法渲染分镜「${shot.name}」`);
         }
-        const requestedAt = now();
-        track.requestFrame();
-        if (firstFrameRequestedAt === null) firstFrameRequestedAt = requestedAt;
+        const timestamp = frameTimestamp(completedFrames);
+        encoder.encodeFrame(canvas, {
+          timestamp,
+          duration: frameTimestamp(completedFrames + 1) - timestamp,
+          keyFrame: completedFrames === 0 || completedFrames % plan.fps === 0,
+        });
         ensureOperationCurrent();
         completedFrames += 1;
         options.onProgress?.({
@@ -402,39 +401,25 @@ export async function recordPreviewWebm(
           shotName: shot.name,
         });
         ensureOperationCurrent();
-        const targetElapsed = completedFrames * frameDuration;
-        const remaining = Math.max(0, targetElapsed - (now() - firstFrameRequestedAt));
-        await dependencies.waitForFrame(remaining, signal);
-        ensureOperationCurrent();
-        if (now() - firstFrameRequestedAt - targetElapsed > frameDuration * 2) {
-          throw new PreviewExportError(
-            'timing-failed',
-            '浏览器未能维持所选帧率，已停止导出以避免生成时长漂移的 WebM',
-          );
-        }
       }
     }
-    // Content frames are timestamped 0..(N-1)/fps. Re-request the unchanged
-    // canvas at N/fps so Chromium's WebM muxer receives an explicit quantized
-    // end timestamp instead of ending the file at the final content timestamp.
+    // The muxer derives duration from the last encoded PTS, so encode the
+    // unchanged canvas once at N/fps and wait for WebCodecs flush completion.
+    const terminalTimestamp = frameTimestamp(plan.totalFrames);
+    encoder.encodeFrame(canvas, {
+      timestamp: terminalTimestamp,
+      duration: frameTimestamp(plan.totalFrames + 1) - terminalTimestamp,
+      keyFrame: false,
+    });
     ensureOperationCurrent();
-    track.requestFrame();
-    ensureOperationCurrent();
-    await dependencies.waitForFrame(0, signal);
-    ensureOperationCurrent();
-    if (recorderFailure) throw recorderFailure;
-    recorder.stop();
-    ensureOperationCurrent();
-    const finalization = await new Promise<RecorderOutcome>((resolve, reject) => {
-      if (signal?.aborted) {
-        reject(abortError());
-        return;
-      }
+    const blob = await new Promise<Blob>((resolve, reject) => {
       let settled = false;
+      let ownershipTimer: number | null = null;
       const finish = (callback: () => void) => {
         if (settled) return;
         settled = true;
         globalThis.clearTimeout(timer);
+        if (ownershipTimer !== null) globalThis.clearInterval(ownershipTimer);
         signal?.removeEventListener('abort', onAbort);
         callback();
       };
@@ -447,14 +432,21 @@ export async function recordPreviewWebm(
         Math.max(1, finalizationTimeoutMs),
       );
       signal?.addEventListener('abort', onAbort, { once: true });
-      void recorderOutcome.then((outcome) => finish(() => resolve(outcome)));
+      if (options.isOperationCurrent) {
+        ownershipTimer = globalThis.setInterval(() => {
+          if (options.isOperationCurrent?.() === false) finish(() => reject(abortError()));
+        }, OPERATION_OWNERSHIP_POLL_MS);
+      }
+      void encoder.flush().then(
+        (result) => finish(() => resolve(result)),
+        (error: unknown) => finish(() => reject(error)),
+      );
     });
     ensureOperationCurrent();
-    if (finalization.type === 'error') throw finalization.error;
-    if (chunks.length === 0) {
+    if (blob.size === 0) {
       throw new PreviewExportError('encoder-failed', 'WebM 编码器未产生有效数据');
     }
-    return new Blob(chunks, { type: plan.mimeType });
+    return blob;
   } catch (error) {
     if (signal?.aborted && !(error instanceof PreviewExportError)) throw abortError();
     if (error instanceof PreviewExportError) throw error;
@@ -463,14 +455,7 @@ export async function recordPreviewWebm(
       error instanceof Error ? error.message : 'WebM 导出失败',
     );
   } finally {
-    if (recorder.state !== 'inactive') {
-      try {
-        recorder.stop();
-      } catch {
-        // 终止失败不阻断底层媒体轨道释放。
-      }
-    }
-    for (const track of stream.getTracks()) track.stop();
+    encoder.close();
     canvas.width = 1;
     canvas.height = 1;
   }

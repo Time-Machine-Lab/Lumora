@@ -6,7 +6,8 @@ import { createStudioRuntime } from '../src/runtime/studio-runtime';
 import { ExportWorkspace } from '../src/components/export/ExportWorkspace';
 import type { TimelineSession } from '../src/hooks/use-timeline-session';
 import type {
-  MediaRecorderLike,
+  PreviewEncodedFrame,
+  PreviewEncoderSession,
   PreviewRecordingDependencies,
   WebmSupport,
 } from '../src/export/preview-export';
@@ -39,38 +40,26 @@ function sessionHarness(options: { recording?: boolean } = {}) {
   };
 }
 
-function recorderDependencies(options: { wait?: PreviewRecordingDependencies['waitForFrame'] } = {}) {
-  const track = { requestFrame: vi.fn(), stop: vi.fn() };
-  const stream = {
-    getTracks: () => [track],
-    getVideoTracks: () => [track],
-  } as unknown as MediaStream;
+function encoderDependencies(options: { flush?: () => Promise<Blob> } = {}) {
+  const encodedFrames: PreviewEncodedFrame[] = [];
   const canvas = {
     width: 0,
     height: 0,
-    captureStream: vi.fn(() => stream),
   } as unknown as HTMLCanvasElement;
-  const recorder: MediaRecorderLike = {
-    state: 'inactive',
-    ondataavailable: null,
-    onerror: null,
-    onstop: null,
-    start: vi.fn(function start(this: MediaRecorderLike) {
-      this.state = 'recording';
-    }),
-    stop: vi.fn(function stop(this: MediaRecorderLike) {
-      if (this.state === 'inactive') return;
-      this.state = 'inactive';
-      this.ondataavailable?.({ data: new Blob(['webm']) } as BlobEvent);
-      this.onstop?.(new Event('stop'));
-    }),
+  const encoder = {
+    encodeFrame: vi.fn((_canvas, frame) => encodedFrames.push({ ...frame })),
+    flush: vi.fn(options.flush ?? (async () => new Blob(['webm'], { type: 'video/webm;codecs=vp8' }))),
+    close: vi.fn(),
+  } as PreviewEncoderSession & {
+    encodeFrame: ReturnType<typeof vi.fn>;
+    flush: ReturnType<typeof vi.fn>;
+    close: ReturnType<typeof vi.fn>;
   };
   const dependencies: PreviewRecordingDependencies = {
     createCanvas: () => canvas,
-    createRecorder: () => recorder,
-    waitForFrame: options.wait ?? vi.fn(async () => undefined),
+    createEncoder: () => encoder,
   };
-  return { dependencies, recorder, track };
+  return { dependencies, encoder, encodedFrames };
 }
 
 function readBlob(blob: Blob): Promise<string> {
@@ -83,6 +72,19 @@ function readBlob(blob: Blob): Promise<string> {
 }
 
 const SUPPORTED: WebmSupport = { supported: true, mimeType: 'video/webm;codecs=vp8' };
+
+const SEEK_SESSION_REENTRIES: Array<[
+  string,
+  (runtime: ReturnType<typeof createStudioRuntime>, project: Project) => void,
+]> = [
+  ['resets the editor', (runtime) => runtime.editor.reset()],
+  ['opens a different URI', (runtime) => {
+    runtime.editor.openProject(createSampleProject('lumora://seek-different', 'Different project'));
+  }],
+  ['reopens the same URI', (runtime, project) => {
+    runtime.editor.openProject(createSampleProject(project.uri, 'Reopened project'));
+  }],
+];
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -209,7 +211,7 @@ describe('ExportWorkspace', () => {
     expect(screen.getAllByRole('button', { name: /导出 .* PNG/ })[0]).toBeDisabled();
   });
 
-  it('reports exact-size PNG capture failure instead of downloading a thumbnail fallback', () => {
+  it('reports exact-size PNG capture failure instead of downloading a thumbnail fallback', async () => {
     const runtime = createStudioRuntime();
     const project = createSampleProject();
     const { session } = sessionHarness();
@@ -228,7 +230,7 @@ describe('ExportWorkspace', () => {
     );
     fireEvent.click(screen.getAllByRole('button', { name: /导出 .* PNG/ })[0]!);
 
-    expect(screen.getByRole('alert')).toHaveTextContent('PNG 导出失败');
+    expect(await screen.findByRole('alert')).toHaveTextContent('PNG 导出失败');
     expect(thumbnailCapture).not.toHaveBeenCalled();
     expect(HTMLAnchorElement.prototype.click).not.toHaveBeenCalled();
   });
@@ -268,7 +270,7 @@ describe('ExportWorkspace', () => {
     const runtime = createStudioRuntime();
     const project = createSampleProject();
     const { session } = sessionHarness();
-    const recorder = recorderDependencies();
+    const recorder = encoderDependencies();
 
     render(
       <ExportWorkspace
@@ -285,7 +287,7 @@ describe('ExportWorkspace', () => {
 
     expect(screen.getByRole('alert')).toHaveTextContent('不支持 VP8/VP9');
     expect(screen.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
-    expect(recorder.recorder.start).not.toHaveBeenCalled();
+    expect(recorder.encoder.encodeFrame).not.toHaveBeenCalled();
   });
 
   it('downloads a privacy-safe manifest for the selected range', async () => {
@@ -321,7 +323,7 @@ describe('ExportWorkspace', () => {
     const runtime = createStudioRuntime();
     const project = projectWithShortShots();
     const { session, pause, seek } = sessionHarness();
-    const recorder = recorderDependencies();
+    const recorder = encoderDependencies();
     const renderFrame = vi.fn(() => true);
     const onClose = vi.fn();
 
@@ -343,7 +345,7 @@ describe('ExportWorkspace', () => {
     expect(renderFrame).toHaveBeenCalledTimes(3);
     expect(pause).toHaveBeenCalled();
     expect(seek).toHaveBeenLastCalledWith(0.5, false);
-    expect(recorder.track.stop).toHaveBeenCalledTimes(1);
+    expect(recorder.encoder.close).toHaveBeenCalledTimes(1);
     expect(URL.createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
 
     fireEvent.click(screen.getByRole('button', { name: '关闭导出' }));
@@ -357,7 +359,7 @@ describe('ExportWorkspace', () => {
     const pluginResult = deferred<{ fileName: string; mime: string; data: string }>();
     const plugin = await registerDeferredExporter(runtime, pluginResult.promise);
     const { session } = sessionHarness();
-    const recorder = recorderDependencies();
+    const recorder = encoderDependencies();
 
     render(
       <ExportWorkspace
@@ -380,7 +382,7 @@ describe('ExportWorkspace', () => {
     expect(screen.getAllByRole('button', { name: /导出 .* PNG/ })[0]).toBeDisabled();
     fireEvent.click(pluginButton);
     expect(plugin.exportCall).toHaveBeenCalledTimes(1);
-    expect(recorder.recorder.start).not.toHaveBeenCalled();
+    expect(recorder.encoder.encodeFrame).not.toHaveBeenCalled();
 
     pluginResult.resolve({ fileName: 'slow.json', mime: 'application/json', data: '{}' });
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('慢导出器导出完成'));
@@ -419,7 +421,16 @@ describe('ExportWorkspace', () => {
     expect(URL.createObjectURL).not.toHaveBeenCalled();
   });
 
-  it('invalidates a pending plugin result when its plugin is removed', async () => {
+  it.each([
+    ['WebM is unsupported', {
+      captureReady: true,
+      support: { supported: false, reason: 'WebCodecs unavailable' } as WebmSupport,
+    }],
+    ['the capture bridge is unavailable', {
+      captureReady: false,
+      support: SUPPORTED,
+    }],
+  ])('invalidates a pending plugin result and focuses the manifest when %s', async (_label, capability) => {
     const runtime = createStudioRuntime();
     const project = createSampleProject();
     await runtime.openProject(project);
@@ -433,7 +444,8 @@ describe('ExportWorkspace', () => {
         session={session}
         captureRef={{ current: null }}
         exportFrameRef={{ current: null }}
-        support={SUPPORTED}
+        captureReady={capability.captureReady}
+        support={capability.support}
         onClose={vi.fn()}
       />,
     );
@@ -448,6 +460,76 @@ describe('ExportWorkspace', () => {
 
     expect(URL.createObjectURL).not.toHaveBeenCalled();
     expect(screen.queryByRole('button', { name: '运行 慢导出器' })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('button', { name: '导出清单' })).toHaveFocus());
+  });
+
+  it('focuses close when a removed plugin leaves no enabled export operation', async () => {
+    const runtime = createStudioRuntime();
+    const project = { ...createSampleProject(), shots: [] };
+    await runtime.openProject(project);
+    const pluginResult = deferred<{ fileName: string; mime: string; data: string }>();
+    const plugin = await registerDeferredExporter(runtime, pluginResult.promise);
+    const { session } = sessionHarness();
+
+    render(
+      <ExportWorkspace
+        runtime={runtime}
+        project={runtime.getProject()!}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: null }}
+        captureReady={false}
+        support={{ supported: false, reason: 'WebCodecs unavailable' }}
+        onClose={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: '运行 慢导出器' }));
+    await act(async () => {
+      await runtime.host.disable(plugin.pluginId);
+    });
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '关闭导出' })).toHaveFocus());
+    expect(screen.getByRole('button', { name: '导出清单' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
+  });
+
+  it('cancels stale focus restoration when a newer export starts', async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = createStudioRuntime();
+      const project = createSampleProject();
+      await runtime.openProject(project);
+      const pluginResult = deferred<{ fileName: string; mime: string; data: string }>();
+      const plugin = await registerDeferredExporter(runtime, pluginResult.promise);
+      const { session } = sessionHarness();
+      render(
+        <ExportWorkspace
+          runtime={runtime}
+          project={runtime.getProject()!}
+          session={session}
+          captureRef={{ current: null }}
+          exportFrameRef={{ current: vi.fn(() => true) }}
+          captureReady
+          support={SUPPORTED}
+          onClose={vi.fn()}
+        />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: '运行 慢导出器' }));
+      await act(async () => {
+        await runtime.host.disable(plugin.pluginId);
+      });
+
+      const manifestButton = screen.getByRole('button', { name: '导出清单' });
+      await act(async () => {
+        manifestButton.focus();
+        fireEvent.click(manifestButton);
+      });
+      act(() => vi.runOnlyPendingTimers());
+
+      expect(manifestButton).toHaveFocus();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps a removed plugin result stale after the same exporter id is registered again', async () => {
@@ -507,10 +589,169 @@ describe('ExportWorkspace', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: /导出 分镜 1.*PNG/ }));
 
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('项目会话已变更'));
     expect(pause).toHaveBeenCalledTimes(1);
     expect(seek).not.toHaveBeenCalled();
     expect(URL.createObjectURL).not.toHaveBeenCalled();
     expect(HTMLAnchorElement.prototype.click).not.toHaveBeenCalled();
+  });
+
+  it.each(SEEK_SESSION_REENTRIES)(
+    'cancels PNG before capture when seek synchronously %s',
+    async (_label, replaceSession) => {
+      const runtime = createStudioRuntime();
+      const initial = createSampleProject('lumora://png-seek-reentry', 'PNG seek reentry');
+      await runtime.openProject(initial);
+      const project = runtime.getProject()!;
+      const { session, seek } = sessionHarness();
+      const exportFrame = vi.fn(() => true);
+      seek.mockImplementationOnce(() => replaceSession(runtime, project));
+
+      render(
+        <ExportWorkspace
+          runtime={runtime}
+          project={project}
+          session={session}
+          captureRef={{ current: null }}
+          exportFrameRef={{ current: exportFrame }}
+          support={SUPPORTED}
+          onClose={vi.fn()}
+        />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: /导出 分镜 1.*PNG/ }));
+
+      await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('项目会话已变更'));
+      expect(seek).toHaveBeenCalledTimes(1);
+      expect(exportFrame).not.toHaveBeenCalled();
+      expect(HTMLAnchorElement.prototype.click).not.toHaveBeenCalled();
+    },
+  );
+
+  it('cancels PNG before capture when seek queues a session replacement', async () => {
+    const runtime = createStudioRuntime();
+    const initial = createSampleProject('lumora://png-seek-microtask', 'PNG seek microtask');
+    await runtime.openProject(initial);
+    const project = runtime.getProject()!;
+    const { session, seek } = sessionHarness();
+    const exportFrame = vi.fn(() => true);
+    seek.mockImplementationOnce(() => {
+      queueMicrotask(() => runtime.editor.openProject(createSampleProject(project.uri, 'Replacement')));
+    });
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,frame');
+
+    render(
+      <ExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: exportFrame }}
+        support={SUPPORTED}
+        onClose={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /导出 分镜 1.*PNG/ }));
+
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('项目会话已变更'));
+    expect(exportFrame).not.toHaveBeenCalled();
+    expect(HTMLAnchorElement.prototype.click).not.toHaveBeenCalled();
+  });
+
+  it('cancels PNG before download when capture queues a session replacement', async () => {
+    const runtime = createStudioRuntime();
+    const initial = createSampleProject('lumora://png-capture-microtask', 'PNG capture microtask');
+    await runtime.openProject(initial);
+    const project = runtime.getProject()!;
+    const { session } = sessionHarness();
+    const exportFrame = vi.fn(() => {
+      queueMicrotask(() => runtime.editor.openProject(createSampleProject(project.uri, 'Replacement')));
+      return true;
+    });
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,frame');
+
+    render(
+      <ExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: exportFrame }}
+        support={SUPPORTED}
+        onClose={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /导出 分镜 1.*PNG/ }));
+
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('项目会话已变更'));
+    expect(exportFrame).toHaveBeenCalledTimes(1);
+    expect(HTMLCanvasElement.prototype.toDataURL).not.toHaveBeenCalled();
+    expect(HTMLAnchorElement.prototype.click).not.toHaveBeenCalled();
+  });
+
+  it.each(SEEK_SESSION_REENTRIES)(
+    'cancels WebM before capture when seek synchronously %s',
+    async (_label, replaceSession) => {
+      const runtime = createStudioRuntime();
+      const initial = projectWithShortShots();
+      await runtime.openProject(initial);
+      const project = runtime.getProject()!;
+      const { session, seek } = sessionHarness();
+      const recorder = encoderDependencies();
+      const exportFrame = vi.fn(() => true);
+      seek.mockImplementationOnce(() => replaceSession(runtime, project));
+
+      render(
+        <ExportWorkspace
+          runtime={runtime}
+          project={project}
+          session={session}
+          captureRef={{ current: null }}
+          exportFrameRef={{ current: exportFrame }}
+          support={SUPPORTED}
+          recordingDependencies={recorder.dependencies}
+          onClose={vi.fn()}
+        />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: '导出 WebM' }));
+
+      await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('已取消'));
+      expect(seek).toHaveBeenCalledTimes(1);
+      expect(exportFrame).not.toHaveBeenCalled();
+      expect(recorder.encoder.encodeFrame).not.toHaveBeenCalled();
+      expect(URL.createObjectURL).not.toHaveBeenCalled();
+    },
+  );
+
+  it('cancels WebM before capture when seek queues a session replacement', async () => {
+    const runtime = createStudioRuntime();
+    const initial = projectWithShortShots();
+    await runtime.openProject(initial);
+    const project = runtime.getProject()!;
+    const { session, seek } = sessionHarness();
+    const recorder = encoderDependencies();
+    const exportFrame = vi.fn(() => true);
+    seek.mockImplementationOnce(() => {
+      queueMicrotask(() => runtime.editor.openProject(createSampleProject(project.uri, 'Replacement')));
+    });
+
+    render(
+      <ExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: exportFrame }}
+        support={SUPPORTED}
+        recordingDependencies={recorder.dependencies}
+        onClose={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: '导出 WebM' }));
+
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('已取消'));
+    expect(exportFrame).not.toHaveBeenCalled();
+    expect(recorder.encoder.encodeFrame).not.toHaveBeenCalled();
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
   });
 
   it('does not request a WebM frame after capture queues a same-URI session replacement', async () => {
@@ -519,7 +760,7 @@ describe('ExportWorkspace', () => {
     await runtime.openProject(project);
     const current = runtime.getProject()!;
     const { session } = sessionHarness();
-    const recorder = recorderDependencies();
+    const recorder = encoderDependencies();
     const renderFrame = vi.fn(() => {
       queueMicrotask(() => runtime.editor.openProject(createSampleProject(project.uri, 'Replacement')));
       return true;
@@ -541,24 +782,17 @@ describe('ExportWorkspace', () => {
 
     await waitFor(() => expect(renderFrame).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('已取消'));
-    expect(recorder.track.requestFrame).not.toHaveBeenCalled();
+    expect(recorder.encoder.encodeFrame).not.toHaveBeenCalled();
     expect(URL.createObjectURL).not.toHaveBeenCalled();
   });
 
-  it('does not capture, download, or restore the playhead after the project session changes', async () => {
+  it('does not download or restore the playhead after the project session changes', async () => {
     const runtime = createStudioRuntime();
     await runtime.openProject(projectWithShortShots());
     const project = runtime.getProject()!;
     const { session, seek } = sessionHarness();
-    let releaseFrame!: () => void;
-    let waits = 0;
-    const recorder = recorderDependencies({
-      wait: () => {
-        waits += 1;
-        if (waits !== 1) return Promise.resolve();
-        return new Promise<void>((resolve) => { releaseFrame = resolve; });
-      },
-    });
+    const flush = deferred<Blob>();
+    const recorder = encoderDependencies({ flush: () => flush.promise });
     const renderFrame = vi.fn(() => true);
 
     render(
@@ -574,26 +808,67 @@ describe('ExportWorkspace', () => {
       />,
     );
     fireEvent.click(screen.getByRole('button', { name: '导出 WebM' }));
-    await waitFor(() => expect(renderFrame).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(recorder.encoder.flush).toHaveBeenCalledTimes(1));
 
     act(() => runtime.editor.openProject(createSampleProject(project.uri, 'Reopened session')));
-    releaseFrame();
+    flush.resolve(new Blob(['stale-webm'], { type: 'video/webm;codecs=vp8' }));
 
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('已取消'));
-    expect(renderFrame).toHaveBeenCalledTimes(1);
     expect(URL.createObjectURL).not.toHaveBeenCalled();
     expect(seek).not.toHaveBeenLastCalledWith(0.5, false);
   });
 
-  it('cancels an in-flight export and releases its media track', async () => {
+  it('keeps a newer WebM operation busy when a removed plugin promise settles', async () => {
+    const runtime = createStudioRuntime();
+    const initial = projectWithShortShots();
+    await runtime.openProject(initial);
+    const project = runtime.getProject()!;
+    const pluginResult = deferred<{ fileName: string; mime: string; data: string }>();
+    const plugin = await registerDeferredExporter(runtime, pluginResult.promise);
+    const flush = deferred<Blob>();
+    const recorder = encoderDependencies({ flush: () => flush.promise });
+    const { session } = sessionHarness();
+
+    render(
+      <ExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        support={SUPPORTED}
+        recordingDependencies={recorder.dependencies}
+        onClose={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: '运行 慢导出器' }));
+    await act(async () => {
+      await runtime.host.disable(plugin.pluginId);
+    });
+    fireEvent.click(screen.getByRole('button', { name: '导出 WebM' }));
+    await waitFor(() => expect(recorder.encoder.flush).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      pluginResult.resolve({ fileName: 'stale.json', mime: 'application/json', data: '{}' });
+      await pluginResult.promise;
+    });
+
+    expect(screen.getByTestId('export-operation-controls')).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByRole('status')).toHaveTextContent('正在导出');
+    expect(screen.getByRole('button', { name: '导出清单' })).toBeDisabled();
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+
+    flush.resolve(new Blob(['current-webm'], { type: 'video/webm;codecs=vp8' }));
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('导出完成'));
+    expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels an in-flight export and closes its encoder', async () => {
     const runtime = createStudioRuntime();
     const project = projectWithShortShots();
     const { session } = sessionHarness();
-    const recorder = recorderDependencies({
-      wait: (_milliseconds, signal) =>
-        new Promise((_resolve, reject) => {
-          signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
-        }),
+    const recorder = encoderDependencies({
+      flush: () => new Promise<Blob>(() => undefined),
     });
 
     render(
@@ -612,19 +887,17 @@ describe('ExportWorkspace', () => {
     fireEvent.click(await screen.findByRole('button', { name: '取消导出' }));
 
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('已取消'));
-    expect(recorder.track.stop).toHaveBeenCalledTimes(1);
+    expect(recorder.encoder.close).toHaveBeenCalledTimes(1);
     expect(URL.createObjectURL).not.toHaveBeenCalled();
-    expect(screen.getByRole('button', { name: '导出 WebM' })).toHaveFocus();
+    await waitFor(() => expect(screen.getByRole('button', { name: '导出 WebM' })).toHaveFocus());
   });
 
   it('keeps the live status outside the busy controls and restores WebM focus after failure', async () => {
     const runtime = createStudioRuntime();
     const project = projectWithShortShots();
     const { session } = sessionHarness();
-    let release!: () => void;
-    const recorder = recorderDependencies({
-      wait: () => new Promise<void>((resolve) => { release = resolve; }),
-    });
+    const flush = deferred<Blob>();
+    const recorder = encoderDependencies({ flush: () => flush.promise });
     const renderFrame = vi.fn(() => true);
 
     render(
@@ -646,10 +919,9 @@ describe('ExportWorkspace', () => {
     expect(controls).toHaveAttribute('aria-busy', 'true');
     expect(screen.getByTestId('export-workspace')).not.toHaveAttribute('aria-busy');
     expect(controls).not.toContainElement(screen.getByRole('status'));
-    renderFrame.mockReturnValue(false);
-    release();
+    flush.reject(new Error('codec failed'));
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('WebM 导出失败'));
-    expect(primary).toHaveFocus();
+    await waitFor(() => expect(primary).toHaveFocus());
   });
 
   it('isolates a plugin exporter failure and preserves the current project', async () => {
@@ -696,9 +968,11 @@ describe('ExportWorkspace', () => {
         onClose={vi.fn()}
       />,
     );
-    fireEvent.click(screen.getByRole('button', { name: '运行 失败导出器' }));
+    const pluginButton = screen.getByRole('button', { name: '运行 失败导出器' });
+    fireEvent.click(pluginButton);
 
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('插件导出失败'));
+    expect(pluginButton).toHaveFocus();
     expect(runtime.getProject()).toBe(current);
     expect(screen.getByRole('button', { name: '关闭导出' })).toBeEnabled();
   });

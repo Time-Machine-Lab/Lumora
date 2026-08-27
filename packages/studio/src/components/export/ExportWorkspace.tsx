@@ -50,6 +50,7 @@ interface ExportOperationToken {
   sessionGeneration: number;
   operationGeneration: number;
   kind: ExportOperationKind;
+  initiator: HTMLButtonElement;
   exporterId?: string;
   pluginId?: string;
   exporterRegistrationGeneration?: number;
@@ -113,6 +114,9 @@ export function ExportWorkspace({
   const abortRef = useRef<AbortController | null>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const primaryRef = useRef<HTMLButtonElement>(null);
+  const operationControlsRef = useRef<HTMLDivElement>(null);
+  const pendingFocusOriginRef = useRef<HTMLButtonElement | null>(null);
+  const focusTimerRef = useRef<number | null>(null);
   const boundSessionToken = projectSessionToken ?? runtime.editor.getSessionToken();
 
   const isWorkspaceSessionCurrent = (token?: ExportOperationToken) => {
@@ -146,14 +150,21 @@ export function ExportWorkspace({
 
   const beginOperation = (
     kind: ExportOperationKind,
+    initiator: HTMLButtonElement,
     exporter?: { id: string; pluginId: string },
   ): ExportOperationToken | null => {
     if (!mountedRef.current || activeOperationRef.current || !isWorkspaceSessionCurrent()) return null;
+    if (focusTimerRef.current !== null) {
+      globalThis.clearTimeout(focusTimerRef.current);
+      focusTimerRef.current = null;
+    }
+    pendingFocusOriginRef.current = null;
     const token: ExportOperationToken = {
       uri: project.uri,
       sessionGeneration: boundSessionToken,
       operationGeneration: operationGenerationRef.current + 1,
       kind,
+      initiator,
       ...(exporter ? {
         exporterId: exporter.id,
         pluginId: exporter.pluginId,
@@ -169,6 +180,9 @@ export function ExportWorkspace({
 
   const completeOperation = (token: ExportOperationToken, nextStatus?: ExportStatus) => {
     if (!isOperationOwner(token)) return;
+    if (nextStatus?.kind === 'cancelled' || nextStatus?.kind === 'error') {
+      pendingFocusOriginRef.current = token.initiator;
+    }
     activeOperationRef.current = null;
     if (!mountedRef.current) return;
     setActiveOperation(null);
@@ -176,6 +190,10 @@ export function ExportWorkspace({
   };
 
   const invalidateActiveOperation = useCallback((nextStatus?: ExportStatus) => {
+    const operation = activeOperationRef.current;
+    if (operation && (nextStatus?.kind === 'cancelled' || nextStatus?.kind === 'error')) {
+      pendingFocusOriginRef.current = operation.initiator;
+    }
     operationGenerationRef.current += 1;
     activeOperationRef.current = null;
     abortRef.current?.abort();
@@ -194,12 +212,34 @@ export function ExportWorkspace({
       activeOperationRef.current = null;
       abortRef.current?.abort();
       abortRef.current = null;
+      if (focusTimerRef.current !== null) globalThis.clearTimeout(focusTimerRef.current);
     };
   }, []);
 
   useEffect(() => {
-    if (status.kind === 'cancelled' || status.kind === 'error') primaryRef.current?.focus();
-  }, [status.kind]);
+    if (status.kind !== 'cancelled' && status.kind !== 'error') {
+      if (focusTimerRef.current !== null) {
+        globalThis.clearTimeout(focusTimerRef.current);
+        focusTimerRef.current = null;
+      }
+      pendingFocusOriginRef.current = null;
+      return;
+    }
+    if (focusTimerRef.current !== null) globalThis.clearTimeout(focusTimerRef.current);
+    const focusGeneration = operationGenerationRef.current;
+    focusTimerRef.current = globalThis.setTimeout(() => {
+      focusTimerRef.current = null;
+      if (!mountedRef.current || operationGenerationRef.current !== focusGeneration) return;
+      const origin = pendingFocusOriginRef.current;
+      pendingFocusOriginRef.current = null;
+      if (origin?.isConnected && !origin.disabled) {
+        origin.focus();
+        return;
+      }
+      const fallback = operationControlsRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)');
+      (fallback ?? closeRef.current)?.focus();
+    }, 0);
+  }, [status]);
 
   useEffect(() => {
     const subscription = runtime.events.on('contribution:changed', ({ pluginId }) => {
@@ -232,8 +272,8 @@ export function ExportWorkspace({
   const running = activeOperation?.kind === 'webm';
   const aspect = project.settings.aspect[0] / project.settings.aspect[1];
 
-  const exportManifest = () => {
-    const token = beginOperation('manifest');
+  const exportManifest = (initiator: HTMLButtonElement) => {
+    const token = beginOperation('manifest', initiator);
     if (!token) return;
     let nextStatus: ExportStatus;
     try {
@@ -255,7 +295,7 @@ export function ExportWorkspace({
     }
   };
 
-  const exportPng = (shot: ShotClipData) => {
+  const exportPng = async (shot: ShotClipData, initiator: HTMLButtonElement) => {
     if (!isWorkspaceSessionCurrent()) {
       setStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
       return;
@@ -268,25 +308,30 @@ export function ExportWorkspace({
       setStatus({ kind: 'error', message: `分镜「${shot.name}」未绑定活动场景中的有效机位` });
       return;
     }
-    const token = beginOperation('png');
+    const token = beginOperation('png', initiator);
     if (!token) return;
     const previousTime = session.timeline.getTime();
     let nextStatus: ExportStatus;
     try {
       assertOperationCurrent(token);
       session.pause();
+      await Promise.resolve();
       assertOperationCurrent(token);
       session.seek((shot.startTime + shot.endTime) / 2, false);
+      await Promise.resolve();
       assertOperationCurrent(token);
       const canvas = document.createElement('canvas');
       const size = RESOLUTION_SIZE[resolution];
-      if (!exportFrameRef.current?.(shot.cameraObjectId!, canvas, { ...size, aspect })) {
+      const rendered = exportFrameRef.current?.(shot.cameraObjectId!, canvas, { ...size, aspect }) ?? false;
+      await Promise.resolve();
+      assertOperationCurrent(token);
+      if (!rendered) {
         throw new Error('无法渲染指定分辨率画面');
       }
-      assertOperationCurrent(token);
       const dataUrl = canvas.toDataURL('image/png');
       assertOperationCurrent(token);
       clickDownload(dataUrl, `${safeFilename(project.name)}-${safeFilename(shot.name)}.png`);
+      await Promise.resolve();
       assertOperationCurrent(token);
       nextStatus = { kind: 'success', message: `已导出「${shot.name}」PNG` };
     } catch (error) {
@@ -298,6 +343,7 @@ export function ExportWorkspace({
     } finally {
       if (isOperationCurrent(token)) {
         session.seek(previousTime, false);
+        await Promise.resolve();
         if (!isOperationCurrent(token)) {
           nextStatus = { kind: 'cancelled', message: '项目会话已变更，导出已取消' };
         }
@@ -306,7 +352,7 @@ export function ExportWorkspace({
     }
   };
 
-  const exportWebm = async () => {
+  const exportWebm = async (initiator: HTMLButtonElement) => {
     if (!support.supported || activeOperationRef.current) return;
     if (!isWorkspaceSessionCurrent()) {
       setStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
@@ -331,7 +377,7 @@ export function ExportWorkspace({
       return;
     }
 
-    const token = beginOperation('webm');
+    const token = beginOperation('webm', initiator);
     if (!token) return;
     const previousTime = session.timeline.getTime();
     const controller = new AbortController();
@@ -345,11 +391,13 @@ export function ExportWorkspace({
       setStatus({ kind: 'running', message: '正在导出 0%' });
       const blob = await recordPreviewWebm(
         result.plan,
-        ({ canvas, shot, sourceTime, width, height }) => {
+        async ({ canvas, shot, sourceTime, width, height }) => {
           assertOperationCurrent(token);
           session.seek(sourceTime, false);
+          await Promise.resolve();
           assertOperationCurrent(token);
           const rendered = exportFrameRef.current?.(shot.cameraObjectId!, canvas, { width, height, aspect }) ?? false;
+          await Promise.resolve();
           assertOperationCurrent(token);
           return rendered;
         },
@@ -367,6 +415,7 @@ export function ExportWorkspace({
       );
       assertOperationCurrent(token);
       downloadBlob(blob, `${safeFilename(project.name)}-${resolution}-${fps}fps.webm`);
+      await Promise.resolve();
       assertOperationCurrent(token);
       setProgress(100);
       nextStatus = { kind: 'success', message: '导出完成' };
@@ -380,8 +429,10 @@ export function ExportWorkspace({
       if (abortRef.current === controller) abortRef.current = null;
       if (isOperationCurrent(token)) {
         session.pause();
+        await Promise.resolve();
         if (isOperationCurrent(token)) {
           session.seek(previousTime, false);
+          await Promise.resolve();
           if (!isOperationCurrent(token)) {
             nextStatus = { kind: 'cancelled', message: '项目会话已变更，导出已取消' };
           }
@@ -393,13 +444,16 @@ export function ExportWorkspace({
     }
   };
 
-  const runPluginExporter = async (exporter: (typeof exporters)[number]) => {
+  const runPluginExporter = async (
+    exporter: (typeof exporters)[number],
+    initiator: HTMLButtonElement,
+  ) => {
     if (activeOperationRef.current) return;
     if (!isWorkspaceSessionCurrent()) {
       setStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
       return;
     }
-    const token = beginOperation('plugin', exporter);
+    const token = beginOperation('plugin', initiator, exporter);
     if (!token) return;
     let nextStatus: ExportStatus;
     setStatus({ kind: 'running', message: `正在运行 ${exporter.name}` });
@@ -456,6 +510,7 @@ export function ExportWorkspace({
       <div className="lumora-export__layout">
         <div className="lumora-export__settings">
           <div
+            ref={operationControlsRef}
             className="lumora-export__operation-controls"
             data-testid="export-operation-controls"
             aria-busy={busy}
@@ -522,7 +577,7 @@ export function ExportWorkspace({
                 session.state.recording ||
                 selectedShots.length === 0
               }
-              onClick={() => void exportWebm()}
+              onClick={(event) => void exportWebm(event.currentTarget)}
             >
               导出 WebM
             </button>
@@ -539,7 +594,7 @@ export function ExportWorkspace({
               type="button"
               className="lumora-button"
               disabled={busy || selectedShots.length === 0}
-              onClick={exportManifest}
+              onClick={(event) => exportManifest(event.currentTarget)}
             >
               导出清单
             </button>
@@ -554,7 +609,7 @@ export function ExportWorkspace({
                   type="button"
                   className="lumora-button"
                   disabled={busy}
-                  onClick={() => void runPluginExporter(exporter)}
+                  onClick={(event) => void runPluginExporter(exporter, event.currentTarget)}
                 >
                   {activeOperation?.kind === 'plugin' && activeOperation.exporterId === exporter.id
                     ? `正在运行 ${exporter.name}`
@@ -593,7 +648,7 @@ export function ExportWorkspace({
                   className="lumora-button"
                   disabled={busy || session.state.recording || !captureReady || !shot.cameraObjectId}
                   aria-label={`导出 ${shot.name} PNG`}
-                  onClick={() => exportPng(shot)}
+                  onClick={(event) => void exportPng(shot, event.currentTarget)}
                 >
                   PNG
                 </button>

@@ -1,5 +1,8 @@
 import { expect, test } from '@playwright/test';
 import type { Download, Page } from '@playwright/test';
+import { execFile } from 'node:child_process';
+import { writeFile } from 'node:fs/promises';
+import { promisify } from 'node:util';
 import { MINIMAL_GLB } from './helpers/glb';
 import { decodePng, pngPixel } from './helpers/png';
 
@@ -15,9 +18,84 @@ interface VideoMetadata {
 }
 
 interface ExportInstrumentation {
-  recorderConstructions: number;
+  encoderConstructions: number;
+  encoderFlushes: number;
+  encoderCloses: number;
   captureStreams: number;
-  trackStops: number;
+}
+
+interface WebmProbe {
+  packets: Array<{ pts_time: string; duration_time?: string }>;
+  format: { duration: string };
+}
+
+const execFileAsync = promisify(execFile);
+
+async function instrumentWebCodecs(
+  page: Page,
+  flushMode: 'native' | 'pending' | 'fail-once' = 'native',
+): Promise<void> {
+  await page.addInitScript(({ mode }) => {
+    const scope = globalThis as typeof globalThis & {
+      __lumoraExportInstrumentation?: ExportInstrumentation;
+    };
+    const instrumentation: ExportInstrumentation = {
+      encoderConstructions: 0,
+      encoderFlushes: 0,
+      encoderCloses: 0,
+      captureStreams: 0,
+    };
+    scope.__lumoraExportInstrumentation = instrumentation;
+
+    const originalCaptureStream = HTMLCanvasElement.prototype.captureStream;
+    if (originalCaptureStream) {
+      Object.defineProperty(HTMLCanvasElement.prototype, 'captureStream', {
+        configurable: true,
+        value: function captureStream(this: HTMLCanvasElement, frameRate?: number) {
+          instrumentation.captureStreams += 1;
+          return originalCaptureStream.call(this, frameRate);
+        },
+      });
+    }
+
+    const NativeVideoEncoder = globalThis.VideoEncoder;
+    if (typeof NativeVideoEncoder !== 'function') return;
+    const InstrumentedVideoEncoder = new Proxy(NativeVideoEncoder, {
+      construct(target, args) {
+        const encoder = Reflect.construct(target, args) as VideoEncoder;
+        instrumentation.encoderConstructions += 1;
+        const nativeFlush = encoder.flush.bind(encoder);
+        const nativeClose = encoder.close.bind(encoder);
+        let closed = false;
+        Object.defineProperty(encoder, 'flush', {
+          configurable: true,
+          value: () => {
+            instrumentation.encoderFlushes += 1;
+            if (mode === 'pending') return new Promise<void>(() => undefined);
+            if (mode === 'fail-once' && instrumentation.encoderFlushes === 1) {
+              return Promise.reject(new DOMException('Injected WebCodecs flush failure', 'EncodingError'));
+            }
+            return nativeFlush();
+          },
+        });
+        Object.defineProperty(encoder, 'close', {
+          configurable: true,
+          value: () => {
+            if (!closed) {
+              closed = true;
+              instrumentation.encoderCloses += 1;
+            }
+            return nativeClose();
+          },
+        });
+        return encoder;
+      },
+    });
+    Object.defineProperty(globalThis, 'VideoEncoder', {
+      configurable: true,
+      value: InstrumentedVideoEncoder,
+    });
+  }, { mode: flushMode });
 }
 
 async function readDownload(download: Download): Promise<Buffer> {
@@ -25,6 +103,174 @@ async function readDownload(download: Download): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of stream) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks);
+}
+
+async function probeWebm(bytes: Buffer, outputPath: string): Promise<WebmProbe> {
+  await writeFile(outputPath, bytes);
+  const { stdout } = await execFileAsync('ffprobe', [
+    '-v', 'error',
+    '-select_streams', 'v:0',
+    '-show_entries', 'packet=pts_time,duration_time',
+    '-show_entries', 'format=duration',
+    '-of', 'json',
+    outputPath,
+  ], { windowsHide: true, maxBuffer: 4 * 1024 * 1024 });
+  return JSON.parse(stdout) as WebmProbe;
+}
+
+async function persistTimingProbe(page: Page, sourceDuration: number): Promise<void> {
+  await page.evaluate((duration) => {
+    const focalLength = 50;
+    const fov = (2 * Math.atan(24 / 2 / focalLength) * 180) / Math.PI;
+    const project = {
+      uri: `lumora://webm-timing-${duration}`,
+      name: 'WebM timing probe',
+      schemaVersion: 4,
+      createdAt: new Date().toISOString(),
+      revision: 0,
+      settings: { fps: 24, aspect: [16, 9] },
+      activeSceneId: 'probe-scene',
+      scenes: [{
+        id: 'probe-scene',
+        name: 'Probe scene',
+        rootObjectIds: ['probe-camera', 'probe-cube', 'probe-light'],
+        activeCameraId: 'probe-camera',
+      }],
+      objects: [
+        {
+          id: 'probe-camera',
+          type: 'camera',
+          name: 'Probe camera',
+          parentId: null,
+          transform: { position: [0, 0, 5], rotation: [0, 0, 0], scale: [1, 1, 1] },
+          visible: true,
+          locked: false,
+          camera: {
+            projection: 'perspective',
+            focalLength,
+            fov,
+            sensorWidth: 36,
+            sensorHeight: 24,
+            near: 0.1,
+            far: 200,
+            aspect: null,
+          },
+        },
+        {
+          id: 'probe-cube',
+          type: 'primitive',
+          name: 'Probe cube',
+          parentId: null,
+          transform: { position: [0, 0, 0], rotation: [0.2, 0.4, 0], scale: [1.5, 1.5, 1.5] },
+          visible: true,
+          locked: false,
+          geometry: { kind: 'box' },
+          material: { color: '#e64980' },
+        },
+        {
+          id: 'probe-light',
+          type: 'light',
+          name: 'Probe light',
+          parentId: null,
+          transform: { position: [3, 4, 5], rotation: [0, 0, 0], scale: [1, 1, 1] },
+          visible: true,
+          locked: false,
+          light: { kind: 'directional', color: '#ffffff', intensity: 1.5 },
+        },
+      ],
+      tracks: [],
+      shots: [{
+        id: 'probe-shot',
+        name: 'Timing probe',
+        cameraObjectId: 'probe-camera',
+        startTime: 0,
+        endTime: duration,
+      }],
+      assets: [],
+    };
+    localStorage.setItem('lumora.demo.last-export', JSON.stringify(project));
+  }, sourceDuration);
+}
+
+async function persistVisualOrderProbe(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const focalLength = 50;
+    const fov = (2 * Math.atan(24 / 2 / focalLength) * 180) / Math.PI;
+    const camera = (id: string, name: string, x: number, z: number) => ({
+      id,
+      type: 'camera',
+      name,
+      parentId: null,
+      transform: { position: [x, 0, z], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      visible: true,
+      locked: false,
+      camera: {
+        projection: 'perspective',
+        focalLength,
+        fov,
+        sensorWidth: 36,
+        sensorHeight: 24,
+        near: 0.1,
+        far: 200,
+        aspect: null,
+      },
+    });
+    const subject = (id: string, name: string, x: number, kind: string, color: string) => ({
+      id,
+      type: 'primitive',
+      name,
+      parentId: null,
+      transform: { position: [x, 0, 0], rotation: [0.2, 0.4, 0], scale: [1.6, 1.6, 1.6] },
+      visible: true,
+      locked: false,
+      geometry: { kind },
+      material: { color },
+    });
+    const project = {
+      uri: 'lumora://persisted-three-camera-export',
+      name: 'Persisted three-camera export',
+      schemaVersion: 4,
+      createdAt: new Date().toISOString(),
+      revision: 0,
+      settings: { fps: 24, aspect: [16, 9] },
+      activeSceneId: 'visual-scene',
+      scenes: [{
+        id: 'visual-scene',
+        name: 'Visual order scene',
+        rootObjectIds: [
+          'camera-red', 'camera-green', 'camera-blue',
+          'subject-red', 'subject-green', 'subject-blue', 'visual-light',
+        ],
+        activeCameraId: 'camera-red',
+      }],
+      objects: [
+        camera('camera-red', 'Red camera', -4, 6),
+        camera('camera-green', 'Green camera', 0, 5),
+        camera('camera-blue', 'Blue camera', 4, 4),
+        subject('subject-red', 'Red box', -4, 'box', '#f03e3e'),
+        subject('subject-green', 'Green sphere', 0, 'sphere', '#37b24d'),
+        subject('subject-blue', 'Blue cone', 4, 'cone', '#228be6'),
+        {
+          id: 'visual-light',
+          type: 'light',
+          name: 'Visual light',
+          parentId: null,
+          transform: { position: [3, 5, 6], rotation: [0, 0, 0], scale: [1, 1, 1] },
+          visible: true,
+          locked: false,
+          light: { kind: 'directional', color: '#ffffff', intensity: 1.8 },
+        },
+      ],
+      tracks: [],
+      shots: [
+        { id: 'shot-red', name: 'Red view', cameraObjectId: 'camera-red', startTime: 0, endTime: 0.5 },
+        { id: 'shot-green', name: 'Green view', cameraObjectId: 'camera-green', startTime: 0.5, endTime: 1 },
+        { id: 'shot-blue', name: 'Blue view', cameraObjectId: 'camera-blue', startTime: 1, endTime: 1.5 },
+      ],
+      assets: [],
+    };
+    localStorage.setItem('lumora.demo.last-export', JSON.stringify(project));
+  });
 }
 
 async function inspectWebm(
@@ -229,44 +475,87 @@ test('opens export with the native Space button action without toggling playback
   await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
   const trigger = page.getByTestId('open-export-workspace');
   const playBefore = await page.getByTestId('timeline-play').textContent();
+  await page.evaluate(() => {
+    const scope = globalThis as typeof globalThis & { __lumoraHostShortcutCount?: number };
+    scope.__lumoraHostShortcutCount = 0;
+    window.addEventListener('keydown', () => {
+      scope.__lumoraHostShortcutCount! += 1;
+    });
+  });
 
   await trigger.focus();
   await trigger.press('Space');
 
   await expect(page.getByTestId('export-workspace')).toBeVisible();
   await expect(page.getByTestId('timeline-play')).toHaveText(playBefore ?? '');
+  expect(await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraHostShortcutCount?: number }
+  ).__lumoraHostShortcutCount)).toBe(0);
 });
 
-test('exports three ordered shots as a playable 720p/24fps WebM', async ({ page }) => {
-  await openSampleExport(page);
-  await page.getByRole('button', { name: '关闭导出' }).click();
-  await page.getByTestId('open-storyboard-workspace').click();
-  await page.getByTestId('storyboard-tab-adopted').click();
-  const adoptedShots = page.getByTestId('storyboard-adopted-shot');
-  await expect(adoptedShots).toHaveCount(3);
-  await adoptedShots.nth(2).locator('label').filter({ hasText: '机位' }).locator('select')
-    .selectOption('sample-camera');
-  await page.getByRole('button', { name: '关闭 AI 分镜工作台' }).click();
+test('retains the quantized terminal packet in real 24fps and 30fps WebM artifacts', async ({ page }, testInfo) => {
+  const cases = [
+    { frames: 14, fps: 24, sourceDuration: 0.58 },
+    { frames: 45, fps: 30, sourceDuration: 1.49 },
+  ] as const;
+
+  for (const probeCase of cases) {
+    await page.goto('/');
+    await persistTimingProbe(page, probeCase.sourceDuration);
+    await page.reload();
+    await page.getByTestId('reopen-last-export').click();
+    await expect(page.getByTestId('tree-row-probe-cube')).toBeVisible();
+    await page.getByTestId('open-export-workspace').click();
+    await page.getByLabel('分辨率').selectOption('480p');
+    await page.getByLabel('帧率').selectOption(String(probeCase.fps));
+
+    const { bytes } = await exportWebm(page);
+    const probe = await probeWebm(
+      bytes,
+      testInfo.outputPath(`terminal-${probeCase.frames}-${probeCase.fps}.webm`),
+    );
+    await testInfo.attach(`ffprobe-${probeCase.frames}-${probeCase.fps}`, {
+      body: Buffer.from(JSON.stringify(probe, null, 2)),
+      contentType: 'application/json',
+    });
+
+    const quantizedDuration = probeCase.frames / probeCase.fps;
+    const tolerance = 1 / probeCase.fps / 4;
+    expect(Math.abs(probeCase.sourceDuration - quantizedDuration)).toBeLessThan(1 / probeCase.fps / 2);
+    expect(probe.packets).toHaveLength(probeCase.frames + 1);
+    expect(Math.abs(Number(probe.packets.at(-1)!.pts_time) - quantizedDuration)).toBeLessThan(tolerance);
+    expect(Math.abs(Number(probe.format.duration) - quantizedDuration)).toBeLessThan(tolerance);
+  }
+});
+
+test('reopens and exports three visually distinct camera shots in order', async ({ page }) => {
+  await page.goto('/');
+  await persistVisualOrderProbe(page);
+  await page.reload();
+  await page.getByTestId('reopen-last-export').click();
+  await expect(page.getByTestId('tree-row-camera-red')).toBeVisible();
+  await expect(page.getByTestId('tree-row-camera-green')).toBeVisible();
+  await expect(page.getByTestId('tree-row-camera-blue')).toBeVisible();
   await page.getByTestId('open-export-workspace').click();
   await expect(page.getByTestId('export-workspace')).toBeVisible();
-  await expect(page.getByLabel('分辨率')).toHaveValue('720p');
+  await page.getByLabel('分辨率').selectOption('480p');
   await expect(page.getByLabel('帧率')).toHaveValue('24');
   const referencePngs = [
-    await exportShotPng(page, /导出 分镜 1.*PNG/),
-    await exportShotPng(page, /导出 分镜 2.*PNG/),
-    await exportShotPng(page, /导出 分镜 3.*PNG/),
+    await exportShotPng(page, /导出 Red view.*PNG/),
+    await exportShotPng(page, /导出 Green view.*PNG/),
+    await exportShotPng(page, /导出 Blue view.*PNG/),
   ];
 
   const { bytes, order } = await exportWebm(page);
   expect(bytes.length).toBeGreaterThan(1_000);
   expect([...bytes.subarray(0, 4)]).toEqual([0x1a, 0x45, 0xdf, 0xa3]);
-  expect(order).toEqual(['分镜 1 · 开场全景', '分镜 2 · 推近主体', '分镜 3 · 特写']);
+  expect(order).toEqual(['Red view', 'Green view', 'Blue view']);
 
-  const metadata = await inspectWebm(page, bytes, referencePngs, [0.75, 2.25, 3.75]);
-  expect(metadata.width).toBe(1280);
-  expect(metadata.height).toBe(720);
-  expect(Math.abs(metadata.duration - 4.5)).toBeLessThanOrEqual(1 / 24);
-  expect(metadata.decodedPixelCount).toBeGreaterThan(1280 * 720 * 0.9);
+  const metadata = await inspectWebm(page, bytes, referencePngs, [0.25, 0.75, 1.25]);
+  expect(metadata.width).toBe(854);
+  expect(metadata.height).toBe(480);
+  expect(Math.abs(metadata.duration - 1.5)).toBeLessThan(1 / 96);
+  expect(metadata.decodedPixelCount).toBeGreaterThan(854 * 480 * 0.9);
   expect(metadata.frameComparisons).toHaveLength(3);
   expect(metadata.frameComparisons.map(({ differences }) => (
     differences.indexOf(Math.min(...differences))
@@ -278,15 +567,16 @@ test('exports three ordered shots as a playable 720p/24fps WebM', async ({ page 
   }
 });
 
-test('reports unsupported codecs before constructing a recorder or downloading a file', async ({ page }) => {
+test('reports missing WebCodecs before encoding or downloading a file', async ({ page }) => {
   await page.addInitScript(() => {
     const scope = globalThis as typeof globalThis & {
       __lumoraExportInstrumentation?: ExportInstrumentation;
     };
     scope.__lumoraExportInstrumentation = {
-      recorderConstructions: 0,
+      encoderConstructions: 0,
+      encoderFlushes: 0,
+      encoderCloses: 0,
       captureStreams: 0,
-      trackStops: 0,
     };
     const originalCaptureStream = HTMLCanvasElement.prototype.captureStream;
     Object.defineProperty(HTMLCanvasElement.prototype, 'captureStream', {
@@ -296,67 +586,33 @@ test('reports unsupported codecs before constructing a recorder or downloading a
         return originalCaptureStream.call(this, frameRate);
       },
     });
-    class UnsupportedMediaRecorder {
-      static isTypeSupported(): boolean {
-        return false;
-      }
-
-      constructor() {
-        scope.__lumoraExportInstrumentation!.recorderConstructions += 1;
-        throw new Error('Recorder must not be constructed for an unsupported codec');
-      }
-    }
-    Object.defineProperty(globalThis, 'MediaRecorder', {
+    Object.defineProperty(globalThis, 'VideoEncoder', {
       configurable: true,
-      value: UnsupportedMediaRecorder,
+      value: undefined,
+    });
+    Object.defineProperty(globalThis, 'VideoFrame', {
+      configurable: true,
+      value: undefined,
     });
   });
   let downloads = 0;
   page.on('download', () => downloads += 1);
 
   await openSampleExport(page);
-  await expect(page.getByRole('alert')).toContainText('不支持 VP8/VP9 WebM 编码');
+  await expect(page.getByRole('alert')).toContainText('不支持 WebCodecs VideoEncoder');
   await expect(page.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
   await page.waitForTimeout(200);
 
   const instrumentation = await page.evaluate(() => (
     globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
   ).__lumoraExportInstrumentation);
-  expect(instrumentation.recorderConstructions).toBe(0);
+  expect(instrumentation.encoderConstructions).toBe(0);
   expect(instrumentation.captureStreams).toBe(0);
   expect(downloads).toBe(0);
 });
 
-test('cancels recording, releases media tracks, and returns to an editable project', async ({ page }) => {
-  await page.addInitScript(() => {
-    const scope = globalThis as typeof globalThis & {
-      __lumoraExportInstrumentation?: ExportInstrumentation;
-    };
-    scope.__lumoraExportInstrumentation = {
-      recorderConstructions: 0,
-      captureStreams: 0,
-      trackStops: 0,
-    };
-    const originalCaptureStream = HTMLCanvasElement.prototype.captureStream;
-    Object.defineProperty(HTMLCanvasElement.prototype, 'captureStream', {
-      configurable: true,
-      value: function captureStream(this: HTMLCanvasElement, frameRate?: number) {
-        const stream = originalCaptureStream.call(this, frameRate);
-        scope.__lumoraExportInstrumentation!.captureStreams += 1;
-        for (const track of stream.getTracks()) {
-          const originalStop = track.stop.bind(track);
-          Object.defineProperty(track, 'stop', {
-            configurable: true,
-            value: () => {
-              scope.__lumoraExportInstrumentation!.trackStops += 1;
-              originalStop();
-            },
-          });
-        }
-        return stream;
-      },
-    });
-  });
+test('cancels encoding, closes WebCodecs, and returns to an editable project', async ({ page }) => {
+  await instrumentWebCodecs(page);
   let downloads = 0;
   page.on('download', () => downloads += 1);
 
@@ -370,8 +626,9 @@ test('cancels recording, releases media tracks, and returns to an editable proje
   const instrumentation = await page.evaluate(() => (
     globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
   ).__lumoraExportInstrumentation);
-  expect(instrumentation.captureStreams).toBe(1);
-  expect(instrumentation.trackStops).toBeGreaterThanOrEqual(1);
+  expect(instrumentation.encoderConstructions).toBe(1);
+  expect(instrumentation.encoderCloses).toBe(1);
+  expect(instrumentation.captureStreams).toBe(0);
   expect(downloads).toBe(0);
 
   await page.getByRole('button', { name: '关闭导出' }).click();
@@ -383,7 +640,8 @@ test('cancels recording, releases media tracks, and returns to an editable proje
   await expect(rows).toHaveCount(before + 1);
 });
 
-test('isolates editor shortcuts while export is idle and while recording', async ({ page }) => {
+test('isolates editor shortcuts while export is idle and while encoding', async ({ page }) => {
+  await instrumentWebCodecs(page, 'pending');
   await page.goto('/');
   await page.getByTestId('open-sample-project').click();
   await expect(page.getByTestId('tree-row-sample-camera-2')).toBeVisible();
@@ -431,33 +689,7 @@ test('isolates editor shortcuts while export is idle and while recording', async
 });
 
 test('cancels at 100% finalization without downloading and remains retryable', async ({ page }) => {
-  await page.addInitScript(() => {
-    class FinalizationRecorder {
-      static isTypeSupported(mimeType: string): boolean {
-        return mimeType.startsWith('video/webm');
-      }
-
-      state: RecordingState = 'inactive';
-      ondataavailable: ((event: BlobEvent) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      onstop: ((event: Event) => void) | null = null;
-
-      start(): void {
-        this.state = 'recording';
-      }
-
-      stop(): void {
-        if (this.state === 'inactive') return;
-        this.state = 'inactive';
-        this.ondataavailable?.(new BlobEvent('dataavailable', { data: new Blob(['partial-webm']) }));
-        // Deliberately omit onstop so AbortSignal must win the finalization race.
-      }
-    }
-    Object.defineProperty(globalThis, 'MediaRecorder', {
-      configurable: true,
-      value: FinalizationRecorder,
-    });
-  });
+  await instrumentWebCodecs(page, 'pending');
   let downloads = 0;
   page.on('download', () => downloads += 1);
   await openSampleExport(page);
@@ -474,34 +706,43 @@ test('cancels at 100% finalization without downloading and remains retryable', a
   await runAndCancel();
   await runAndCancel();
   expect(downloads).toBe(0);
+  const instrumentation = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation);
+  expect(instrumentation.encoderConstructions).toBe(2);
+  expect(instrumentation.encoderFlushes).toBe(2);
+  expect(instrumentation.encoderCloses).toBe(2);
+  expect(instrumentation.captureStreams).toBe(0);
 });
 
-test('fails explicitly when timer throttling misses the real-time frame deadline', async ({ page }) => {
-  await page.addInitScript(() => {
-    const scope = globalThis as typeof globalThis & { __lumoraThrottleExport?: boolean };
-    const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
-    globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) =>
-      nativeSetTimeout(
-        handler,
-        scope.__lumoraThrottleExport && (timeout ?? 0) < 100 ? (timeout ?? 0) + 120 : timeout,
-        ...args,
-      )) as typeof globalThis.setTimeout;
-  });
+test('surfaces a WebCodecs flush failure and remains retryable', async ({ page }) => {
+  await instrumentWebCodecs(page, 'fail-once');
   let downloads = 0;
   page.on('download', () => downloads += 1);
   await openSampleExport(page);
   await page.getByLabel('导出范围').selectOption('sample-shot-1');
-  await page.evaluate(() => {
-    (globalThis as typeof globalThis & { __lumoraThrottleExport?: boolean }).__lumoraThrottleExport = true;
-  });
 
   await page.getByRole('button', { name: '导出 WebM' }).click();
-  await expect(page.getByRole('alert')).toContainText('未能维持所选帧率');
+  await expect(page.getByRole('alert')).toContainText('Injected WebCodecs flush failure');
   await expect(page.getByRole('button', { name: '导出 WebM' })).toBeFocused();
   expect(downloads).toBe(0);
+
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: '导出 WebM' }).click();
+  await downloadPromise;
+  await expect(page.getByRole('status')).toContainText('导出完成');
+  expect(downloads).toBe(1);
+  const instrumentation = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation);
+  expect(instrumentation.encoderConstructions).toBe(2);
+  expect(instrumentation.encoderFlushes).toBe(2);
+  expect(instrumentation.encoderCloses).toBe(2);
+  expect(instrumentation.captureStreams).toBe(0);
 });
 
 test('invalidates an old export when the same project URI is reopened', async ({ page }) => {
+  await instrumentWebCodecs(page);
   await page.goto('/');
   await page.getByTestId('open-sample-project').click();
   const projectDownload = page.waitForEvent('download');
@@ -520,6 +761,12 @@ test('invalidates an old export when the same project URI is reopened', async ({
   await expect(page.getByTestId('tree-row-sample-camera')).toBeVisible();
   await page.waitForTimeout(250);
   expect(previewDownloads).toBe(0);
+  const instrumentation = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation);
+  expect(instrumentation.encoderConstructions).toBe(1);
+  expect(instrumentation.encoderCloses).toBe(1);
+  expect(instrumentation.captureStreams).toBe(0);
 });
 
 test('preserves foreground geometry in a full-width 854x480 PNG', async ({ page }) => {

@@ -146,6 +146,9 @@ export function Toolbar({
           data-testid="open-export-workspace"
           aria-pressed={exportOpen}
           disabled={!project}
+          onKeyDown={(event) => {
+            if (event.key === ' ' || event.key === 'Enter') event.stopPropagation();
+          }}
           onClick={onToggleExport}
         >
           导出
