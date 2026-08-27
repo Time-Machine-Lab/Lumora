@@ -18,6 +18,7 @@ import type {
   PreviewRecordingDependencies,
   PreviewResolution,
   WebmSupport,
+  WebmSupportProbe,
 } from '../../export/preview-export';
 
 export type ThumbnailCapture = (cameraObjectId?: string | null) => string | null;
@@ -33,6 +34,7 @@ export interface ExportWorkspaceProps {
   captureReady?: boolean;
   onClose: () => void;
   support?: WebmSupport;
+  supportProbe?: WebmSupportProbe;
   recordingDependencies?: PreviewRecordingDependencies;
 }
 
@@ -60,6 +62,17 @@ const RESOLUTION_SIZE: Record<PreviewResolution, { width: number; height: number
   '720p': { width: 1280, height: 720 },
   '480p': { width: 854, height: 480 },
 };
+
+const CHECKING_WEBM_SUPPORT: WebmSupport = {
+  supported: false,
+  checking: true,
+  reason: '正在检查 VP8 编码配置…',
+};
+
+interface DetectedWebmSupport {
+  checkKey: string;
+  support: WebmSupport;
+}
 
 function safeFilename(value: string): string {
   const invalid = '\\/:*?"<>|';
@@ -97,13 +110,19 @@ export function ExportWorkspace({
   captureReady = true,
   onClose,
   support: supportOverride,
+  supportProbe,
   recordingDependencies,
 }: ExportWorkspaceProps) {
   useEventRefresh(runtime.events, ['contribution:changed', 'plugin:state-changed']);
-  const support = useMemo(() => supportOverride ?? detectWebmSupport(), [supportOverride]);
   const [range, setRange] = useState('all');
   const [resolution, setResolution] = useState<PreviewResolution>('720p');
   const [fps, setFps] = useState<PreviewFrameRate>(24);
+  const boundSessionToken = projectSessionToken ?? runtime.editor.getSessionToken();
+  const supportCheckKey = JSON.stringify([boundSessionToken, project.uri, resolution, fps]);
+  const [detectedSupport, setDetectedSupport] = useState<DetectedWebmSupport>(() => ({
+    checkKey: supportCheckKey,
+    support: CHECKING_WEBM_SUPPORT,
+  }));
   const [status, setStatus] = useState<ExportStatus>({ kind: 'idle' });
   const [progress, setProgress] = useState(0);
   const [activeOperation, setActiveOperation] = useState<ExportOperationToken | null>(null);
@@ -117,7 +136,38 @@ export function ExportWorkspace({
   const operationControlsRef = useRef<HTMLDivElement>(null);
   const pendingFocusOriginRef = useRef<HTMLButtonElement | null>(null);
   const focusTimerRef = useRef<number | null>(null);
-  const boundSessionToken = projectSessionToken ?? runtime.editor.getSessionToken();
+  const support = supportOverride ?? (
+    detectedSupport.checkKey === supportCheckKey
+      ? detectedSupport.support
+      : CHECKING_WEBM_SUPPORT
+  );
+
+  useEffect(() => {
+    if (supportOverride) return;
+    let current = true;
+    setDetectedSupport({ checkKey: supportCheckKey, support: CHECKING_WEBM_SUPPORT });
+    void Promise.resolve(detectWebmSupport({ resolution, fps }, supportProbe)).then((result) => {
+      const currentProject = runtime.editor.getProject();
+      if (
+        !current ||
+        !runtime.editor.isCurrentSession(boundSessionToken) ||
+        (currentProject !== null && currentProject.uri !== project.uri)
+      ) return;
+      setDetectedSupport({ checkKey: supportCheckKey, support: result });
+    });
+    return () => {
+      current = false;
+    };
+  }, [
+    boundSessionToken,
+    fps,
+    project.uri,
+    resolution,
+    runtime.editor,
+    supportCheckKey,
+    supportOverride,
+    supportProbe,
+  ]);
 
   const isWorkspaceSessionCurrent = (token?: ExportOperationToken) => {
     const current = runtime.editor.getProject();
@@ -555,7 +605,11 @@ export function ExportWorkspace({
             </select>
           </label>
 
-          {!support.supported && <p className="lumora-export__notice" role="alert">{support.reason}</p>}
+          {!support.supported && (
+            <p className="lumora-export__notice" role={support.checking ? 'status' : 'alert'}>
+              {support.reason}
+            </p>
+          )}
           {support.supported && (
             <p className="lumora-export__codec">WebM · {support.mimeType.includes('vp9') ? 'VP9' : support.mimeType.includes('vp8') ? 'VP8' : '浏览器默认'}</p>
           )}

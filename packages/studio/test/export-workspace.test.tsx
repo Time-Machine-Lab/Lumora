@@ -12,6 +12,16 @@ import type {
   WebmSupport,
 } from '../src/export/preview-export';
 
+interface ConfigSupportProbe {
+  hasVideoEncoder: boolean;
+  hasVideoFrame: boolean;
+  isConfigSupported(config: VideoEncoderConfig): Promise<{ supported: boolean }>;
+}
+
+const AsyncExportWorkspace = ExportWorkspace as unknown as (
+  props: Parameters<typeof ExportWorkspace>[0] & { supportProbe: ConfigSupportProbe },
+) => ReturnType<typeof ExportWorkspace>;
+
 function projectWithShortShots(): Project {
   const project = createSampleProject('lumora://export-ui', '导出界面');
   return {
@@ -47,11 +57,14 @@ function encoderDependencies(options: { flush?: () => Promise<Blob> } = {}) {
     height: 0,
   } as unknown as HTMLCanvasElement;
   const encoder = {
+    encodeQueueSize: 0,
     encodeFrame: vi.fn((_canvas, frame) => encodedFrames.push({ ...frame })),
+    waitForQueueSize: vi.fn(async () => undefined),
     flush: vi.fn(options.flush ?? (async () => new Blob(['webm'], { type: 'video/webm;codecs=vp8' }))),
     close: vi.fn(),
-  } as PreviewEncoderSession & {
+  } as Omit<PreviewEncoderSession, 'encodeFrame' | 'waitForQueueSize' | 'flush' | 'close'> & {
     encodeFrame: ReturnType<typeof vi.fn>;
+    waitForQueueSize: ReturnType<typeof vi.fn>;
     flush: ReturnType<typeof vi.fn>;
     close: ReturnType<typeof vi.fn>;
   };
@@ -288,6 +301,192 @@ describe('ExportWorkspace', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('不支持 VP8/VP9');
     expect(screen.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
     expect(recorder.encoder.encodeFrame).not.toHaveBeenCalled();
+  });
+
+  it('keeps WebM disabled with a status while the selected VP8 config is checking', async () => {
+    const runtime = createStudioRuntime();
+    const project = createSampleProject();
+    const { session } = sessionHarness();
+    const check = deferred<{ supported: boolean }>();
+    const supportProbe: ConfigSupportProbe = {
+      hasVideoEncoder: true,
+      hasVideoFrame: true,
+      isConfigSupported: vi.fn(() => check.promise),
+    };
+
+    render(
+      <AsyncExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        supportProbe={supportProbe}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('status')).toHaveTextContent('正在检查 VP8');
+    expect(screen.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
+    check.resolve({ supported: true });
+    await waitFor(() => expect(screen.getByRole('button', { name: '导出 WebM' })).toBeEnabled());
+  });
+
+  it.each([
+    ['unsupported', async () => ({ supported: false }), '不支持当前分辨率'],
+    ['failed', async () => { throw new Error('capability unavailable'); }, 'capability unavailable'],
+  ])('shows an actionable reason when VP8 preflight is %s', async (_label, check, reason) => {
+    const runtime = createStudioRuntime();
+    const project = createSampleProject();
+    const { session } = sessionHarness();
+
+    render(
+      <AsyncExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        supportProbe={{
+          hasVideoEncoder: true,
+          hasVideoFrame: true,
+          isConfigSupported: vi.fn(check),
+        }}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(reason));
+    expect(screen.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
+  });
+
+  it('ignores an out-of-order VP8 result after resolution changes', async () => {
+    const runtime = createStudioRuntime();
+    const project = createSampleProject();
+    const { session } = sessionHarness();
+    const firstCheck = deferred<{ supported: boolean }>();
+    const secondCheck = deferred<{ supported: boolean }>();
+    const isConfigSupported = vi.fn()
+      .mockReturnValueOnce(firstCheck.promise)
+      .mockReturnValueOnce(secondCheck.promise);
+
+    render(
+      <AsyncExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        supportProbe={{ hasVideoEncoder: true, hasVideoFrame: true, isConfigSupported }}
+        onClose={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(isConfigSupported).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByLabelText('分辨率'), { target: { value: '480p' } });
+    await waitFor(() => expect(isConfigSupported).toHaveBeenCalledTimes(2));
+
+    secondCheck.resolve({ supported: true });
+    await waitFor(() => expect(screen.getByRole('button', { name: '导出 WebM' })).toBeEnabled());
+    firstCheck.resolve({ supported: false });
+    await act(async () => firstCheck.promise);
+
+    expect(screen.getByRole('button', { name: '导出 WebM' })).toBeEnabled();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(isConfigSupported).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      width: 854,
+      height: 480,
+    }));
+  });
+
+  it('disables WebM synchronously when a supported selection changes', async () => {
+    const runtime = createStudioRuntime();
+    const project = createSampleProject();
+    const { session } = sessionHarness();
+    const firstCheck = deferred<{ supported: boolean }>();
+    const secondCheck = deferred<{ supported: boolean }>();
+    let disabledWhenSecondProbeStarted: boolean | undefined;
+    let checkingWhenSecondProbeStarted: boolean | undefined;
+    const isConfigSupported = vi.fn()
+      .mockReturnValueOnce(firstCheck.promise)
+      .mockImplementationOnce(() => {
+        disabledWhenSecondProbeStarted = screen.getByRole('button', { name: '导出 WebM' })
+          .hasAttribute('disabled');
+        checkingWhenSecondProbeStarted = screen.queryByRole('status') !== null;
+        return secondCheck.promise;
+      });
+
+    render(
+      <AsyncExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        supportProbe={{ hasVideoEncoder: true, hasVideoFrame: true, isConfigSupported }}
+        onClose={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(isConfigSupported).toHaveBeenCalledTimes(1));
+    firstCheck.resolve({ supported: true });
+    await waitFor(() => expect(screen.getByRole('button', { name: '导出 WebM' })).toBeEnabled());
+
+    fireEvent.change(screen.getByLabelText('分辨率'), { target: { value: '480p' } });
+    await waitFor(() => expect(isConfigSupported).toHaveBeenCalledTimes(2));
+
+    expect(disabledWhenSecondProbeStarted).toBe(true);
+    expect(checkingWhenSecondProbeStarted).toBe(true);
+    expect(screen.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
+    expect(screen.getByRole('status')).toHaveTextContent('正在检查 VP8');
+  });
+
+  it('ignores an old session preflight result after the same project URI is reopened', async () => {
+    const runtime = createStudioRuntime();
+    await runtime.openProject(createSampleProject('lumora://vp8-session', 'Initial'));
+    const initial = runtime.getProject()!;
+    const firstToken = runtime.editor.getSessionToken();
+    const { session } = sessionHarness();
+    const firstCheck = deferred<{ supported: boolean }>();
+    const secondCheck = deferred<{ supported: boolean }>();
+    const isConfigSupported = vi.fn()
+      .mockReturnValueOnce(firstCheck.promise)
+      .mockReturnValueOnce(secondCheck.promise);
+
+    const view = render(
+      <AsyncExportWorkspace
+        runtime={runtime}
+        project={initial}
+        projectSessionToken={firstToken}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        supportProbe={{ hasVideoEncoder: true, hasVideoFrame: true, isConfigSupported }}
+        onClose={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(isConfigSupported).toHaveBeenCalledTimes(1));
+
+    act(() => runtime.editor.openProject(createSampleProject(initial.uri, 'Replacement')));
+    const replacement = runtime.getProject()!;
+    view.rerender(
+      <AsyncExportWorkspace
+        runtime={runtime}
+        project={replacement}
+        projectSessionToken={runtime.editor.getSessionToken()}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        supportProbe={{ hasVideoEncoder: true, hasVideoFrame: true, isConfigSupported }}
+        onClose={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(isConfigSupported).toHaveBeenCalledTimes(2));
+    secondCheck.resolve({ supported: true });
+    await waitFor(() => expect(screen.getByRole('button', { name: '导出 WebM' })).toBeEnabled());
+    firstCheck.resolve({ supported: false });
+    await act(async () => firstCheck.promise);
+
+    expect(screen.getByRole('button', { name: '导出 WebM' })).toBeEnabled();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('downloads a privacy-safe manifest for the selected range', async () => {

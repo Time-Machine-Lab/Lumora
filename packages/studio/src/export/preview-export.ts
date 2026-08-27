@@ -41,11 +41,12 @@ export type PreviewPlanResult =
 export interface WebmSupportProbe {
   hasVideoEncoder: boolean;
   hasVideoFrame: boolean;
+  isConfigSupported?: (config: VideoEncoderConfig) => Promise<{ supported?: boolean }>;
 }
 
 export type WebmSupport =
   | { supported: true; mimeType: string }
-  | { supported: false; reason: string };
+  | { supported: false; reason: string; checking?: boolean };
 
 export interface StoryboardManifest {
   format: 'lumora.storyboard';
@@ -98,7 +99,9 @@ export interface PreviewEncodedFrame {
 }
 
 export interface PreviewEncoderSession {
+  readonly encodeQueueSize: number;
   encodeFrame(canvas: HTMLCanvasElement, frame: PreviewEncodedFrame): void;
+  waitForQueueSize(maxQueueSize: number, signal?: AbortSignal): Promise<void>;
   flush(): Promise<Blob>;
   close(): void;
 }
@@ -117,6 +120,8 @@ export interface PreviewRecordingOptions {
 }
 
 export const DEFAULT_RECORDER_FINALIZATION_TIMEOUT_MS = 5_000;
+export const MAX_ENCODER_QUEUE_SIZE = 4;
+export const ENCODER_MACROTASK_YIELD_INTERVAL = 4;
 const OPERATION_OWNERSHIP_POLL_MS = 16;
 
 const MIME_CANDIDATES = [
@@ -144,17 +149,68 @@ function defaultSupportProbe(): WebmSupportProbe {
   return {
     hasVideoEncoder: typeof globalThis.VideoEncoder === 'function',
     hasVideoFrame: typeof globalThis.VideoFrame === 'function',
+    isConfigSupported: typeof globalThis.VideoEncoder?.isConfigSupported === 'function'
+      ? (config) => globalThis.VideoEncoder.isConfigSupported(config)
+      : undefined,
   };
 }
 
-export function detectWebmSupport(probe: WebmSupportProbe = defaultSupportProbe()): WebmSupport {
+function encoderConfig(
+  width: number,
+  height: number,
+  fps: PreviewFrameRate,
+  mimeType: string,
+): VideoEncoderConfig {
+  return {
+    codec: mimeType.toLowerCase().includes('vp9') ? 'vp09.00.10.08' : 'vp8',
+    width,
+    height,
+    bitrate: height >= 720 ? 6_000_000 : 3_000_000,
+    framerate: fps,
+    latencyMode: 'quality',
+  };
+}
+
+function readableError(error: unknown, fallback: string): string {
+  if (typeof error === 'object' && error !== null && 'message' in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === 'string' && message) return message;
+  }
+  return fallback;
+}
+
+export async function detectWebmSupport(
+  selection: Pick<PreviewExportOptions, 'resolution' | 'fps'>,
+  probe: WebmSupportProbe = defaultSupportProbe(),
+): Promise<WebmSupport> {
   if (!probe.hasVideoEncoder) {
     return { supported: false, reason: '当前浏览器不支持 WebCodecs VideoEncoder，无法可靠导出 WebM' };
   }
   if (!probe.hasVideoFrame) {
     return { supported: false, reason: '当前浏览器不支持 WebCodecs VideoFrame，无法可靠导出 WebM' };
   }
-  return { supported: true, mimeType: MIME_CANDIDATES[1] };
+  if (!probe.isConfigSupported) {
+    return { supported: false, reason: '当前浏览器无法检查 VP8 编码配置支持性，无法可靠导出 WebM' };
+  }
+  const resolution = RESOLUTIONS[selection.resolution];
+  const config = encoderConfig(
+    resolution.width,
+    resolution.height,
+    selection.fps,
+    MIME_CANDIDATES[1],
+  );
+  try {
+    const result = await probe.isConfigSupported(config);
+    if (!result.supported) {
+      return { supported: false, reason: '当前浏览器不支持当前分辨率、帧率和码率的 VP8 WebM 编码' };
+    }
+    return { supported: true, mimeType: MIME_CANDIDATES[1] };
+  } catch (error) {
+    return {
+      supported: false,
+      reason: `无法检查当前 VP8 编码配置：${readableError(error, '浏览器能力检查失败')}`,
+    };
+  }
 }
 
 function selectedShots(project: Project, shotIds: readonly string[]): ShotClipData[] {
@@ -291,21 +347,28 @@ function defaultRecordingDependencies(): PreviewRecordingDependencies {
         firstTimestampBehavior: 'strict',
       });
       let encoderFailure: Error | null = null;
+      const encoderFailureListeners = new Set<(error: Error) => void>();
       const encoder = new VideoEncoder({
         output: (chunk, metadata) => muxer.addVideoChunk(chunk, metadata),
         error: (error) => {
           encoderFailure = error;
+          for (const listener of encoderFailureListeners) listener(error);
         },
       });
-      encoder.configure({
-        codec: vp9 ? 'vp09.00.10.08' : 'vp8',
-        width: plan.width,
-        height: plan.height,
-        bitrate: plan.height >= 720 ? 6_000_000 : 3_000_000,
-        framerate: plan.fps,
-        latencyMode: 'quality',
-      });
+      try {
+        encoder.configure(encoderConfig(plan.width, plan.height, plan.fps, plan.mimeType));
+      } catch (error) {
+        try {
+          encoder.close();
+        } catch {
+          // The codec may have transitioned to closed while configure failed.
+        }
+        throw error;
+      }
       return {
+        get encodeQueueSize() {
+          return encoder.encodeQueueSize;
+        },
         encodeFrame: (canvas, frame) => {
           if (encoderFailure) throw encoderFailure;
           const videoFrame = new VideoFrame(canvas, {
@@ -317,6 +380,36 @@ function defaultRecordingDependencies(): PreviewRecordingDependencies {
           } finally {
             videoFrame.close();
           }
+          if (encoderFailure) throw encoderFailure;
+        },
+        waitForQueueSize: async (maxQueueSize, signal) => {
+          if (encoderFailure) throw encoderFailure;
+          if (encoder.encodeQueueSize <= maxQueueSize) return;
+          await new Promise<void>((resolve, reject) => {
+            let settled = false;
+            const finish = (callback: () => void) => {
+              if (settled) return;
+              settled = true;
+              encoder.removeEventListener('dequeue', onDequeue);
+              encoderFailureListeners.delete(onEncoderFailure);
+              signal?.removeEventListener('abort', onAbort);
+              callback();
+            };
+            const onEncoderFailure = (error: Error) => finish(() => reject(error));
+            const onDequeue = () => {
+              if (encoderFailure) {
+                finish(() => reject(encoderFailure));
+              } else if (encoder.encodeQueueSize <= maxQueueSize) {
+                finish(resolve);
+              }
+            };
+            const onAbort = () => finish(() => reject(abortError()));
+            encoder.addEventListener('dequeue', onDequeue);
+            encoderFailureListeners.add(onEncoderFailure);
+            signal?.addEventListener('abort', onAbort, { once: true });
+            if (signal?.aborted) onAbort();
+            else onDequeue();
+          });
           if (encoderFailure) throw encoderFailure;
         },
         flush: async () => {
@@ -335,6 +428,60 @@ function defaultRecordingDependencies(): PreviewRecordingDependencies {
       };
     },
   };
+}
+
+function waitForCurrentOperation<T>(
+  operation: (waitSignal: AbortSignal) => Promise<T>,
+  signal?: AbortSignal,
+  isOperationCurrent?: () => boolean,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    let ownershipTimer: number | null = null;
+    const waitController = new AbortController();
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (ownershipTimer !== null) globalThis.clearInterval(ownershipTimer);
+      signal?.removeEventListener('abort', onAbort);
+      waitController.abort();
+      callback();
+    };
+    const onAbort = () => finish(() => reject(abortError()));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted || isOperationCurrent?.() === false) {
+      onAbort();
+      return;
+    }
+    if (isOperationCurrent) {
+      ownershipTimer = globalThis.setInterval(() => {
+        if (isOperationCurrent() === false) onAbort();
+      }, OPERATION_OWNERSHIP_POLL_MS);
+    }
+    void Promise.resolve()
+      .then(() => operation(waitController.signal))
+      .then(
+        (value) => finish(() => resolve(value)),
+        (error: unknown) => finish(() => reject(error)),
+      );
+  });
+}
+
+function waitForMacrotask(waitSignal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      globalThis.clearTimeout(timer);
+      waitSignal.removeEventListener('abort', onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(abortError()));
+    const timer = globalThis.setTimeout(() => finish(resolve), 0);
+    waitSignal.addEventListener('abort', onAbort, { once: true });
+    if (waitSignal.aborted) onAbort();
+  });
 }
 
 export async function recordPreviewWebm(
@@ -367,9 +514,24 @@ export async function recordPreviewWebm(
 
   try {
     const frameTimestamp = (index: number) => Math.round(index * 1_000_000 / plan.fps);
+    const waitForEncoderCapacity = async () => {
+      if (encoder.encodeQueueSize < MAX_ENCODER_QUEUE_SIZE) return;
+      await waitForCurrentOperation(
+        (waitSignal) => encoder.waitForQueueSize(MAX_ENCODER_QUEUE_SIZE - 1, waitSignal),
+        signal,
+        options.isOperationCurrent,
+      );
+      ensureOperationCurrent();
+    };
+    const yieldToMacrotask = async () => {
+      await waitForCurrentOperation(waitForMacrotask, signal, options.isOperationCurrent);
+      ensureOperationCurrent();
+    };
     let completedFrames = 0;
     for (const shot of plan.shots) {
       for (let shotFrame = 0; shotFrame < shot.frameCount; shotFrame += 1) {
+        ensureOperationCurrent();
+        await waitForEncoderCapacity();
         ensureOperationCurrent();
         const sourceTime = shot.startTime + shotFrame / plan.fps;
         const rendered = await renderFrame({
@@ -401,10 +563,16 @@ export async function recordPreviewWebm(
           shotName: shot.name,
         });
         ensureOperationCurrent();
+        if (completedFrames % ENCODER_MACROTASK_YIELD_INTERVAL === 0) {
+          await yieldToMacrotask();
+          ensureOperationCurrent();
+        }
       }
     }
     // The muxer derives duration from the last encoded PTS, so encode the
     // unchanged canvas once at N/fps and wait for WebCodecs flush completion.
+    await waitForEncoderCapacity();
+    ensureOperationCurrent();
     const terminalTimestamp = frameTimestamp(plan.totalFrames);
     encoder.encodeFrame(canvas, {
       timestamp: terminalTimestamp,
@@ -452,7 +620,7 @@ export async function recordPreviewWebm(
     if (error instanceof PreviewExportError) throw error;
     throw new PreviewExportError(
       'encoder-failed',
-      error instanceof Error ? error.message : 'WebM 导出失败',
+      readableError(error, 'WebM 导出失败'),
     );
   } finally {
     encoder.close();

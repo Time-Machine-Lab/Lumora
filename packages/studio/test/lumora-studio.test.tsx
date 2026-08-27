@@ -167,7 +167,7 @@ describe('LumoraStudio', () => {
 
   it('keeps the editor selection when Escape is pressed while export is running', async () => {
     let finishRecording: ((blob: Blob) => void) | undefined;
-    const supportSpy = vi.spyOn(previewExport, 'detectWebmSupport').mockReturnValue({
+    const supportSpy = vi.spyOn(previewExport, 'detectWebmSupport').mockResolvedValue({
       supported: true,
       mimeType: 'video/webm;codecs=vp9',
     });

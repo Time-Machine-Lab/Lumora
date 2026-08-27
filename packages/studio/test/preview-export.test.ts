@@ -13,7 +13,19 @@ import type {
   PreviewEncoderSession,
   PreviewExportPlan,
   PreviewRecordingDependencies,
+  WebmSupport,
 } from '../src/export/preview-export';
+
+interface ConfigSupportProbe {
+  hasVideoEncoder: boolean;
+  hasVideoFrame: boolean;
+  isConfigSupported(config: VideoEncoderConfig): Promise<{ supported: boolean }>;
+}
+
+const detectConfiguredWebmSupport = detectWebmSupport as unknown as (
+  selection: { resolution: '720p' | '480p'; fps: 24 | 30 },
+  probe: ConfigSupportProbe,
+) => Promise<WebmSupport>;
 
 function sampleProject(): Project {
   return createSampleProject('lumora://export-test', '导出测试');
@@ -138,20 +150,53 @@ describe('preview export contract', () => {
     });
   });
 
-  it('detects WebCodecs support without constructing an encoder', () => {
-    expect(
-      detectWebmSupport({
+  it('checks the exact selected VP8 configuration before reporting support', async () => {
+    const isConfigSupported = vi.fn(async () => ({ supported: true }));
+
+    await expect(detectConfiguredWebmSupport(
+      { resolution: '480p', fps: 30 },
+      { hasVideoEncoder: true, hasVideoFrame: true, isConfigSupported },
+    )).resolves.toEqual({ supported: true, mimeType: 'video/webm;codecs=vp8' });
+
+    expect(isConfigSupported).toHaveBeenCalledWith({
+      codec: 'vp8',
+      width: 854,
+      height: 480,
+      bitrate: 3_000_000,
+      framerate: 30,
+      latencyMode: 'quality',
+    });
+  });
+
+  it('rejects unsupported and failed VP8 configuration checks without constructing an encoder', async () => {
+    await expect(detectConfiguredWebmSupport(
+      { resolution: '720p', fps: 24 },
+      {
         hasVideoEncoder: true,
         hasVideoFrame: true,
-      }),
-    ).toEqual({ supported: true, mimeType: 'video/webm;codecs=vp8' });
+        isConfigSupported: vi.fn(async () => ({ supported: false })),
+      },
+    )).resolves.toEqual({ supported: false, reason: expect.stringContaining('VP8') });
 
-    expect(
-      detectWebmSupport({
+    await expect(detectConfiguredWebmSupport(
+      { resolution: '720p', fps: 24 },
+      {
+        hasVideoEncoder: true,
+        hasVideoFrame: true,
+        isConfigSupported: vi.fn(async () => {
+          throw new Error('capability unavailable');
+        }),
+      },
+    )).resolves.toEqual({ supported: false, reason: expect.stringContaining('capability unavailable') });
+
+    await expect(detectConfiguredWebmSupport(
+      { resolution: '720p', fps: 24 },
+      {
         hasVideoEncoder: false,
         hasVideoFrame: true,
-      }),
-    ).toEqual({ supported: false, reason: expect.stringContaining('VideoEncoder') });
+        isConfigSupported: vi.fn(),
+      },
+    )).resolves.toEqual({ supported: false, reason: expect.stringContaining('VideoEncoder') });
   });
 
   it('builds a structured storyboard manifest without assets or plugin settings', () => {
@@ -222,8 +267,9 @@ describe('preview export contract', () => {
 });
 
 interface EncoderHarness {
-  encoder: PreviewEncoderSession & {
+  encoder: Omit<PreviewEncoderSession, 'encodeFrame' | 'waitForQueueSize' | 'flush' | 'close'> & {
     encodeFrame: ReturnType<typeof vi.fn>;
+    waitForQueueSize: ReturnType<typeof vi.fn>;
     flush: ReturnType<typeof vi.fn>;
     close: ReturnType<typeof vi.fn>;
   };
@@ -249,10 +295,13 @@ function encoderHarness(blob = new Blob(['webm-bytes'], { type: 'video/webm;code
     height: 0,
   } as unknown as HTMLCanvasElement;
   const encoder = {
+    encodeQueueSize: 0,
     encodeFrame: vi.fn((_canvas, frame) => encodedFrames.push({ ...frame })),
+    waitForQueueSize: vi.fn(async () => undefined),
     flush: vi.fn(async () => blob),
     close: vi.fn(),
-  } as PreviewEncoderSession & {
+  } as Omit<PreviewEncoderSession, 'encodeFrame' | 'waitForQueueSize' | 'flush' | 'close'> & {
+    waitForQueueSize: ReturnType<typeof vi.fn>;
     encodeFrame: ReturnType<typeof vi.fn>;
     flush: ReturnType<typeof vi.fn>;
     close: ReturnType<typeof vi.fn>;
@@ -290,7 +339,154 @@ function shortPlan(): PreviewExportPlan {
   };
 }
 
+function longPlan(frameCount = 24): PreviewExportPlan {
+  const plan = shortPlan();
+  return {
+    ...plan,
+    shots: [{
+      ...plan.shots[0]!,
+      startTime: 0,
+      endTime: frameCount / plan.fps,
+      frameCount,
+    }],
+    duration: frameCount / plan.fps,
+    totalFrames: frameCount,
+  };
+}
+
 describe('recordPreviewWebm', () => {
+  it('waits for encoder dequeue capacity and never exceeds four queued frames', async () => {
+    const harness = encoderHarness();
+    let queueSize = 0;
+    let maxQueueSize = 0;
+    Object.defineProperty(harness.encoder, 'encodeQueueSize', {
+      configurable: true,
+      get: () => queueSize,
+    });
+    harness.encoder.encodeFrame.mockImplementation((_canvas, frame) => {
+      harness.encodedFrames.push({ ...frame });
+      queueSize += 1;
+      maxQueueSize = Math.max(maxQueueSize, queueSize);
+    });
+    harness.encoder.waitForQueueSize.mockImplementation(async (target: number) => {
+      expect(target).toBe(3);
+      queueSize = target;
+    });
+
+    await recordPreviewWebm(shortPlan(), () => true, { dependencies: harness.deps });
+
+    expect(harness.encoder.waitForQueueSize).toHaveBeenCalled();
+    expect(maxQueueSize).toBeLessThanOrEqual(4);
+  });
+
+  it('yields to a browser timer task so cancellation interrupts a long low-queue export', async () => {
+    const harness = encoderHarness();
+    const controller = new AbortController();
+    let renderedFrames = 0;
+    let cancelTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const recording = recordPreviewWebm(longPlan(), () => {
+      renderedFrames += 1;
+      if (renderedFrames === 1) cancelTimer = setTimeout(() => controller.abort(), 0);
+      return true;
+    }, { dependencies: harness.deps, signal: controller.signal });
+
+    try {
+      await expect(recording).rejects.toMatchObject(
+        { code: 'cancelled' } satisfies Partial<PreviewExportError>,
+      );
+    } finally {
+      if (cancelTimer) clearTimeout(cancelTimer);
+    }
+    expect(renderedFrames).toBeLessThan(24);
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops without further side effects when ownership becomes stale during a timer yield', async () => {
+    vi.useFakeTimers();
+    const harness = encoderHarness();
+    const renderFrame = vi.fn(() => true);
+    const onProgress = vi.fn();
+    let operationCurrent = true;
+
+    try {
+      const recording = recordPreviewWebm(longPlan(), renderFrame, {
+        dependencies: harness.deps,
+        isOperationCurrent: () => operationCurrent,
+        onProgress,
+      });
+      const rejected = expect(recording).rejects.toMatchObject(
+        { code: 'cancelled' } satisfies Partial<PreviewExportError>,
+      );
+      for (let index = 0; index < 20 && renderFrame.mock.calls.length < 4; index += 1) {
+        await Promise.resolve();
+      }
+      for (let index = 0; index < 10 && harness.encoder.encodeFrame.mock.calls.length < 4; index += 1) {
+        await Promise.resolve();
+      }
+      expect(renderFrame).toHaveBeenCalledTimes(4);
+      expect(harness.encoder.encodeFrame).toHaveBeenCalledTimes(4);
+      expect(onProgress).toHaveBeenCalledTimes(4);
+      expect(harness.encoder.flush).not.toHaveBeenCalled();
+
+      operationCurrent = false;
+      await vi.advanceTimersByTimeAsync(0);
+
+      await rejected;
+      expect(renderFrame).toHaveBeenCalledTimes(4);
+      expect(harness.encoder.encodeFrame).toHaveBeenCalledTimes(4);
+      expect(onProgress).toHaveBeenCalledTimes(4);
+      expect(harness.encoder.flush).not.toHaveBeenCalled();
+      expect(harness.encoder.close).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels while an encoder dequeue wait is pending', async () => {
+    const harness = encoderHarness();
+    const controller = new AbortController();
+    Object.defineProperty(harness.encoder, 'encodeQueueSize', { get: () => 4 });
+    harness.encoder.waitForQueueSize.mockImplementation(() => new Promise<void>(() => undefined));
+    const renderFrame = vi.fn(() => true);
+
+    const recording = recordPreviewWebm(shortPlan(), renderFrame, {
+      dependencies: harness.deps,
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(harness.encoder.waitForQueueSize).toHaveBeenCalledTimes(1));
+    controller.abort();
+
+    await expect(recording).rejects.toMatchObject(
+      { code: 'cancelled' } satisfies Partial<PreviewExportError>,
+    );
+    expect(renderFrame).not.toHaveBeenCalled();
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('rechecks operation ownership after an encoder dequeue wait resumes', async () => {
+    const harness = encoderHarness();
+    const dequeued = deferred<void>();
+    let operationCurrent = true;
+    Object.defineProperty(harness.encoder, 'encodeQueueSize', { get: () => 4 });
+    harness.encoder.waitForQueueSize.mockImplementation(() => dequeued.promise);
+    const renderFrame = vi.fn(() => true);
+
+    const recording = recordPreviewWebm(shortPlan(), renderFrame, {
+      dependencies: harness.deps,
+      isOperationCurrent: () => operationCurrent,
+    });
+    await vi.waitFor(() => expect(harness.encoder.waitForQueueSize).toHaveBeenCalledTimes(1));
+    operationCurrent = false;
+    dequeued.resolve();
+
+    await expect(recording).rejects.toMatchObject(
+      { code: 'cancelled' } satisfies Partial<PreviewExportError>,
+    );
+    expect(renderFrame).not.toHaveBeenCalled();
+    expect(harness.encoder.close).toHaveBeenCalledTimes(1);
+  });
+
   it('renders frames in shot order, reports monotonic progress, and closes the encoder', async () => {
     const harness = encoderHarness();
     const rendered: Array<{ shot: string; sourceTime: number }> = [];
@@ -503,6 +699,78 @@ describe('recordPreviewWebm', () => {
 
     expect(harness.canvas.width).toBe(1);
     expect(harness.canvas.height).toBe(1);
+  });
+
+  it('closes a constructed encoder when configure throws synchronously', async () => {
+    let constructions = 0;
+    let closes = 0;
+    const renderFrame = vi.fn(() => true);
+    class ConfigureFailingVideoEncoder {
+      readonly encodeQueueSize = 0;
+      constructor() {
+        constructions += 1;
+      }
+      configure(): void {
+        throw new Error('configure failed');
+      }
+      close(): void {
+        closes += 1;
+      }
+    }
+    vi.stubGlobal('VideoEncoder', ConfigureFailingVideoEncoder);
+
+    try {
+      await expect(recordPreviewWebm(shortPlan(), renderFrame)).rejects.toMatchObject(
+        { code: 'encoder-failed', message: 'configure failed' } satisfies Partial<PreviewExportError>,
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(constructions).toBe(1);
+    expect(closes).toBe(1);
+    expect(renderFrame).not.toHaveBeenCalled();
+
+    const retryHarness = encoderHarness();
+    await expect(recordPreviewWebm(shortPlan(), renderFrame, {
+      dependencies: retryHarness.deps,
+    })).resolves.toMatchObject({ type: 'video/webm;codecs=vp8' });
+    expect(renderFrame).toHaveBeenCalled();
+    expect(retryHarness.encoder.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects and closes when an async encoder error arrives during a dequeue wait', async () => {
+    let closes = 0;
+    class QueueErrorVideoEncoder {
+      readonly encodeQueueSize = 4;
+      constructor(init: VideoEncoderInit) {
+        setTimeout(() => init.error(new DOMException('async encoder failure', 'EncodingError')), 0);
+      }
+      configure(): void {}
+      addEventListener(): void {}
+      removeEventListener(): void {}
+      close(): void {
+        closes += 1;
+      }
+    }
+    vi.stubGlobal('VideoEncoder', QueueErrorVideoEncoder);
+    const controller = new AbortController();
+    const recording = recordPreviewWebm(shortPlan(), () => true, { signal: controller.signal });
+
+    try {
+      await expect(Promise.race([
+        recording,
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(() => reject(new Error('encoder error wait timed out')), 50);
+        }),
+      ])).rejects.toThrow('async encoder failure');
+    } finally {
+      controller.abort();
+      await recording.catch(() => undefined);
+      vi.unstubAllGlobals();
+    }
+
+    expect(closes).toBe(1);
   });
 
   it('rejects an empty muxer result and closes the encoder', async () => {

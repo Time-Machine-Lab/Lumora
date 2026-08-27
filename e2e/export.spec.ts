@@ -19,8 +19,13 @@ interface VideoMetadata {
 
 interface ExportInstrumentation {
   encoderConstructions: number;
+  encoderConfigures: number;
+  encoderEncodes: number;
   encoderFlushes: number;
   encoderCloses: number;
+  maxEncodeQueueSize: number;
+  supportChecks: number;
+  supportConfigs: VideoEncoderConfig[];
   captureStreams: number;
 }
 
@@ -34,15 +39,23 @@ const execFileAsync = promisify(execFile);
 async function instrumentWebCodecs(
   page: Page,
   flushMode: 'native' | 'pending' | 'fail-once' = 'native',
+  supportMode: 'native' | 'pending' | 'unsupported' | 'reject' | 'deferred' = 'native',
+  configureMode: 'native' | 'fail-once' = 'native',
 ): Promise<void> {
-  await page.addInitScript(({ mode }) => {
+  await page.addInitScript(({ flush, support, configure }) => {
     const scope = globalThis as typeof globalThis & {
       __lumoraExportInstrumentation?: ExportInstrumentation;
+      __lumoraResolveSupportCheck?: (index: number, supported: boolean) => void;
     };
     const instrumentation: ExportInstrumentation = {
       encoderConstructions: 0,
+      encoderConfigures: 0,
+      encoderEncodes: 0,
       encoderFlushes: 0,
       encoderCloses: 0,
+      maxEncodeQueueSize: 0,
+      supportChecks: 0,
+      supportConfigs: [],
       captureStreams: 0,
     };
     scope.__lumoraExportInstrumentation = instrumentation;
@@ -60,19 +73,45 @@ async function instrumentWebCodecs(
 
     const NativeVideoEncoder = globalThis.VideoEncoder;
     if (typeof NativeVideoEncoder !== 'function') return;
+    const nativeIsConfigSupported = NativeVideoEncoder.isConfigSupported.bind(NativeVideoEncoder);
+    const supportResolvers: Array<(supported: boolean) => void> = [];
+    scope.__lumoraResolveSupportCheck = (index, supported) => supportResolvers[index]?.(supported);
     const InstrumentedVideoEncoder = new Proxy(NativeVideoEncoder, {
       construct(target, args) {
         const encoder = Reflect.construct(target, args) as VideoEncoder;
         instrumentation.encoderConstructions += 1;
+        const nativeConfigure = encoder.configure.bind(encoder);
+        const nativeEncode = encoder.encode.bind(encoder);
         const nativeFlush = encoder.flush.bind(encoder);
         const nativeClose = encoder.close.bind(encoder);
         let closed = false;
+        Object.defineProperty(encoder, 'configure', {
+          configurable: true,
+          value: (config: VideoEncoderConfig) => {
+            instrumentation.encoderConfigures += 1;
+            if (configure === 'fail-once' && instrumentation.encoderConfigures === 1) {
+              throw new DOMException('Injected WebCodecs configure failure', 'NotSupportedError');
+            }
+            return nativeConfigure(config);
+          },
+        });
+        Object.defineProperty(encoder, 'encode', {
+          configurable: true,
+          value: (frame: VideoFrame, options?: VideoEncoderEncodeOptions) => {
+            nativeEncode(frame, options);
+            instrumentation.encoderEncodes += 1;
+            instrumentation.maxEncodeQueueSize = Math.max(
+              instrumentation.maxEncodeQueueSize,
+              encoder.encodeQueueSize,
+            );
+          },
+        });
         Object.defineProperty(encoder, 'flush', {
           configurable: true,
           value: () => {
             instrumentation.encoderFlushes += 1;
-            if (mode === 'pending') return new Promise<void>(() => undefined);
-            if (mode === 'fail-once' && instrumentation.encoderFlushes === 1) {
+            if (flush === 'pending') return new Promise<void>(() => undefined);
+            if (flush === 'fail-once' && instrumentation.encoderFlushes === 1) {
               return Promise.reject(new DOMException('Injected WebCodecs flush failure', 'EncodingError'));
             }
             return nativeFlush();
@@ -90,12 +129,31 @@ async function instrumentWebCodecs(
         });
         return encoder;
       },
+      get(target, property, receiver) {
+        if (property !== 'isConfigSupported') return Reflect.get(target, property, receiver);
+        return (config: VideoEncoderConfig) => {
+          const checkIndex = instrumentation.supportChecks;
+          instrumentation.supportChecks += 1;
+          instrumentation.supportConfigs.push({ ...config });
+          if (support === 'pending') return new Promise<VideoEncoderSupport>(() => undefined);
+          if (support === 'unsupported') return Promise.resolve({ supported: false, config });
+          if (support === 'reject') {
+            return Promise.reject(new DOMException('Injected VP8 capability failure', 'NotSupportedError'));
+          }
+          if (support === 'deferred') {
+            return new Promise<VideoEncoderSupport>((resolve) => {
+              supportResolvers[checkIndex] = (supported) => resolve({ supported, config });
+            });
+          }
+          return nativeIsConfigSupported(config);
+        };
+      },
     });
     Object.defineProperty(globalThis, 'VideoEncoder', {
       configurable: true,
       value: InstrumentedVideoEncoder,
     });
-  }, { mode: flushMode });
+  }, { flush: flushMode, support: supportMode, configure: configureMode });
 }
 
 async function readDownload(download: Download): Promise<Buffer> {
@@ -574,8 +632,13 @@ test('reports missing WebCodecs before encoding or downloading a file', async ({
     };
     scope.__lumoraExportInstrumentation = {
       encoderConstructions: 0,
+      encoderConfigures: 0,
+      encoderEncodes: 0,
       encoderFlushes: 0,
       encoderCloses: 0,
+      maxEncodeQueueSize: 0,
+      supportChecks: 0,
+      supportConfigs: [],
       captureStreams: 0,
     };
     const originalCaptureStream = HTMLCanvasElement.prototype.captureStream;
@@ -638,6 +701,191 @@ test('cancels encoding, closes WebCodecs, and returns to an editable project', a
   await page.getByTestId('add-object').click();
   await page.getByTestId('add-立方体').click();
   await expect(rows).toHaveCount(before + 1);
+});
+
+test('cancels a long native WebCodecs export before all frames with a bounded queue', async ({ page }, testInfo) => {
+  await instrumentWebCodecs(page);
+  let downloads = 0;
+  page.on('download', () => downloads += 1);
+  await page.goto('/');
+  await persistTimingProbe(page, 8);
+  await page.getByTestId('reopen-last-export').click();
+  await expect(page.getByTestId('tree-row-probe-cube')).toBeVisible();
+  await page.getByTestId('open-export-workspace').click();
+  await expect(page.getByTestId('export-workspace')).toBeVisible();
+  await page.getByRole('button', { name: '导出 WebM' }).click();
+  await expect(page.getByRole('button', { name: '取消导出' })).toBeVisible();
+
+  const encodedAtCancellation = await page.evaluate(() => new Promise<number>((resolve, reject) => {
+    const startedAt = performance.now();
+    const poll = () => {
+      const scope = globalThis as typeof globalThis & {
+        __lumoraExportInstrumentation: ExportInstrumentation;
+      };
+      if (scope.__lumoraExportInstrumentation.encoderEncodes > 0) {
+        setTimeout(() => {
+          const cancel = [...document.querySelectorAll<HTMLButtonElement>('button')]
+            .find((button) => button.textContent?.trim() === '取消导出');
+          if (!cancel) {
+            reject(new Error('Cancel control disappeared before the timer task ran'));
+            return;
+          }
+          const encoded = scope.__lumoraExportInstrumentation.encoderEncodes;
+          cancel.click();
+          resolve(encoded);
+        }, 0);
+        return;
+      }
+      if (performance.now() - startedAt > 5_000) {
+        reject(new Error('Encoding did not begin before the cancellation deadline'));
+        return;
+      }
+      setTimeout(poll, 0);
+    };
+    poll();
+  }));
+
+  await expect(page.getByRole('status')).toContainText('导出已取消');
+  await expect(page.getByRole('button', { name: '导出 WebM' })).toBeEnabled();
+  const instrumentation = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation);
+  expect(encodedAtCancellation).toBeGreaterThan(0);
+  expect(instrumentation.encoderEncodes).toBeLessThan(8 * 24);
+  expect(instrumentation.maxEncodeQueueSize).toBeLessThanOrEqual(4);
+  expect(instrumentation.encoderConstructions).toBe(1);
+  expect(instrumentation.encoderCloses).toBe(1);
+  expect(downloads).toBe(0);
+  await testInfo.attach('long-export-backpressure-evidence', {
+    body: Buffer.from(JSON.stringify({
+      sourceFrames: 8 * 24,
+      encodedAtCancellation,
+      encodedFramesWhenSettled: instrumentation.encoderEncodes,
+      maxEncodeQueueSize: instrumentation.maxEncodeQueueSize,
+      encoderConstructions: instrumentation.encoderConstructions,
+      encoderCloses: instrumentation.encoderCloses,
+      downloads,
+    }, null, 2)),
+    contentType: 'application/json',
+  });
+});
+
+test('keeps WebM disabled while the native VP8 configuration check is pending', async ({ page }) => {
+  await instrumentWebCodecs(page, 'native', 'pending');
+  await openSampleExport(page);
+
+  await expect(page.getByRole('status')).toContainText('正在检查 VP8');
+  await expect(page.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
+  const instrumentation = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation);
+  expect(instrumentation.supportChecks).toBeGreaterThanOrEqual(1);
+  expect(instrumentation.supportConfigs[0]).toMatchObject({
+    codec: 'vp8',
+    width: 1280,
+    height: 720,
+    bitrate: 6_000_000,
+    framerate: 24,
+  });
+  expect(instrumentation.encoderConstructions).toBe(0);
+});
+
+test('reports an unsupported native VP8 configuration without constructing an encoder', async ({ page }) => {
+  await instrumentWebCodecs(page, 'native', 'unsupported');
+  await openSampleExport(page);
+
+  await expect(page.getByRole('alert')).toContainText('不支持当前分辨率');
+  await expect(page.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
+  const instrumentation = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation);
+  expect(instrumentation.supportChecks).toBeGreaterThanOrEqual(1);
+  expect(instrumentation.encoderConstructions).toBe(0);
+});
+
+test('reports a failed native VP8 configuration check without constructing an encoder', async ({ page }) => {
+  await instrumentWebCodecs(page, 'native', 'reject');
+  await openSampleExport(page);
+
+  await expect(page.getByRole('alert')).toContainText('Injected VP8 capability failure');
+  await expect(page.getByRole('button', { name: '导出 WebM' })).toBeDisabled();
+  const instrumentation = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation);
+  expect(instrumentation.supportChecks).toBeGreaterThanOrEqual(1);
+  expect(instrumentation.encoderConstructions).toBe(0);
+});
+
+test('ignores a stale VP8 preflight result after the selected resolution changes', async ({ page }) => {
+  await instrumentWebCodecs(page, 'native', 'deferred');
+  await openSampleExport(page);
+  await expect(page.getByRole('status')).toContainText('正在检查 VP8');
+  await expect.poll(async () => page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation.supportChecks)).toBeGreaterThan(0);
+  const initialChecks = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation.supportChecks);
+
+  await page.getByLabel('分辨率').selectOption('480p');
+  await expect.poll(async () => page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation.supportChecks)).toBe(initialChecks + 1);
+  await page.evaluate((index) => (
+    globalThis as typeof globalThis & {
+      __lumoraResolveSupportCheck(index: number, supported: boolean): void;
+    }
+  ).__lumoraResolveSupportCheck(index, true), initialChecks);
+  await expect(page.getByRole('button', { name: '导出 WebM' })).toBeEnabled();
+
+  await page.evaluate((count) => {
+    const scope = globalThis as typeof globalThis & {
+      __lumoraResolveSupportCheck(index: number, supported: boolean): void;
+    };
+    for (let index = 0; index < count; index += 1) {
+      scope.__lumoraResolveSupportCheck(index, false);
+    }
+  }, initialChecks);
+  await page.waitForTimeout(50);
+  await expect(page.getByRole('button', { name: '导出 WebM' })).toBeEnabled();
+  await expect(page.getByText('WebM · VP8')).toBeVisible();
+  const instrumentation = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation);
+  expect(instrumentation.supportConfigs.slice(0, initialChecks).every((config) => config.width === 1280)).toBe(true);
+  expect(instrumentation.supportConfigs.at(-1)?.width).toBe(854);
+  expect(instrumentation.encoderConstructions).toBe(0);
+});
+
+test('closes a configure-failed encoder and remains retryable', async ({ page }) => {
+  await instrumentWebCodecs(page, 'native', 'native', 'fail-once');
+  let downloads = 0;
+  page.on('download', () => downloads += 1);
+  await openSampleExport(page);
+
+  await page.getByRole('button', { name: '导出 WebM' }).click();
+  await expect(page.getByRole('alert')).toContainText('Injected WebCodecs configure failure');
+  await expect(page.getByRole('button', { name: '导出 WebM' })).toBeEnabled();
+  let instrumentation = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation);
+  expect(instrumentation.encoderConstructions).toBe(1);
+  expect(instrumentation.encoderConfigures).toBe(1);
+  expect(instrumentation.encoderEncodes).toBe(0);
+  expect(instrumentation.encoderCloses).toBe(1);
+  expect(downloads).toBe(0);
+
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: '导出 WebM' }).click();
+  await downloadPromise;
+  await expect(page.getByRole('status')).toContainText('导出完成');
+  instrumentation = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+  ).__lumoraExportInstrumentation);
+  expect(instrumentation.encoderConstructions).toBe(2);
+  expect(instrumentation.encoderConfigures).toBe(2);
+  expect(instrumentation.encoderCloses).toBe(2);
+  expect(downloads).toBe(1);
 });
 
 test('isolates editor shortcuts while export is idle and while encoding', async ({ page }) => {
