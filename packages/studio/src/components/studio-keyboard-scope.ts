@@ -3,6 +3,10 @@
  * inside the owning root. */
 const mountedStudioRoots = new Set<HTMLElement>();
 
+export function stopActivationKeyPropagation(event: { key: string; stopPropagation(): void }): void {
+  if (event.key === ' ' || event.key === 'Enter') event.stopPropagation();
+}
+
 export function registerStudioKeyboardRoot(root: HTMLElement): () => void {
   mountedStudioRoots.add(root);
   return () => mountedStudioRoots.delete(root);

@@ -4,12 +4,13 @@
 
 This inventory identifies the third-party npm packages present in the locked Lumora dependency graph. It is not a replacement for the license text shipped by each package. Release artifacts must retain any license or notice files required by those packages.
 
-Locked package identities: **417**
+Locked package identities: **419**
 
 | Package | Version | License | Scope |
 | --- | --- | --- | --- |
 | @adobe/css-tools | 4.5.0 | MIT | development |
 | @asamuzakjp/css-color | 3.2.0 | MIT | development |
+| @axe-core/playwright | 4.13.0 | MPL-2.0 | development |
 | @babel/code-frame | 7.29.7 | MIT | development |
 | @babel/compat-data | 7.29.7 | MIT | development |
 | @babel/core | 7.29.7 | MIT | development |
@@ -189,6 +190,7 @@ Locked package identities: **417**
 | aria-query | 5.3.0 | Apache-2.0 | development |
 | assertion-error | 2.0.1 | MIT | development |
 | asynckit | 0.4.0 | MIT | development |
+| axe-core | 4.13.0 | MPL-2.0 | development |
 | balanced-match | 1.0.2 | MIT | development |
 | balanced-match | 4.0.4 | MIT | development |
 | base64-js | 1.5.1 | MIT | runtime |

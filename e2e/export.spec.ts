@@ -485,7 +485,7 @@ async function observeExportShotOrder(page: Page): Promise<void> {
     const workspace = document.querySelector('[data-testid="export-workspace"]');
     if (!workspace) throw new Error('Export workspace is not mounted');
     new MutationObserver(() => {
-      const status = workspace.querySelector('[role="status"]')?.textContent ?? '';
+      const status = workspace.querySelector('[data-testid="export-visual-status"]')?.textContent ?? '';
       const shot = /\u00b7\s*(.+)$/.exec(status)?.[1]?.trim();
       const shots = scope.__lumoraExportShotOrder!;
       if (shot && shots.at(-1) !== shot) shots.push(shot);
@@ -512,17 +512,34 @@ async function exportShotPng(page: Page, accessibleName: RegExp): Promise<Buffer
   return readDownload(await downloadPromise);
 }
 
-async function cameraPose(
-  page: Page,
-  cameraId: string,
-): Promise<{ position: [number, number, number]; rotation: [number, number, number] }> {
-  const readout = page.getByTestId('camera-pose-readout');
-  await expect.poll(() => readout.textContent()).not.toBe('');
-  const text = await readout.textContent();
-  if (!text) throw new Error('Camera pose readout is unavailable');
-  const pose = JSON.parse(text)[cameraId];
-  if (!pose) throw new Error(`Camera ${cameraId} is missing from the pose readout`);
-  return pose;
+async function inspectorPosition(page: Page): Promise<[string, string, string]> {
+  return Promise.all([
+    page.getByTestId('inspector-axis-0').inputValue(),
+    page.getByTestId('inspector-axis-1').inputValue(),
+    page.getByTestId('inspector-axis-2').inputValue(),
+  ]);
+}
+
+async function observeExportLiveAnnouncements(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const scope = globalThis as typeof globalThis & { __lumoraLiveAnnouncements?: string[] };
+    scope.__lumoraLiveAnnouncements = [];
+    const workspace = document.querySelector('[data-testid="export-workspace"]');
+    if (!workspace) throw new Error('Export workspace is not mounted');
+    new MutationObserver(() => {
+      const polite = workspace.querySelector('[data-testid="export-live-status"]')?.textContent?.trim() ?? '';
+      const assertive = workspace.querySelector('[data-testid="export-live-alert"]')?.textContent?.trim() ?? '';
+      const message = assertive || polite;
+      const announcements = scope.__lumoraLiveAnnouncements!;
+      if (message && announcements.at(-1) !== message) announcements.push(message);
+    }).observe(workspace, { childList: true, characterData: true, subtree: true });
+  });
+}
+
+async function exportLiveAnnouncements(page: Page): Promise<string[]> {
+  return page.evaluate(() => (
+    globalThis as typeof globalThis & { __lumoraLiveAnnouncements?: string[] }
+  ).__lumoraLiveAnnouncements ?? []);
 }
 
 function blueSphereSilhouetteAspect(png: ReturnType<typeof decodePng>): number {
@@ -570,6 +587,114 @@ test('opens export with the native Space button action without toggling playback
   expect(await page.evaluate(() => (
     globalThis as typeof globalThis & { __lumoraHostShortcutCount?: number }
   ).__lumoraHostShortcutCount)).toBe(0);
+});
+
+test('keeps Enter and Space export activations from a later host window listener', async ({ page }) => {
+  await instrumentWebCodecs(page, 'pending');
+
+  for (const key of ['Enter', 'Space']) {
+    await openSampleExport(page);
+    await page.getByLabel('导出范围').selectOption('sample-shot-1');
+    await page.evaluate(() => {
+      const scope = globalThis as typeof globalThis & { __lumoraHostExportKeys?: string[] };
+      scope.__lumoraHostExportKeys = [];
+      window.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        const target = event.target;
+        if (!(target instanceof HTMLElement) || !target.closest('[data-testid="export-workspace"]')) return;
+        scope.__lumoraHostExportKeys!.push(`${event.key}:${target.getAttribute('aria-label') ?? target.textContent?.trim()}`);
+      });
+    });
+
+    const manifestDownload = page.waitForEvent('download');
+    await page.getByRole('button', { name: '导出清单' }).press(key);
+    await manifestDownload;
+
+    const pngDownload = page.waitForEvent('download');
+    await page.getByRole('button', { name: /导出 分镜 1.*PNG/ }).press(key);
+    await pngDownload;
+
+    const primary = page.getByRole('button', { name: '导出 WebM' });
+    await expect(primary).toBeEnabled();
+    await primary.press(key);
+    const cancel = page.getByRole('button', { name: '取消导出' });
+    await expect(cancel).toBeVisible();
+    await cancel.press(key);
+    await expect(page.getByRole('status')).toContainText('导出已取消');
+
+    await expect(primary).toBeEnabled();
+    await primary.press(key);
+    await expect(cancel).toBeVisible();
+    await cancel.press(key);
+    await expect(page.getByRole('status')).toContainText('导出已取消');
+
+    expect(await page.evaluate(() => (
+      globalThis as typeof globalThis & { __lumoraHostExportKeys?: string[] }
+    ).__lumoraHostExportKeys)).toEqual([]);
+  }
+});
+
+test('keeps per-frame visual progress while live status uses bounded milestones', async ({ page }) => {
+  await instrumentWebCodecs(page);
+  await openSampleExport(page);
+  await page.getByLabel('导出范围').selectOption('sample-shot-1');
+  await page.getByLabel('分辨率').selectOption('480p');
+  await observeExportLiveAnnouncements(page);
+
+  const download = page.waitForEvent('download');
+  await page.getByRole('button', { name: '导出 WebM' }).click();
+  await download;
+  await expect(page.getByTestId('export-live-status')).toContainText('导出完成');
+
+  const evidence = await page.evaluate(() => ({
+    announcements: (
+      globalThis as typeof globalThis & { __lumoraLiveAnnouncements?: string[] }
+    ).__lumoraLiveAnnouncements ?? [],
+    progressValues: (
+      globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
+    ).__lumoraExportInstrumentation.progressValues,
+  }));
+  const running = evidence.announcements.filter((message) => message.startsWith('正在导出'));
+  expect(evidence.progressValues.length).toBeGreaterThan(10);
+  expect(running).toEqual([
+    '正在导出 0%',
+    '正在导出 25%',
+    '正在导出 50%',
+    '正在导出 75%',
+  ]);
+  expect(running.length).toBeLessThan(evidence.progressValues.length);
+  expect(evidence.announcements.filter((message) => message === '导出完成')).toHaveLength(1);
+});
+
+test('announces WebM cancellation exactly once', async ({ page }) => {
+  await instrumentWebCodecs(page, 'pending');
+  await openSampleExport(page);
+  await page.getByLabel('导出范围').selectOption('sample-shot-1');
+  await observeExportLiveAnnouncements(page);
+
+  await page.getByRole('button', { name: '导出 WebM' }).click();
+  const cancel = page.getByRole('button', { name: '取消导出' });
+  await expect(cancel).toBeVisible();
+  await cancel.click();
+  await expect(page.getByRole('status')).toContainText('导出已取消');
+
+  await expect.poll(async () => (
+    await exportLiveAnnouncements(page)
+  ).filter((message) => message === '导出已取消')).toEqual(['导出已取消']);
+});
+
+test('announces a WebM error exactly once through the assertive region', async ({ page }) => {
+  await instrumentWebCodecs(page, 'native', 'native', 'fail-once');
+  await openSampleExport(page);
+  await page.getByLabel('导出范围').selectOption('sample-shot-1');
+  await observeExportLiveAnnouncements(page);
+
+  await page.getByRole('button', { name: '导出 WebM' }).click();
+  await expect(page.getByTestId('export-live-alert')).toContainText('Injected WebCodecs configure failure');
+
+  await expect.poll(async () => (
+    await exportLiveAnnouncements(page)
+  ).filter((message) => message.includes('Injected WebCodecs configure failure'))).toHaveLength(1);
 });
 
 test('retains the quantized terminal packet in real 24fps and 30fps WebM artifacts', async ({ page }, testInfo) => {
@@ -975,9 +1100,11 @@ test('closes a configure-failed encoder and remains retryable', async ({ page })
   page.on('download', () => downloads += 1);
   await openSampleExport(page);
 
-  await page.getByRole('button', { name: '导出 WebM' }).click();
+  const primary = page.getByRole('button', { name: '导出 WebM' });
+  await primary.click();
   await expect(page.getByRole('alert')).toContainText('Injected WebCodecs configure failure');
-  await expect(page.getByRole('button', { name: '导出 WebM' })).toBeEnabled();
+  await expect(primary).toBeEnabled();
+  await expect(primary).toBeFocused();
   let instrumentation = await page.evaluate(() => (
     globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
   ).__lumoraExportInstrumentation);
@@ -988,9 +1115,10 @@ test('closes a configure-failed encoder and remains retryable', async ({ page })
   expect(downloads).toBe(0);
 
   const downloadPromise = page.waitForEvent('download');
-  await page.getByRole('button', { name: '导出 WebM' }).click();
+  await primary.click();
   await downloadPromise;
   await expect(page.getByRole('status')).toContainText('导出完成');
+  await expect(primary).toBeFocused();
   instrumentation = await page.evaluate(() => (
     globalThis as typeof globalThis & { __lumoraExportInstrumentation: ExportInstrumentation }
   ).__lumoraExportInstrumentation);
@@ -1008,7 +1136,7 @@ test('isolates editor shortcuts while export is idle and while encoding', async 
   await page.getByTestId('tree-row-sample-camera-2').click();
   const rows = page.locator('.lumora-tree-row');
   const rowCount = await rows.count();
-  const cameraPoseBefore = await cameraPose(page, 'sample-camera-2');
+  const cameraPositionBefore = await inspectorPosition(page);
   const playBefore = await page.getByTestId('timeline-play').textContent();
   await page.getByTestId('open-export-workspace').click();
 
@@ -1034,7 +1162,7 @@ test('isolates editor shortcuts while export is idle and while encoding', async 
   await expect(rows).toHaveCount(rowCount);
   await expect(page.getByTestId('tree-row-sample-camera-2')).toHaveAttribute('aria-selected', 'true');
   await expect(page.getByTestId('timeline-play')).toHaveText(playBefore ?? '');
-  expect(await cameraPose(page, 'sample-camera-2')).toEqual(cameraPoseBefore);
+  expect(await inspectorPosition(page)).toEqual(cameraPositionBefore);
 
   await page.getByRole('button', { name: '导出 WebM' }).click();
   await expect(page.getByLabel('导出进度')).not.toHaveJSProperty('value', 0);
@@ -1043,7 +1171,7 @@ test('isolates editor shortcuts while export is idle and while encoding', async 
   await expect(rows).toHaveCount(rowCount);
   await expect(page.getByTestId('tree-row-sample-camera-2')).toHaveAttribute('aria-selected', 'true');
   await expect(page.getByTestId('timeline-play')).toHaveText(playBefore ?? '');
-  expect(await cameraPose(page, 'sample-camera-2')).toEqual(cameraPoseBefore);
+  expect(await inspectorPosition(page)).toEqual(cameraPositionBefore);
   await page.getByRole('button', { name: '取消导出' }).click();
   await expect(page.getByRole('status')).toContainText('导出已取消');
 });

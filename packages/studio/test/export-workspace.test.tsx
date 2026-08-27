@@ -657,6 +657,56 @@ describe('ExportWorkspace', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps visual progress continuous while live announcements use bounded milestones', async () => {
+    const runtime = createStudioRuntime();
+    const project = createSampleProject();
+    const { session } = sessionHarness();
+    const flush = deferred<Blob>();
+    const recorder = encoderDependencies({ flush: () => flush.promise });
+    const renderFrame = vi.fn(() => true);
+
+    render(
+      <ExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: renderFrame }}
+        support={SUPPORTED}
+        recordingDependencies={recorder.dependencies}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const liveStatus = screen.getByTestId('export-live-status');
+    const announcements: string[] = [];
+    const observer = new MutationObserver(() => {
+      const text = liveStatus.textContent?.trim() ?? '';
+      if (text && announcements.at(-1) !== text) announcements.push(text);
+    });
+    observer.observe(liveStatus, { childList: true, characterData: true, subtree: true });
+
+    fireEvent.click(screen.getByRole('button', { name: '导出 WebM' }));
+    await waitFor(() => expect((screen.getByLabelText('导出进度') as HTMLProgressElement).value).toBe(100));
+    expect(renderFrame).toHaveBeenCalledTimes(108);
+
+    const runningAnnouncements = announcements.filter((message) => message.startsWith('正在导出'));
+    expect(runningAnnouncements).toEqual([
+      '正在导出 0%',
+      '正在导出 25%',
+      '正在导出 50%',
+      '正在导出 75%',
+    ]);
+
+    await act(async () => {
+      flush.resolve(new Blob(['webm'], { type: 'video/webm;codecs=vp8' }));
+      await flush.promise;
+    });
+    await waitFor(() => expect(liveStatus).toHaveTextContent('导出完成'));
+    await waitFor(() => expect(announcements.filter((message) => message === '导出完成')).toHaveLength(1));
+    observer.disconnect();
+  });
+
   it('serializes a pending plugin exporter with every core export operation', async () => {
     const runtime = createStudioRuntime();
     const project = projectWithShortShots();
@@ -1195,6 +1245,50 @@ describe('ExportWorkspace', () => {
     expect(recorder.encoder.close).toHaveBeenCalledTimes(1);
     expect(URL.createObjectURL).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.getByRole('button', { name: '导出 WebM' })).toHaveFocus());
+  });
+
+  it('keeps export activation keys from reaching a later host window listener', async () => {
+    const runtime = createStudioRuntime();
+    const project = projectWithShortShots();
+    const { session } = sessionHarness();
+    const recorder = encoderDependencies({ flush: () => new Promise<Blob>(() => undefined) });
+    const hostKeydown = vi.fn();
+
+    render(
+      <ExportWorkspace
+        runtime={runtime}
+        project={project}
+        session={session}
+        captureRef={{ current: null }}
+        exportFrameRef={{ current: vi.fn(() => true) }}
+        support={SUPPORTED}
+        recordingDependencies={recorder.dependencies}
+        onClose={vi.fn()}
+      />,
+    );
+    window.addEventListener('keydown', hostKeydown);
+
+    try {
+      const primary = screen.getByRole('button', { name: '导出 WebM' });
+      const manifest = screen.getByRole('button', { name: '导出清单' });
+      const png = screen.getAllByRole('button', { name: /导出 .* PNG/ })[0]!;
+      for (const key of ['Enter', ' ']) {
+        fireEvent.keyDown(manifest, { key });
+        fireEvent.keyDown(png, { key });
+        fireEvent.keyDown(primary, { key });
+      }
+
+      fireEvent.click(primary);
+      const cancel = await screen.findByRole('button', { name: '取消导出' });
+      for (const key of ['Enter', ' ']) fireEvent.keyDown(cancel, { key });
+      fireEvent.click(cancel);
+      await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('导出已取消'));
+      for (const key of ['Enter', ' ']) fireEvent.keyDown(primary, { key });
+
+      expect(hostKeydown).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener('keydown', hostKeydown);
+    }
   });
 
   it('keeps the live status outside the busy controls and restores WebM focus after failure', async () => {

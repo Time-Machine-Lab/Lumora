@@ -273,8 +273,13 @@ export default function App() {
             Studio 已卸载 —— WebGL 场景、插件贡献项与事件订阅均已释放
           </div>
         )}
-        <aside className="host__log">
-          <h2>宿主事件日志</h2>
+        <aside
+          className="host__log"
+          data-testid="host-event-log"
+          tabIndex={0}
+          aria-labelledby="host-event-log-heading"
+        >
+          <h2 id="host-event-log-heading">宿主事件日志</h2>
           <ul data-testid="event-log">
             {log.map((line, index) => (
               <li key={`${index}-${line}`}>{line}</li>

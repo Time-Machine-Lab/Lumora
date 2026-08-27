@@ -5,6 +5,7 @@ import type { StudioRuntime } from '../../runtime/studio-runtime';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
 import { useEventRefresh } from '../../hooks/use-event-refresh';
 import type { ProjectFrameCapture } from '../editor/frame-capture';
+import { stopActivationKeyPropagation } from '../studio-keyboard-scope';
 import {
   PreviewExportError,
   buildStoryboardManifest,
@@ -124,6 +125,7 @@ export function ExportWorkspace({
     support: CHECKING_WEBM_SUPPORT,
   }));
   const [status, setStatus] = useState<ExportStatus>({ kind: 'idle' });
+  const [liveStatus, setLiveStatus] = useState<ExportStatus>({ kind: 'idle' });
   const [progress, setProgress] = useState(0);
   const [activeOperation, setActiveOperation] = useState<ExportOperationToken | null>(null);
   const operationGenerationRef = useRef(0);
@@ -136,6 +138,7 @@ export function ExportWorkspace({
   const operationControlsRef = useRef<HTMLDivElement>(null);
   const pendingFocusOriginRef = useRef<HTMLButtonElement | null>(null);
   const focusTimerRef = useRef<number | null>(null);
+  const runningAnnouncementBucketRef = useRef(-1);
   const support = supportOverride ?? (
     detectedSupport.checkKey === supportCheckKey
       ? detectedSupport.support
@@ -194,6 +197,11 @@ export function ExportWorkspace({
     );
   };
 
+  const publishStatus = useCallback((nextStatus: ExportStatus) => {
+    setStatus(nextStatus);
+    if (nextStatus.kind !== 'idle' && nextStatus.kind !== 'running') setLiveStatus(nextStatus);
+  }, []);
+
   const assertOperationCurrent = (token: ExportOperationToken) => {
     if (!isOperationCurrent(token)) throw staleTaskError();
   };
@@ -230,18 +238,18 @@ export function ExportWorkspace({
 
   const completeOperation = (token: ExportOperationToken, nextStatus?: ExportStatus) => {
     if (!isOperationOwner(token)) return;
-    if (nextStatus?.kind === 'cancelled' || nextStatus?.kind === 'error') {
+    if (nextStatus && nextStatus.kind !== 'idle' && nextStatus.kind !== 'running') {
       pendingFocusOriginRef.current = token.initiator;
     }
     activeOperationRef.current = null;
     if (!mountedRef.current) return;
     setActiveOperation(null);
-    if (nextStatus) setStatus(nextStatus);
+    if (nextStatus) publishStatus(nextStatus);
   };
 
   const invalidateActiveOperation = useCallback((nextStatus?: ExportStatus) => {
     const operation = activeOperationRef.current;
-    if (operation && (nextStatus?.kind === 'cancelled' || nextStatus?.kind === 'error')) {
+    if (operation && nextStatus && nextStatus.kind !== 'idle' && nextStatus.kind !== 'running') {
       pendingFocusOriginRef.current = operation.initiator;
     }
     operationGenerationRef.current += 1;
@@ -250,8 +258,8 @@ export function ExportWorkspace({
     abortRef.current = null;
     if (!mountedRef.current) return;
     setActiveOperation(null);
-    if (nextStatus) setStatus(nextStatus);
-  }, []);
+    if (nextStatus) publishStatus(nextStatus);
+  }, [publishStatus]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -267,7 +275,7 @@ export function ExportWorkspace({
   }, []);
 
   useEffect(() => {
-    if (status.kind !== 'cancelled' && status.kind !== 'error') {
+    if (status.kind === 'idle' || status.kind === 'running') {
       if (focusTimerRef.current !== null) {
         globalThis.clearTimeout(focusTimerRef.current);
         focusTimerRef.current = null;
@@ -321,6 +329,11 @@ export function ExportWorkspace({
   const busy = activeOperation !== null;
   const running = activeOperation?.kind === 'webm';
   const aspect = project.settings.aspect[0] / project.settings.aspect[1];
+  const politeLiveMessage = liveStatus.kind === 'error'
+    ? ''
+    : liveStatus.kind === 'idle'
+      ? (!support.supported && support.checking ? support.reason : '')
+      : liveStatus.message;
 
   const exportManifest = (initiator: HTMLButtonElement) => {
     const token = beginOperation('manifest', initiator);
@@ -347,15 +360,15 @@ export function ExportWorkspace({
 
   const exportPng = async (shot: ShotClipData, initiator: HTMLButtonElement) => {
     if (!isWorkspaceSessionCurrent()) {
-      setStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
+      publishStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
       return;
     }
     if (session.state.recording) {
-      setStatus({ kind: 'error', message: '请先结束时间线录制再导出画面' });
+      publishStatus({ kind: 'error', message: '请先结束时间线录制再导出画面' });
       return;
     }
     if (!isActiveSceneCamera(project, shot.cameraObjectId)) {
-      setStatus({ kind: 'error', message: `分镜「${shot.name}」未绑定活动场景中的有效机位` });
+      publishStatus({ kind: 'error', message: `分镜「${shot.name}」未绑定活动场景中的有效机位` });
       return;
     }
     const token = beginOperation('png', initiator);
@@ -405,11 +418,11 @@ export function ExportWorkspace({
   const exportWebm = async (initiator: HTMLButtonElement) => {
     if (!support.supported || activeOperationRef.current) return;
     if (!isWorkspaceSessionCurrent()) {
-      setStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
+      publishStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
       return;
     }
     if (session.state.recording) {
-      setStatus({ kind: 'error', message: '请先结束时间线录制再导出画面' });
+      publishStatus({ kind: 'error', message: '请先结束时间线录制再导出画面' });
       return;
     }
     const result = createPreviewExportPlan(project, {
@@ -419,11 +432,11 @@ export function ExportWorkspace({
       mimeType: support.mimeType,
     });
     if (!result.ok) {
-      setStatus({ kind: 'error', message: result.message });
+      publishStatus({ kind: 'error', message: result.message });
       return;
     }
     if (!exportFrameRef.current) {
-      setStatus({ kind: 'error', message: '3D 画面尚未就绪，无法开始导出' });
+      publishStatus({ kind: 'error', message: '3D 画面尚未就绪，无法开始导出' });
       return;
     }
 
@@ -438,7 +451,10 @@ export function ExportWorkspace({
       session.pause();
       assertOperationCurrent(token);
       setProgress(0);
-      setStatus({ kind: 'running', message: '正在导出 0%' });
+      runningAnnouncementBucketRef.current = 0;
+      const initialStatus: ExportStatus = { kind: 'running', message: '正在导出 0%' };
+      setStatus(initialStatus);
+      setLiveStatus(initialStatus);
       const blob = await recordPreviewWebm(
         result.plan,
         async ({ canvas, shot, sourceTime, width, height }) => {
@@ -460,6 +476,11 @@ export function ExportWorkspace({
             const percentage = Math.round(event.ratio * 100);
             setProgress(percentage);
             setStatus({ kind: 'running', message: `正在导出 ${percentage}% · ${event.shotName}` });
+            const announcementBucket = Math.min(75, Math.floor(percentage / 25) * 25);
+            if (announcementBucket > runningAnnouncementBucketRef.current) {
+              runningAnnouncementBucketRef.current = announcementBucket;
+              setLiveStatus({ kind: 'running', message: `正在导出 ${announcementBucket}%` });
+            }
           },
         },
       );
@@ -500,13 +521,15 @@ export function ExportWorkspace({
   ) => {
     if (activeOperationRef.current) return;
     if (!isWorkspaceSessionCurrent()) {
-      setStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
+      publishStatus({ kind: 'cancelled', message: '项目会话已变更，导出已取消' });
       return;
     }
     const token = beginOperation('plugin', initiator, exporter);
     if (!token) return;
     let nextStatus: ExportStatus;
-    setStatus({ kind: 'running', message: `正在运行 ${exporter.name}` });
+    const runningStatus: ExportStatus = { kind: 'running', message: `正在运行 ${exporter.name}` };
+    setStatus(runningStatus);
+    setLiveStatus(runningStatus);
     try {
       const result = await exporter.export(project);
       assertOperationCurrent(token);
@@ -535,7 +558,11 @@ export function ExportWorkspace({
   };
 
   return (
-    <section className="lumora-export" data-testid="export-workspace">
+    <section
+      className="lumora-export"
+      data-testid="export-workspace"
+      onKeyDown={stopActivationKeyPropagation}
+    >
       <header className="lumora-export__header">
         <div>
           <h2>导出</h2>
@@ -606,7 +633,7 @@ export function ExportWorkspace({
           </label>
 
           {!support.supported && (
-            <p className="lumora-export__notice" role={support.checking ? 'status' : 'alert'}>
+            <p className="lumora-export__notice" role={support.checking ? undefined : 'alert'}>
               {support.reason}
             </p>
           )}
@@ -677,9 +704,29 @@ export function ExportWorkspace({
           {status.kind !== 'idle' && (
             <p
               className={`lumora-export__status lumora-export__status--${status.kind}`}
-              role={status.kind === 'error' ? 'alert' : 'status'}
+              data-testid="export-visual-status"
             >
               {status.message}
+            </p>
+          )}
+          <p
+            className="lumora-export__live-status"
+            data-testid="export-live-status"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            {politeLiveMessage}
+          </p>
+          {liveStatus.kind === 'error' && (
+            <p
+              className="lumora-export__live-status"
+              data-testid="export-live-alert"
+              role="alert"
+              aria-live="assertive"
+              aria-atomic="true"
+            >
+              {liveStatus.message}
             </p>
           )}
         </div>

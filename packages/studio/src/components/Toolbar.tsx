@@ -9,6 +9,7 @@ import type { ContentCache } from './editor/content-cache';
 import { importModelFile } from './editor/model-import';
 import { showToast } from './editor/toasts';
 import { ProjectMenu } from './ProjectMenu';
+import { stopActivationKeyPropagation } from './studio-keyboard-scope';
 
 interface ToolbarProps {
   runtime: StudioRuntime;
@@ -146,9 +147,7 @@ export function Toolbar({
           data-testid="open-export-workspace"
           aria-pressed={exportOpen}
           disabled={!project}
-          onKeyDown={(event) => {
-            if (event.key === ' ' || event.key === 'Enter') event.stopPropagation();
-          }}
+          onKeyDown={stopActivationKeyPropagation}
           onClick={onToggleExport}
         >
           导出
