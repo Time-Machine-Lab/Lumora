@@ -138,6 +138,54 @@ describe('LumoraStudio', () => {
     expect(editor.getSelection()).toEqual([]);
   });
 
+  it('closes the command palette with one Escape without clearing the editor selection', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://palette-escape', 'Palette Escape');
+    render(
+      <LumoraStudio
+        ref={handle}
+        plugins={[goodPlugin]}
+        hostVersion="0.1.0"
+        initialProject={project}
+      />,
+    );
+    await waitFor(() => expect(handle.current?.runtime.host.commands.count()).toBe(1));
+    await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri));
+    const editor = handle.current!.runtime.editor;
+    act(() => editor.setSelection(['sample-cube']));
+    const clearSelection = vi.spyOn(editor, 'clearSelection');
+
+    fireEvent.keyDown(screen.getByTestId('lumora-studio'), { key: 'k', code: 'KeyK', ctrlKey: true });
+    const command = await screen.findByTestId('palette-command-com.test.good.cmd');
+    command.focus();
+    fireEvent.keyDown(command, { key: 'Escape', code: 'Escape' });
+
+    expect(screen.queryByTestId('command-palette')).not.toBeInTheDocument();
+    expect(clearSelection).not.toHaveBeenCalled();
+    expect(editor.getSelection()).toEqual(['sample-cube']);
+  });
+
+  it('preserves Escape editing semantics for a button inside light-DOM contenteditable', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://editable-button-escape', 'Editable Button Escape');
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri));
+    const editor = handle.current!.runtime.editor;
+    act(() => editor.setSelection(['sample-cube']));
+    const clearSelection = vi.spyOn(editor, 'clearSelection');
+    const editable = document.createElement('div');
+    editable.setAttribute('contenteditable', 'true');
+    const button = document.createElement('button');
+    editable.append(button);
+    screen.getByTestId('lumora-studio').append(editable);
+    button.focus();
+
+    fireEvent.keyDown(button, { key: 'Escape', code: 'Escape' });
+
+    expect(clearSelection).not.toHaveBeenCalled();
+    expect(editor.getSelection()).toEqual(['sample-cube']);
+  });
+
   it('isolates editor shortcuts while the export workspace is open and idle', async () => {
     let driveDefaultPrevented = false;
     const observeDriveKey = (event: KeyboardEvent) => {

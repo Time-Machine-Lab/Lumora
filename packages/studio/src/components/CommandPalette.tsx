@@ -17,14 +17,6 @@ export function CommandPalette({ runtime, onClose }: CommandPaletteProps) {
     inputRef.current?.focus();
   }, []);
 
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
   // 每次渲染直接读取注册表：命令注册/注销（command:changed）触发的重渲染必须反映最新列表，
   // 不能依赖 useMemo —— 其依赖在事件触发时不会变化。
   // when() 由 CommandRegistry 统一构造命令所属插件的上下文（pluginId/services 与 execute 一致）
@@ -52,6 +44,12 @@ export function CommandPalette({ runtime, onClose }: CommandPaletteProps) {
         role="dialog"
         aria-label="命令面板"
         onClick={(event) => event.stopPropagation()}
+        onKeyDownCapture={(event) => {
+          if (event.key !== 'Escape') return;
+          event.preventDefault();
+          event.stopPropagation();
+          onClose();
+        }}
       >
         <input
           ref={inputRef}

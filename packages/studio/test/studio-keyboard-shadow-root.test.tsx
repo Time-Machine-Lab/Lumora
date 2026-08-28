@@ -169,19 +169,25 @@ describe('Studio keyboard routing across ShadowRoot boundaries', () => {
     const contentEditableChild = document.createElement('span');
     contentEditableChild.tabIndex = 0;
     contentEditable.append(contentEditableChild);
+    const select = document.createElement('select');
+    const option = document.createElement('option');
+    select.append(option);
+    const button = document.createElement('button');
     const controls = [
       document.createElement('input'),
       document.createElement('textarea'),
-      document.createElement('select'),
-      document.createElement('button'),
+      select,
+      option,
+      button,
       contentEditableChild,
     ];
-    controls.slice(0, -1).forEach((control) => studio.root.append(control));
+    [controls[0]!, controls[1]!, select, button].forEach((control) => studio.root.append(control));
     studio.root.append(contentEditable);
 
     for (const control of controls) {
-      control.focus();
-      expect(studio.shadowRoot.activeElement).toBe(control);
+      const focusTarget = control === option ? select : control;
+      focusTarget.focus();
+      expect(studio.shadowRoot.activeElement).toBe(focusTarget);
       for (const key of ['Delete', 'Backspace']) {
         let event!: KeyboardEvent;
         act(() => {
@@ -221,6 +227,27 @@ describe('Studio keyboard routing across ShadowRoot boundaries', () => {
     expect(deleteSelection).not.toHaveBeenCalled();
     expect(editor.getSelection()).toEqual(['sample-camera']);
     expect(play).toHaveTextContent(playBefore ?? '');
+  });
+
+  it('preserves Escape editing semantics for a button inside ShadowRoot contenteditable', async () => {
+    const studio = await mountShadowStudio('lumora://shadow-editable-button-escape');
+    const editor = studio.handle.current!.runtime.editor;
+    act(() => editor.setSelection(['sample-cube']));
+    const clearSelection = vi.spyOn(editor, 'clearSelection');
+    const editable = document.createElement('div');
+    editable.setAttribute('contenteditable', 'true');
+    const button = document.createElement('button');
+    editable.append(button);
+    studio.root.append(editable);
+    button.focus();
+    expect(studio.shadowRoot.activeElement).toBe(button);
+
+    act(() => {
+      dispatchComposedKey(button, 'keydown', { key: 'Escape', code: 'Escape' });
+    });
+
+    expect(clearSelection).not.toHaveBeenCalled();
+    expect(editor.getSelection()).toEqual(['sample-cube']);
   });
 
   it('clears the editor selection when Escape originates from a button in the ShadowRoot Studio', async () => {

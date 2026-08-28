@@ -30,12 +30,13 @@ export function preservesNativeKeyboardSemantics(event: Event): boolean {
   const source = event.composedPath()[0];
   if (!isClosestElement(source)) return false;
   const key = 'key' in event ? event.key : undefined;
-  if (source.closest('button')) return key !== 'Escape';
-  if (source.closest(NATIVE_KEYBOARD_CONTROL_SELECTOR)) return true;
-
   const editable = source.closest('[contenteditable]');
   const editableValue = editable?.getAttribute('contenteditable');
-  return editableValue !== null && editableValue !== undefined && editableValue.toLowerCase() !== 'false';
+  if (editableValue !== null && editableValue !== undefined && editableValue.toLowerCase() !== 'false') {
+    return true;
+  }
+  if (source.closest('button')) return key !== 'Escape';
+  return source.closest(NATIVE_KEYBOARD_CONTROL_SELECTOR) !== null;
 }
 
 export function stopActivationKeyPropagation(event: { key: string; stopPropagation(): void }): void {
