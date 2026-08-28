@@ -19,11 +19,14 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "lint": "eslint .",
     "e2e": "playwright test",
+    "e2e:preview": "node scripts/check-preview-prerequisites.mjs && playwright test --config playwright.preview.config.ts",
     "e2e:install": "playwright install chromium",
+    "licenses:generate": "node scripts/generate-third-party-notices.mjs",
     "smoke:pack": "node scripts/smoke-pack.mjs",
     "smoke:pack:boundary": "node scripts/smoke-pack.mjs --self-test"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.13.0",
     "@eslint/js": "^9.17.0",
     "@playwright/test": "^1.49.1",
     "eslint": "^9.17.0",

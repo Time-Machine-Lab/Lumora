@@ -18,12 +18,16 @@ function captureSize(aspect: number): { width: number; height: number; aspect: n
   };
 }
 
-function encodePixels(pixels: Uint8Array, width: number, height: number): string | null {
-  const canvas = document.createElement('canvas');
+function writePixelsToCanvas(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  canvas: HTMLCanvasElement,
+): boolean {
   canvas.width = width;
   canvas.height = height;
   const context = canvas.getContext('2d');
-  if (!context) return null;
+  if (!context) return false;
   const image = context.createImageData(width, height);
   const rowBytes = width * 4;
   for (let row = 0; row < height; row += 1) {
@@ -31,17 +35,59 @@ function encodePixels(pixels: Uint8Array, width: number, height: number): string
     image.data.set(pixels.subarray(sourceStart, sourceStart + rowBytes), row * rowBytes);
   }
   context.putImageData(image, 0, 0);
-  return canvas.toDataURL('image/png');
+  return true;
 }
 
-/** Render a project-aspect thumbnail without drawing into the visible canvas. */
-export function captureProjectFrame(
+export interface ProjectFrameRenderOptions {
+  width: number;
+  height: number;
+  aspect: number;
+  excludeEditorHelpers?: boolean;
+}
+
+export type ProjectFrameCapture = (
+  cameraObjectId: string,
+  canvas: HTMLCanvasElement,
+  options: ProjectFrameRenderOptions,
+) => boolean;
+
+function fitViewport(
+  width: number,
+  height: number,
+  aspect: number,
+): { x: number; y: number; width: number; height: number } {
+  const outputAspect = width / height;
+  // 854x480 is the conventional integer 480p representation of 16:9. The
+  // exact ratio differs by less than one output pixel, so letterboxing would
+  // create a visible one-sided column without preserving meaningful geometry.
+  if (Math.abs(width - height * aspect) <= 1 || Math.abs(height - width / aspect) <= 1) {
+    return { x: 0, y: 0, width, height };
+  }
+  if (aspect >= outputAspect) {
+    const fittedHeight = Math.min(height, Math.max(1, Math.round(width / aspect)));
+    return { x: 0, y: Math.floor((height - fittedHeight) / 2), width, height: fittedHeight };
+  }
+  const fittedWidth = Math.min(width, Math.max(1, Math.round(height * aspect)));
+  return { x: Math.floor((width - fittedWidth) / 2), y: 0, width: fittedWidth, height };
+}
+
+/** Render an exact-size project frame into a caller-owned 2D canvas. */
+export function renderProjectFrameToCanvas(
   renderer: THREE.WebGLRenderer,
   scene: THREE.Scene,
   camera: THREE.Camera,
-  projectAspect: number,
-): string | null {
-  const { width, height, aspect } = captureSize(projectAspect);
+  canvas: HTMLCanvasElement,
+  options: ProjectFrameRenderOptions,
+): boolean {
+  const width = Math.floor(options.width);
+  const height = Math.floor(options.height);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return false;
+  }
+  const aspect = Number.isFinite(options.aspect) && options.aspect > 0
+    ? options.aspect
+    : width / height;
+  const viewport = fitViewport(width, height, aspect);
   const previousTarget = renderer.getRenderTarget();
   const previousCubeFace = renderer.getActiveCubeFace();
   const previousMipmapLevel = renderer.getActiveMipmapLevel();
@@ -52,6 +98,15 @@ export function captureProjectFrame(
   const previousClearAlpha = renderer.getClearAlpha();
   const perspectiveCamera = camera instanceof THREE.PerspectiveCamera ? camera : null;
   const previousCameraAspect = perspectiveCamera?.aspect ?? null;
+  const hiddenHelpers: Array<{ object: THREE.Object3D; visible: boolean }> = [];
+  if (options.excludeEditorHelpers) {
+    scene.traverse((object) => {
+      const transformControls = object as THREE.Object3D & { isTransformControls?: boolean };
+      if (!(object instanceof THREE.GridHelper) && transformControls.isTransformControls !== true) return;
+      hiddenHelpers.push({ object, visible: object.visible });
+      object.visible = false;
+    });
+  }
   const target = new THREE.WebGLRenderTarget(width, height, {
     depthBuffer: true,
     stencilBuffer: false,
@@ -63,18 +118,22 @@ export function captureProjectFrame(
 
   try {
     if (perspectiveCamera) {
-      perspectiveCamera.aspect = aspect;
+      // The fitted viewport is integer-sized. Projecting with its actual
+      // raster aspect prevents sub-pixel stretch (notably 854x480 vs 16:9)
+      // while fitViewport still preserves the project's intended framing.
+      perspectiveCamera.aspect = viewport.width / viewport.height;
       perspectiveCamera.updateProjectionMatrix();
     }
     renderer.setRenderTarget(target);
     renderer.setClearColor('#14161f', 1);
     renderer.clear();
+    renderer.setViewport(viewport.x, viewport.y, viewport.width, viewport.height);
     renderer.render(scene, camera);
     const pixels = new Uint8Array(width * height * 4);
     renderer.readRenderTargetPixels(target, 0, 0, width, height, pixels);
-    return encodePixels(pixels, width, height);
+    return writePixelsToCanvas(pixels, width, height, canvas);
   } catch {
-    return null;
+    return false;
   } finally {
     // getViewport/getScissor expose default-framebuffer state even when a
     // render target is active. Restore those defaults while null is bound,
@@ -91,6 +150,24 @@ export function captureProjectFrame(
       perspectiveCamera.aspect = previousCameraAspect;
       perspectiveCamera.updateProjectionMatrix();
     }
+    for (const helper of hiddenHelpers) helper.object.visible = helper.visible;
     target.dispose();
+  }
+}
+
+/** Render a project-aspect thumbnail without drawing into the visible canvas. */
+export function captureProjectFrame(
+  renderer: THREE.WebGLRenderer,
+  scene: THREE.Scene,
+  camera: THREE.Camera,
+  projectAspect: number,
+): string | null {
+  const size = captureSize(projectAspect);
+  const canvas = document.createElement('canvas');
+  if (!renderProjectFrameToCanvas(renderer, scene, camera, canvas, size)) return null;
+  try {
+    return canvas.toDataURL('image/png');
+  } catch {
+    return null;
   }
 }

@@ -20,9 +20,14 @@ import {
 import { showToast } from './toasts';
 import { CameraDrive, captureCameraSample, DRIVE_KEY_CODES, restoreObjectOnNode } from './camera-drive';
 import { PlaybackDriver } from './PlaybackDriver';
-import { captureProjectFrame } from './frame-capture';
+import { captureProjectFrame, renderProjectFrameToCanvas } from './frame-capture';
+import type { ProjectFrameCapture } from './frame-capture';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
-import { isKeyboardEventForStudio } from '../studio-keyboard-scope';
+import {
+  isKeyboardEventForStudio,
+  preservesNativeKeyboardSemantics,
+} from '../studio-keyboard-scope';
+import type { LiveTransformStore } from './live-transform-store';
 
 interface EditorViewportProps {
   editor: SceneEditor;
@@ -35,6 +40,8 @@ interface EditorViewportProps {
   /** 帧截图通道：FrameCaptureBridge 在 Canvas 内注册（分镜缩略图用）；
    *  可选参数 = 分镜绑定机位 id，传参时按该机位渲染 */
   captureRef?: React.RefObject<((cameraObjectId?: string | null) => string | null) | null>;
+  /** Exact-size export frame channel used by the WebM/PNG export workspace. */
+  exportFrameRef?: React.RefObject<ProjectFrameCapture | null>;
   /** 截图通道就绪通知（FrameCaptureBridge 挂载/卸载时回调；缩略图链据此
    *  启动，复审阻断 2） */
   onCaptureReady?: (ready: boolean) => void;
@@ -42,6 +49,10 @@ interface EditorViewportProps {
   onRenderContentChange?: () => void;
   /** Owning Studio root used to isolate window-level camera-drive keys. */
   keyboardScopeRef?: React.RefObject<HTMLElement | null>;
+  /** Whether keyboard camera drive input is currently available. */
+  driveEnabled?: boolean;
+  /** Selected live THREE-node transform exposed through the visible inspector. */
+  liveTransformStore?: LiveTransformStore;
 }
 
 /** 沿父链找到最近的对象 id（GLB 内容网格挂在模型组下，需要向上追溯）。
@@ -67,9 +78,12 @@ export function EditorViewport({
   cache,
   session = null,
   captureRef: captureRefProp,
+  exportFrameRef: exportFrameRefProp,
   onCaptureReady,
   onRenderContentChange,
   keyboardScopeRef,
+  driveEnabled = true,
+  liveTransformStore,
 }: EditorViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<THREE.Group | null>(null);
@@ -84,6 +98,8 @@ export function EditorViewport({
   // 分镜缩略图截图通道（FrameCaptureBridge 在 Canvas 内挂载后可用）
   const localCaptureRef = useRef<((cameraObjectId?: string | null) => string | null) | null>(null);
   const captureRef = captureRefProp ?? localCaptureRef;
+  const localExportFrameRef = useRef<ProjectFrameCapture | null>(null);
+  const exportFrameRef = exportFrameRefProp ?? localExportFrameRef;
 
   // 驾驶目标：单选机位；已有轨道机位在暂停态不驾驶（时间线接管），录制中始终可驾驶
   const drivenCameraId = useMemo(() => {
@@ -92,7 +108,7 @@ export function EditorViewport({
     return object && object.type === 'camera' ? object.id : null;
   }, [project, selection]);
 
-  useCameraDrive(session, drivenCameraId, rootRef, editor, keyboardScopeRef);
+  useCameraDrive(session, drivenCameraId, rootRef, editor, keyboardScopeRef, driveEnabled);
 
   // 录制采样源：视口把机位节点映射为通道样本（录制期间节点由驾驶/静止接管）
   useEffect(() => {
@@ -233,7 +249,20 @@ export function EditorViewport({
         />
         {!cameraView && <OrbitControls makeDefault enableDamping enabled={!dragging} />}
         <CameraProxy cameraRef={cameraRef} />
-        <FrameCaptureBridge captureRef={captureRef} onCaptureReady={onCaptureReady} rootRef={rootRef} aspect={aspect} />
+        <FrameCaptureBridge
+          captureRef={captureRef}
+          exportFrameRef={exportFrameRef}
+          onCaptureReady={onCaptureReady}
+          rootRef={rootRef}
+          aspect={aspect}
+        />
+        {liveTransformStore && (
+          <LiveTransformBridge
+            objectId={drivenCameraId}
+            rootRef={rootRef}
+            store={liveTransformStore}
+          />
+        )}
       </Canvas>
       {session && (
         <>
@@ -252,6 +281,34 @@ export function EditorViewport({
   );
 }
 
+function LiveTransformBridge({
+  objectId,
+  rootRef,
+  store,
+}: {
+  objectId: string | null;
+  rootRef: React.RefObject<THREE.Group | null>;
+  store: LiveTransformStore;
+}) {
+  useEffect(() => {
+    if (!objectId) store.clear();
+    return () => {
+      if (objectId) store.clear(objectId);
+    };
+  }, [objectId, store]);
+  useFrame(() => {
+    if (!objectId) return;
+    const root = rootRef.current;
+    const node = root ? findNode(root, objectId) : null;
+    if (!node) {
+      store.clear(objectId);
+      return;
+    }
+    store.publish(objectId, [node.position.x, node.position.y, node.position.z]);
+  });
+  return null;
+}
+
 /**
  * 键鼠机位驾驶（TML-52）：选中机位且非播放态时启用（录制中强制可驾驶），
  * rAF 每帧把按键意图积分到节点。脱离驾驶（取消选中/开始回放/录制暂停）时
@@ -267,11 +324,14 @@ function useCameraDrive(
   rootRef: React.RefObject<THREE.Group | null>,
   editor: SceneEditor,
   keyboardScopeRef?: React.RefObject<HTMLElement | null>,
+  driveEnabled = true,
 ) {
   const cameraIdRef = useRef<string | null>(null);
   cameraIdRef.current = drivenCameraId;
   const sessionRef = useRef(session);
   sessionRef.current = session;
+  const driveEnabledRef = useRef(driveEnabled);
+  driveEnabledRef.current = driveEnabled;
 
   useEffect(() => {
     if (!session) return;
@@ -298,30 +358,20 @@ function useCameraDrive(
         drive.attach(node);
         attachedId = cameraId;
         attachedNode = node;
+        for (const code of heldKeys) drive.press(code);
       }
       return true;
     };
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented) return;
+      if (event.defaultPrevented || !driveEnabledRef.current) return;
       const keyboardRoot = keyboardScopeRef?.current;
       if (keyboardRoot && !isKeyboardEventForStudio(keyboardRoot, event)) return;
-      const target = event.target as HTMLElement | null;
-      if (
-        target &&
-        (target.tagName === 'INPUT' ||
-          target.tagName === 'TEXTAREA' ||
-          target.tagName === 'SELECT' ||
-          target.isContentEditable)
-      ) {
-        return;
-      }
+      if (preservesNativeKeyboardSemantics(event)) return;
       if (DRIVE_KEY_CODES.has(event.code)) {
         if (cameraIdRef.current) event.preventDefault();
-        if (attachCurrentCamera()) {
-          heldKeys.add(event.code);
-          drive.press(event.code);
-        }
+        heldKeys.add(event.code);
+        if (attachCurrentCamera()) drive.press(event.code);
       }
     };
     const onKeyUp = (event: KeyboardEvent) => {
@@ -378,6 +428,11 @@ function useCameraDrive(
     const loop = (now: number) => {
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
+      if (!driveEnabledRef.current) {
+        clearDrive();
+        raf = requestAnimationFrame(loop);
+        return;
+      }
       const st = sessionRef.current?.state;
       const cameraId = cameraIdRef.current;
       // 可驾驶：选中机位 && 录制未暂停 && （暂停 || 录制中）&& 无启用轨道（录制中无视轨道；
@@ -437,9 +492,9 @@ function CameraProxy({ cameraRef }: { cameraRef: React.MutableRefObject<THREE.Ca
 
 /**
  * 数值位姿读取钩子（e2e AC1/AC3 数值断言）：把各相机节点当前的 position /
- * rotation / focalLength 序列化进隐藏 span 的 textContent，播放、暂停、项目
- * 变更时刷新（无需 React 状态，零重渲染成本）。订阅注册在 PlaybackDriver
- * 之后，同一次事件里读到的是已应用轨道求值的位姿。
+ * rotation / focalLength 序列化进隐藏 span 的 textContent。开发环境逐帧刷新，
+ * 让浏览器测试也能观察连续驾驶；不使用 React 状态，因此不会触发重渲染。
+ * 事件订阅注册在 PlaybackDriver 之后，同一次事件里读到已应用轨道求值的位姿。
  */
 function CameraPoseReadout({
   session,
@@ -478,7 +533,14 @@ function CameraPoseReadout({
       editor.events.on('project:changed', refresh),
     ];
     refresh();
+    let animationFrame = 0;
+    const refreshEachFrame = () => {
+      refresh();
+      animationFrame = requestAnimationFrame(refreshEachFrame);
+    };
+    animationFrame = requestAnimationFrame(refreshEachFrame);
     return () => {
+      cancelAnimationFrame(animationFrame);
       for (const sub of subs) sub.dispose();
     };
   }, [session, editor, rootRef]);
@@ -491,11 +553,13 @@ function CameraPoseReadout({
  */
 function FrameCaptureBridge({
   captureRef,
+  exportFrameRef,
   onCaptureReady,
   rootRef,
   aspect,
 }: {
   captureRef: React.RefObject<((cameraObjectId?: string | null) => string | null) | null>;
+  exportFrameRef: React.RefObject<ProjectFrameCapture | null>;
   /** 通道就绪通知：挂载置 true、卸载置 false。仅写 ref 不触发 React 渲染，
    *  缩略图链依赖该回调启动（复审阻断 2） */
   onCaptureReady?: (ready: boolean) => void;
@@ -508,28 +572,43 @@ function FrameCaptureBridge({
   const scene = useThree((s) => s.scene);
   const camera = useThree((s) => s.camera);
   useEffect(() => {
+    const resolveCamera = (cameraObjectId?: string | null): THREE.Camera | null => {
+      if (!cameraObjectId) return camera;
+      const node = rootRef.current ? findNode(rootRef.current, cameraObjectId) : null;
+      return node instanceof THREE.PerspectiveCamera ? node : null;
+    };
     captureRef.current = (cameraObjectId?: string | null) => {
       if (typeof gl.render !== 'function') return null;
       try {
         // 分镜机位截图：解析绑定相机并按项目画幅校正投影；绑定缺失时返回 null
         // 让缩略图保持占位，而不是用当前相机渲染出错误画面（复审阻断 2）
-        let viewCamera = camera;
-        if (cameraObjectId) {
-          const node = rootRef.current ? findNode(rootRef.current, cameraObjectId) : null;
-          if (!node || !(node instanceof THREE.PerspectiveCamera)) return null;
-          viewCamera = node;
-        }
+        const viewCamera = resolveCamera(cameraObjectId);
+        if (!viewCamera) return null;
         return captureProjectFrame(gl, scene, viewCamera, aspect);
       } catch {
         return null;
       }
     };
+    exportFrameRef.current = (cameraObjectId, canvas, options) => {
+      if (typeof gl.render !== 'function') return false;
+      try {
+        const viewCamera = resolveCamera(cameraObjectId);
+        if (!viewCamera) return false;
+        return renderProjectFrameToCanvas(gl, scene, viewCamera, canvas, {
+          ...options,
+          excludeEditorHelpers: true,
+        });
+      } catch {
+        return false;
+      }
+    };
     onCaptureReady?.(true);
     return () => {
       captureRef.current = null;
+      exportFrameRef.current = null;
       onCaptureReady?.(false);
     };
-  }, [gl, scene, camera, captureRef, onCaptureReady, rootRef, aspect]);
+  }, [gl, scene, camera, captureRef, exportFrameRef, onCaptureReady, rootRef, aspect]);
   return null;
 }
 

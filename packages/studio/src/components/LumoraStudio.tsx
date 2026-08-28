@@ -17,10 +17,17 @@ import { TimelinePanel } from './editor/TimelinePanel';
 import { ObjectTree } from './editor/ObjectTree';
 import { PropertiesPanel } from './editor/PropertiesPanel';
 import { StoryboardWorkspace } from './storyboard/StoryboardWorkspace';
+import { ExportWorkspace } from './export/ExportWorkspace';
+import type { ExportFrameCapture } from './export/ExportWorkspace';
 import { ToastHost, showToast } from './editor/toasts';
 import { ContentCache } from './editor/content-cache';
+import { LiveTransformStore } from './editor/live-transform-store';
 import { DRIVE_KEY_CODES } from './editor/camera-drive';
-import { isKeyboardEventForStudio, registerStudioKeyboardRoot } from './studio-keyboard-scope';
+import {
+  isKeyboardEventForStudio,
+  preservesNativeKeyboardSemantics,
+  registerStudioKeyboardRoot,
+} from './studio-keyboard-scope';
 import '../lumora.css';
 
 /**
@@ -44,6 +51,21 @@ function invokeCloseError(
   } catch {
     // 宿主同步 throw 已隔离，不外溢
   }
+}
+
+function isStudioEditingShortcut(event: KeyboardEvent): boolean {
+  const key = event.key.toLowerCase();
+  return (
+    key === ' ' ||
+    key === 'delete' ||
+    key === 'backspace' ||
+    key === 'escape' ||
+    key === '1' ||
+    key === '2' ||
+    key === '3' ||
+    ((event.ctrlKey || event.metaKey) && (key === 'k' || key === 'z' || key === 'y' || key === 'd')) ||
+    DRIVE_KEY_CODES.has(event.code)
+  );
 }
 
 export interface LumoraStudioProps {
@@ -140,19 +162,6 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     // 捕获阶段处理先于全局冒泡处理器，stopImmediatePropagation 使其不可达。
     // 应用快捷键统一小写匹配：Ctrl+Shift+K 的 key 为大写 K，未小写化时泄漏到
     // 命令面板开关（复审阻断 4）
-    const isAppShortcut = (event: KeyboardEvent) => {
-      const key = event.key.toLowerCase();
-      return (
-        key === 'delete' ||
-        key === 'backspace' ||
-        key === '1' ||
-        key === '2' ||
-        key === '3' ||
-        ((event.ctrlKey || event.metaKey) &&
-          (key === 'k' || key === 'z' || key === 'y' || key === 'd')) ||
-        DRIVE_KEY_CODES.has(event.code)
-      );
-    };
     const onKeyDownCapture = (event: KeyboardEvent) => {
       // Escape 无条件取消，先于「模态外」分支判定：焦点逃逸到对话框外后
       // Escape 不得被 outside 分支吞掉（复审阻断 4）
@@ -197,7 +206,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         }
         return;
       }
-      if (isAppShortcut(event)) {
+      if (isStudioEditingShortcut(event)) {
         event.preventDefault();
         event.stopImmediatePropagation();
         return;
@@ -217,6 +226,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   }, [session.state.overwritePending, session]);
   // 分镜缩略图截图通道：EditorViewport 的 FrameCaptureBridge 挂载后可用
   const captureRef = useRef<((cameraObjectId?: string | null) => string | null) | null>(null);
+  const exportFrameRef = useRef<ExportFrameCapture | null>(null);
   // 通道就绪状态：仅写 ref 不触发渲染，缩略图链依赖该状态在通道就绪后重跑
   // （复审阻断 2：初载时 effect 早于 FrameCaptureBridge 挂载而空转）
   const [captureReady, setCaptureReady] = useState(false);
@@ -228,14 +238,22 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   if (!cacheRef.current) cacheRef.current = new ContentCache();
   const cache = cacheRef.current;
   const cacheDisposedRef = useRef(false);
+  const liveTransformStoreRef = useRef<LiveTransformStore | null>(null);
+  if (!liveTransformStoreRef.current) liveTransformStoreRef.current = new LiveTransformStore();
+  const liveTransformStore = liveTransformStoreRef.current;
 
   const [pluginManagerOpen, setPluginManagerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [storyboardOpen, setStoryboardOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const exportButtonRef = useRef<HTMLButtonElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const closeWorkspace = () => setStoryboardOpen(false);
+    const closeWorkspace = () => {
+      setStoryboardOpen(false);
+      setExportOpen(false);
+    };
     const opened = runtime.events.on('project:opened', closeWorkspace);
     const closed = runtime.events.on('project:closed', closeWorkspace);
     return () => {
@@ -370,6 +388,19 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     };
   }, [runtime, cache, close]);
 
+  useEffect(() => {
+    if (!exportOpen) return;
+    const root = rootRef.current;
+    if (!root) return;
+    const onKeyDownCapture = (event: KeyboardEvent) => {
+      if (!isKeyboardEventForStudio(root, event) || !isStudioEditingShortcut(event)) return;
+      if (!preservesNativeKeyboardSemantics(event)) event.preventDefault();
+    };
+    // Mark editor-only shortcuts before viewport listeners can consume drive keys.
+    window.addEventListener('keydown', onKeyDownCapture, true);
+    return () => window.removeEventListener('keydown', onKeyDownCapture, true);
+  }, [exportOpen]);
+
   // 编辑器快捷键：撤销/重做/复制/删除/取消选择/Gizmo 模式。
   // 按实例作用域（R8-9）：多个 Studio 实例共存时共享 window 监听，
   // 无焦点包含校验则每个实例都执行全部快捷键（一个实例内按 Delete
@@ -382,6 +413,12 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     const unregisterRoot = registerStudioKeyboardRoot(root);
     const onKey = (event: KeyboardEvent) => {
       if (!isKeyboardEventForStudio(root, event)) return;
+      if (exportOpen && isStudioEditingShortcut(event)) {
+        if (preservesNativeKeyboardSemantics(event)) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
       // 已由内层处理（对话框/下拉等 stopPropagation 的兜底）：全局键处理不得越权执行
       if (event.defaultPrevented) return;
       const key = event.key.toLowerCase();
@@ -392,16 +429,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         setPaletteOpen((open) => !open);
         return;
       }
-      const target = event.target as HTMLElement | null;
-      if (
-        target &&
-        (target.tagName === 'INPUT' ||
-          target.tagName === 'TEXTAREA' ||
-          target.tagName === 'SELECT' ||
-          target.isContentEditable)
-      ) {
-        return;
-      }
+      if (preservesNativeKeyboardSemantics(event)) return;
       const editor = runtime.editor;
       if ((event.ctrlKey || event.metaKey) && key === 'z') {
         event.preventDefault();
@@ -445,7 +473,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       window.removeEventListener('keydown', onKey);
       unregisterRoot();
     };
-  }, [runtime]);
+  }, [runtime, exportOpen]);
 
   return (
     <>
@@ -453,6 +481,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         ref={rootRef}
         className={`lumora-studio${className ? ` ${className}` : ''}`}
         data-testid="lumora-studio"
+        data-workspace={storyboardOpen ? 'storyboard' : exportOpen ? 'export' : undefined}
         // 覆盖确认模态打开时整壳 inert：工具栏/对象树/视口/时间线整体不可达
         // （复审阻断 4：仅时间线内容 inert 时其余应用仍可交互）
         inert={session.state.overwritePending || undefined}
@@ -463,22 +492,33 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
           editorState={editorState}
           cache={cache}
           storyboardOpen={storyboardOpen}
+          exportOpen={exportOpen}
+          exportButtonRef={exportButtonRef}
           onToggleStoryboard={() => {
             setPluginManagerOpen(false);
             setPaletteOpen(false);
+            setExportOpen(false);
             setStoryboardOpen((open) => !open);
+          }}
+          onToggleExport={() => {
+            setPluginManagerOpen(false);
+            setPaletteOpen(false);
+            setStoryboardOpen(false);
+            setExportOpen((open) => !open);
           }}
           onTogglePlugins={() => {
             setStoryboardOpen(false);
+            setExportOpen(false);
             setPluginManagerOpen((open) => !open);
           }}
           onTogglePalette={() => {
             setStoryboardOpen(false);
+            setExportOpen(false);
             setPaletteOpen((open) => !open);
           }}
         />
         <div className="lumora-studio__stage">
-        <div className="lumora-studio__body" inert={storyboardOpen || undefined}>
+        <div className="lumora-studio__body" inert={storyboardOpen || exportOpen || undefined}>
           <div className="lumora-studio__sidebar">
             <ObjectTree
               editor={runtime.editor}
@@ -505,9 +545,12 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
                   cache={cache}
                   session={session}
                   captureRef={captureRef}
+                  exportFrameRef={exportFrameRef}
                   onCaptureReady={handleCaptureReady}
                   onRenderContentChange={handleRenderContentChange}
                   keyboardScopeRef={rootRef}
+                  driveEnabled={!exportOpen}
+                  liveTransformStore={liveTransformStore}
                 />
               )}
               {!project && (
@@ -532,6 +575,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
             editor={runtime.editor}
             project={project}
             selection={editorState.selection}
+            liveTransformStore={liveTransformStore}
           />
         </div>
         {storyboardOpen && project && (
@@ -540,6 +584,22 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
             runtime={runtime}
             project={project}
             onClose={() => setStoryboardOpen(false)}
+          />
+        )}
+        {exportOpen && project && (
+          <ExportWorkspace
+            key={`${project.uri}:${runtime.editor.getSessionToken()}`}
+            runtime={runtime}
+            project={project}
+            projectSessionToken={runtime.editor.getSessionToken()}
+            session={session}
+            captureRef={captureRef}
+            exportFrameRef={exportFrameRef}
+            captureReady={captureReady}
+            onClose={() => {
+              setExportOpen(false);
+              queueMicrotask(() => exportButtonRef.current?.focus());
+            }}
           />
         )}
         </div>
