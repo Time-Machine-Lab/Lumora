@@ -172,6 +172,7 @@ const DEBUG_FULL = new URLSearchParams(window.location.search).get('debug') === 
 
 /** 本地存储后端选择：?storage=opfs 使用 OPFS，缺省 IndexedDB（持久化门面可切换，TML-53 范围项） */
 const STORAGE = new URLSearchParams(window.location.search).get('storage') === 'opfs' ? 'opfs' : 'indexeddb';
+const DUAL_STUDIO_FIXTURE = new URLSearchParams(window.location.search).get('fixture') === 'dual-studio';
 
 export default function App() {
   const [mounted, setMounted] = useState(true);
@@ -300,6 +301,11 @@ export default function App() {
           </ul>
         </aside>
       </div>
+      {DUAL_STUDIO_FIXTURE && (
+        <div className="host__fixture-studio" data-testid="dual-studio-fixture">
+          <LumoraStudio hostVersion="0.1.0" />
+        </div>
+      )}
     </div>
   );
 }

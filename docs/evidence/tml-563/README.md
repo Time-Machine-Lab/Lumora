@@ -22,5 +22,17 @@ Each after image uses a fresh browser context so project persistence and runtime
 | 08 | Mobile storyboard, 375x667 | [Before](before/08-mobile-storyboard-375x667.png) | [After](after/08-mobile-storyboard-375x667.png) |
 | 09 | Mobile landscape editor, 667x375 | [Before](before/09-mobile-landscape-editor-667x375.png) | [After](after/09-mobile-landscape-editor-667x375.png) |
 | 10 | Mobile landscape export, 667x375 | [Before](before/10-mobile-landscape-export-667x375.png) | [After](after/10-mobile-landscape-export-667x375.png) |
+| 11 | Host sibling isolation, plugin modal, 1440x900 | [Before](before/11-portal-host-isolation-1440x900.png) | [After](after/11-portal-host-isolation-1440x900.png) |
+| 12 | ShadowRoot opener focus restored, 1440x900 | [Before](before/12-shadow-root-focus-restore-1440x900.png) | [After](after/12-shadow-root-focus-restore-1440x900.png) |
+| 13a | 900px Studio boundary (1240x768 host) | [Before](before/13-responsive-boundary-1240x768.png) | [After](after/13-responsive-boundary-1240x768.png) |
+| 13b | 901px Studio boundary (1241x768 host) | [Before](before/13-responsive-boundary-1241x768.png) | [After](after/13-responsive-boundary-1241x768.png) |
+| 13c | 1100px Studio boundary (1440x768 host) | [Before](before/13-responsive-boundary-1440x768.png) | [After](after/13-responsive-boundary-1440x768.png) |
+| 13d | 1101px Studio boundary (1441x768 host) | [Before](before/13-responsive-boundary-1441x768.png) | [After](after/13-responsive-boundary-1441x768.png) |
+| 14 | Mobile landscape with host log expanded, 667x375 | [Before](before/14-mobile-landscape-log-open-667x375.png) | [After](after/14-mobile-landscape-log-open-667x375.png) |
+| 15 | Mobile fit zoom with 0.1s shot controls, 375x667 | [Before](before/15-mobile-fit-shot-controls-375x667.png) | [After](after/15-mobile-fit-shot-controls-375x667.png) |
+| 16 | Mobile keyframe target lanes, 375x667 | [Before](before/16-mobile-keyframe-overlap-375x667.png) | [After](after/16-mobile-keyframe-overlap-375x667.png) |
+| 17 | Mobile storyboard close/delete controls, 375x667 | [Before](before/17-mobile-storyboard-controls-375x667.png) | [After](after/17-mobile-storyboard-controls-375x667.png) |
+| 18 | Plugin transition focus, 1440x900 | [Before](before/18-plugin-transition-focus-1440x900.png) | [After](after/18-plugin-transition-focus-1440x900.png) |
+| 19 | Two-Studio top-modal stack after Escape, 1440x900 | [Before](before/19-multiple-modal-stack-1440x900.png) | [After](after/19-multiple-modal-stack-1440x900.png) |
 
-The focused regression suite also checks WCAG A/AA violations, modal focus containment and restoration, embed-width layout, collapsed host logs, and nonblank desktop/mobile WebGL canvas pixels.
+The focused regression suite also checks WCAG A/AA violations, document-level host isolation, deep ShadowRoot focus restoration, two-Studio modal ordering, stable plugin-toggle focus, 900/901 and 1100/1101 container geometry, mobile shot/keyframe hitbox geometry, expanded landscape logs, and nonblank desktop/mobile WebGL canvas pixels.

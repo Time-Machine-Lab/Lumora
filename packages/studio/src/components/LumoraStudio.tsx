@@ -586,9 +586,9 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         className={`lumora-studio${className ? ` ${className}` : ''}`}
         data-testid="lumora-studio"
         data-workspace={storyboardOpen ? 'storyboard' : exportOpen ? 'export' : undefined}
-        // 覆盖确认模态打开时整壳 inert：工具栏/对象树/视口/时间线整体不可达
-        // （复审阻断 4：仅时间线内容 inert 时其余应用仍可交互）
-        inert={session.state.overwritePending || pluginManagerOpen || paletteOpen || undefined}
+        // 时间线覆盖确认仍在 Studio 树内；portalled dialogs 由 document 级模态栈
+        // 隔离全部 body 兄弟，避免与这里的 inert 生命周期重复。
+        inert={session.state.overwritePending || undefined}
       >
         <Toolbar
           runtime={runtime}

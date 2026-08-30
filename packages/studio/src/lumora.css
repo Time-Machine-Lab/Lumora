@@ -2412,7 +2412,7 @@
 }
 
 /* The editor responds to its embed width, not the browser viewport. */
-@container (max-width: 1100px) {
+@container (max-width: 1240px) {
   .lumora-toolbar__version {
     display: none;
   }
@@ -2436,7 +2436,7 @@
   }
 }
 
-@container (max-width: 900px) {
+@container (max-width: 1080px) {
   .lumora-toolbar__version {
     display: none;
   }
@@ -2514,7 +2514,7 @@
   }
 }
 
-@container (max-width: 760px) {
+@container (max-width: 1080px) {
   .lumora-toolbar {
     gap: 6px;
     min-height: 44px;
@@ -2563,6 +2563,10 @@
     height: 1px;
   }
 
+}
+
+@container (max-width: 760px) {
+
   .lumora-timeline__frame,
   .lumora-timeline__fps {
     display: none;
@@ -2587,6 +2591,20 @@
   .lumora-timeline__keyframe::after {
     inset: 18px;
   }
+
+  .lumora-timeline__lane {
+    min-height: 45px;
+  }
+
+  .lumora-timeline__shot-select {
+    min-width: 44px;
+  }
+
+  .lumora-storyboard__header-actions > .lumora-icon-button,
+  .lumora-storyboard__row-heading .lumora-icon-button {
+    width: 44px;
+    height: 44px;
+  }
 }
 
 @container (max-width: 420px) {
@@ -2596,8 +2614,20 @@
 }
 
 @media (max-height: 500px) {
+  .lumora-studio__scene-slot {
+    min-height: 56px;
+  }
+
+  .lumora-timeline {
+    flex: 0 1 72px;
+    max-height: 72px;
+    overflow: hidden;
+  }
+
+  .lumora-timeline__content,
   .lumora-timeline__body {
-    max-height: 56px;
+    flex: 1;
+    min-height: 0;
   }
 }
 

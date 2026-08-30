@@ -14,10 +14,16 @@ async function sampledColorCount(page: import('@playwright/test').Page) {
   return { colors: colors.size, width: image.width, height: image.height };
 }
 
+async function clickToolbarItem(page: import('@playwright/test').Page, testId: string) {
+  const item = page.getByTestId(testId);
+  if (!(await item.isVisible())) await page.getByTestId('toolbar-more').click();
+  await item.click();
+}
+
 test.beforeEach(async ({ page }) => {
   await page.goto('/');
-  await page.getByTestId('open-sample-project').click();
-  await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
+  await clickToolbarItem(page, 'open-sample-project');
+  await expect(page.getByTestId('open-export-workspace')).toBeEnabled();
 });
 
 test('1024 desktop uses the Studio container width and preserves the scene workspace', async ({ page }) => {
@@ -37,6 +43,39 @@ test('1024 desktop uses the Studio container width and preserves the scene works
   await expect(studio.getByRole('tab', { name: '场景' })).toHaveAttribute('aria-selected', 'true');
 });
 
+test('900/901 editor boundary preserves a usable Scene instead of collapsing on growth', async ({ page }) => {
+  const sceneWidths: number[] = [];
+  for (const width of [1240, 1241]) {
+    await page.setViewportSize({ width, height: 768 });
+    const measurements = await page.evaluate(() => {
+      const studio = document.querySelector<HTMLElement>('[data-testid="lumora-studio"]')!;
+      const scene = document.querySelector<HTMLElement>('.lumora-studio__viewport')!;
+      const more = document.querySelector<HTMLElement>('[data-testid="toolbar-more"]')!;
+      return {
+        studio: studio.getBoundingClientRect().width,
+        scene: scene.getBoundingClientRect().width,
+        moreVisible: getComputedStyle(more).display !== 'none',
+      };
+    });
+    expect(measurements.studio).toBeCloseTo(width - 340, 0);
+    expect(measurements.scene).toBeGreaterThanOrEqual(480);
+    expect(measurements.moreVisible).toBe(true);
+    sceneWidths.push(measurements.scene);
+  }
+  expect(Math.abs(sceneWidths[1]! - sceneWidths[0]!)).toBeLessThan(80);
+});
+
+test('1100/1101 toolbar boundary remains a compact single row', async ({ page }) => {
+  const heights: number[] = [];
+  for (const width of [1440, 1441]) {
+    await page.setViewportSize({ width, height: 768 });
+    const height = await page.getByTestId('lumora-toolbar').evaluate((element) => element.getBoundingClientRect().height);
+    expect(height).toBeLessThan(60);
+    heights.push(height);
+  }
+  expect(Math.abs(heights[1]! - heights[0]!)).toBeLessThan(4);
+});
+
 test('mobile defaults to a usable scene and keeps the host log collapsed', async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 667 });
   await expect(page.getByTestId('host-event-log')).toBeHidden();
@@ -50,6 +89,89 @@ test('mobile defaults to a usable scene and keeps the host log collapsed', async
   await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
   await page.getByTestId('editor-panel-scene').click();
   await expect(viewport).toBeVisible();
+});
+
+test('375 fit zoom preserves every shot action and non-overlapping keyframe lane', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 667 });
+  await page.getByTestId('open-storyboard-workspace').click();
+  await page.getByTestId('storyboard-tab-adopted').click();
+  const shortestValidShot = page.getByTestId('storyboard-adopted-shot').first();
+  await shortestValidShot.locator('input[type="number"]').fill('0.1');
+  await shortestValidShot.locator('input[type="number"]').press('Tab');
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('storyboard-workspace')).toBeHidden();
+  await page.getByRole('button', { name: '适配' }).click();
+
+  const shots = page.locator('[data-testid^="shot-block-"]');
+  await expect(shots).toHaveCount(3);
+  for (let index = 0; index < await shots.count(); index += 1) {
+    const shot = shots.nth(index);
+    const shotBox = await shot.boundingBox();
+    const actionBoxes = await shot.locator('button').evaluateAll((buttons) =>
+      buttons.map((button) => button.getBoundingClientRect().width),
+    );
+    expect(shotBox?.width ?? 0).toBeGreaterThanOrEqual(148);
+    expect(actionBoxes).toHaveLength(3);
+    expect(Math.min(...actionBoxes)).toBeGreaterThanOrEqual(44);
+  }
+
+  const laneGeometry = await page.locator('.lumora-timeline__lane').evaluateAll((lanes) =>
+    lanes.map((lane) => {
+      const laneRect = lane.getBoundingClientRect();
+      const keyframes = Array.from(lane.querySelectorAll<HTMLElement>('.lumora-timeline__keyframe'));
+      return {
+        height: laneRect.height,
+        containsTargets: keyframes.every((keyframe) => {
+          const rect = keyframe.getBoundingClientRect();
+          return rect.top >= laneRect.top && rect.bottom <= laneRect.bottom;
+        }),
+      };
+    }),
+  );
+  expect(laneGeometry.length).toBeGreaterThan(1);
+  expect(
+    laneGeometry.every(({ height, containsTargets }) => height >= 44 && containsTargets),
+    JSON.stringify(laneGeometry),
+  ).toBe(true);
+});
+
+test('375 storyboard close and delete controls use 44px icon targets', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 667 });
+  await page.getByTestId('open-storyboard-workspace').click();
+  await page.getByTestId('storyboard-tab-adopted').click();
+
+  const controls = page.getByRole('button', { name: /关闭 AI 分镜工作台|删除分镜/ });
+  expect(await controls.count()).toBeGreaterThan(1);
+  for (let index = 0; index < await controls.count(); index += 1) {
+    const control = controls.nth(index);
+    const box = await control.boundingBox();
+    expect(box?.width ?? 0).toBeGreaterThanOrEqual(44);
+    expect(box?.height ?? 0).toBeGreaterThanOrEqual(44);
+  }
+  const deletes = page.getByRole('button', { name: /删除分镜/ });
+  await expect(deletes.first().locator('svg.lucide-trash-2')).toBeVisible();
+});
+
+test('667x375 expanded host log keeps both Scene and Timeline inside Studio', async ({ page }) => {
+  await page.setViewportSize({ width: 667, height: 375 });
+  await page.getByTestId('host-log-toggle').click();
+  await expect(page.getByTestId('host-event-log')).toBeVisible();
+
+  const geometry = await page.evaluate(() => {
+    const rect = (selector: string) => document.querySelector<HTMLElement>(selector)!.getBoundingClientRect();
+    const studio = rect('[data-testid="lumora-studio"]');
+    const scene = rect('[data-testid="lumora-viewport"]');
+    const timeline = rect('[data-testid="lumora-timeline"]');
+    return {
+      studio: { top: studio.top, bottom: studio.bottom },
+      scene: { top: scene.top, bottom: scene.bottom, height: scene.height },
+      timeline: { top: timeline.top, bottom: timeline.bottom, height: timeline.height },
+    };
+  });
+  expect(geometry.scene.height).toBeGreaterThanOrEqual(100);
+  expect(geometry.timeline.height).toBeGreaterThanOrEqual(48);
+  expect(geometry.scene.top).toBeGreaterThanOrEqual(geometry.studio.top);
+  expect(geometry.timeline.bottom).toBeLessThanOrEqual(geometry.studio.bottom + 1);
 });
 
 test('mobile editor tabs support roving keyboard navigation', async ({ page }) => {
@@ -123,7 +245,7 @@ test('desktop and mobile canvases render nonblank scene pixels at stable dimensi
 
 test('plugin manager and command palette contain focus and restore their openers', async ({ page }) => {
   const pluginOpener = page.getByTestId('open-plugin-manager');
-  await pluginOpener.click();
+  await clickToolbarItem(page, 'open-plugin-manager');
   const pluginDialog = page.getByRole('dialog', { name: '插件管理' });
   await expect(pluginDialog).toHaveAttribute('aria-modal', 'true');
   await page.keyboard.press('Shift+Tab');
@@ -133,7 +255,7 @@ test('plugin manager and command palette contain focus and restore their openers
   await expect(pluginOpener).toBeFocused();
 
   const paletteOpener = page.getByTestId('open-command-palette');
-  await paletteOpener.click();
+  await clickToolbarItem(page, 'open-command-palette');
   const palette = page.getByRole('dialog', { name: '命令面板' });
   await expect(page.getByTestId('command-palette-input')).toHaveAccessibleName('搜索命令');
   await page.keyboard.press('Shift+Tab');
@@ -142,15 +264,83 @@ test('plugin manager and command palette contain focus and restore their openers
   await expect(paletteOpener).toBeFocused();
 });
 
+test('portal modal inerts the host root and restores a deep ShadowRoot opener', async ({ page }) => {
+  await clickToolbarItem(page, 'open-plugin-manager');
+  const pluginDialog = page.getByRole('dialog', { name: '插件管理' });
+  await expect(page.locator('#root')).toHaveAttribute('inert', '');
+  const escaped = await page.evaluate(() => {
+    const target = document.querySelector<HTMLElement>('[data-testid="studio-mount-toggle"]')!;
+    target.focus();
+    return document.activeElement === target;
+  });
+  expect(escaped).toBe(false);
+  expect(await pluginDialog.evaluate((dialog) => dialog.contains(document.activeElement))).toBe(true);
+  await page.keyboard.press('Escape');
+
+  await page.evaluate(() => {
+    const host = document.createElement('div');
+    host.id = 'shadow-focus-host';
+    const shadow = host.attachShadow({ mode: 'open' });
+    const button = document.createElement('button');
+    button.id = 'shadow-focus-opener';
+    button.textContent = 'Shadow opener';
+    shadow.append(button);
+    document.body.append(host);
+    button.focus();
+  });
+  await page.evaluate(() => {
+    document.querySelector<HTMLButtonElement>('[data-testid="open-command-palette"]')!.click();
+  });
+  await expect(page.getByRole('dialog', { name: '命令面板' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  expect(await page.evaluate(() =>
+    document.querySelector<HTMLElement>('#shadow-focus-host')?.shadowRoot?.activeElement?.id,
+  )).toBe('shadow-focus-opener');
+});
+
+test('plugin toggles keep browser focus through active, disabled, and failed transitions', async ({ page }) => {
+  await clickToolbarItem(page, 'open-plugin-manager');
+  const activeToggle = page.getByTestId('plugin-toggle-com.lumora.mock');
+  await activeToggle.click();
+  await expect(page.getByTestId('plugin-state-com.lumora.mock')).toHaveText('已禁用');
+  await expect(activeToggle).toBeFocused();
+  await activeToggle.click();
+  await expect(page.getByTestId('plugin-state-com.lumora.mock')).toHaveText('运行中');
+  await expect(activeToggle).toBeFocused();
+
+  const failedToggle = page.getByTestId('plugin-toggle-com.example.brokenmanifest');
+  await failedToggle.click();
+  await expect(page.getByTestId('plugin-state-com.example.brokenmanifest')).toHaveText('已停用');
+  await expect(failedToggle).toBeFocused();
+});
+
+test('two Studio instances route Escape to the top portal only', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('/?fixture=dual-studio');
+  const openers = page.getByTestId('open-plugin-manager');
+  await expect(openers).toHaveCount(2);
+  await openers.first().click();
+  const lowerDialog = page.getByRole('dialog', { name: '插件管理' }).first();
+  await openers.nth(1).evaluate((button) => button.click());
+  await expect(page.getByRole('dialog', { name: '插件管理' })).toHaveCount(2);
+
+  await page.keyboard.press('Escape');
+
+  await expect(page.getByRole('dialog', { name: '插件管理' })).toHaveCount(1);
+  await expect(lowerDialog).toBeVisible();
+});
+
 test('main editor and dialogs have no WCAG A/AA axe violations', async ({ page }) => {
+  await page.getByTestId('editor-panel-objects').click();
   await page.getByTestId('tree-row-sample-cube').click();
+  await page.getByTestId('editor-panel-scene').click();
   let results = await new AxeBuilder({ page })
     .include('[data-testid="lumora-studio"]')
     .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
     .analyze();
   expect(results.violations, JSON.stringify(results.violations, null, 2)).toEqual([]);
 
-  await page.getByTestId('open-plugin-manager').click();
+  await clickToolbarItem(page, 'open-plugin-manager');
   results = await new AxeBuilder({ page })
     .include('[data-testid="plugin-manager"]')
     .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
@@ -159,6 +349,7 @@ test('main editor and dialogs have no WCAG A/AA axe violations', async ({ page }
 });
 
 test('Mock plugin controls inherit Studio surface, border, text, focus, and disabled tokens', async ({ page }) => {
+  await page.getByTestId('editor-panel-objects').click();
   await page.getByTestId('panel-tab-com.lumora.mock.panel.ai').click();
   const panel = page.getByTestId('mock-ai-panel');
   const input = page.getByTestId('mock-ai-input');

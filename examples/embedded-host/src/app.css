@@ -73,6 +73,7 @@ body {
 .host__studio {
   flex: 1;
   min-width: 0;
+  min-height: 0;
 }
 
 .host__placeholder {
@@ -163,6 +164,26 @@ body {
 
   .host__log[data-open] {
     display: block;
+  }
+}
+
+.host__fixture-studio {
+  position: fixed;
+  left: -10000px;
+  top: 0;
+  width: 800px;
+  height: 600px;
+  overflow: hidden;
+}
+
+@media (max-width: 900px) and (max-height: 500px) {
+  .host__log {
+    height: 64px;
+    padding-block: 6px;
+  }
+
+  .host__log h2 {
+    margin-bottom: 4px;
   }
 }
 

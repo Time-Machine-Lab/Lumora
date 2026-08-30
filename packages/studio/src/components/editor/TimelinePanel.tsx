@@ -24,6 +24,7 @@ import { CAMERA_DRIVE_LIMITS } from './camera-drive';
 
 /** 标签列宽度：标尺/轨道/分镜共用，测试与坐标换算引用此常量 */
 export const TIMELINE_LABEL_WIDTH = 186;
+const MIN_SHOT_BLOCK_WIDTH = 152;
 
 export interface TimelinePanelProps {
   session: TimelineSession;
@@ -155,8 +156,14 @@ export function TimelinePanel({
     const viewport = bodyRef.current?.clientWidth ?? 800;
     const width = Math.max(50, viewport - TIMELINE_LABEL_WIDTH);
     const duration = Math.max(0.1, state.duration);
-    session.setZoom(Math.min(MAX_TIMELINE_ZOOM, Math.max(MIN_TIMELINE_ZOOM, width / duration)));
-  }, [session, state.duration]);
+    const minimumShotZoom = project.shots.reduce((minimum, shot) => {
+      const shotDuration = Math.max(0.1, shot.endTime - shot.startTime);
+      return Math.max(minimum, MIN_SHOT_BLOCK_WIDTH / shotDuration);
+    }, MIN_TIMELINE_ZOOM);
+    session.setZoom(
+      Math.min(MAX_TIMELINE_ZOOM, Math.max(MIN_TIMELINE_ZOOM, minimumShotZoom, width / duration)),
+    );
+  }, [project.shots, session, state.duration]);
 
   // 缩略图：串行截取缺失分镜（一次 seek → 双 RAF → capture → 下一分镜），
   // 链尾统一恢复播放头；播放/录制开始、外部 seek、项目切换或卸载 → 取消链，
