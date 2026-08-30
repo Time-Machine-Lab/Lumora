@@ -1479,6 +1479,80 @@
   padding: 0;
 }
 
+.lumora-camera-controls,
+.lumora-camera-controls__modes,
+.lumora-camera-controls__field {
+  display: inline-flex;
+  align-items: center;
+}
+
+.lumora-camera-controls {
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.lumora-camera-controls__modes {
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 1px solid var(--lumora-border);
+  border-radius: 6px;
+}
+
+.lumora-camera-controls__mode {
+  height: 22px;
+  padding: 0 7px;
+  border: 0;
+  border-right: 1px solid var(--lumora-border);
+  background: var(--lumora-surface-2);
+  color: var(--lumora-text-dim);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.lumora-camera-controls__mode:last-child {
+  border-right: 0;
+}
+
+.lumora-camera-controls__mode[aria-pressed='true'] {
+  background: rgba(77, 171, 247, 0.18);
+  color: var(--lumora-text);
+}
+
+.lumora-camera-controls__mode:focus-visible,
+.lumora-camera-controls__field input:focus-visible {
+  outline: 2px solid var(--lumora-accent);
+  outline-offset: -2px;
+}
+
+.lumora-camera-controls__field {
+  min-width: 126px;
+  gap: 4px;
+  color: var(--lumora-text-dim);
+  font-size: 11px;
+}
+
+.lumora-camera-controls__field span {
+  flex: 0 0 auto;
+}
+
+.lumora-camera-controls__field input {
+  width: 72px;
+  min-width: 52px;
+  accent-color: var(--lumora-accent);
+}
+
+.lumora-camera-controls__field input:disabled {
+  opacity: 0.45;
+}
+
+.lumora-camera-controls__field output {
+  width: 28px;
+  color: var(--lumora-text);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
 .lumora-recording-shortcut__dialog {
   position: absolute;
   z-index: 30;

@@ -19,6 +19,7 @@ import { projectContentFingerprint } from './timeline-thumbnail-cache';
 import { RecordingShortcutSettings } from './RecordingShortcutSettings';
 import type { KeyboardShortcut } from './recording-shortcut';
 import { DEFAULT_RECORDING_SHORTCUT, formatShortcut } from './recording-shortcut';
+import { CAMERA_DRIVE_LIMITS } from './camera-drive';
 
 /** 标签列宽度：标尺/轨道/分镜共用，测试与坐标换算引用此常量 */
 export const TIMELINE_LABEL_WIDTH = 186;
@@ -342,6 +343,73 @@ export function TimelinePanel({
           shortcut={recordingShortcut}
           onChange={onRecordingShortcutChange}
         />
+        <div className="lumora-camera-controls" data-testid="camera-control-settings">
+          <div className="lumora-camera-controls__modes" role="group" aria-label="机位操控模式">
+            <button
+              type="button"
+              className="lumora-camera-controls__mode"
+              aria-label="键盘移动 + 鼠标视角"
+              aria-pressed={state.cameraControls.mode === 'keyboard-mouse'}
+              onClick={() => session.setCameraControlSettings({ mode: 'keyboard-mouse' })}
+            >
+              键鼠
+            </button>
+            <button
+              type="button"
+              className="lumora-camera-controls__mode"
+              aria-label="纯键盘操控"
+              aria-pressed={state.cameraControls.mode === 'keyboard-only'}
+              onClick={() => session.setCameraControlSettings({ mode: 'keyboard-only' })}
+            >
+              键盘
+            </button>
+          </div>
+          <label className="lumora-camera-controls__field">
+            <span>速度</span>
+            <input
+              type="range"
+              aria-label="连续移动速度"
+              data-testid="camera-control-speed"
+              min={CAMERA_DRIVE_LIMITS.speed.min}
+              max={CAMERA_DRIVE_LIMITS.speed.max}
+              step="0.1"
+              value={state.cameraControls.speed}
+              onChange={(event) => session.setCameraControlSettings({ speed: Number(event.target.value) })}
+            />
+            <output>{state.cameraControls.speed.toFixed(1)}</output>
+          </label>
+          <label className="lumora-camera-controls__field">
+            <span>步长</span>
+            <input
+              type="range"
+              aria-label="短按移动步长"
+              data-testid="camera-control-tap-step"
+              min={CAMERA_DRIVE_LIMITS.tapStep.min}
+              max={CAMERA_DRIVE_LIMITS.tapStep.max}
+              step="0.01"
+              value={state.cameraControls.tapStep}
+              onChange={(event) => session.setCameraControlSettings({ tapStep: Number(event.target.value) })}
+            />
+            <output>{state.cameraControls.tapStep.toFixed(2)}</output>
+          </label>
+          <label className="lumora-camera-controls__field">
+            <span>视角</span>
+            <input
+              type="range"
+              aria-label="鼠标视角灵敏度"
+              data-testid="camera-control-sensitivity"
+              min={CAMERA_DRIVE_LIMITS.mouseSensitivity.min}
+              max={CAMERA_DRIVE_LIMITS.mouseSensitivity.max}
+              step="0.1"
+              value={state.cameraControls.mouseSensitivity}
+              disabled={state.cameraControls.mode === 'keyboard-only'}
+              onChange={(event) => session.setCameraControlSettings({
+                mouseSensitivity: Number(event.target.value),
+              })}
+            />
+            <output>{state.cameraControls.mouseSensitivity.toFixed(1)}</output>
+          </label>
+        </div>
         <span className="lumora-timeline__time" data-testid="timeline-time">
           {formatTime(time)}
         </span>

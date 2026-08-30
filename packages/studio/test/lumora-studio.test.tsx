@@ -389,7 +389,7 @@ describe('LumoraStudio', () => {
 
     await waitFor(() => expect(screen.getByTestId('export-workspace')).not.toBe(oldWorkspace));
     fireEvent.click(screen.getByRole('button', { name: '导出清单' }));
-    expect(await screen.findByRole('status')).toHaveTextContent('分镜清单已导出');
+    expect(await screen.findByTestId('export-live-status')).toHaveTextContent('分镜清单已导出');
   });
 
   it('渲染壳层并激活合法插件：面板、工具栏贡献项可见', async () => {

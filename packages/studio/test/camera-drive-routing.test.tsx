@@ -104,6 +104,132 @@ afterEach(() => {
 });
 
 describe('camera drive keyboard routing', () => {
+  it('right-button dragging rotates the selected camera without translating it', async () => {
+    const studio = await mountStudio('lumora://drive-mouse-look');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    const beforePosition = camera.position.clone();
+    const beforeQuaternion = camera.quaternion.clone();
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    await act(async () => delay(60));
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 7, clientX: 100, clientY: 100 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 7, clientX: 140, clientY: 80 });
+    await act(async () => delay(80));
+    fireEvent.pointerUp(viewport, { button: 2, pointerId: 7, clientX: 140, clientY: 80 });
+
+    expect(camera.position.distanceTo(beforePosition)).toBeLessThan(1e-9);
+    expect(camera.quaternion.angleTo(beforeQuaternion)).toBeGreaterThan(0.001);
+  });
+
+  it('keyboard-mouse mode keeps translation and pointer look independent', async () => {
+    const studio = await mountStudio('lumora://drive-independent-inputs');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    await act(async () => delay(60));
+    const beforePosition = camera.position.clone();
+    const beforeQuaternion = camera.quaternion.clone();
+
+    fireEvent.keyDown(studio.root, { key: 'w', code: 'KeyW' });
+    await act(async () => delay(180));
+    fireEvent.keyUp(studio.root, { key: 'w', code: 'KeyW' });
+    fireEvent.keyDown(studio.root, { key: 'ArrowLeft', code: 'ArrowLeft' });
+    await act(async () => delay(80));
+    fireEvent.keyUp(studio.root, { key: 'ArrowLeft', code: 'ArrowLeft' });
+
+    expect(camera.position.distanceTo(beforePosition)).toBeGreaterThan(0.01);
+    expect(camera.quaternion.angleTo(beforeQuaternion)).toBeLessThan(1e-9);
+  });
+
+  it('keyboard-only mode ignores pointer look and rotates with arrow keys', async () => {
+    const studio = await mountStudio('lumora://drive-keyboard-only');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    fireEvent.click(within(studio.root).getByRole('button', { name: '纯键盘操控' }));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    const beforePointer = camera.quaternion.clone();
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    await act(async () => delay(60));
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 8, clientX: 100, clientY: 100 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 8, clientX: 150, clientY: 80 });
+    fireEvent.pointerUp(viewport, { button: 2, pointerId: 8, clientX: 150, clientY: 80 });
+    await act(async () => delay(80));
+    expect(camera.quaternion.angleTo(beforePointer)).toBeLessThan(1e-9);
+
+    fireEvent.keyDown(studio.root, { key: 'ArrowLeft', code: 'ArrowLeft' });
+    await act(async () => delay(100));
+    fireEvent.keyUp(studio.root, { key: 'ArrowLeft', code: 'ArrowLeft' });
+    expect(camera.quaternion.angleTo(beforePointer)).toBeGreaterThan(0.001);
+  });
+
+  it('scopes pointer capture and context-menu suppression to an active camera-look gesture', async () => {
+    const studio = await mountStudio('lumora://drive-pointer-lifecycle');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    const setPointerCapture = vi.fn();
+    const releasePointerCapture = vi.fn();
+    Object.assign(viewport, { setPointerCapture, releasePointerCapture });
+    const look = vi.spyOn(CameraDrive.prototype, 'look');
+    await act(async () => delay(60));
+
+    const idleContextMenu = fireEvent.contextMenu(viewport);
+    expect(idleContextMenu).toBe(true);
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 9, clientX: 10, clientY: 10 });
+    expect(setPointerCapture).toHaveBeenCalledWith(9);
+    const activeContextMenu = fireEvent.contextMenu(viewport);
+    expect(activeContextMenu).toBe(false);
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 9, clientX: 30, clientY: 20 });
+    expect(look).toHaveBeenCalled();
+    fireEvent.pointerCancel(viewport, { pointerId: 9 });
+    expect(releasePointerCapture).toHaveBeenCalledWith(9);
+    const callsAtCancel = look.mock.calls.length;
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 9, clientX: 60, clientY: 40 });
+    expect(look).toHaveBeenCalledTimes(callsAtCancel);
+    expect(fireEvent.contextMenu(viewport)).toBe(true);
+  });
+
+  it.each(['blur', 'export', 'overwrite'] as const)(
+    'ends camera-look and clears residual rotation on %s',
+    async (terminal) => {
+      const studio = await mountStudio(`lumora://drive-look-${terminal}`, terminal === 'overwrite');
+      act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+      const camera = findNode(studio.scene, 'sample-camera')!;
+      const viewport = within(studio.root).getByTestId('lumora-viewport');
+      const releasePointerCapture = vi.fn();
+      Object.assign(viewport, { setPointerCapture: vi.fn(), releasePointerCapture });
+      const look = vi.spyOn(CameraDrive.prototype, 'look');
+      await act(async () => delay(60));
+
+      fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 10, clientX: 10, clientY: 10 });
+      fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 10, clientX: 45, clientY: 25 });
+      await act(async () => delay(40));
+      if (terminal === 'blur') {
+        const outside = document.createElement('button');
+        document.body.append(outside);
+        viewport.focus();
+        outside.focus();
+        outside.remove();
+      }
+      if (terminal === 'export') {
+        fireEvent.click(within(studio.root).getByTestId('open-export-workspace'));
+        await screen.findByTestId('export-workspace');
+      }
+      if (terminal === 'overwrite') {
+        fireEvent.click(within(studio.root).getByTestId('timeline-record'));
+        await screen.findByTestId('overwrite-confirm');
+      }
+      await act(async () => delay(40));
+      const callsAtTerminal = look.mock.calls.length;
+      const rotationAtTerminal = camera.quaternion.clone();
+      fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 10, clientX: 80, clientY: 40 });
+      await act(async () => delay(80));
+
+      expect(look).toHaveBeenCalledTimes(callsAtTerminal);
+      expect(releasePointerCapture).toHaveBeenCalledWith(10);
+      expect(camera.quaternion.angleTo(rotationAtTerminal)).toBeLessThan(1e-6);
+    },
+  );
+
   it('does not consume Ctrl+W or move the recording camera', async () => {
     const studio = await mountStudio('lumora://drive-browser-shortcut');
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
