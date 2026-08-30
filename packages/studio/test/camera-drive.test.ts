@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import { focalLengthToFovDeg } from '@lumora/core';
 import type { SceneObjectData } from '@lumora/core';
 import {
+  CAMERA_DRIVE_LIMITS,
   CameraDrive,
   MAX_FOCAL_MM,
   MIN_FOCAL_MM,
@@ -19,6 +20,85 @@ function makeCameraNode(): THREE.PerspectiveCamera {
 }
 
 describe('CameraDrive：键鼠驾驶积分器', () => {
+  it('短按移动键只产生一次确定的本地轴步进', () => {
+    const drive = new CameraDrive({ tapStep: 0.1, holdDelay: 0.12, speed: 2.5 });
+    const node = makeCameraNode();
+    drive.attach(node);
+    drive.press('KeyW');
+    drive.update(0.05);
+    drive.release('KeyW');
+
+    expect(node.position.z).toBeCloseTo(5.9, 6);
+  });
+
+  it('越过短按阈值后按住移动键产生连续平滑位移', () => {
+    const drive = new CameraDrive({ tapStep: 0.1, holdDelay: 0.12, speed: 2.5, smoothing: 12 });
+    const node = makeCameraNode();
+    drive.attach(node);
+    drive.press('KeyW');
+    drive.update(0.06);
+    drive.update(0.06);
+    drive.update(0.2);
+    drive.release('KeyW');
+
+    expect(node.position.z).toBeLessThan(5.9);
+  });
+
+  it('held movement never applies the maximum tap step when crossing holdDelay', () => {
+    const drive = new CameraDrive({
+      tapStep: CAMERA_DRIVE_LIMITS.tapStep.max,
+      holdDelay: CAMERA_DRIVE_LIMITS.holdDelay.min,
+      speed: CAMERA_DRIVE_LIMITS.speed.max,
+      smoothing: CAMERA_DRIVE_LIMITS.smoothing.max,
+    });
+    const node = makeCameraNode();
+    drive.attach(node);
+    drive.press('KeyW');
+
+    const frameSeconds = 1 / 60;
+    const positions: THREE.Vector3[] = [node.position.clone()];
+    for (let frame = 0; frame < 12; frame += 1) {
+      drive.update(frameSeconds);
+      positions.push(node.position.clone());
+    }
+    const beforeRelease = node.position.clone();
+    drive.release('KeyW');
+    positions.push(node.position.clone());
+
+    const perFrameDistances = positions.slice(1).map((position, index) =>
+      position.distanceTo(positions[index]!),
+    );
+    expect(Math.max(...perFrameDistances)).toBeLessThanOrEqual(
+      CAMERA_DRIVE_LIMITS.speed.max * frameSeconds,
+    );
+    expect(node.position.distanceTo(beforeRelease)).toBeLessThan(1e-12);
+  });
+
+  it('重复 keydown 不重置按住计时，且不会在释放时追加短按步进', () => {
+    const drive = new CameraDrive({ tapStep: 0.1, holdDelay: 0.12, speed: 3, smoothing: 20 });
+    const node = makeCameraNode();
+    drive.attach(node);
+    drive.press('KeyW');
+    drive.update(0.08);
+    drive.press('KeyW');
+    drive.update(0.2);
+    drive.release('KeyW');
+
+    expect(node.position.z).toBeLessThan(5.8);
+  });
+
+  it('相反方向的短按使用同一步长并可预测地抵消', () => {
+    const drive = new CameraDrive({ tapStep: 0.15, holdDelay: 0.12 });
+    const node = makeCameraNode();
+    drive.attach(node);
+    drive.press('KeyW');
+    drive.release('KeyW');
+    drive.press('KeyS');
+    drive.release('KeyS');
+
+    expect(node.position.toArray()).toEqual([0, 1.6, 6]);
+  });
+
   it('按住 W 前进：向相机朝向的 -Z 平滑加速（指数逼近目标速度）', () => {
     const drive = new CameraDrive({ speed: 2.5, rotateSpeed: 1.2, smoothing: 8 });
     const node = makeCameraNode();
@@ -65,7 +145,7 @@ describe('CameraDrive：键鼠驾驶积分器', () => {
   });
 
   it('方向键偏航/俯仰：左转绕世界 Y，抬头绕局部 X', () => {
-    const drive = new CameraDrive({ rotateSpeed: 1.2, smoothing: 8 });
+    const drive = new CameraDrive({ mode: 'keyboard-only', rotateSpeed: 1.2, smoothing: 8 });
     const node = makeCameraNode();
     drive.attach(node);
     drive.press('ArrowLeft');
@@ -116,6 +196,81 @@ describe('CameraDrive：键鼠驾驶积分器', () => {
     const before = b.position.z;
     drive.update(0.5);
     expect(b.position.z).toBeCloseTo(before, 10);
+  });
+
+  it('键鼠模式接收位移键、拒绝方向键，并平滑应用鼠标视角', () => {
+    const drive = new CameraDrive({ mode: 'keyboard-mouse', mouseSensitivity: 1, smoothing: 8 });
+    const node = makeCameraNode();
+    drive.attach(node);
+
+    expect(drive.acceptsKey('KeyW')).toBe(true);
+    expect(drive.acceptsKey('ArrowLeft')).toBe(false);
+    drive.look(40, -20);
+    drive.update(1 / 60);
+
+    expect(node.rotation.y).not.toBe(0);
+    expect(node.rotation.x).not.toBe(0);
+    expect(drive.hasInput).toBe(true);
+  });
+
+  it('纯键盘模式忽略鼠标视角，切换模式会清除残余视角输入', () => {
+    const drive = new CameraDrive({ mode: 'keyboard-mouse', mouseSensitivity: 1 });
+    const node = makeCameraNode();
+    drive.attach(node);
+    drive.look(40, 20);
+    drive.setSettings({ mode: 'keyboard-only' });
+    drive.update(0.5);
+    const rotation = node.rotation.clone();
+    drive.look(40, 20);
+    drive.update(0.5);
+
+    expect(node.rotation.x).toBeCloseTo(rotation.x, 10);
+    expect(node.rotation.y).toBeCloseTo(rotation.y, 10);
+    expect(drive.acceptsKey('ArrowLeft')).toBe(true);
+  });
+
+  it('鼠标视角限幅且残余输入逐帧衰减，不会产生单帧无界跳变', () => {
+    const huge = new CameraDrive({ mode: 'keyboard-mouse', mouseSensitivity: 1, smoothing: 8 });
+    const bounded = new CameraDrive({ mode: 'keyboard-mouse', mouseSensitivity: 1, smoothing: 8 });
+    const hugeNode = makeCameraNode();
+    const boundedNode = makeCameraNode();
+    huge.attach(hugeNode);
+    bounded.attach(boundedNode);
+    huge.look(10_000, -10_000);
+    bounded.look(80, -80);
+    huge.update(1 / 60);
+    bounded.update(1 / 60);
+
+    expect(hugeNode.rotation.x).toBeCloseTo(boundedNode.rotation.x, 8);
+    expect(hugeNode.rotation.y).toBeCloseTo(boundedNode.rotation.y, 8);
+    const firstYaw = hugeNode.rotation.y;
+    huge.update(1 / 60);
+    expect(Math.abs(hugeNode.rotation.y)).toBeGreaterThan(Math.abs(firstYaw));
+    expect(Math.abs(hugeNode.rotation.y - firstYaw)).toBeLessThan(Math.abs(firstYaw));
+  });
+
+  it('cancelLook clears queued mouse rotation without cancelling held translation', () => {
+    const drive = new CameraDrive({ mode: 'keyboard-mouse', speed: 3, smoothing: 8 });
+    const node = makeCameraNode();
+    drive.attach(node);
+    drive.press('KeyW');
+    drive.update(0.06);
+    drive.update(0.08);
+    drive.look(80, -40);
+    drive.update(1 / 60);
+
+    const rotationAtCancel = node.quaternion.clone();
+    const positionAtCancel = node.position.clone();
+    const cancelLook = (drive as CameraDrive & { cancelLook?: () => void }).cancelLook;
+    expect(cancelLook).toBeTypeOf('function');
+    if (!cancelLook) return;
+
+    cancelLook.call(drive);
+    drive.update(0.1);
+
+    expect(node.quaternion.angleTo(rotationAtCancel)).toBeLessThan(1e-9);
+    expect(node.position.distanceTo(positionAtCancel)).toBeGreaterThan(0.05);
+    expect(drive.hasInput).toBe(true);
   });
 });
 

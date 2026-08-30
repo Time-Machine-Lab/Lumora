@@ -19,6 +19,11 @@ import {
 import type { SceneEditor, TrackData, TrackKeyframeData, TrackTargetPath } from '@lumora/core';
 import { TimelineRecorder } from '../components/editor/timeline-recorder';
 import type { CaptureSource } from '../components/editor/timeline-recorder';
+import {
+  DEFAULT_CAMERA_DRIVE_SETTINGS,
+  normalizeCameraDriveSettings,
+} from '../components/editor/camera-drive';
+import type { CameraDriveSettings } from '../components/editor/camera-drive';
 import { showToast } from '../components/editor/toasts';
 
 export type RecorderChannel = 'position' | 'rotation' | 'focalLength';
@@ -42,6 +47,7 @@ export interface TimelineSessionState {
   zoom: number;
   snapEnabled: boolean;
   loopEnabled: boolean;
+  cameraControls: CameraDriveSettings;
 }
 
 export type StopRecordingResult = { ok: true } | { ok: false; message: string };
@@ -58,6 +64,7 @@ export interface TimelineSession {
   setSnap(enabled: boolean): void;
   setLoop(enabled: boolean): void;
   setCaptureSource(source: CaptureSource | null): void;
+  setCameraControlSettings(settings: Partial<CameraDriveSettings>): void;
   /** 开始录制指定机位；已有录制轨道时进入覆盖确认 */
   startRecording(cameraObjectId: string): void;
   confirmOverwrite(): void;
@@ -86,6 +93,7 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     zoom: timeline.getZoom(),
     snapEnabled: timeline.isSnapEnabled(),
     loopEnabled: timeline.isLoopEnabled(),
+    cameraControls: { ...DEFAULT_CAMERA_DRIVE_SETTINGS },
   }));
 
   const pendingRecordingRef = useRef<{ sessionToken: number; cameraId: string } | null>(null);
@@ -326,6 +334,13 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     [recorder],
   );
 
+  const setCameraControlSettings = useCallback((settings: Partial<CameraDriveSettings>) => {
+    setState((current) => ({
+      ...current,
+      cameraControls: normalizeCameraDriveSettings(settings, current.cameraControls),
+    }));
+  }, []);
+
   const beginRecording = useCallback(
     (cameraObjectId: string) => {
       const project = editor.getProject();
@@ -493,6 +508,7 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       setSnap,
       setLoop,
       setCaptureSource,
+      setCameraControlSettings,
       startRecording,
       confirmOverwrite,
       cancelOverwrite,

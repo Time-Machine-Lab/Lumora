@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
 import { resolve } from 'node:path';
+import { Euler, Quaternion } from 'three';
 
 /** 标签列宽度（px），与 TimelinePanel 导出的 TIMELINE_LABEL_WIDTH 一致；
  *  播放头 = 标签列 + time * zoom，关键帧/分镜/标尺刻度 = time * zoom（时间画布内） */
@@ -87,6 +88,22 @@ async function cameraPose(
   const pose = JSON.parse(text)[cameraId];
   if (!pose) throw new Error(`机位 ${cameraId} 不在位姿钩子输出中`);
   return pose;
+}
+
+function vectorDistance(a: readonly number[], b: readonly number[]): number {
+  return Math.hypot(...a.map((value, index) => value - (b[index] ?? 0)));
+}
+
+function quaternionAngle(a: readonly number[], b: readonly number[]): number {
+  const qa = new Quaternion().setFromEuler(new Euler(a[0], a[1], a[2], 'XYZ'));
+  const qb = new Quaternion().setFromEuler(new Euler(b[0], b[1], b[2], 'XYZ'));
+  return qa.angleTo(qb);
+}
+
+async function setRange(page: Page, testId: string, value: number): Promise<void> {
+  const input = page.getByTestId(testId);
+  await input.fill(String(value));
+  await expect(input).toHaveValue(String(value));
 }
 
 /** 两张 PNG 截图的像素差异比例（0..1）：任一通道差绝对值之和 > 30 的像素占比；
@@ -403,6 +420,326 @@ test('AC1 浏览器级：真实约 5s 持续驾驶录制 → 抽稀覆盖轨道 
   expect(runB.pose.focalLength).toEqual(runA.pose.focalLength);
   const diffEnd = await pixelDiffRatio(page, runA.pixels, runB.pixels);
   expect(diffEnd).toBeLessThan(0.01);
+});
+
+test('recording control: keyboard-mouse mode records deterministic tap, smooth hold, and bounded look', async ({ page }) => {
+  await setRange(page, 'camera-control-speed', 3);
+  await setRange(page, 'camera-control-tap-step', 0.2);
+  await setRange(page, 'camera-control-sensitivity', 1.4);
+  await startRecording(page);
+  const viewport = page.getByTestId('lumora-viewport');
+  const start = await cameraPose(page);
+
+  await page.keyboard.down('w');
+  await page.waitForTimeout(50);
+  await page.keyboard.up('w');
+  await page.waitForTimeout(120);
+  const afterTap = await cameraPose(page);
+  expect(vectorDistance(afterTap.position, start.position)).toBeGreaterThan(0.17);
+  expect(vectorDistance(afterTap.position, start.position)).toBeLessThan(0.23);
+
+  await page.keyboard.down('d');
+  await page.waitForTimeout(320);
+  const holdMid = await cameraPose(page);
+  await page.waitForTimeout(360);
+  const holdLate = await cameraPose(page);
+  await page.keyboard.up('d');
+  expect(vectorDistance(holdMid.position, afterTap.position)).toBeGreaterThan(0.2);
+  expect(vectorDistance(holdLate.position, holdMid.position)).toBeGreaterThan(0.35);
+  expect(vectorDistance(holdLate.rotation, start.rotation)).toBeLessThan(0.001);
+
+  await page.waitForTimeout(800);
+  const box = await viewport.boundingBox();
+  if (!box) throw new Error('视口不可见');
+  const lookStart = await cameraPose(page);
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(box.x + box.width / 2 + 60, box.y + box.height / 2 - 30, { steps: 6 });
+  await page.mouse.up({ button: 'right' });
+  await page.waitForTimeout(240);
+  const afterLook = await cameraPose(page);
+  expect(vectorDistance(afterLook.position, lookStart.position)).toBeLessThan(0.01);
+  expect(vectorDistance(afterLook.rotation, lookStart.rotation)).toBeGreaterThan(0.03);
+
+  if (process.env.RECORDING_CONTROL_EVIDENCE === '1') {
+    await page.screenshot({
+      fullPage: true,
+      path: resolve('test-results/edge-recording-controls-desktop.png'),
+    });
+    await page.setViewportSize({ width: 760, height: 800 });
+    await page.getByTestId('timeline-record').scrollIntoViewIfNeeded();
+    await page.waitForTimeout(120);
+    await page.screenshot({
+      fullPage: true,
+      path: resolve('test-results/edge-recording-controls-760px.png'),
+    });
+    await page.setViewportSize({ width: 375, height: 800 });
+    await page.getByTestId('timeline-record').scrollIntoViewIfNeeded();
+    await page.waitForTimeout(120);
+    await page.screenshot({
+      fullPage: true,
+      path: resolve('test-results/edge-recording-controls-375px.png'),
+    });
+    await page.setViewportSize({ width: 1280, height: 800 });
+  }
+
+  await page.getByTestId('timeline-record').click();
+  await expect(page.getByTestId('timeline-time')).toHaveText('00:00.00');
+  const positionLane = page.getByTestId('track-lane-sample-track-camera-dolly');
+  const rotationLane = page.locator('.lumora-timeline__lane').filter({ hasText: '录制主摄像机·旋转' });
+  await expect(positionLane).toHaveCount(1);
+  await expect(rotationLane).toHaveCount(1);
+  const positionKeys = positionLane.locator('.lumora-timeline__keyframe');
+  const positionCount = await positionKeys.count();
+  expect(positionCount).toBeGreaterThanOrEqual(3);
+  const recordedPositionSamples = await positionKeys.evaluateAll((elements) => {
+    const prefix = 'keyframe-sample-track-camera-dolly-';
+    return elements.map((element) => ({
+      time: Number((element.getAttribute('data-testid') ?? '').slice(prefix.length)),
+      value: JSON.parse(element.getAttribute('data-keyframe-value') ?? '[]') as number[],
+    }));
+  });
+  const sampledTap = recordedPositionSamples.reduce((closest, sample) =>
+    vectorDistance(sample.value, afterTap.position) < vectorDistance(closest.value, afterTap.position)
+      ? sample
+      : closest,
+  ).value;
+  const sampledLateHold = recordedPositionSamples.reduce((closest, sample) =>
+    vectorDistance(sample.value, holdLate.position) < vectorDistance(closest.value, holdLate.position)
+      ? sample
+      : closest,
+  ).value;
+  expect(vectorDistance(sampledTap, afterTap.position)).toBeLessThan(0.05);
+  expect(vectorDistance(sampledTap, start.position)).toBeGreaterThan(0.17);
+  expect(vectorDistance(sampledTap, start.position)).toBeLessThan(0.23);
+  expect(vectorDistance(sampledLateHold, holdLate.position)).toBeLessThan(0.12);
+  expect(vectorDistance(sampledLateHold, sampledTap)).toBeGreaterThan(0.5);
+  for (let index = 1; index < recordedPositionSamples.length; index += 1) {
+    const previous = recordedPositionSamples[index - 1]!;
+    const current = recordedPositionSamples[index]!;
+    const elapsed = current.time - previous.time;
+    expect(vectorDistance(current.value, previous.value)).toBeLessThanOrEqual(0.23 + 3.1 * elapsed);
+  }
+  const rotationKeys = rotationLane.locator('.lumora-timeline__keyframe');
+  const rotationCount = await rotationKeys.count();
+  expect(rotationCount).toBeGreaterThanOrEqual(2);
+  const rotations = await rotationKeys.evaluateAll((elements) =>
+    elements.map((element) => JSON.parse(element.getAttribute('data-keyframe-value') ?? '[]') as number[]),
+  );
+  const sampledLook = rotations.reduce((closest, rotation) =>
+    vectorDistance(rotation, afterLook.rotation) < vectorDistance(closest, afterLook.rotation)
+      ? rotation
+      : closest,
+  );
+  expect(vectorDistance(sampledLook, afterLook.rotation)).toBeLessThan(0.05);
+  expect(vectorDistance(sampledLook, start.rotation)).toBeGreaterThan(0.03);
+  const adjacentRotationDeltas = rotations.slice(1).map((rotation, index) =>
+    vectorDistance(rotation, rotations[index]!),
+  );
+  expect(Math.max(...adjacentRotationDeltas)).toBeLessThan(0.5);
+});
+
+test('recording control stays bound to its camera across camera selection and deselection', async ({ page }) => {
+  await startRecording(page);
+  const recordingStart = await cameraPose(page, 'sample-camera');
+  const otherStart = await cameraPose(page, 'sample-camera-2');
+
+  await page.getByTestId('tree-row-sample-camera-2').click();
+  await page.keyboard.down('s');
+  await page.waitForTimeout(260);
+  await page.keyboard.up('s');
+  await page.waitForTimeout(80);
+  const afterSwitch = await cameraPose(page, 'sample-camera');
+  const otherAfterSwitch = await cameraPose(page, 'sample-camera-2');
+  expect(vectorDistance(afterSwitch.position, recordingStart.position)).toBeGreaterThan(0.1);
+  expect(vectorDistance(otherAfterSwitch.position, otherStart.position)).toBeLessThan(0.01);
+
+  await page.getByTestId('tree-row-sample-camera-2').click({ modifiers: ['Control'] });
+  await page.keyboard.down('s');
+  await page.waitForTimeout(260);
+  await page.keyboard.up('s');
+  await page.waitForTimeout(80);
+  const afterDeselection = await cameraPose(page, 'sample-camera');
+  const otherAfterDeselection = await cameraPose(page, 'sample-camera-2');
+  expect(vectorDistance(afterDeselection.position, afterSwitch.position)).toBeGreaterThan(0.1);
+  expect(vectorDistance(otherAfterDeselection.position, otherStart.position)).toBeLessThan(0.01);
+});
+
+test('recording right drag rotates its camera without panning the director view', async ({ page }) => {
+  await startRecording(page);
+  await hideViewportOverlays(page);
+  const viewport = page.getByTestId('lumora-viewport');
+  const box = await viewport.boundingBox();
+  if (!box) throw new Error('viewport is unavailable');
+  const speedControl = page.getByTestId('camera-control-speed');
+  await speedControl.focus();
+  await expect(speedControl).toBeFocused();
+  const cameraStart = await cameraPose(page);
+  const directorStart = await canvasShot(page);
+
+  await page.mouse.move(box.x + box.width * 0.55, box.y + box.height * 0.65);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(box.x + box.width * 0.7, box.y + box.height * 0.55, { steps: 8 });
+  await page.mouse.up({ button: 'right' });
+  await page.waitForTimeout(260);
+  await expect(viewport).toBeFocused();
+
+  const cameraEnd = await cameraPose(page);
+  const directorEnd = await canvasShot(page);
+  expect(vectorDistance(cameraEnd.rotation, cameraStart.rotation)).toBeGreaterThan(0.03);
+  expect(await pixelDiffRatio(page, directorStart, directorEnd)).toBeLessThan(0.01);
+
+  await page.mouse.move(box.x + box.width * 0.5, box.y + box.height * 0.7);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(box.x + box.width * 0.58, box.y + box.height * 0.65, { steps: 3 });
+  await page.waitForTimeout(80);
+  await page.evaluate(() => {
+    window.dispatchEvent(new PointerEvent('pointercancel', {
+      bubbles: true,
+      pointerId: 1,
+      pointerType: 'mouse',
+    }));
+  });
+  const cancelledPose = await cameraPose(page);
+  await page.mouse.move(box.x + box.width * 0.75, box.y + box.height * 0.5, { steps: 5 });
+  await page.waitForTimeout(220);
+  const afterCancelledMove = await cameraPose(page);
+  await page.mouse.up({ button: 'right' });
+  expect(vectorDistance(afterCancelledMove.rotation, cancelledPose.rotation)).toBeLessThan(0.001);
+});
+
+test('recording lost pointer capture freezes queued look while held keyboard movement continues', async ({ page }) => {
+  await startRecording(page);
+  await hideViewportOverlays(page);
+  const viewport = page.getByTestId('lumora-viewport');
+  const box = await viewport.boundingBox();
+  if (!box) throw new Error('viewport is unavailable');
+  const start = await cameraPose(page);
+
+  await page.keyboard.down('s');
+  await page.waitForTimeout(220);
+  await page.mouse.move(box.x + box.width * 0.45, box.y + box.height * 0.65);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(box.x + box.width * 0.75, box.y + box.height * 0.45, { steps: 4 });
+  await page.waitForTimeout(50);
+  const afterLook = await cameraPose(page);
+  expect(quaternionAngle(afterLook.rotation, start.rotation)).toBeGreaterThan(0.03);
+
+  await viewport.dispatchEvent('lostpointercapture', { pointerId: 1, pointerType: 'mouse' });
+  const lossTime = await timeSeconds(page);
+  const poseAtLoss = await cameraPose(page);
+  await page.waitForTimeout(400);
+  const poseAfterWait = await cameraPose(page);
+  await page.keyboard.up('s');
+  await page.mouse.up({ button: 'right' });
+
+  expect(quaternionAngle(poseAfterWait.rotation, poseAtLoss.rotation)).toBeLessThan(0.001);
+  expect(vectorDistance(poseAfterWait.position, poseAtLoss.position)).toBeGreaterThan(0.1);
+
+  await page.getByTestId('timeline-record').click();
+  await expect(page.getByTestId('timeline-time')).toHaveText('00:00.00');
+  const rotationLane = page.locator('.lumora-timeline__lane').filter({ hasText: '录制主摄像机·旋转' });
+  const rotationSamples = await rotationLane.locator('.lumora-timeline__keyframe').evaluateAll((elements) =>
+    elements.map((element) => {
+      const testId = element.getAttribute('data-testid') ?? '';
+      return {
+        time: Number(testId.slice(testId.lastIndexOf('-') + 1)),
+        value: JSON.parse(element.getAttribute('data-keyframe-value') ?? '[]') as number[],
+      };
+    }),
+  );
+  const postLossSamples = rotationSamples.filter((sample) => sample.time >= lossTime + 0.05);
+  expect(postLossSamples.length).toBeGreaterThan(0);
+  for (const sample of postLossSamples) {
+    expect(quaternionAngle(sample.value, poseAtLoss.rotation)).toBeLessThan(0.002);
+  }
+});
+
+test('recording viewport remains operable at 760px and 375px and right drag survives resize', async ({ page }) => {
+  await startRecording(page);
+
+  const expectOperableViewport = async (width: number, height: number, minimumSceneHeight: number) => {
+    await page.setViewportSize({ width, height });
+    const viewport = page.getByTestId('lumora-viewport');
+    await viewport.scrollIntoViewIfNeeded();
+    await page.waitForTimeout(160);
+    const measurements = await page.evaluate(() => {
+      const scene = document.querySelector<HTMLElement>('.lumora-studio__scene-slot')!.getBoundingClientRect();
+      const viewportRect = document.querySelector<HTMLElement>('[data-testid="lumora-viewport"]')!.getBoundingClientRect();
+      const toolbar = document.querySelector<HTMLElement>('[data-testid="viewport-toolbar"]')!.getBoundingClientRect();
+      return {
+        scene: { top: scene.top, right: scene.right, bottom: scene.bottom, left: scene.left, height: scene.height },
+        viewport: {
+          top: viewportRect.top,
+          right: viewportRect.right,
+          bottom: viewportRect.bottom,
+          left: viewportRect.left,
+          height: viewportRect.height,
+        },
+        toolbar: {
+          top: toolbar.top,
+          right: toolbar.right,
+          bottom: toolbar.bottom,
+          left: toolbar.left,
+          height: toolbar.height,
+        },
+        horizontalOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      };
+    });
+    expect(measurements.horizontalOverflow).toBeLessThanOrEqual(0);
+    expect(measurements.scene.height).toBeGreaterThanOrEqual(minimumSceneHeight);
+    expect(measurements.viewport.height).toBeGreaterThanOrEqual(minimumSceneHeight);
+    expect(measurements.toolbar.left).toBeGreaterThanOrEqual(measurements.scene.left);
+    expect(measurements.toolbar.right).toBeLessThanOrEqual(measurements.scene.right);
+    expect(measurements.toolbar.top).toBeGreaterThanOrEqual(measurements.scene.top);
+    expect(measurements.toolbar.bottom).toBeLessThanOrEqual(measurements.scene.bottom - 24);
+  };
+
+  await expectOperableViewport(760, 800, 280);
+  await expectOperableViewport(375, 667, 220);
+
+  const canvas = page.locator('.lumora-viewport canvas');
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error('viewport canvas is unavailable after resize');
+  const beforeDrag = await cameraPose(page);
+  const dragY = box.height - 10;
+  await canvas.hover({ position: { x: box.width * 0.45, y: dragY } });
+  await page.mouse.down({ button: 'right' });
+  const visibleBox = await canvas.boundingBox();
+  if (!visibleBox) throw new Error('viewport canvas disappeared during resize regression');
+  await page.mouse.move(visibleBox.x + visibleBox.width * 0.75, visibleBox.y + dragY, { steps: 6 });
+  await page.mouse.up({ button: 'right' });
+  await page.waitForTimeout(220);
+  const afterDrag = await cameraPose(page);
+  expect(vectorDistance(afterDrag.rotation, beforeDrag.rotation)).toBeGreaterThan(0.03);
+});
+
+test('recording control: keyboard-only mode ignores pointer look and records arrow rotation', async ({ page }) => {
+  await page.getByRole('button', { name: '纯键盘操控' }).click();
+  await startRecording(page);
+  const viewport = page.getByTestId('lumora-viewport');
+  const box = await viewport.boundingBox();
+  if (!box) throw new Error('视口不可见');
+  const start = await cameraPose(page);
+
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(box.x + box.width / 2 + 60, box.y + box.height / 2 - 30, { steps: 4 });
+  await page.mouse.up({ button: 'right' });
+  await page.waitForTimeout(180);
+  const afterPointer = await cameraPose(page);
+  expect(vectorDistance(afterPointer.rotation, start.rotation)).toBeLessThan(0.001);
+
+  await page.keyboard.down('ArrowLeft');
+  await page.waitForTimeout(260);
+  await page.keyboard.up('ArrowLeft');
+  await page.waitForTimeout(80);
+  const afterArrow = await cameraPose(page);
+  expect(vectorDistance(afterArrow.position, start.position)).toBeLessThan(0.01);
+  expect(vectorDistance(afterArrow.rotation, start.rotation)).toBeGreaterThan(0.03);
+
+  await page.getByTestId('timeline-record').click();
+  await expect(page.locator('.lumora-timeline__lane').filter({ hasText: '录制主摄像机·旋转' })).toHaveCount(1);
 });
 
 test('AC2 浏览器级：按住驾驶键时页面失焦 → 相机 transform 冻结（录制暂停、画面逐像素不变）', async ({ page }) => {

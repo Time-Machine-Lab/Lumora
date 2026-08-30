@@ -10,6 +10,7 @@ import {
 } from '../src/components/editor/TimelinePanel';
 import { projectContentFingerprint } from '../src/components/editor/timeline-thumbnail-cache';
 import { TimelineRecorder } from '../src/components/editor/timeline-recorder';
+import { DEFAULT_CAMERA_DRIVE_SETTINGS } from '../src/components/editor/camera-drive';
 import type { TimelineSession, TimelineSessionState } from '../src/hooks/use-timeline-session';
 
 function makeProject(): Project {
@@ -49,6 +50,7 @@ function baseState(): TimelineSessionState {
     zoom: new TimelineController().getZoom(),
     snapEnabled: true,
     loopEnabled: true,
+    cameraControls: { ...DEFAULT_CAMERA_DRIVE_SETTINGS },
   };
 }
 
@@ -77,6 +79,7 @@ function mountPanel(
     setSnap: vi.fn(),
     setLoop: vi.fn(),
     setCaptureSource: vi.fn(),
+    setCameraControlSettings: vi.fn(),
     startRecording: vi.fn(),
     confirmOverwrite: vi.fn(),
     cancelOverwrite: vi.fn(),
@@ -120,6 +123,31 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     expect(screen.getByTestId('timeline-record')).toBeEnabled();
     fireEvent.click(screen.getByTestId('timeline-record'));
     expect(second.session.startRecording).toHaveBeenCalledWith('cam');
+  });
+
+  it('录制前可选择操控模式并调整速度、短按步长和鼠标灵敏度', () => {
+    const view = mountPanel({}, ['cam']);
+    const keyboardMouse = screen.getByRole('button', { name: '键盘移动 + 鼠标视角' });
+    const keyboardOnly = screen.getByRole('button', { name: '纯键盘操控' });
+
+    expect(keyboardMouse).toHaveAttribute('aria-pressed', 'true');
+    expect(keyboardOnly).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(keyboardOnly);
+    expect(view.session.setCameraControlSettings).toHaveBeenCalledWith({ mode: 'keyboard-only' });
+
+    const speed = screen.getByLabelText('连续移动速度');
+    const tapStep = screen.getByLabelText('短按移动步长');
+    const sensitivity = screen.getByLabelText('鼠标视角灵敏度');
+    expect(speed).toHaveAttribute('type', 'range');
+    expect(tapStep).toHaveAttribute('type', 'range');
+    expect(sensitivity).toHaveAttribute('type', 'range');
+    fireEvent.change(speed, { target: { value: '4.5' } });
+    fireEvent.change(tapStep, { target: { value: '0.2' } });
+    fireEvent.change(sensitivity, { target: { value: '1.4' } });
+
+    expect(view.session.setCameraControlSettings).toHaveBeenCalledWith({ speed: 4.5 });
+    expect(view.session.setCameraControlSettings).toHaveBeenCalledWith({ tapStep: 0.2 });
+    expect(view.session.setCameraControlSettings).toHaveBeenCalledWith({ mouseSensitivity: 1.4 });
   });
 
   it('录制中：播放键显示 ■，点击停止录制；录制暂停态点击继续', () => {

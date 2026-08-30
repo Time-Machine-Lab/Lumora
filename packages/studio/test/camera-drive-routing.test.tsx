@@ -104,6 +104,227 @@ afterEach(() => {
 });
 
 describe('camera drive keyboard routing', () => {
+  it('right-button dragging rotates the selected camera without translating it', async () => {
+    const studio = await mountStudio('lumora://drive-mouse-look');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    const beforePosition = camera.position.clone();
+    const beforeQuaternion = camera.quaternion.clone();
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    await act(async () => delay(60));
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 7, clientX: 100, clientY: 100 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 7, clientX: 140, clientY: 80 });
+    await act(async () => delay(80));
+    fireEvent.pointerUp(viewport, { button: 2, pointerId: 7, clientX: 140, clientY: 80 });
+
+    expect(camera.position.distanceTo(beforePosition)).toBeLessThan(1e-9);
+    expect(camera.quaternion.angleTo(beforeQuaternion)).toBeGreaterThan(0.001);
+  });
+
+  it('keyboard-mouse mode keeps translation and pointer look independent', async () => {
+    const studio = await mountStudio('lumora://drive-independent-inputs');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    await act(async () => delay(60));
+    const beforePosition = camera.position.clone();
+    const beforeQuaternion = camera.quaternion.clone();
+
+    fireEvent.keyDown(studio.root, { key: 'w', code: 'KeyW' });
+    await act(async () => delay(180));
+    fireEvent.keyUp(studio.root, { key: 'w', code: 'KeyW' });
+    fireEvent.keyDown(studio.root, { key: 'ArrowLeft', code: 'ArrowLeft' });
+    await act(async () => delay(80));
+    fireEvent.keyUp(studio.root, { key: 'ArrowLeft', code: 'ArrowLeft' });
+
+    expect(camera.position.distanceTo(beforePosition)).toBeGreaterThan(0.01);
+    expect(camera.quaternion.angleTo(beforeQuaternion)).toBeLessThan(1e-9);
+  });
+
+  it('keeps driving the recording camera after selecting another camera or clearing selection', async () => {
+    const studio = await mountStudio('lumora://drive-recording-camera-lock');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    fireEvent.click(within(studio.root).getByTestId('timeline-record'));
+    const recordingCamera = findNode(studio.scene, 'sample-camera')!;
+    const otherCamera = findNode(studio.scene, 'sample-camera-2')!;
+    await act(async () => delay(60));
+    const recordingStart = recordingCamera.position.clone();
+    const otherStart = otherCamera.position.clone();
+
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera-2']));
+    fireEvent.keyDown(studio.root, { key: 's', code: 'KeyS' });
+    await act(async () => delay(180));
+    fireEvent.keyUp(studio.root, { key: 's', code: 'KeyS' });
+
+    expect(recordingCamera.position.distanceTo(recordingStart)).toBeGreaterThan(0.01);
+    expect(otherCamera.position.distanceTo(otherStart)).toBeLessThan(1e-9);
+
+    act(() => studio.handle.current!.runtime.editor.clearSelection());
+    const beforeDeselectedDrive = recordingCamera.position.clone();
+    fireEvent.keyDown(studio.root, { key: 's', code: 'KeyS' });
+    await act(async () => delay(180));
+    fireEvent.keyUp(studio.root, { key: 's', code: 'KeyS' });
+
+    expect(recordingCamera.position.distanceTo(beforeDeselectedDrive)).toBeGreaterThan(0.01);
+    expect(otherCamera.position.distanceTo(otherStart)).toBeLessThan(1e-9);
+  });
+
+  it('keyboard-only mode ignores pointer look and rotates with arrow keys', async () => {
+    const studio = await mountStudio('lumora://drive-keyboard-only');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    fireEvent.click(within(studio.root).getByRole('button', { name: '纯键盘操控' }));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    const beforePointer = camera.quaternion.clone();
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    await act(async () => delay(60));
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 8, clientX: 100, clientY: 100 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 8, clientX: 150, clientY: 80 });
+    fireEvent.pointerUp(viewport, { button: 2, pointerId: 8, clientX: 150, clientY: 80 });
+    await act(async () => delay(80));
+    expect(camera.quaternion.angleTo(beforePointer)).toBeLessThan(1e-9);
+
+    fireEvent.keyDown(studio.root, { key: 'ArrowLeft', code: 'ArrowLeft' });
+    await act(async () => delay(100));
+    fireEvent.keyUp(studio.root, { key: 'ArrowLeft', code: 'ArrowLeft' });
+    expect(camera.quaternion.angleTo(beforePointer)).toBeGreaterThan(0.001);
+  });
+
+  it('scopes pointer capture and context-menu suppression to an active camera-look gesture', async () => {
+    const studio = await mountStudio('lumora://drive-pointer-lifecycle');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    const setPointerCapture = vi.fn();
+    const releasePointerCapture = vi.fn();
+    Object.assign(viewport, { setPointerCapture, releasePointerCapture });
+    const look = vi.spyOn(CameraDrive.prototype, 'look');
+    await act(async () => delay(60));
+
+    const idleContextMenu = fireEvent.contextMenu(viewport);
+    expect(idleContextMenu).toBe(true);
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 9, clientX: 10, clientY: 10 });
+    expect(setPointerCapture).toHaveBeenCalledWith(9);
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 9, clientX: 30, clientY: 20 });
+    expect(look).toHaveBeenCalled();
+    fireEvent.pointerUp(viewport, { button: 2, pointerId: 9, clientX: 30, clientY: 20 });
+    expect(releasePointerCapture).toHaveBeenCalledWith(9);
+    expect(fireEvent.contextMenu(viewport)).toBe(false);
+    expect(fireEvent.contextMenu(viewport)).toBe(true);
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 10, clientX: 30, clientY: 20 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 10, clientX: 45, clientY: 30 });
+    const callsAtButtonRelease = look.mock.calls.length;
+    fireEvent.pointerMove(viewport, { buttons: 0, pointerId: 10, clientX: 50, clientY: 35 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 10, clientX: 60, clientY: 40 });
+    expect(look).toHaveBeenCalledTimes(callsAtButtonRelease);
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 11, clientX: 60, clientY: 40 });
+    fireEvent.lostPointerCapture(viewport, { pointerId: 11 });
+    const callsAtCaptureLoss = look.mock.calls.length;
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 11, clientX: 80, clientY: 50 });
+    expect(look).toHaveBeenCalledTimes(callsAtCaptureLoss);
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 12, clientX: 80, clientY: 50 });
+    fireEvent.pointerUp(window, { button: 2, pointerId: 12, clientX: 90, clientY: 55 });
+    const callsAtWindowRelease = look.mock.calls.length;
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 12, clientX: 100, clientY: 60 });
+    expect(look).toHaveBeenCalledTimes(callsAtWindowRelease);
+  });
+
+  it('lost pointer capture clears queued look while held keyboard movement continues', async () => {
+    const studio = await mountStudio('lumora://drive-lost-capture');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    Object.assign(viewport, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+    const press = vi.spyOn(CameraDrive.prototype, 'press');
+    await act(async () => delay(60));
+
+    fireEvent.keyDown(viewport, { key: 'w', code: 'KeyW' });
+    const drive = press.mock.instances[press.mock.instances.length - 1] as unknown as CameraDrive;
+    act(() => {
+      drive.update(0.06);
+      drive.update(0.08);
+    });
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 14, clientX: 20, clientY: 20 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 14, clientX: 100, clientY: 60 });
+    act(() => drive.update(1 / 60));
+    fireEvent.lostPointerCapture(viewport, { pointerId: 14 });
+
+    const rotationAtLoss = camera.quaternion.clone();
+    const positionAtLoss = camera.position.clone();
+    expect(drive.hasInput).toBe(true);
+    act(() => drive.update(0.1));
+    fireEvent.keyUp(viewport, { key: 'w', code: 'KeyW' });
+
+    expect(camera.quaternion.angleTo(rotationAtLoss)).toBeLessThan(1e-9);
+    expect(camera.position.distanceTo(positionAtLoss)).toBeGreaterThan(0.05);
+  });
+
+  it('right-button camera look reclaims focus from a control before subsequent keyboard driving', async () => {
+    const studio = await mountStudio('lumora://drive-pointer-focus-transfer');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    const speed = within(studio.root).getByTestId('camera-control-speed');
+    Object.assign(viewport, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+    await act(async () => delay(60));
+    speed.focus();
+    expect(document.activeElement).toBe(speed);
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 13, clientX: 20, clientY: 20 });
+    fireEvent.pointerUp(viewport, { button: 2, pointerId: 13, clientX: 20, clientY: 20 });
+    expect(document.activeElement).toBe(viewport);
+    const beforeKeyboardDrive = camera.position.clone();
+    fireEvent.keyDown(viewport, { key: 's', code: 'KeyS' });
+    await act(async () => delay(220));
+    fireEvent.keyUp(viewport, { key: 's', code: 'KeyS' });
+
+    expect(camera.position.distanceTo(beforeKeyboardDrive)).toBeGreaterThan(0.01);
+  });
+
+  it.each(['blur', 'export', 'overwrite'] as const)(
+    'ends camera-look and clears residual rotation on %s',
+    async (terminal) => {
+      const studio = await mountStudio(`lumora://drive-look-${terminal}`, terminal === 'overwrite');
+      act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+      const camera = findNode(studio.scene, 'sample-camera')!;
+      const viewport = within(studio.root).getByTestId('lumora-viewport');
+      const releasePointerCapture = vi.fn();
+      Object.assign(viewport, { setPointerCapture: vi.fn(), releasePointerCapture });
+      const look = vi.spyOn(CameraDrive.prototype, 'look');
+      await act(async () => delay(60));
+
+      fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 10, clientX: 10, clientY: 10 });
+      fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 10, clientX: 45, clientY: 25 });
+      await act(async () => delay(40));
+      if (terminal === 'blur') {
+        const outside = document.createElement('button');
+        document.body.append(outside);
+        viewport.focus();
+        outside.focus();
+        outside.remove();
+      }
+      if (terminal === 'export') {
+        fireEvent.click(within(studio.root).getByTestId('open-export-workspace'));
+        await screen.findByTestId('export-workspace');
+      }
+      if (terminal === 'overwrite') {
+        fireEvent.click(within(studio.root).getByTestId('timeline-record'));
+        await screen.findByTestId('overwrite-confirm');
+      }
+      await act(async () => delay(40));
+      const callsAtTerminal = look.mock.calls.length;
+      const rotationAtTerminal = camera.quaternion.clone();
+      fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 10, clientX: 80, clientY: 40 });
+      await act(async () => delay(80));
+
+      expect(look).toHaveBeenCalledTimes(callsAtTerminal);
+      expect(releasePointerCapture).toHaveBeenCalledWith(10);
+      expect(camera.quaternion.angleTo(rotationAtTerminal)).toBeLessThan(1e-6);
+    },
+  );
+
   it('does not consume Ctrl+W or move the recording camera', async () => {
     const studio = await mountStudio('lumora://drive-browser-shortcut');
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
@@ -132,7 +353,7 @@ describe('camera drive keyboard routing', () => {
     await act(async () => delay(60));
 
     fireEvent.keyDown(studio.root, { key: 'w', code: 'KeyW' });
-    await act(async () => delay(120));
+    await act(async () => delay(220));
     fireEvent.keyDown(studio.root, { key: 'Control', code: 'ControlLeft', ctrlKey: true });
     const atModifier = camera.position.clone();
     await act(async () => delay(160));
@@ -252,7 +473,7 @@ describe('camera drive keyboard routing', () => {
     const beforeB = cameraB.position.clone();
 
     fireEvent.keyDown(a.root, { key: 's', code: 'KeyS' });
-    await act(async () => delay(120));
+    await act(async () => delay(220));
     fireEvent.keyUp(a.root, { key: 's', code: 'KeyS' });
 
     expect(cameraA.position.distanceTo(beforeA)).toBeGreaterThan(0.01);
@@ -270,7 +491,7 @@ describe('camera drive keyboard routing', () => {
     fireEvent.keyDown(studio.root, { key: 's', code: 'KeyS' });
     await act(async () => delay(30));
     parent.add(camera);
-    await act(async () => delay(120));
+    await act(async () => delay(200));
     fireEvent.keyUp(studio.root, { key: 's', code: 'KeyS' });
 
     expect(camera.position.distanceTo(before)).toBeGreaterThan(0.01);
@@ -283,7 +504,7 @@ describe('camera drive keyboard routing', () => {
     const staticPosition = camera.position.clone();
 
     fireEvent.keyDown(studio.root, { key: 's', code: 'KeyS' });
-    await act(async () => delay(120));
+    await act(async () => delay(220));
     expect(camera.position.distanceTo(staticPosition)).toBeGreaterThan(0.01);
 
     fireEvent.click(within(studio.root).getByTestId('open-export-workspace'));
@@ -326,7 +547,7 @@ describe('camera drive keyboard routing', () => {
     fireEvent.pointerDown(viewportB, { button: 0, ctrlKey: true, clientX: 0, clientY: 0 });
     expect(document.activeElement).toBe(viewportB);
     fireEvent.keyDown(document.activeElement!, { key: 's', code: 'KeyS' });
-    await act(async () => delay(120));
+    await act(async () => delay(220));
     fireEvent.keyUp(document.activeElement!, { key: 's', code: 'KeyS' });
 
     expect(cameraA.position.distanceTo(beforeA)).toBeLessThan(1e-9);
@@ -346,7 +567,7 @@ describe('camera drive keyboard routing', () => {
     const viewportB = within(b.root).getByTestId('lumora-viewport');
     fireEvent.pointerDown(viewportA, { button: 0, ctrlKey: true, clientX: 0, clientY: 0 });
     fireEvent.keyDown(viewportA, { key: 's', code: 'KeyS' });
-    await act(async () => delay(120));
+    await act(async () => delay(220));
 
     fireEvent.pointerDown(viewportB, { button: 0, ctrlKey: true, clientX: 0, clientY: 0 });
     const atTransfer = cameraA.position.clone();
@@ -357,7 +578,7 @@ describe('camera drive keyboard routing', () => {
 
     fireEvent.pointerDown(viewportA, { button: 0, ctrlKey: true, clientX: 0, clientY: 0 });
     fireEvent.keyDown(viewportA, { key: 's', code: 'KeyS' });
-    await act(async () => delay(120));
+    await act(async () => delay(220));
     fireEvent.keyUp(viewportA, { key: 's', code: 'KeyS' });
     expect(cameraA.position.distanceTo(atTransfer)).toBeGreaterThan(0.01);
   });
@@ -374,7 +595,7 @@ describe('camera drive keyboard routing', () => {
 
     focusTarget.focus();
     fireEvent.keyDown(focusTarget, { key: 's', code: 'KeyS' });
-    await act(async () => delay(120));
+    await act(async () => delay(220));
     focusTarget.blur();
     expect(document.activeElement).toBe(document.body);
     fireEvent.keyUp(document.body, { key: 's', code: 'KeyS' });
@@ -386,7 +607,7 @@ describe('camera drive keyboard routing', () => {
     focusTarget.focus();
     const beforeRebind = cameraA.position.clone();
     fireEvent.keyDown(focusTarget, { key: 's', code: 'KeyS' });
-    await act(async () => delay(120));
+    await act(async () => delay(220));
     fireEvent.keyUp(focusTarget, { key: 's', code: 'KeyS' });
 
     expect(cameraA.position.distanceTo(beforeRebind)).toBeGreaterThan(0.01);
