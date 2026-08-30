@@ -469,16 +469,40 @@ test('recording control: keyboard-mouse mode records deterministic tap, smooth h
   const rotationLane = page.locator('.lumora-timeline__lane').filter({ hasText: '录制主摄像机·旋转' });
   await expect(positionLane).toHaveCount(1);
   await expect(rotationLane).toHaveCount(1);
-  expect(await positionLane.locator('.lumora-timeline__keyframe').count()).toBeGreaterThanOrEqual(3);
+  const positionKeys = positionLane.locator('.lumora-timeline__keyframe');
+  const positionCount = await positionKeys.count();
+  expect(positionCount).toBeGreaterThanOrEqual(3);
+  const recordedPositions = await positionKeys.evaluateAll((elements) =>
+    elements.map((element) => JSON.parse(element.getAttribute('data-keyframe-value') ?? '[]') as number[]),
+  );
+  const sampledTap = recordedPositions.reduce((closest, position) =>
+    vectorDistance(position, afterTap.position) < vectorDistance(closest, afterTap.position)
+      ? position
+      : closest,
+  );
+  const sampledLateHold = recordedPositions.reduce((closest, position) =>
+    vectorDistance(position, holdLate.position) < vectorDistance(closest, holdLate.position)
+      ? position
+      : closest,
+  );
+  expect(vectorDistance(sampledTap, afterTap.position)).toBeLessThan(0.05);
+  expect(vectorDistance(sampledTap, start.position)).toBeGreaterThan(0.17);
+  expect(vectorDistance(sampledTap, start.position)).toBeLessThan(0.23);
+  expect(vectorDistance(sampledLateHold, holdLate.position)).toBeLessThan(0.12);
+  expect(vectorDistance(sampledLateHold, sampledTap)).toBeGreaterThan(0.5);
   const rotationKeys = rotationLane.locator('.lumora-timeline__keyframe');
   const rotationCount = await rotationKeys.count();
   expect(rotationCount).toBeGreaterThanOrEqual(2);
-  const rotations: number[][] = [];
-  for (let index = 0; index < rotationCount; index += 1) {
-    await rotationKeys.nth(index).click();
-    await page.waitForTimeout(50);
-    rotations.push((await cameraPose(page)).rotation);
-  }
+  const rotations = await rotationKeys.evaluateAll((elements) =>
+    elements.map((element) => JSON.parse(element.getAttribute('data-keyframe-value') ?? '[]') as number[]),
+  );
+  const sampledLook = rotations.reduce((closest, rotation) =>
+    vectorDistance(rotation, afterLook.rotation) < vectorDistance(closest, afterLook.rotation)
+      ? rotation
+      : closest,
+  );
+  expect(vectorDistance(sampledLook, afterLook.rotation)).toBeLessThan(0.05);
+  expect(vectorDistance(sampledLook, start.rotation)).toBeGreaterThan(0.03);
   const adjacentRotationDeltas = rotations.slice(1).map((rotation, index) =>
     vectorDistance(rotation, rotations[index]!),
   );

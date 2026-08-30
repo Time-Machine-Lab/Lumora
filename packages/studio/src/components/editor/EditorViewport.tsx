@@ -353,20 +353,23 @@ function useCameraDrive(
     let lookPointerId: number | null = null;
     let lookClientX = 0;
     let lookClientY = 0;
+    let suppressNextContextMenu = false;
 
     const endLookGesture = () => {
       if (lookPointerId === null) return;
+      const pointerId = lookPointerId;
+      lookPointerId = null;
       const viewport = viewportRef.current;
       try {
-        viewport?.releasePointerCapture(lookPointerId);
+        viewport?.releasePointerCapture(pointerId);
       } catch {
         // Pointer capture can already be released by the browser.
       }
-      lookPointerId = null;
     };
 
     const clearDrive = () => {
       endLookGesture();
+      suppressNextContextMenu = false;
       heldKeys.clear();
       drive.stop();
       attachedId = null;
@@ -433,7 +436,9 @@ function useCameraDrive(
       }
     };
     const onPointerDown = (event: PointerEvent) => {
-      if (event.button !== 2 || lookPointerId !== null) return;
+      if (event.button !== 2) return;
+      suppressNextContextMenu = false;
+      if (lookPointerId !== null) return;
       const target = event.target;
       if (
         target instanceof HTMLElement &&
@@ -447,6 +452,7 @@ function useCameraDrive(
       lookPointerId = event.pointerId;
       lookClientX = event.clientX;
       lookClientY = event.clientY;
+      suppressNextContextMenu = true;
       event.preventDefault();
       try {
         viewportRef.current?.setPointerCapture(event.pointerId);
@@ -456,6 +462,10 @@ function useCameraDrive(
     };
     const onPointerMove = (event: PointerEvent) => {
       if (lookPointerId === null || event.pointerId !== lookPointerId) return;
+      if ((event.buttons & 2) === 0) {
+        endLookGesture();
+        return;
+      }
       const movementX = event.movementX || event.clientX - lookClientX;
       const movementY = event.movementY || event.clientY - lookClientY;
       lookClientX = event.clientX;
@@ -469,8 +479,13 @@ function useCameraDrive(
     const onPointerCancel = (event: PointerEvent) => {
       if (event.pointerId === lookPointerId) clearDrive();
     };
+    const onLostPointerCapture = (event: PointerEvent) => {
+      if (event.pointerId === lookPointerId) endLookGesture();
+    };
     const onContextMenu = (event: MouseEvent) => {
-      if (lookPointerId !== null) event.preventDefault();
+      if (!suppressNextContextMenu) return;
+      event.preventDefault();
+      suppressNextContextMenu = false;
     };
     const onKeyUp = (event: KeyboardEvent) => {
       if (heldKeys.delete(event.code)) {
@@ -500,6 +515,8 @@ function useCameraDrive(
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
     window.addEventListener('blur', onBlur);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerCancel);
     document.addEventListener('focusin', onFocusIn);
     document.addEventListener('focusout', onFocusOut);
     const viewport = viewportRef.current;
@@ -507,6 +524,7 @@ function useCameraDrive(
     viewport?.addEventListener('pointermove', onPointerMove);
     viewport?.addEventListener('pointerup', onPointerUp);
     viewport?.addEventListener('pointercancel', onPointerCancel);
+    viewport?.addEventListener('lostpointercapture', onLostPointerCapture);
     viewport?.addEventListener('contextmenu', onContextMenu);
 
     const restoreIfNeeded = () => {
@@ -574,12 +592,15 @@ function useCameraDrive(
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('blur', onBlur);
+      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerCancel);
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
       viewport?.removeEventListener('pointerdown', onPointerDown);
       viewport?.removeEventListener('pointermove', onPointerMove);
       viewport?.removeEventListener('pointerup', onPointerUp);
       viewport?.removeEventListener('pointercancel', onPointerCancel);
+      viewport?.removeEventListener('lostpointercapture', onLostPointerCapture);
       viewport?.removeEventListener('contextmenu', onContextMenu);
       restoreIfNeeded();
       clearDrive();

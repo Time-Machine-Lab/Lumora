@@ -176,16 +176,31 @@ describe('camera drive keyboard routing', () => {
     expect(idleContextMenu).toBe(true);
     fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 9, clientX: 10, clientY: 10 });
     expect(setPointerCapture).toHaveBeenCalledWith(9);
-    const activeContextMenu = fireEvent.contextMenu(viewport);
-    expect(activeContextMenu).toBe(false);
     fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 9, clientX: 30, clientY: 20 });
     expect(look).toHaveBeenCalled();
-    fireEvent.pointerCancel(viewport, { pointerId: 9 });
+    fireEvent.pointerUp(viewport, { button: 2, pointerId: 9, clientX: 30, clientY: 20 });
     expect(releasePointerCapture).toHaveBeenCalledWith(9);
-    const callsAtCancel = look.mock.calls.length;
-    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 9, clientX: 60, clientY: 40 });
-    expect(look).toHaveBeenCalledTimes(callsAtCancel);
+    expect(fireEvent.contextMenu(viewport)).toBe(false);
     expect(fireEvent.contextMenu(viewport)).toBe(true);
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 10, clientX: 30, clientY: 20 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 10, clientX: 45, clientY: 30 });
+    const callsAtButtonRelease = look.mock.calls.length;
+    fireEvent.pointerMove(viewport, { buttons: 0, pointerId: 10, clientX: 50, clientY: 35 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 10, clientX: 60, clientY: 40 });
+    expect(look).toHaveBeenCalledTimes(callsAtButtonRelease);
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 11, clientX: 60, clientY: 40 });
+    fireEvent.lostPointerCapture(viewport, { pointerId: 11 });
+    const callsAtCaptureLoss = look.mock.calls.length;
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 11, clientX: 80, clientY: 50 });
+    expect(look).toHaveBeenCalledTimes(callsAtCaptureLoss);
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 12, clientX: 80, clientY: 50 });
+    fireEvent.pointerUp(window, { button: 2, pointerId: 12, clientX: 90, clientY: 55 });
+    const callsAtWindowRelease = look.mock.calls.length;
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 12, clientX: 100, clientY: 60 });
+    expect(look).toHaveBeenCalledTimes(callsAtWindowRelease);
   });
 
   it.each(['blur', 'export', 'overwrite'] as const)(
