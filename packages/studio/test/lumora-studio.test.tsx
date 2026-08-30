@@ -10,6 +10,7 @@ import type { ProjectStorage } from '../src/persistence/project-storage';
 import { ContentCache } from '../src/components/editor/content-cache';
 import { CommandPalette } from '../src/components/CommandPalette';
 import { TimelineRecorder } from '../src/components/editor/timeline-recorder';
+import * as previewExport from '../src/export/preview-export';
 
 vi.mock('@react-three/fiber', () => ({
   Canvas: ({ children }: { children?: React.ReactNode }) => (
@@ -80,6 +81,218 @@ const badPlugin: PluginDescriptor = {
 };
 
 describe('LumoraStudio', () => {
+  it('opens and closes the export workspace without changing the current project', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://export-integration', '导出集成');
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    const trigger = await screen.findByTestId('open-export-workspace');
+    await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri));
+
+    trigger.click();
+    expect(await screen.findByRole('heading', { name: '导出' })).toBeInTheDocument();
+    expect(screen.getByTestId('lumora-studio')).toHaveAttribute('data-workspace', 'export');
+    expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri);
+
+    screen.getByRole('button', { name: '关闭导出' }).click();
+    await waitFor(() => expect(screen.queryByTestId('export-workspace')).not.toBeInTheDocument());
+    expect(trigger).toHaveFocus();
+    expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri);
+  });
+
+  it('preserves native Space and Enter activation on the closed export button', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://export-native-key', 'Export native key');
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    const trigger = await screen.findByTestId('open-export-workspace');
+    await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri));
+    const playBefore = screen.getByTestId('timeline-play').textContent;
+    const hostKeydown = vi.fn();
+    window.addEventListener('keydown', hostKeydown);
+
+    try {
+      trigger.focus();
+      expect(fireEvent.keyDown(trigger, { key: ' ' })).toBe(true);
+      expect(hostKeydown).not.toHaveBeenCalled();
+      expect(screen.queryByTestId('export-workspace')).not.toBeInTheDocument();
+      expect(screen.getByTestId('timeline-play')).toHaveTextContent(playBefore ?? '');
+      expect(fireEvent.keyDown(trigger, { key: 'Enter' })).toBe(true);
+      expect(hostKeydown).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener('keydown', hostKeydown);
+    }
+  });
+
+  it('clears the editor selection when Escape originates from a light-DOM button', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://button-escape', 'Button Escape');
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri));
+    const editor = handle.current!.runtime.editor;
+    act(() => editor.setSelection(['sample-cube']));
+    const clearSelection = vi.spyOn(editor, 'clearSelection');
+    const play = screen.getByTestId('timeline-play');
+
+    play.focus();
+    fireEvent.keyDown(play, { key: 'Escape', code: 'Escape' });
+
+    expect(clearSelection).toHaveBeenCalledTimes(1);
+    expect(editor.getSelection()).toEqual([]);
+  });
+
+  it('closes the command palette with one Escape without clearing the editor selection', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://palette-escape', 'Palette Escape');
+    render(
+      <LumoraStudio
+        ref={handle}
+        plugins={[goodPlugin]}
+        hostVersion="0.1.0"
+        initialProject={project}
+      />,
+    );
+    await waitFor(() => expect(handle.current?.runtime.host.commands.count()).toBe(1));
+    await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri));
+    const editor = handle.current!.runtime.editor;
+    act(() => editor.setSelection(['sample-cube']));
+    const clearSelection = vi.spyOn(editor, 'clearSelection');
+
+    fireEvent.keyDown(screen.getByTestId('lumora-studio'), { key: 'k', code: 'KeyK', ctrlKey: true });
+    const command = await screen.findByTestId('palette-command-com.test.good.cmd');
+    command.focus();
+    fireEvent.keyDown(command, { key: 'Escape', code: 'Escape' });
+
+    expect(screen.queryByTestId('command-palette')).not.toBeInTheDocument();
+    expect(clearSelection).not.toHaveBeenCalled();
+    expect(editor.getSelection()).toEqual(['sample-cube']);
+  });
+
+  it('preserves Escape editing semantics for a button inside light-DOM contenteditable', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://editable-button-escape', 'Editable Button Escape');
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri));
+    const editor = handle.current!.runtime.editor;
+    act(() => editor.setSelection(['sample-cube']));
+    const clearSelection = vi.spyOn(editor, 'clearSelection');
+    const editable = document.createElement('div');
+    editable.setAttribute('contenteditable', 'true');
+    const button = document.createElement('button');
+    editable.append(button);
+    screen.getByTestId('lumora-studio').append(editable);
+    button.focus();
+
+    fireEvent.keyDown(button, { key: 'Escape', code: 'Escape' });
+
+    expect(clearSelection).not.toHaveBeenCalled();
+    expect(editor.getSelection()).toEqual(['sample-cube']);
+  });
+
+  it('isolates editor shortcuts while the export workspace is open and idle', async () => {
+    let driveDefaultPrevented = false;
+    const observeDriveKey = (event: KeyboardEvent) => {
+      if (event.code !== 'KeyW') return;
+      driveDefaultPrevented = event.defaultPrevented;
+      window.removeEventListener('keydown', observeDriveKey);
+    };
+    window.addEventListener('keydown', observeDriveKey);
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://export-keyboard', 'Export keyboard');
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    const trigger = await screen.findByTestId('open-export-workspace');
+    await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri));
+    const editor = handle.current!.runtime.editor;
+    act(() => editor.setSelection(['sample-camera']));
+    const undo = vi.spyOn(editor, 'undo').mockReturnValue({ ok: true });
+    const redo = vi.spyOn(editor, 'redo').mockReturnValue({ ok: true });
+    const duplicate = vi.spyOn(editor, 'duplicateSelection').mockReturnValue({ ok: true });
+    const remove = vi.spyOn(editor, 'deleteSelection').mockReturnValue({ ok: true });
+    const playBefore = screen.getByTestId('timeline-play').textContent;
+
+    fireEvent.click(trigger);
+    const target = await screen.findByRole('button', { name: '关闭导出' });
+    fireEvent.keyDown(target, { key: 'K', ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(target, { key: 'z', ctrlKey: true });
+    fireEvent.keyDown(target, { key: 'z', ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(target, { key: 'y', ctrlKey: true });
+    fireEvent.keyDown(target, { key: 'd', ctrlKey: true });
+    fireEvent.keyDown(target, { key: 'Delete' });
+    fireEvent.keyDown(target, { key: 'Backspace' });
+    fireEvent.keyDown(target, { key: ' ' });
+    fireEvent.keyDown(target, { key: 'w', code: 'KeyW' });
+    fireEvent.keyDown(target, { key: 'Escape' });
+
+    expect(screen.queryByTestId('command-palette')).not.toBeInTheDocument();
+    expect(undo).not.toHaveBeenCalled();
+    expect(redo).not.toHaveBeenCalled();
+    expect(duplicate).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+    expect(driveDefaultPrevented).toBe(false);
+    expect(editor.getSelection()).toEqual(['sample-camera']);
+    expect(screen.getByTestId('timeline-play')).toHaveTextContent(playBefore ?? '');
+  });
+
+  it('keeps the editor selection when Escape is pressed while export is running', async () => {
+    let finishRecording: ((blob: Blob) => void) | undefined;
+    const supportSpy = vi.spyOn(previewExport, 'detectWebmSupport').mockResolvedValue({
+      supported: true,
+      mimeType: 'video/webm;codecs=vp9',
+    });
+    const recordingSpy = vi.spyOn(previewExport, 'recordPreviewWebm').mockImplementation(
+      () => new Promise<Blob>((resolve) => {
+        finishRecording = resolve;
+      }),
+    );
+    const handle = createRef<LumoraStudioHandle>();
+
+    try {
+      render(
+        <LumoraStudio
+          ref={handle}
+          initialProject={createSampleProject('lumora://export-escape-running', 'Export Escape running')}
+        />,
+      );
+      const trigger = await screen.findByTestId('open-export-workspace');
+      await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe('lumora://export-escape-running'));
+      const editor = handle.current!.runtime.editor;
+      act(() => editor.setSelection(['sample-camera']));
+
+      fireEvent.click(trigger);
+      fireEvent.click(await screen.findByRole('button', { name: '导出 WebM' }));
+      const cancel = await screen.findByRole('button', { name: '取消导出' });
+      fireEvent.keyDown(cancel, { key: 'Escape' });
+
+      expect(editor.getSelection()).toEqual(['sample-camera']);
+    } finally {
+      await act(async () => {
+        finishRecording?.(new Blob(['webm'], { type: 'video/webm' }));
+      });
+      supportSpy.mockRestore();
+      recordingSpy.mockRestore();
+    }
+  });
+
+  it('remounts export for a replacement session with the same project URI', async () => {
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:replacement-export'),
+    });
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    const handle = createRef<LumoraStudioHandle>();
+    const uri = 'lumora://same-uri-export';
+    render(<LumoraStudio ref={handle} initialProject={createSampleProject(uri, 'Original')} />);
+    const trigger = await screen.findByTestId('open-export-workspace');
+    await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(uri));
+    fireEvent.click(trigger);
+    const oldWorkspace = await screen.findByTestId('export-workspace');
+
+    act(() => handle.current!.runtime.editor.openProject(createSampleProject(uri, 'Replacement')));
+
+    await waitFor(() => expect(screen.getByTestId('export-workspace')).not.toBe(oldWorkspace));
+    fireEvent.click(screen.getByRole('button', { name: '导出清单' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('分镜清单已导出');
+  });
+
   it('渲染壳层并激活合法插件：面板、工具栏贡献项可见', async () => {
     render(<LumoraStudio plugins={[goodPlugin]} hostVersion="0.1.0" />);
     expect(await screen.findByTestId('lumora-studio')).toBeInTheDocument();

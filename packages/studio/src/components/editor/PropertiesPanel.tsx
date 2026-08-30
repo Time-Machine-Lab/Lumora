@@ -1,13 +1,18 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { findObject, focalLengthToFovDeg } from '@lumora/core';
 import type { Project, SceneEditor, SceneObjectData, Vec3 } from '@lumora/core';
 import { showToast } from './toasts';
+import type { LiveTransformSnapshot, LiveTransformStore } from './live-transform-store';
 
 interface PropertiesPanelProps {
   editor: SceneEditor;
   project: Project | null;
   selection: string[];
+  liveTransformStore?: LiveTransformStore;
 }
+
+const subscribeToNothing = () => () => undefined;
+const getNoLiveTransform = (): LiveTransformSnapshot | null => null;
 
 const DEG = 180 / Math.PI;
 const RAD = Math.PI / 180;
@@ -148,7 +153,12 @@ function ColorField({
 }
 
 /** 属性面板：名称/变换数值编辑（角度制显示）、材质/灯光/摄像机参数 */
-export function PropertiesPanel({ editor, project, selection }: PropertiesPanelProps) {
+export function PropertiesPanel({ editor, project, selection, liveTransformStore }: PropertiesPanelProps) {
+  const liveTransform = useSyncExternalStore(
+    liveTransformStore?.subscribe ?? subscribeToNothing,
+    liveTransformStore?.getSnapshot ?? getNoLiveTransform,
+    getNoLiveTransform,
+  );
   if (!project) return null;
   if (selection.length === 0) {
     return (
@@ -164,6 +174,9 @@ export function PropertiesPanel({ editor, project, selection }: PropertiesPanelP
     .filter((o): o is SceneObjectData => !!o);
   if (objects.length === 0) return null;
   const object = objects[0]!;
+  const livePosition = liveTransform?.objectId === object.id
+    ? liveTransform.position
+    : object.transform.position;
 
   const commitName = (name: string) => {
     const trimmed = name.trim();
@@ -227,7 +240,7 @@ export function PropertiesPanel({ editor, project, selection }: PropertiesPanelP
                     />
                   ) : (
                     <AxisFields
-                      values={object.transform[axis]}
+                      values={axis === 'position' ? livePosition : object.transform[axis]}
                       locked={object.locked}
                       testIdPrefix={axis === 'position' ? 'inspector-axis' : 'inspector-scale'}
                       onCommit={(values) => commitTransform({ [axis]: values })}

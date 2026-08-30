@@ -13,8 +13,18 @@ export default defineConfig({
   use: {
     baseURL: `http://localhost:${port}`,
     viewport: { width: 1280, height: 800 },
-    channel: browserChannel,
   },
+  projects: [
+    {
+      name: 'chromium',
+      use: {
+        browserName: 'chromium',
+        ...(browserChannel ? { channel: browserChannel } : {}),
+      },
+    },
+    { name: 'firefox', use: { browserName: 'firefox' } },
+    { name: 'webkit', use: { browserName: 'webkit' } },
+  ],
   webServer: {
     command: `npm run dev -w examples/embedded-host -- --port ${port} --strictPort`,
     url: `http://localhost:${port}`,

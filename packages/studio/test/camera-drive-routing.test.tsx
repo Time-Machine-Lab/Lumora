@@ -61,14 +61,14 @@ vi.mock('@react-three/drei', () => ({
   TransformControls: () => null,
 }));
 
-function drivableProject(uri: string): Project {
+function drivableProject(uri: string, includeDisabledOverwriteTrack = false): Project {
   const sample = createSampleProject();
   return {
     ...sample,
     uri,
-    tracks: sample.tracks.map((track) =>
-      track.objectId === 'sample-camera' ? { ...track, disabled: true } : track,
-    ),
+    tracks: sample.tracks
+      .filter((track) => track.objectId !== 'sample-camera' || includeDisabledOverwriteTrack)
+      .map((track) => track.objectId === 'sample-camera' ? { ...track, disabled: true } : track),
   };
 }
 
@@ -76,14 +76,14 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function mountStudio(uri: string): Promise<{
+async function mountStudio(uri: string, includeDisabledOverwriteTrack = false): Promise<{
   handle: React.RefObject<LumoraStudioHandle | null>;
   root: HTMLElement;
   scene: THREE.Group;
 }> {
   const handle = createRef<LumoraStudioHandle>();
   const before = r3fHarness.scenes.length;
-  render(<LumoraStudio ref={handle} initialProject={drivableProject(uri)} />);
+  render(<LumoraStudio ref={handle} initialProject={drivableProject(uri, includeDisabledOverwriteTrack)} />);
   await waitFor(() => expect(handle.current?.runtime.editor.getProject()?.uri).toBe(uri));
   await waitFor(() => expect(r3fHarness.scenes.length).toBeGreaterThan(before));
   const roots = screen.getAllByTestId('lumora-studio');
@@ -143,7 +143,7 @@ describe('camera drive keyboard routing', () => {
   });
 
   it('uses Shift+R as the documented default recording shortcut', async () => {
-    const studio = await mountStudio('lumora://recording-default-shortcut');
+    const studio = await mountStudio('lumora://recording-default-shortcut', true);
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
     const record = within(studio.root).getByTestId('timeline-record');
 
@@ -186,16 +186,35 @@ describe('camera drive keyboard routing', () => {
     expect(localStorage.getItem('lumora.recording-shortcut.v1')).toBeNull();
   });
 
+  it('closes shortcut settings with Escape after focus leaves and restores the trigger', async () => {
+    const studio = await mountStudio('lumora://recording-shortcut-focus');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const trigger = within(studio.root).getByTestId('recording-shortcut-settings');
+    fireEvent.click(trigger);
+    expect(await screen.findByTestId('recording-shortcut-dialog')).toBeInTheDocument();
+
+    const outside = within(studio.root).getByTestId('project-menu');
+    outside.focus();
+    expect(outside).toHaveFocus();
+    fireEvent.keyDown(outside, { key: 'Escape', code: 'Escape' });
+
+    expect(screen.queryByTestId('recording-shortcut-dialog')).not.toBeInTheDocument();
+    await waitFor(() => expect(trigger).toHaveFocus());
+    expect(studio.handle.current!.runtime.editor.getSelection()).toEqual(['sample-camera']);
+  });
+
   it('protects active and pending-save recordings but not clean projects on beforeunload', async () => {
-    const studio = await mountStudio('lumora://recording-beforeunload');
+    const studio = await mountStudio('lumora://recording-beforeunload', true);
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
     await waitFor(() =>
       expect(within(studio.root).getByTestId('save-state-badge')).toHaveTextContent('已保存'),
     );
 
-    const clean = new Event('beforeunload', { cancelable: true });
-    window.dispatchEvent(clean);
-    expect(clean.defaultPrevented).toBe(false);
+    await waitFor(() => {
+      const clean = new Event('beforeunload', { cancelable: true });
+      window.dispatchEvent(clean);
+      expect(clean.defaultPrevented).toBe(false);
+    });
 
     fireEvent.click(within(studio.root).getByTestId('timeline-record'));
     fireEvent.click(await screen.findByText('覆盖录制'));
@@ -238,6 +257,43 @@ describe('camera drive keyboard routing', () => {
 
     expect(cameraA.position.distanceTo(beforeA)).toBeGreaterThan(0.01);
     expect(cameraB.position.distanceTo(beforeB)).toBeLessThan(1e-9);
+  });
+
+  it('applies a held drive key when the selected camera node becomes available after keydown', async () => {
+    const studio = await mountStudio('lumora://drive-late-node');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    const parent = camera.parent!;
+    const before = camera.position.clone();
+    parent.remove(camera);
+
+    fireEvent.keyDown(studio.root, { key: 's', code: 'KeyS' });
+    await act(async () => delay(30));
+    parent.add(camera);
+    await act(async () => delay(120));
+    fireEvent.keyUp(studio.root, { key: 's', code: 'KeyS' });
+
+    expect(camera.position.distanceTo(before)).toBeGreaterThan(0.01);
+  });
+
+  it('freezes a held camera drive key when the export workspace opens', async () => {
+    const studio = await mountStudio('lumora://drive-export-freeze');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    const staticPosition = camera.position.clone();
+
+    fireEvent.keyDown(studio.root, { key: 's', code: 'KeyS' });
+    await act(async () => delay(120));
+    expect(camera.position.distanceTo(staticPosition)).toBeGreaterThan(0.01);
+
+    fireEvent.click(within(studio.root).getByTestId('open-export-workspace'));
+    await waitFor(() => expect(within(studio.root).getByTestId('export-workspace')).toBeVisible());
+    const frozenPosition = camera.position.clone();
+    expect(frozenPosition.distanceTo(staticPosition)).toBeGreaterThan(0.01);
+    await act(async () => delay(120));
+    fireEvent.keyUp(studio.root, { key: 's', code: 'KeyS' });
+
+    expect(camera.position.distanceTo(frozenPosition)).toBeLessThan(1e-9);
   });
 
   it('a drive key release inside Studio A is consumed only by A', async () => {
@@ -311,7 +367,9 @@ describe('camera drive keyboard routing', () => {
     await mountStudio('lumora://drive-body-keyup-b');
     act(() => a.handle.current!.runtime.editor.setSelection(['sample-camera']));
     const cameraA = findNode(a.scene, 'sample-camera')!;
-    const focusTarget = within(a.root).getByTestId('timeline-play');
+    const focusTarget = document.createElement('div');
+    focusTarget.tabIndex = 0;
+    a.root.append(focusTarget);
     await act(async () => delay(60));
 
     focusTarget.focus();
@@ -356,7 +414,7 @@ describe('camera drive keyboard routing', () => {
   });
 
   it('overwrite confirmation clears existing momentum and blocks drive keys from portal controls', async () => {
-    const studio = await mountStudio('lumora://drive-modal');
+    const studio = await mountStudio('lumora://drive-modal', true);
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
     const camera = findNode(studio.scene, 'sample-camera')!;
     await act(async () => delay(60));

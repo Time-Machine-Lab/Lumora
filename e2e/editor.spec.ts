@@ -27,10 +27,93 @@ async function showOverlays(page: import('@playwright/test').Page, selector: str
   });
 }
 
+async function countGizmoPixels(page: Page): Promise<number> {
+  const png = decodePng(await page.locator('.lumora-viewport canvas').screenshot());
+  let count = 0;
+  for (let y = 0; y < png.height; y += 2) {
+    for (let x = 0; x < png.width; x += 2) {
+      const [r, g, b] = pngPixel(png, x, y);
+      if ((r > 230 && g < 50 && b < 50) || (b > 230 && r < 50 && g < 50)) count += 1;
+    }
+  }
+  return count;
+}
+
 test.beforeEach(async ({ page }) => {
   await page.goto('/');
   await page.getByTestId('open-sample-project').click();
   await expect(page.getByTestId('tree-row-sample-group')).toBeVisible();
+});
+
+async function moveReactRootIntoOpenShadowRoot(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const reactRoot = document.getElementById('root');
+    if (!reactRoot) throw new Error('React root is missing');
+    const host = document.createElement('div');
+    host.dataset.testid = 'e2e-shadow-host';
+    document.body.append(host);
+    host.attachShadow({ mode: 'open' }).append(reactRoot);
+  });
+}
+
+for (const rootMode of ['light DOM', 'open ShadowRoot'] as const) {
+  test(`button Escape clears selection in ${rootMode}`, async ({ page }) => {
+    if (rootMode === 'open ShadowRoot') await moveReactRootIntoOpenShadowRoot(page);
+    await centerCubeAndScale(page);
+    await expect(page.locator('.lumora-tree-row--selected')).toHaveCount(1);
+    await expect.poll(() => countGizmoPixels(page)).toBeGreaterThan(0);
+    const button = page.getByTestId('timeline-play');
+    await button.focus();
+
+    await button.press('Escape');
+
+    await expect(page.locator('.lumora-tree-row--selected')).toHaveCount(0);
+    await expect(page.getByTestId('inspector-empty')).toHaveText('未选择对象');
+    await expect.poll(() => countGizmoPixels(page)).toBe(0);
+  });
+
+  test(`contenteditable nested button preserves Escape editing semantics in ${rootMode}`, async ({ page }) => {
+    if (rootMode === 'open ShadowRoot') await moveReactRootIntoOpenShadowRoot(page);
+    await centerCubeAndScale(page);
+    await expect(page.locator('.lumora-tree-row--selected')).toHaveCount(1);
+    await expect.poll(() => countGizmoPixels(page)).toBeGreaterThan(0);
+    await page.getByTestId('lumora-studio').evaluate((studio) => {
+      const editable = document.createElement('div');
+      editable.contentEditable = 'true';
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.testid = 'editable-nested-button';
+      button.textContent = 'Editable action';
+      editable.append(button);
+      studio.append(editable);
+    });
+    const button = page.getByTestId('editable-nested-button');
+    await button.focus();
+
+    await button.press('Escape');
+
+    await expect(page.locator('.lumora-tree-row--selected')).toHaveCount(1);
+    await expect(page.getByTestId('inspector-name')).toHaveValue('立方体');
+    await expect.poll(() => countGizmoPixels(page)).toBeGreaterThan(0);
+  });
+}
+
+test('command palette consumes one Escape without clearing selection or gizmo', async ({ page }) => {
+  await expect(page.getByTestId('panel-tab-com.lumora.mock.panel.console')).toBeVisible();
+  await centerCubeAndScale(page);
+  await expect(page.locator('.lumora-tree-row--selected')).toHaveCount(1);
+  await expect(page.getByTestId('inspector-name')).toHaveValue('立方体');
+  await expect.poll(() => countGizmoPixels(page)).toBeGreaterThan(0);
+  await page.keyboard.press('Control+k');
+  const command = page.getByTestId('palette-command-com.lumora.mock.exportScene');
+  await command.focus();
+
+  await command.press('Escape');
+
+  await expect(page.getByTestId('command-palette')).not.toBeVisible();
+  await expect(page.locator('.lumora-tree-row--selected')).toHaveCount(1);
+  await expect(page.getByTestId('inspector-name')).toHaveValue('立方体');
+  await expect.poll(() => countGizmoPixels(page)).toBeGreaterThan(0);
 });
 
 test('对象树选择联动属性面板；数值变换提交后数据与撤销恢复一致（AC1）', async ({ page }) => {

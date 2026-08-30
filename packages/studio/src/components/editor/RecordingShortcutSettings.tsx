@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { KeyboardShortcut } from './recording-shortcut';
 import {
   DEFAULT_RECORDING_SHORTCUT,
@@ -20,25 +20,36 @@ export function RecordingShortcutSettings({ shortcut, onChange }: RecordingShort
   const triggerRef = useRef<HTMLButtonElement>(null);
   const keyRef = useRef<HTMLSelectElement>(null);
 
+  const close = useCallback(() => {
+    setOpen(false);
+    queueMicrotask(() => triggerRef.current?.focus());
+  }, []);
+
   useEffect(() => {
     if (!open) return;
     keyRef.current?.focus();
     const closeOnOutsidePointer = (event: PointerEvent) => {
-      if (event.target instanceof Node && !rootRef.current?.contains(event.target)) setOpen(false);
+      const root = rootRef.current;
+      if (root && !event.composedPath().includes(root)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      close();
     };
     document.addEventListener('pointerdown', closeOnOutsidePointer);
-    return () => document.removeEventListener('pointerdown', closeOnOutsidePointer);
-  }, [open]);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [close, open]);
 
   const update = (patch: Partial<KeyboardShortcut>) => {
     const next = { ...draft, ...patch };
     setDraft(next);
     setError(validateRecordingShortcut(next));
-  };
-
-  const close = () => {
-    setOpen(false);
-    queueMicrotask(() => triggerRef.current?.focus());
   };
 
   const save = () => {

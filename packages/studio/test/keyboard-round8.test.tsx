@@ -174,6 +174,29 @@ describe('R8-9 多实例快捷键隔离 + 移动菜单键盘语义', () => {
     expect(within(a.root).queryByTestId('command-palette')).not.toBeNull();
   });
 
+  it('单实例嵌入不接管聚焦的宿主控件，同时保留 body 兜底', async () => {
+    const a = await mountStudio();
+    const hostLog = document.createElement('aside');
+    hostLog.tabIndex = 0;
+    document.body.appendChild(hostLog);
+    const play = within(a.root).getByTestId('timeline-play');
+    const playBefore = play.textContent;
+
+    hostLog.focus();
+    act(() => {
+      hostLog.dispatchEvent(key(' '));
+    });
+
+    expect(play).toHaveTextContent(playBefore ?? '');
+    expect(within(a.root).queryByTestId('command-palette')).toBeNull();
+
+    act(() => {
+      document.body.dispatchEvent(key('k', { ctrlKey: true }));
+    });
+    expect(within(a.root).queryByTestId('command-palette')).not.toBeNull();
+    hostLog.remove();
+  });
+
   it('R8-9-T5 移动菜单 Escape：关闭并返回焦点到触发行', async () => {
     const { root } = await mountStudio();
     const row = within(root).getByTestId('tree-row-sample-cube');

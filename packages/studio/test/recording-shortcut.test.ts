@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   BROWSER_RESERVED_SHORTCUTS,
   DEFAULT_RECORDING_SHORTCUT,
@@ -10,6 +10,21 @@ import {
   saveRecordingShortcut,
   validateRecordingShortcut,
 } from '../src/components/editor/recording-shortcut';
+
+const REQUIRED_RESERVED_SHORTCUTS = [
+  'Ctrl+Shift+B',
+  'Ctrl+Shift+O',
+  'Ctrl+Shift+D',
+  'Alt+F',
+  'Alt+Space',
+  'Cmd+D',
+  'Cmd+H',
+  'Cmd+M',
+  'Cmd+Space',
+  'Cmd+Shift+B',
+  'Cmd+Shift+D',
+  'Cmd+Shift+P',
+] as const;
 
 describe('recording shortcut policy', () => {
   it('rejects an independent matrix of common Edge, Chrome, Firefox, and Safari shortcuts', () => {
@@ -24,6 +39,7 @@ describe('recording shortcut policy', () => {
       'Ctrl+Shift+I',
       'Ctrl+Shift+J',
       'Ctrl+Shift+C',
+      ...REQUIRED_RESERVED_SHORTCUTS,
       'F3',
       'Shift+F3',
       'Cmd+W',
@@ -42,6 +58,25 @@ describe('recording shortcut policy', () => {
       const shortcut = parseShortcut(value);
       expect(shortcut, value).not.toBeNull();
       expect(validateRecordingShortcut(shortcut!), value).toContain('浏览器');
+    }
+  });
+
+  it('reports and refuses every required high-risk fixture without writing storage', () => {
+    for (const value of REQUIRED_RESERVED_SHORTCUTS) {
+      const shortcut = parseShortcut(value);
+      expect(shortcut, value).not.toBeNull();
+      expect(validateRecordingShortcut(shortcut!), value).toMatch(/浏览器/);
+
+      const storage = {
+        getItem: vi.fn(() => null),
+        setItem: vi.fn(),
+      };
+      expect(saveRecordingShortcut(shortcut!, storage), value).toBe(false);
+      expect(storage.setItem, value).not.toHaveBeenCalled();
+
+      localStorage.removeItem(RECORDING_SHORTCUT_STORAGE_KEY);
+      expect(saveRecordingShortcut(shortcut!), value).toBe(false);
+      expect(localStorage.getItem(RECORDING_SHORTCUT_STORAGE_KEY), value).toBeNull();
     }
   });
 

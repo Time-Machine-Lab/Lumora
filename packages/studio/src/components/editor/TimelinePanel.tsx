@@ -413,6 +413,7 @@ export function TimelinePanel({
                 key={track.id}
                 className={`lumora-timeline__row lumora-timeline__lane${track.disabled ? ' lumora-timeline__lane--disabled' : ''}`}
                 data-testid={`track-lane-${track.id}`}
+                data-track-target-path={track.targetPath}
                 onClick={() => editor.setSelection([track.objectId])}
                 title={track.disabled ? '已禁用' : undefined}
               >
@@ -437,6 +438,7 @@ export function TimelinePanel({
                       className="lumora-timeline__keyframe"
                       style={{ left: kf.time * zoom }}
                       data-testid={`keyframe-${track.id}-${kf.time}`}
+                      data-keyframe-value={JSON.stringify(kf.value ?? null)}
                       title={`${formatTime(kf.time)}`}
                       onClick={(e) => {
                         e.stopPropagation();
