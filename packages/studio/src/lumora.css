@@ -51,6 +51,11 @@
     border-color 0.15s ease;
 }
 
+.lumora-toolbar .lumora-button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 .lumora-button > svg,
 .lumora-icon-button > svg,
 .lumora-timeline button > svg {
@@ -1910,7 +1915,6 @@
 
 .lumora-timeline__keyframe {
   position: absolute;
-  top: 50%;
   width: 24px;
   height: 24px;
   margin: -12px 0 0 -12px;
@@ -1933,6 +1937,20 @@
   outline: 2px solid rgba(77, 171, 247, 0.4);
 }
 
+.lumora-timeline__keyframe--cluster {
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--lumora-accent);
+  background: var(--lumora-surface);
+  color: var(--lumora-text);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.lumora-timeline__keyframe--cluster::after {
+  display: none;
+}
+
 .lumora-timeline__shot {
   position: absolute;
   top: 6px;
@@ -1947,21 +1965,14 @@
   cursor: pointer;
   overflow: hidden;
   box-sizing: border-box;
+  color: var(--lumora-text);
+  font: inherit;
+  text-align: left;
 }
 
-.lumora-timeline__shot-select {
-  display: flex;
-  align-items: center;
-  flex: 1;
-  align-self: stretch;
-  min-width: 0;
-  gap: 4px;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
+.lumora-timeline__shot--selected {
+  border-color: var(--lumora-accent);
+  box-shadow: inset 0 0 0 1px var(--lumora-accent);
 }
 
 .lumora-timeline__shot:hover {
@@ -1980,6 +1991,12 @@
   cursor: pointer;
   font-size: 12px;
   line-height: 1;
+}
+
+.lumora-timeline__shot-actions {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
 }
 
 .lumora-timeline__shot-move:disabled {
@@ -2016,7 +2033,7 @@
   color: var(--lumora-text-dim);
 }
 
-.lumora-timeline__overlay {
+.lumora-modal-backdrop.lumora-timeline__overlay {
   /* 模态提升到壳层根级并经 portal 挂 body：fixed 覆盖整个视口（复审阻断 4） */
   position: fixed;
   inset: 0;
@@ -2025,6 +2042,7 @@
   justify-content: center;
   background: rgba(0, 0, 0, 0.55);
   z-index: 30;
+  padding: 0;
 }
 
 .lumora-studio--portal {
@@ -2412,7 +2430,7 @@
 }
 
 /* The editor responds to its embed width, not the browser viewport. */
-@container (max-width: 1240px) {
+@container (max-width: 1280px) {
   .lumora-toolbar__version {
     display: none;
   }
@@ -2436,7 +2454,7 @@
   }
 }
 
-@container (max-width: 1080px) {
+@container (max-width: 1120px) {
   .lumora-toolbar__version {
     display: none;
   }
@@ -2514,7 +2532,7 @@
   }
 }
 
-@container (max-width: 1080px) {
+@container (max-width: 1120px) {
   .lumora-toolbar {
     gap: 6px;
     min-height: 44px;
@@ -2594,10 +2612,6 @@
 
   .lumora-timeline__lane {
     min-height: 45px;
-  }
-
-  .lumora-timeline__shot-select {
-    min-width: 44px;
   }
 
   .lumora-storyboard__header-actions > .lumora-icon-button,

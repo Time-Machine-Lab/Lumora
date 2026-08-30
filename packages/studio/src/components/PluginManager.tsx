@@ -1,4 +1,5 @@
 import type { PluginInfo } from '@lumora/core';
+import { useId } from 'react';
 import type { RefObject } from 'react';
 import type { StudioRuntime } from '../runtime/studio-runtime';
 import { X } from 'lucide-react';
@@ -23,6 +24,7 @@ const STATE_LABELS: Record<PluginInfo['state'], string> = {
 };
 
 export function PluginManager({ runtime, onClose, returnFocusRef }: PluginManagerProps) {
+  const titleId = useId();
   useEventRefresh(runtime.events, ['plugin:state-changed', 'contribution:changed']);
   const plugins = runtime.host.listPlugins();
 
@@ -30,12 +32,12 @@ export function PluginManager({ runtime, onClose, returnFocusRef }: PluginManage
     <ModalDialog
       dialogClassName="lumora-modal"
       backdropTestId="plugin-manager"
-      ariaLabelledBy="plugin-manager-title"
+      ariaLabelledBy={titleId}
       returnFocusRef={returnFocusRef}
       onClose={onClose}
     >
         <header className="lumora-modal__header">
-          <h2 id="plugin-manager-title">插件管理</h2>
+          <h2 id={titleId}>插件管理</h2>
           <button
             type="button"
             className="lumora-icon-button lumora-modal__close"

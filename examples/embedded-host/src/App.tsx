@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import type { Manifest, PluginDescriptor } from '@lumora/core';
+import { createSampleProject } from '@lumora/core';
+import type { Manifest, PluginDescriptor, Project } from '@lumora/core';
 import { LumoraStudio } from '@lumora/studio';
 import type { LumoraStudioHandle } from '@lumora/studio';
 import mockManifest from '@lumora/mock-plugin/lumora.plugin.json';
@@ -173,6 +174,30 @@ const DEBUG_FULL = new URLSearchParams(window.location.search).get('debug') === 
 /** 本地存储后端选择：?storage=opfs 使用 OPFS，缺省 IndexedDB（持久化门面可切换，TML-53 范围项） */
 const STORAGE = new URLSearchParams(window.location.search).get('storage') === 'opfs' ? 'opfs' : 'indexeddb';
 const DUAL_STUDIO_FIXTURE = new URLSearchParams(window.location.search).get('fixture') === 'dual-studio';
+const ROUND3_REVIEW_FIXTURE = new URLSearchParams(window.location.search).get('fixture');
+
+function createRound3ReviewProject(dense = false): Project {
+  const project = createSampleProject('lumora://tml-563-round3', 'TML-563 60fps 回归');
+  const sourceTrack = project.tracks[0]!;
+  return {
+    ...project,
+    settings: { ...project.settings, fps: 60 },
+    tracks: [{
+      ...sourceTrack,
+      id: 'review-60fps',
+      name: '60fps 相邻关键帧',
+      keyframes: dense
+        ? Array.from({ length: 60 }, (_, index) => ({
+            time: 1 + index / 60,
+            value: [index, 0, 0] as [number, number, number],
+          }))
+        : [
+            { time: 1, value: [0, 0, 0] },
+            { time: 1 + 1 / 60, value: [1, 0, 0] },
+          ],
+    }],
+  };
+}
 
 export default function App() {
   const [mounted, setMounted] = useState(true);
@@ -279,6 +304,9 @@ export default function App() {
             storage={STORAGE}
             pluginSettingsNamespace="embedded-host"
             className="host__studio"
+            initialProject={ROUND3_REVIEW_FIXTURE?.startsWith('tml-563-round3')
+              ? createRound3ReviewProject(ROUND3_REVIEW_FIXTURE === 'tml-563-round3-dense')
+              : undefined}
           />
         ) : (
           <div className="host__placeholder" data-testid="studio-placeholder">

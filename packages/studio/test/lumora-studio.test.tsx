@@ -1058,16 +1058,19 @@ describe('LumoraStudio：覆盖确认模态（复审阻断 4：全应用级模�
     fireEvent.click(screen.getByTestId('timeline-record'));
     expect(screen.getByTestId('overwrite-confirm')).toBeInTheDocument();
     expect(screen.getByTestId('overwrite-confirm')).toHaveAttribute('role', 'dialog');
-    expect(screen.getByTestId('overwrite-confirm')).toHaveClass('lumora-studio', 'lumora-studio--portal');
+    expect(screen.getByTestId('overwrite-confirm').closest('.lumora-modal-backdrop')).toHaveClass(
+      'lumora-studio',
+      'lumora-studio--portal',
+    );
     // 整壳 inert：工具栏/对象树/视口/时间线整体不可达（修复前仅时间线内容 inert）
-    expect(screen.getByTestId('lumora-studio')).toHaveAttribute('inert');
+    expect(screen.getByTestId('lumora-studio').parentElement).toHaveAttribute('inert');
     // 打开后焦点进入首个可聚焦项
     expect(screen.getByText('覆盖录制')).toHaveFocus();
 
     // 取消：模态关闭、不开始录制
     fireEvent.click(screen.getByText('取消'));
     expect(screen.queryByTestId('overwrite-confirm')).not.toBeInTheDocument();
-    expect(screen.getByTestId('lumora-studio')).not.toHaveAttribute('inert');
+    expect(screen.getByTestId('lumora-studio').parentElement).not.toHaveAttribute('inert');
     expect(screen.getByTestId('timeline-record')).toHaveAccessibleName('开始录制机位运动');
 
     // 再次进入并确认：录制开始
@@ -1131,5 +1134,22 @@ describe('LumoraStudio：覆盖确认模态（复审阻断 4：全应用级模�
     (document.activeElement as HTMLElement).blur();
     fireEvent.keyDown(document.body, { key: 'Tab' });
     expect(confirm).toHaveFocus();
+  });
+
+  it('混合模态栈按顶层顺序处理 Escape：后开的命令面板先关闭，覆盖确认保留', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    render(<LumoraStudio ref={handle} plugins={[goodPlugin]} hostVersion="0.1.0" />);
+    await screen.findByTestId('test-panel');
+    await openSampleWithCamera(handle);
+
+    fireEvent.click(screen.getByTestId('timeline-record'));
+    expect(screen.getByTestId('overwrite-confirm')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('open-command-palette'));
+    expect(screen.getByTestId('command-palette')).toBeInTheDocument();
+
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' });
+
+    expect(screen.getByTestId('overwrite-confirm')).toBeInTheDocument();
+    expect(screen.queryByTestId('command-palette')).not.toBeInTheDocument();
   });
 });

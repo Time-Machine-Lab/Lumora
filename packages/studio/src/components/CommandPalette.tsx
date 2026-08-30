@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { RefObject } from 'react';
 import type { Command } from '@lumora/core';
 import type { StudioRuntime } from '../runtime/studio-runtime';
@@ -12,6 +12,8 @@ interface CommandPaletteProps {
 }
 
 export function CommandPalette({ runtime, onClose, returnFocusRef }: CommandPaletteProps) {
+  const titleId = useId();
+  const inputId = useId();
   useEventRefresh(runtime.events, ['command:changed']);
   const [query, setQuery] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
@@ -43,7 +45,7 @@ export function CommandPalette({ runtime, onClose, returnFocusRef }: CommandPale
     <ModalDialog
       dialogClassName="lumora-palette"
       dialogTestId="command-palette"
-      ariaLabelledBy="command-palette-title"
+      ariaLabelledBy={titleId}
       initialFocusRef={inputRef}
       returnFocusRef={returnFocusRef}
       onClose={onClose}
@@ -55,11 +57,11 @@ export function CommandPalette({ runtime, onClose, returnFocusRef }: CommandPale
       }}
     >
         <header className="lumora-palette__header">
-          <h2 id="command-palette-title">命令面板</h2>
-          <label htmlFor="lumora-command-search">搜索命令</label>
+          <h2 id={titleId}>命令面板</h2>
+          <label htmlFor={inputId}>搜索命令</label>
         </header>
         <input
-          id="lumora-command-search"
+          id={inputId}
           ref={inputRef}
           className="lumora-palette__input"
           placeholder="输入命令名称或 id…"

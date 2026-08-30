@@ -221,11 +221,93 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     expect(session.seek).toHaveBeenCalledWith(1);
   });
 
-  it('分镜：点击区块定位起点；‹› 重排提交 reorderShots（AC4：视觉/时间顺序同变）', () => {
+  it('适配缩放只按可用时间区宽度与总时长计算，不被短分镜放大', () => {
+    const project = makeProject();
+    project.shots[0] = { ...project.shots[0]!, endTime: 0.1 };
+    const view = mountPanel({}, [], false, project);
+    const body = screen.getByTestId('timeline-body');
+    Object.defineProperty(body, 'clientWidth', { configurable: true, value: 375 });
+
+    fireEvent.click(screen.getByTitle('适配时长'));
+
+    expect(view.session.setZoom).toHaveBeenCalledWith((375 - TIMELINE_LABEL_WIDTH) / 3);
+  });
+
+  it('分镜比例区块只负责选中，选中分镜的跳转与重排动作固定在标签列', () => {
+    const view = mountPanel();
+    fireEvent.click(screen.getByTestId('shot-block-s2'));
+
+    const shot = screen.getByTestId('shot-block-s2');
+    const actions = screen.getByTestId('selected-shot-actions');
+    expect(shot.tagName).toBe('BUTTON');
+    expect(shot.querySelector('button')).toBeNull();
+    expect(actions).toContainElement(screen.getByTestId('shot-move-left-s2'));
+    expect(actions).toContainElement(screen.getByTestId('shot-jump-s2'));
+    expect(actions).toContainElement(screen.getByTestId('shot-move-right-s2'));
+
+    fireEvent.click(screen.getByTestId('shot-move-left-s2'));
+    expect(view.editor.getProject()!.shots.map((shot) => shot.id)).toEqual(['s2', 's1', 's3']);
+  });
+
+  it('60fps 相邻关键帧分配到不重叠的命中行', () => {
+    const project = makeProject();
+    project.settings.fps = 60;
+    project.tracks[0] = {
+      ...project.tracks[0]!,
+      keyframes: [
+        { time: 1, value: [0, 0, 0] },
+        { time: 1 + 1 / 60, value: [1, 0, 0] },
+      ],
+    };
+    const view = mountPanel({ state: { ...baseState(), fps: 60, zoom: 240 } }, [], false, project);
+    const trackId = project.tracks[0]!.id;
+    const first = screen.getByTestId(`keyframe-${trackId}-1`);
+    const second = screen.getByTestId(`keyframe-${trackId}-${1 + 1 / 60}`);
+
+    expect(first.style.top).not.toBe(second.style.top);
+    expect(screen.getByTestId(`track-row-${trackId}`).style.height).toBe('88px');
+    expect(view.session.seek).not.toHaveBeenCalled();
+  });
+
+  it('60fps 密集轨道保持两行内，并可从聚合目标循环访问每个关键帧', () => {
+    const project = makeProject();
+    project.settings.fps = 60;
+    const keyframes = Array.from({ length: 60 }, (_, index) => ({
+      time: 1 + index / 60,
+      value: [index, 0, 0] as [number, number, number],
+    }));
+    project.tracks[0] = { ...project.tracks[0]!, keyframes };
+
+    for (const zoom of [240, 30]) {
+      const view = mountPanel({ state: { ...baseState(), fps: 60, zoom } }, [], false, project);
+      const trackId = project.tracks[0]!.id;
+      const row = screen.getByTestId(`track-row-${trackId}`);
+      const clusters = screen.getAllByTestId(new RegExp(`^keyframe-cluster-${trackId}-`));
+
+      expect(Number.parseFloat(row.style.height)).toBeLessThanOrEqual(88);
+      expect(screen.getByTestId(`track-lane-${trackId}`)).toBeInTheDocument();
+      expect(screen.getByTestId('timeline-shots')).toBeInTheDocument();
+      expect(clusters.length).toBeGreaterThan(0);
+
+      if (zoom === 30) {
+        expect(clusters).toHaveLength(1);
+        expect(clusters[0]).toHaveAttribute('data-keyframe-count', '60');
+        vi.mocked(view.session.seek).mockClear();
+        keyframes.forEach(() => fireEvent.click(clusters[0]!));
+        expect(vi.mocked(view.session.seek).mock.calls.map(([time]) => time)).toEqual(
+          keyframes.map(({ time }) => time),
+        );
+      }
+      view.unmount();
+    }
+  });
+
+  it('分镜：固定动作栏定位起点；‹› 重排提交 reorderShots（AC4：视觉/时间顺序同变）', () => {
     const view = mountPanel();
     fireEvent.click(screen.getByTestId('shot-block-s2'));
     expect(view.session.seek).toHaveBeenCalledWith(1);
 
+    fireEvent.click(screen.getByTestId('shot-block-s1'));
     expect(screen.getByTestId('shot-move-left-s1')).toBeDisabled();
     fireEvent.click(screen.getByTestId('shot-move-right-s1'));
     const shots = view.editor.getProject()!.shots;
@@ -245,14 +327,15 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
       />,
     );
     expect(screen.getByTestId('shot-block-s2').style.left).toBe('0px'); // s2 移到最前
+    fireEvent.click(screen.getByTestId('shot-block-s3'));
     expect(screen.getByTestId('shot-move-right-s3')).toBeDisabled();
   });
 
-  it('轨道选择与分镜跳转使用有名称的原生按钮，不嵌套其它交互控件', () => {
+  it('轨道与分镜比例区块使用有名称的原生按钮，固定动作栏提供跳转', () => {
     const view = mountPanel();
     const trackId = view.project.tracks[0]!.id;
     const track = screen.getByTestId(`track-lane-${trackId}`);
-    const shot = screen.getByRole('button', { name: '跳转至分镜：中段' });
+    const shot = screen.getByRole('button', { name: '选择分镜：中段' });
     expect(track.tagName).toBe('BUTTON');
     expect(track).toHaveAccessibleName('选择轨道：主相机·位置');
     expect(track.querySelector('input, button')).toBeNull();
@@ -260,6 +343,7 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
 
     fireEvent.click(track);
     fireEvent.click(shot);
+    fireEvent.click(screen.getByRole('button', { name: '跳转至分镜：中段' }));
     expect(view.editor.getSelection()).toEqual(['cam']);
     expect(view.session.seek).toHaveBeenCalledWith(1);
   });

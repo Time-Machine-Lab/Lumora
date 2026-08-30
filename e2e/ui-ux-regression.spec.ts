@@ -43,37 +43,59 @@ test('1024 desktop uses the Studio container width and preserves the scene works
   await expect(studio.getByRole('tab', { name: '场景' })).toHaveAttribute('aria-selected', 'true');
 });
 
-test('900/901 editor boundary preserves a usable Scene instead of collapsing on growth', async ({ page }) => {
-  const sceneWidths: number[] = [];
-  for (const width of [1240, 1241]) {
+test('Studio 1080/1081 boundary keeps the toolbar on one contained row', async ({ page }) => {
+  const heights: number[] = [];
+  for (const width of [1420, 1421]) {
     await page.setViewportSize({ width, height: 768 });
     const measurements = await page.evaluate(() => {
       const studio = document.querySelector<HTMLElement>('[data-testid="lumora-studio"]')!;
-      const scene = document.querySelector<HTMLElement>('.lumora-studio__viewport')!;
+      const toolbar = document.querySelector<HTMLElement>('[data-testid="lumora-toolbar"]')!;
       const more = document.querySelector<HTMLElement>('[data-testid="toolbar-more"]')!;
+      const toolbarRect = toolbar.getBoundingClientRect();
+      const visibleButtons = Array.from(toolbar.querySelectorAll<HTMLElement>('button')).filter(
+        (button) => button.getClientRects().length > 0,
+      );
       return {
         studio: studio.getBoundingClientRect().width,
-        scene: scene.getBoundingClientRect().width,
+        height: toolbarRect.height,
         moreVisible: getComputedStyle(more).display !== 'none',
+        contained: visibleButtons.every((button) => {
+          const rect = button.getBoundingClientRect();
+          return rect.top >= toolbarRect.top && rect.bottom <= toolbarRect.bottom && rect.right <= toolbarRect.right;
+        }),
       };
     });
     expect(measurements.studio).toBeCloseTo(width - 340, 0);
-    expect(measurements.scene).toBeGreaterThanOrEqual(480);
     expect(measurements.moreVisible).toBe(true);
-    sceneWidths.push(measurements.scene);
+    expect(measurements.contained).toBe(true);
+    expect(measurements.height).toBeLessThanOrEqual(52);
+    heights.push(measurements.height);
   }
-  expect(Math.abs(sceneWidths[1]! - sceneWidths[0]!)).toBeLessThan(80);
+  expect(Math.abs(heights[1]! - heights[0]!)).toBeLessThan(1);
 });
 
-test('1100/1101 toolbar boundary remains a compact single row', async ({ page }) => {
+test('Studio 1240/1241 boundary remains a compact single row', async ({ page }) => {
   const heights: number[] = [];
-  for (const width of [1440, 1441]) {
+  for (const width of [1580, 1581]) {
     await page.setViewportSize({ width, height: 768 });
-    const height = await page.getByTestId('lumora-toolbar').evaluate((element) => element.getBoundingClientRect().height);
-    expect(height).toBeLessThan(60);
-    heights.push(height);
+    const geometry = await page.getByTestId('lumora-toolbar').evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      const visibleButtons = Array.from(element.querySelectorAll<HTMLElement>('button')).filter(
+        (button) => button.getClientRects().length > 0,
+      );
+      return {
+        height: rect.height,
+        contained: visibleButtons.every((button) => {
+          const buttonRect = button.getBoundingClientRect();
+          return buttonRect.top >= rect.top && buttonRect.bottom <= rect.bottom && buttonRect.right <= rect.right;
+        }),
+      };
+    });
+    expect(geometry.height).toBeLessThanOrEqual(52);
+    expect(geometry.contained).toBe(true);
+    heights.push(geometry.height);
   }
-  expect(Math.abs(heights[1]! - heights[0]!)).toBeLessThan(4);
+  expect(Math.abs(heights[1]! - heights[0]!)).toBeLessThan(1);
 });
 
 test('mobile defaults to a usable scene and keeps the host log collapsed', async ({ page }) => {
@@ -91,7 +113,7 @@ test('mobile defaults to a usable scene and keeps the host log collapsed', async
   await expect(viewport).toBeVisible();
 });
 
-test('375 fit zoom preserves every shot action and non-overlapping keyframe lane', async ({ page }) => {
+test('375 fit zoom shows the whole duration and keeps selected-shot actions in the sticky label', async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 667 });
   await page.getByTestId('open-storyboard-workspace').click();
   await page.getByTestId('storyboard-tab-adopted').click();
@@ -104,35 +126,90 @@ test('375 fit zoom preserves every shot action and non-overlapping keyframe lane
 
   const shots = page.locator('[data-testid^="shot-block-"]');
   await expect(shots).toHaveCount(3);
-  for (let index = 0; index < await shots.count(); index += 1) {
-    const shot = shots.nth(index);
-    const shotBox = await shot.boundingBox();
-    const actionBoxes = await shot.locator('button').evaluateAll((buttons) =>
-      buttons.map((button) => button.getBoundingClientRect().width),
-    );
-    expect(shotBox?.width ?? 0).toBeGreaterThanOrEqual(148);
-    expect(actionBoxes).toHaveLength(3);
-    expect(Math.min(...actionBoxes)).toBeGreaterThanOrEqual(44);
-  }
+  const fitGeometry = await page.getByTestId('timeline-body').evaluate((body) => ({
+    clientWidth: body.clientWidth,
+    canvasWidth: body.querySelector<HTMLElement>('.lumora-timeline__canvas')!.getBoundingClientRect().width,
+  }));
+  expect(fitGeometry.canvasWidth).toBeLessThanOrEqual(fitGeometry.clientWidth + 1);
 
-  const laneGeometry = await page.locator('.lumora-timeline__lane').evaluateAll((lanes) =>
-    lanes.map((lane) => {
-      const laneRect = lane.getBoundingClientRect();
-      const keyframes = Array.from(lane.querySelectorAll<HTMLElement>('.lumora-timeline__keyframe'));
-      return {
-        height: laneRect.height,
-        containsTargets: keyframes.every((keyframe) => {
-          const rect = keyframe.getBoundingClientRect();
-          return rect.top >= laneRect.top && rect.bottom <= laneRect.bottom;
-        }),
-      };
+  await shots.first().click();
+  const actions = page.getByTestId('selected-shot-actions');
+  await expect(actions).toBeVisible();
+  const actionGeometry = await actions.locator('button').evaluateAll((buttons) =>
+    buttons.map((button) => {
+      const rect = button.getBoundingClientRect();
+      return { width: rect.width, height: rect.height };
     }),
   );
-  expect(laneGeometry.length).toBeGreaterThan(1);
-  expect(
-    laneGeometry.every(({ height, containsTargets }) => height >= 44 && containsTargets),
-    JSON.stringify(laneGeometry),
-  ).toBe(true);
+  expect(actionGeometry).toHaveLength(3);
+  expect(actionGeometry.every(({ width, height }) => width >= 44 && height >= 44)).toBe(true);
+  expect(await actions.evaluate((element) => getComputedStyle(element.parentElement!).position)).toBe('sticky');
+});
+
+test('375 exact 60fps adjacent keyframes have disjoint hitboxes and own both visible centers', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 667 });
+  await page.goto('/?fixture=tml-563-round3');
+  const lane = page.locator('[data-track-id="review-60fps"]');
+  await expect(lane).toBeVisible();
+  await page.getByRole('button', { name: '适配' }).click();
+  const keys = lane.locator('.lumora-timeline__keyframe');
+  await expect(keys).toHaveCount(2);
+
+  const geometry = await keys.evaluateAll((elements) => elements.map((element) => {
+    const rect = element.getBoundingClientRect();
+    const center = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    return {
+      left: rect.left,
+      right: rect.right,
+      top: rect.top,
+      bottom: rect.bottom,
+      ownsCenter: document.elementFromPoint(center.x, center.y)?.closest('.lumora-timeline__keyframe') === element,
+    };
+  }));
+  const [first, second] = geometry;
+  const overlapWidth = Math.max(0, Math.min(first!.right, second!.right) - Math.max(first!.left, second!.left));
+  const overlapHeight = Math.max(0, Math.min(first!.bottom, second!.bottom) - Math.max(first!.top, second!.top));
+  expect(overlapWidth * overlapHeight).toBe(0);
+  expect(geometry.every(({ ownsCenter }) => ownsCenter)).toBe(true);
+});
+
+test('375 dense 60fps track stays bounded at default and minimum zoom', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 667 });
+  await page.goto('/?fixture=tml-563-round3-dense');
+  const lane = page.locator('[data-track-id="review-60fps"]');
+  await expect(lane).toBeVisible();
+
+  const measure = () => page.evaluate(() => {
+    const rect = (selector: string) => document.querySelector<HTMLElement>(selector)!.getBoundingClientRect();
+    const body = rect('[data-testid="timeline-body"]');
+    const row = rect('[data-track-id="review-60fps"]');
+    const label = rect('[data-testid="track-lane-review-60fps"]');
+    const shots = rect('[data-testid="timeline-shots"]');
+    const clusters = Array.from(document.querySelectorAll<HTMLElement>('[data-testid^="keyframe-cluster-review-60fps-"]'));
+    return {
+      rowHeight: row.height,
+      labelVisible: label.top >= body.top && label.bottom <= body.bottom,
+      shotsVisible: shots.top >= body.top && shots.bottom <= body.bottom,
+      clusterCount: clusters.length,
+      clusteredFrames: clusters.reduce((sum, cluster) => sum + Number(cluster.dataset.keyframeCount), 0),
+    };
+  });
+
+  let geometry = await measure();
+  expect(geometry.rowHeight).toBeLessThanOrEqual(88);
+  expect(geometry.labelVisible).toBe(true);
+  expect(geometry.shotsVisible).toBe(true);
+  expect(geometry.clusterCount).toBeGreaterThan(1);
+  expect(geometry.clusteredFrames).toBe(60);
+
+  for (let index = 0; index < 6; index += 1) await page.getByTitle('缩小').click();
+
+  geometry = await measure();
+  expect(geometry.rowHeight).toBeLessThanOrEqual(88);
+  expect(geometry.labelVisible).toBe(true);
+  expect(geometry.shotsVisible).toBe(true);
+  expect(geometry.clusterCount).toBe(1);
+  expect(geometry.clusteredFrames).toBe(60);
 });
 
 test('375 storyboard close and delete controls use 44px icon targets', async ({ page }) => {
@@ -172,6 +249,32 @@ test('667x375 expanded host log keeps both Scene and Timeline inside Studio', as
   expect(geometry.timeline.height).toBeGreaterThanOrEqual(48);
   expect(geometry.scene.top).toBeGreaterThanOrEqual(geometry.studio.top);
   expect(geometry.timeline.bottom).toBeLessThanOrEqual(geometry.studio.bottom + 1);
+});
+
+test('375x667 expanded host log keeps the complete timeline inside Studio', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 667 });
+  await page.getByTestId('host-log-toggle').click();
+  await expect(page.getByTestId('host-event-log')).toBeVisible();
+  await page.getByTestId('timeline-body').evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+
+  const geometry = await page.evaluate(() => {
+    const rect = (selector: string) => document.querySelector<HTMLElement>(selector)!.getBoundingClientRect();
+    const studio = rect('[data-testid="lumora-studio"]');
+    const timeline = rect('[data-testid="lumora-timeline"]');
+    const timelineBody = rect('[data-testid="timeline-body"]');
+    const shots = rect('[data-testid="timeline-shots"]');
+    return {
+      studioBottom: studio.bottom,
+      timelineBottom: timeline.bottom,
+      timelineBodyBottom: timelineBody.bottom,
+      shotsBottom: shots.bottom,
+    };
+  });
+  expect(geometry.timelineBottom).toBeLessThanOrEqual(geometry.studioBottom + 1);
+  expect(geometry.timelineBodyBottom).toBeLessThanOrEqual(geometry.studioBottom + 1);
+  expect(geometry.shotsBottom).toBeLessThanOrEqual(geometry.timelineBodyBottom + 1);
 });
 
 test('mobile editor tabs support roving keyboard navigation', async ({ page }) => {
@@ -328,6 +431,21 @@ test('two Studio instances route Escape to the top portal only', async ({ page }
 
   await expect(page.getByRole('dialog', { name: '插件管理' })).toHaveCount(1);
   await expect(lowerDialog).toBeVisible();
+});
+
+test('overwrite confirmation participates in the shared modal stack below a later command palette', async ({ page }) => {
+  await page.getByTestId('editor-panel-objects').click();
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('editor-panel-scene').click();
+  await page.getByTestId('timeline-record').click();
+  await expect(page.getByTestId('overwrite-confirm')).toBeVisible();
+  await page.getByTestId('open-command-palette').evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.getByTestId('command-palette')).toBeVisible();
+
+  await page.keyboard.press('Escape');
+
+  await expect(page.getByTestId('overwrite-confirm')).toBeVisible();
+  await expect(page.getByTestId('command-palette')).toHaveCount(0);
 });
 
 test('main editor and dialogs have no WCAG A/AA axe violations', async ({ page }) => {

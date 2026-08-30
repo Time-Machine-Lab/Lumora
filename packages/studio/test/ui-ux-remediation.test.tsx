@@ -125,6 +125,26 @@ describe('TML-563 modal accessibility boundary', () => {
     expect(lowerDialog).toBeInTheDocument();
   });
 
+  it('gives simultaneous Studio dialogs unique accessible-name references', async () => {
+    render(
+      <>
+        <section aria-label="Studio A"><LumoraStudio /></section>
+        <section aria-label="Studio B"><LumoraStudio /></section>
+      </>,
+    );
+    const openers = await screen.findAllByTestId('open-plugin-manager');
+    fireEvent.click(openers[0]!);
+    fireEvent.click(openers[1]!);
+
+    const dialogs = await screen.findAllByRole('dialog', { name: '插件管理' });
+    const labelledBy = dialogs.map((dialog) => dialog.getAttribute('aria-labelledby'));
+    expect(new Set(labelledBy).size).toBe(2);
+    for (const id of labelledBy) {
+      expect(id).toBeTruthy();
+      expect(document.querySelectorAll(`#${CSS.escape(id!)}`)).toHaveLength(1);
+    }
+  });
+
   it('plugin manager is a portal modal, traps focus, closes on Escape, and restores its opener', async () => {
     render(<LumoraStudio />);
     const opener = await screen.findByTestId('open-plugin-manager');

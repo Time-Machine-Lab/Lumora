@@ -143,8 +143,11 @@ class DocumentModalManager {
 
     const active = deepActiveElement(this.document);
     const activeInside = composedContains(top.dialog, active);
+    const targetInside = event.composedPath().includes(top.dialog) || (
+      event.target instanceof HTMLElement && composedContains(top.dialog, event.target)
+    );
     if (event.key !== 'Tab') {
-      if (!activeInside) {
+      if (!activeInside || !targetInside) {
         event.preventDefault();
         event.stopImmediatePropagation();
       }
@@ -160,7 +163,7 @@ class DocumentModalManager {
     }
     const first = items[0]!;
     const last = items[items.length - 1]!;
-    if (!activeInside) {
+    if (!activeInside || !targetInside) {
       event.preventDefault();
       event.stopImmediatePropagation();
       this.focusEntry(top, event.shiftKey);

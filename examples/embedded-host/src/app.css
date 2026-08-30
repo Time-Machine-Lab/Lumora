@@ -199,4 +199,13 @@ body {
   .host__actions button {
     flex: 1;
   }
+
+  .host__log {
+    height: 64px;
+    padding-block: 8px;
+  }
+
+  .host__log h2 {
+    margin-bottom: 6px;
+  }
 }

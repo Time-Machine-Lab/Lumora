@@ -155,14 +155,14 @@ async function expectShotLeft(page: Page, shotId: string, expectedPx: number): P
 test('overwrite confirmation portal retains resolved Studio theme styles', async ({ page }) => {
   await page.getByTestId('tree-row-sample-camera').click();
   await page.getByTestId('timeline-record').click();
-  const overlay = page.getByTestId('overwrite-confirm');
-  await expect(overlay).toBeVisible();
+  const modal = page.getByTestId('overwrite-confirm');
+  await expect(modal).toBeVisible();
 
-  const styles = await overlay.evaluate((element) => {
-    const overlayStyle = getComputedStyle(element);
-    const modal = element.querySelector<HTMLElement>('.lumora-timeline__modal')!;
-    const button = modal.querySelector<HTMLElement>('.lumora-button')!;
-    const modalStyle = getComputedStyle(modal);
+  const styles = await modal.evaluate((element) => {
+    const overlay = element.closest<HTMLElement>('.lumora-modal-backdrop')!;
+    const overlayStyle = getComputedStyle(overlay);
+    const button = element.querySelector<HTMLElement>('.lumora-button')!;
+    const modalStyle = getComputedStyle(element);
     const buttonStyle = getComputedStyle(button);
     return {
       surfaceVariable: overlayStyle.getPropertyValue('--lumora-surface-2').trim(),

@@ -3,46 +3,46 @@ import { resolve } from 'node:path';
 import { expect, test } from '@playwright/test';
 import type { Browser, Page } from '@playwright/test';
 
-const OUTPUT_DIR = resolve('docs/evidence/tml-563/after');
+const OUTPUT_DIR = resolve('docs/evidence/tml-563/round3-after');
 
 async function clickToolbarItem(page: Page, testId: string) {
   const item = page.getByTestId(testId);
   if (!(await item.isVisible())) {
-    const more = page.getByTestId('toolbar-more');
-    await expect(more).toBeVisible();
-    await more.click();
+    await page.getByTestId('toolbar-more').click();
     await expect(item).toBeVisible();
   }
   await item.click();
 }
 
-async function prepareEditor(
-  page: Page,
-  viewport: { width: number; height: number },
-  selected: boolean,
-) {
-  await page.setViewportSize(viewport);
-  await page.goto('/');
+async function openSampleProject(page: Page) {
   await clickToolbarItem(page, 'open-sample-project');
   await expect(page.getByTestId('open-export-workspace')).toBeEnabled();
+}
 
-  if (selected) {
-    const cube = page.getByTestId('tree-row-sample-cube');
-    if (!(await cube.isVisible())) await page.getByTestId('editor-panel-objects').click();
-    await cube.click();
-    if (!(await page.getByTestId('lumora-viewport').isVisible())) {
-      await page.getByTestId('editor-panel-scene').click();
-    }
-  }
+async function prepareShortShot(page: Page) {
+  await openSampleProject(page);
+  await page.getByTestId('open-storyboard-workspace').click();
+  await page.getByTestId('storyboard-tab-adopted').click();
+  const shortestShot = page.getByTestId('storyboard-adopted-shot').first();
+  await shortestShot.locator('input[type="number"]').fill('0.1');
+  await shortestShot.locator('input[type="number"]').press('Tab');
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('storyboard-workspace')).toBeHidden();
+  await page.getByTitle('适配时长').click();
+}
 
-  await expect(page.getByTestId('lumora-viewport')).toBeVisible();
-  await page.waitForTimeout(250);
+async function prepareOverwrite(page: Page) {
+  await openSampleProject(page);
+  await page.getByTestId('editor-panel-objects').click();
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('editor-panel-scene').click();
+  await page.getByTestId('timeline-record').click();
+  await expect(page.getByTestId('overwrite-confirm')).toBeVisible();
 }
 
 async function capture(page: Page, filename: string) {
   await page.screenshot({
     path: resolve(OUTPUT_DIR, filename),
-    fullPage: true,
     animations: 'disabled',
   });
 }
@@ -50,142 +50,226 @@ async function capture(page: Page, filename: string) {
 async function captureScenario(
   browser: Browser,
   viewport: { width: number; height: number },
-  selected: boolean,
   filename: string,
-  arrange?: (page: Page) => Promise<void>,
+  arrange: (page: Page) => Promise<void>,
+  url = '/',
 ) {
   const context = await browser.newContext({ viewport });
   const page = await context.newPage();
   try {
-    await prepareEditor(page, viewport, selected);
-    await arrange?.(page);
+    await page.goto(url);
+    await arrange(page);
+    await page.waitForTimeout(300);
     await capture(page, filename);
   } finally {
     await context.close();
   }
 }
 
-test('captures the TML-563 before/after review matrix', async ({ browser }) => {
-  test.setTimeout(120_000);
+async function expectSingleRowToolbar(page: Page) {
+  const geometry = await page.getByTestId('lumora-toolbar').evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    const visibleButtons = Array.from(element.querySelectorAll<HTMLElement>('button')).filter(
+      (button) => button.getClientRects().length > 0,
+    );
+    return {
+      height: rect.height,
+      contained: visibleButtons.every((button) => {
+        const buttonRect = button.getBoundingClientRect();
+        return buttonRect.top >= rect.top && buttonRect.bottom <= rect.bottom && buttonRect.right <= rect.right;
+      }),
+      singleLine: visibleButtons.every((button) => getComputedStyle(button).whiteSpace === 'nowrap'),
+    };
+  });
+  expect(geometry.height).toBeLessThanOrEqual(52);
+  expect(geometry.contained).toBe(true);
+  expect(geometry.singleLine).toBe(true);
+}
+
+test('captures the TML-563 round 3 before/after matrix', async ({ browser }) => {
+  test.setTimeout(180_000);
   mkdirSync(OUTPUT_DIR, { recursive: true });
 
-  await captureScenario(browser, { width: 1440, height: 900 }, true, '01-desktop-editor-1440x900.png');
-  await captureScenario(browser, { width: 1024, height: 768 }, true, '01a-desktop-editor-1024x768.png');
-  await captureScenario(browser, { width: 1440, height: 900 }, true, '02-desktop-plugin-manager-1440x900.png', async (page) => {
-    await clickToolbarItem(page, 'open-plugin-manager');
-    await expect(page.getByRole('dialog', { name: '插件管理' })).toBeVisible();
-  });
-  await captureScenario(browser, { width: 1440, height: 900 }, true, '03-desktop-command-palette-1440x900.png', async (page) => {
-    await page.keyboard.press('Control+k');
-    await expect(page.getByRole('dialog', { name: '命令面板' })).toBeVisible();
-  });
-  await captureScenario(browser, { width: 1440, height: 900 }, true, '04-desktop-storyboard-1440x900.png', async (page) => {
-    await page.getByTestId('open-storyboard-workspace').click();
-    await expect(page.getByTestId('storyboard-workspace')).toBeVisible();
-  });
-  await captureScenario(browser, { width: 1440, height: 900 }, true, '05-desktop-export-1440x900.png', async (page) => {
-    await page.getByTestId('open-export-workspace').click();
-    await expect(page.getByTestId('export-workspace')).toBeVisible();
-  });
-  await captureScenario(browser, { width: 375, height: 667 }, false, '06a-mobile-editor-before-selection-375x667.png');
-  await captureScenario(browser, { width: 375, height: 667 }, true, '06-mobile-editor-375x667.png');
-  await captureScenario(browser, { width: 375, height: 667 }, false, '07-mobile-plugin-manager-375x667.png', async (page) => {
-    await clickToolbarItem(page, 'open-plugin-manager');
-    await expect(page.getByRole('dialog', { name: '插件管理' })).toBeVisible();
-  });
-  await captureScenario(browser, { width: 375, height: 667 }, false, '08-mobile-storyboard-375x667.png', async (page) => {
-    await page.getByTestId('open-storyboard-workspace').click();
-    await expect(page.getByTestId('storyboard-workspace')).toBeVisible();
-  });
-  await captureScenario(browser, { width: 667, height: 375 }, true, '09-mobile-landscape-editor-667x375.png');
-  await captureScenario(browser, { width: 667, height: 375 }, true, '10-mobile-landscape-export-667x375.png', async (page) => {
-    await page.getByTestId('open-export-workspace').click();
-    await expect(page.getByTestId('export-workspace')).toBeVisible();
-  });
-
-  await captureScenario(browser, { width: 1440, height: 900 }, false, '11-portal-host-isolation-1440x900.png', async (page) => {
-    await clickToolbarItem(page, 'open-plugin-manager');
-    const dialog = page.getByRole('dialog', { name: '插件管理' });
-    await expect(dialog).toBeVisible();
-    await page.evaluate(() => document.querySelector<HTMLElement>('[data-testid="studio-mount-toggle"]')!.focus());
-    expect(await dialog.evaluate((element) => element.contains(document.activeElement))).toBe(true);
-  });
-  await captureScenario(browser, { width: 1440, height: 900 }, false, '12-shadow-root-focus-restore-1440x900.png', async (page) => {
-    await page.evaluate(() => {
-      const host = document.createElement('div');
-      host.id = 'evidence-shadow-host';
-      Object.assign(host.style, {
-        position: 'fixed',
-        left: '16px',
-        bottom: '16px',
-        zIndex: '100',
+  await captureScenario(
+    browser,
+    { width: 1440, height: 900 },
+    'hold-dual-ctrlk-scope.png',
+    async (page) => {
+      const studios = page.locator('#root [data-testid="lumora-studio"]');
+      await expect(studios).toHaveCount(2);
+      await studios.first().dispatchEvent('keydown', {
+        key: 'k',
+        code: 'KeyK',
+        ctrlKey: true,
+        bubbles: true,
+        composed: true,
       });
-      const shadow = host.attachShadow({ mode: 'open' });
-      const button = document.createElement('button');
-      button.id = 'evidence-shadow-opener';
-      button.textContent = 'ShadowRoot opener';
-      button.style.cssText = 'padding:8px 12px;border:2px solid #4dabf7;background:#232834;color:#fff';
-      shadow.append(button);
-      document.body.append(host);
-      button.focus();
-      document.querySelector<HTMLButtonElement>('[data-testid="open-command-palette"]')!.click();
-    });
-    await expect(page.getByRole('dialog', { name: '命令面板' })).toBeVisible();
-    await page.keyboard.press('Escape');
-    expect(await page.evaluate(() =>
-      document.querySelector<HTMLElement>('#evidence-shadow-host')?.shadowRoot?.activeElement?.id,
-    )).toBe('evidence-shadow-opener');
-  });
-  await captureScenario(browser, { width: 1240, height: 768 }, true, '13-responsive-boundary-1240x768.png');
-  await captureScenario(browser, { width: 1241, height: 768 }, true, '13-responsive-boundary-1241x768.png');
-  await captureScenario(browser, { width: 1440, height: 768 }, true, '13-responsive-boundary-1440x768.png');
-  await captureScenario(browser, { width: 1441, height: 768 }, true, '13-responsive-boundary-1441x768.png');
-  await captureScenario(browser, { width: 667, height: 375 }, true, '14-mobile-landscape-log-open-667x375.png', async (page) => {
-    await page.getByTestId('host-log-toggle').click();
-    await expect(page.getByTestId('host-event-log')).toBeVisible();
-  });
-  await captureScenario(browser, { width: 375, height: 667 }, false, '15-mobile-fit-shot-controls-375x667.png', async (page) => {
-    await page.getByTestId('open-storyboard-workspace').click();
-    await page.getByTestId('storyboard-tab-adopted').click();
-    const shortestValidShot = page.getByTestId('storyboard-adopted-shot').first();
-    await shortestValidShot.locator('input[type="number"]').fill('0.1');
-    await shortestValidShot.locator('input[type="number"]').press('Tab');
-    await page.keyboard.press('Escape');
-    await expect(page.getByTestId('storyboard-workspace')).toBeHidden();
-    await page.getByRole('button', { name: '适配' }).click();
-    await page.getByTestId('timeline-body').evaluate((element) => {
-      element.scrollTop = element.scrollHeight;
-    });
-  });
-  await captureScenario(browser, { width: 375, height: 667 }, false, '16-mobile-keyframe-overlap-375x667.png', async (page) => {
-    await page.getByRole('button', { name: '适配' }).click();
-    await page.locator('.lumora-timeline__keyframe').first().focus();
-  });
-  await captureScenario(browser, { width: 375, height: 667 }, false, '17-mobile-storyboard-controls-375x667.png', async (page) => {
-    await page.getByTestId('open-storyboard-workspace').click();
-    await page.getByTestId('storyboard-tab-adopted').click();
-  });
-  await captureScenario(browser, { width: 1440, height: 900 }, false, '18-plugin-transition-focus-1440x900.png', async (page) => {
-    await clickToolbarItem(page, 'open-plugin-manager');
-    const toggle = page.getByTestId('plugin-toggle-com.lumora.mock');
-    await toggle.click();
-    await expect(page.getByTestId('plugin-state-com.lumora.mock')).toHaveText('已禁用');
-    await expect(toggle).toBeFocused();
-  });
+      await expect(page.getByTestId('command-palette')).toHaveCount(1);
+      await studios.nth(1).dispatchEvent('keydown', {
+        key: 'k',
+        code: 'KeyK',
+        ctrlKey: true,
+        bubbles: true,
+        composed: true,
+      });
+      await expect(page.getByTestId('command-palette')).toHaveCount(1);
+    },
+    '/?fixture=dual-studio',
+  );
 
-  const dualContext = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-  const dualPage = await dualContext.newPage();
-  try {
-    await dualPage.goto('/?fixture=dual-studio');
-    const openers = dualPage.getByTestId('open-plugin-manager');
-    await expect(openers).toHaveCount(2);
-    await openers.first().click();
-    await openers.nth(1).evaluate((button) => button.click());
-    await expect(dualPage.getByRole('dialog', { name: '插件管理' })).toHaveCount(2);
-    await dualPage.keyboard.press('Escape');
-    await expect(dualPage.getByRole('dialog', { name: '插件管理' })).toHaveCount(1);
-    await capture(dualPage, '19-multiple-modal-stack-1440x900.png');
-  } finally {
-    await dualContext.close();
+  await captureScenario(
+    browser,
+    { width: 1440, height: 900 },
+    'hold-dual-palette-ids.png',
+    async (page) => {
+      const openers = page.locator('#root [data-testid="open-command-palette"]');
+      await expect(openers).toHaveCount(2);
+      await openers.first().evaluate((button: HTMLButtonElement) => button.click());
+      await openers.nth(1).evaluate((button: HTMLButtonElement) => button.click());
+      const inputs = page.getByTestId('command-palette-input');
+      await expect(inputs).toHaveCount(2);
+      const labels = await inputs.evaluateAll((elements: HTMLInputElement[]) => elements.map((input) => ({
+        id: input.id,
+        labelCount: input.labels?.length ?? 0,
+        accessibleLabel: input.labels?.[0]?.textContent?.trim(),
+      })));
+      expect(new Set(labels.map(({ id }) => id)).size).toBe(2);
+      expect(labels.every(({ labelCount, accessibleLabel }) => labelCount === 1 && accessibleLabel === '搜索命令')).toBe(true);
+    },
+    '/?fixture=dual-studio',
+  );
+
+  await captureScenario(
+    browser,
+    { width: 375, height: 667 },
+    'hold-fit-overview-loss-375x667.png',
+    async (page) => {
+      await prepareShortShot(page);
+      const geometry = await page.getByTestId('timeline-body').evaluate((body) => ({
+        viewportWidth: body.clientWidth,
+        canvasWidth: body.querySelector<HTMLElement>('.lumora-timeline__canvas')!.getBoundingClientRect().width,
+      }));
+      expect(geometry.canvasWidth).toBeLessThanOrEqual(geometry.viewportWidth + 1);
+      await page.getByTestId('timeline-body').evaluate((element) => {
+        element.scrollTop = element.scrollHeight;
+      });
+    },
+  );
+
+  await captureScenario(
+    browser,
+    { width: 375, height: 667 },
+    'hold-shot-actions-clipped-375x667.png',
+    async (page) => {
+      await prepareShortShot(page);
+      await page.getByTitle('缩小').click();
+      await page.locator('[data-testid^="shot-block-"]').first().click();
+      const actions = page.getByTestId('selected-shot-actions');
+      await expect(actions).toBeVisible();
+      const hitTargets = await actions.locator('button').evaluateAll((buttons) => buttons.map((button) => {
+        const rect = button.getBoundingClientRect();
+        return { width: rect.width, height: rect.height };
+      }));
+      expect(hitTargets).toHaveLength(3);
+      expect(hitTargets.every(({ width, height }) => width >= 44 && height >= 44)).toBe(true);
+    },
+  );
+
+  await captureScenario(
+    browser,
+    { width: 375, height: 667 },
+    'tml-563-keyframes-60fps-overlap-375x667.png',
+    async (page) => {
+      const lane = page.locator('[data-track-id="review-60fps"]');
+      await expect(lane).toBeVisible();
+      await page.getByTitle('适配时长').click();
+      const keys = lane.locator('.lumora-timeline__keyframe');
+      await expect(keys).toHaveCount(2);
+      const geometry = await keys.evaluateAll((elements) => elements.map((element) => {
+        const rect = element.getBoundingClientRect();
+        const center = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+        return {
+          left: rect.left,
+          right: rect.right,
+          top: rect.top,
+          bottom: rect.bottom,
+          ownsCenter: document.elementFromPoint(center.x, center.y)?.closest('.lumora-timeline__keyframe') === element,
+        };
+      }));
+      const [first, second] = geometry;
+      const overlapWidth = Math.max(0, Math.min(first!.right, second!.right) - Math.max(first!.left, second!.left));
+      const overlapHeight = Math.max(0, Math.min(first!.bottom, second!.bottom) - Math.max(first!.top, second!.top));
+      expect(overlapWidth * overlapHeight).toBe(0);
+      expect(geometry.every(({ ownsCenter }) => ownsCenter)).toBe(true);
+      await keys.first().focus();
+    },
+    '/?fixture=tml-563-round3',
+  );
+
+  await captureScenario(
+    browser,
+    { width: 1440, height: 900 },
+    'hold-overwrite-host-focus.png',
+    async (page) => {
+      await prepareOverwrite(page);
+      const focusState = await page.evaluate(() => {
+        const hostButton = document.querySelector<HTMLElement>('[data-testid="studio-mount-toggle"]')!;
+        const dialog = document.querySelector<HTMLElement>('[data-testid="overwrite-confirm"]')!;
+        hostButton.focus();
+        return {
+          rootInert: document.querySelector<HTMLElement>('#root')!.inert,
+          hostFocused: document.activeElement === hostButton,
+          dialogFocused: dialog.contains(document.activeElement),
+        };
+      });
+      expect(focusState).toEqual({ rootInert: true, hostFocused: false, dialogFocused: true });
+    },
+  );
+
+  await captureScenario(
+    browser,
+    { width: 1440, height: 900 },
+    'hold-mixed-modal-escape-order.png',
+    async (page) => {
+      await prepareOverwrite(page);
+      await page.getByTestId('open-command-palette').evaluate((button: HTMLButtonElement) => button.click());
+      await expect(page.getByTestId('command-palette')).toBeVisible();
+      await page.keyboard.press('Escape');
+      await expect(page.getByTestId('command-palette')).toHaveCount(0);
+      await expect(page.getByTestId('overwrite-confirm')).toBeVisible();
+    },
+  );
+
+  for (const { width, filename } of [
+    { width: 1420, filename: 'toolbar-studio-1080-host-1420x768.png' },
+    { width: 1421, filename: 'toolbar-studio-1081-host-1421x768.png' },
+    { width: 1580, filename: 'toolbar-studio-1240-host-1580x768.png' },
+    { width: 1581, filename: 'toolbar-studio-1241-host-1581x768.png' },
+  ]) {
+    await captureScenario(browser, { width, height: 768 }, filename, async (page) => {
+      await openSampleProject(page);
+      await expectSingleRowToolbar(page);
+    });
   }
+
+  await captureScenario(
+    browser,
+    { width: 375, height: 667 },
+    'portrait-log-open-375x667.png',
+    async (page) => {
+      await openSampleProject(page);
+      await page.getByTestId('host-log-toggle').click();
+      await expect(page.getByTestId('host-event-log')).toBeVisible();
+      await page.getByTestId('timeline-body').evaluate((element) => {
+        element.scrollTop = element.scrollHeight;
+      });
+      const contained = await page.evaluate(() => {
+        const studio = document.querySelector<HTMLElement>('[data-testid="lumora-studio"]')!.getBoundingClientRect();
+        const timeline = document.querySelector<HTMLElement>('[data-testid="lumora-timeline"]')!.getBoundingClientRect();
+        const shots = document.querySelector<HTMLElement>('[data-testid="timeline-shots"]')!.getBoundingClientRect();
+        return timeline.bottom <= studio.bottom + 1 && shots.bottom <= timeline.bottom + 1;
+      });
+      expect(contained).toBe(true);
+    },
+  );
 });
