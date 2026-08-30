@@ -486,7 +486,9 @@ function useCameraDrive(
       if (event.pointerId === lookPointerId) clearDrive();
     };
     const onLostPointerCapture = (event: PointerEvent) => {
-      if (event.pointerId === lookPointerId) endLookGesture();
+      if (event.pointerId !== lookPointerId) return;
+      drive.cancelLook();
+      endLookGesture();
     };
     const onContextMenu = (event: MouseEvent) => {
       if (!suppressNextContextMenu) return;

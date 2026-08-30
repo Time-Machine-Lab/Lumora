@@ -231,6 +231,36 @@ describe('camera drive keyboard routing', () => {
     expect(look).toHaveBeenCalledTimes(callsAtWindowRelease);
   });
 
+  it('lost pointer capture clears queued look while held keyboard movement continues', async () => {
+    const studio = await mountStudio('lumora://drive-lost-capture');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    Object.assign(viewport, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+    const press = vi.spyOn(CameraDrive.prototype, 'press');
+    await act(async () => delay(60));
+
+    fireEvent.keyDown(viewport, { key: 'w', code: 'KeyW' });
+    const drive = press.mock.instances[press.mock.instances.length - 1] as unknown as CameraDrive;
+    act(() => {
+      drive.update(0.06);
+      drive.update(0.08);
+    });
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 14, clientX: 20, clientY: 20 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 14, clientX: 100, clientY: 60 });
+    act(() => drive.update(1 / 60));
+    fireEvent.lostPointerCapture(viewport, { pointerId: 14 });
+
+    const rotationAtLoss = camera.quaternion.clone();
+    const positionAtLoss = camera.position.clone();
+    expect(drive.hasInput).toBe(true);
+    act(() => drive.update(0.1));
+    fireEvent.keyUp(viewport, { key: 'w', code: 'KeyW' });
+
+    expect(camera.quaternion.angleTo(rotationAtLoss)).toBeLessThan(1e-9);
+    expect(camera.position.distanceTo(positionAtLoss)).toBeGreaterThan(0.05);
+  });
+
   it('right-button camera look reclaims focus from a control before subsequent keyboard driving', async () => {
     const studio = await mountStudio('lumora://drive-pointer-focus-transfer');
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));

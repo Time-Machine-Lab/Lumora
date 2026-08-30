@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
 import { resolve } from 'node:path';
+import { Euler, Quaternion } from 'three';
 
 /** 标签列宽度（px），与 TimelinePanel 导出的 TIMELINE_LABEL_WIDTH 一致；
  *  播放头 = 标签列 + time * zoom，关键帧/分镜/标尺刻度 = time * zoom（时间画布内） */
@@ -91,6 +92,12 @@ async function cameraPose(
 
 function vectorDistance(a: readonly number[], b: readonly number[]): number {
   return Math.hypot(...a.map((value, index) => value - (b[index] ?? 0)));
+}
+
+function quaternionAngle(a: readonly number[], b: readonly number[]): number {
+  const qa = new Quaternion().setFromEuler(new Euler(a[0], a[1], a[2], 'XYZ'));
+  const qb = new Quaternion().setFromEuler(new Euler(b[0], b[1], b[2], 'XYZ'));
+  return qa.angleTo(qb);
 }
 
 async function setRange(page: Page, testId: string, value: number): Promise<void> {
@@ -599,6 +606,53 @@ test('recording right drag rotates its camera without panning the director view'
   const afterCancelledMove = await cameraPose(page);
   await page.mouse.up({ button: 'right' });
   expect(vectorDistance(afterCancelledMove.rotation, cancelledPose.rotation)).toBeLessThan(0.001);
+});
+
+test('recording lost pointer capture freezes queued look while held keyboard movement continues', async ({ page }) => {
+  await startRecording(page);
+  await hideViewportOverlays(page);
+  const viewport = page.getByTestId('lumora-viewport');
+  const box = await viewport.boundingBox();
+  if (!box) throw new Error('viewport is unavailable');
+  const start = await cameraPose(page);
+
+  await page.keyboard.down('s');
+  await page.waitForTimeout(220);
+  await page.mouse.move(box.x + box.width * 0.45, box.y + box.height * 0.65);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(box.x + box.width * 0.75, box.y + box.height * 0.45, { steps: 4 });
+  await page.waitForTimeout(50);
+  const afterLook = await cameraPose(page);
+  expect(quaternionAngle(afterLook.rotation, start.rotation)).toBeGreaterThan(0.03);
+
+  await viewport.dispatchEvent('lostpointercapture', { pointerId: 1, pointerType: 'mouse' });
+  const lossTime = await timeSeconds(page);
+  const poseAtLoss = await cameraPose(page);
+  await page.waitForTimeout(400);
+  const poseAfterWait = await cameraPose(page);
+  await page.keyboard.up('s');
+  await page.mouse.up({ button: 'right' });
+
+  expect(quaternionAngle(poseAfterWait.rotation, poseAtLoss.rotation)).toBeLessThan(0.001);
+  expect(vectorDistance(poseAfterWait.position, poseAtLoss.position)).toBeGreaterThan(0.1);
+
+  await page.getByTestId('timeline-record').click();
+  await expect(page.getByTestId('timeline-time')).toHaveText('00:00.00');
+  const rotationLane = page.locator('.lumora-timeline__lane').filter({ hasText: '录制主摄像机·旋转' });
+  const rotationSamples = await rotationLane.locator('.lumora-timeline__keyframe').evaluateAll((elements) =>
+    elements.map((element) => {
+      const testId = element.getAttribute('data-testid') ?? '';
+      return {
+        time: Number(testId.slice(testId.lastIndexOf('-') + 1)),
+        value: JSON.parse(element.getAttribute('data-keyframe-value') ?? '[]') as number[],
+      };
+    }),
+  );
+  const postLossSamples = rotationSamples.filter((sample) => sample.time >= lossTime + 0.05);
+  expect(postLossSamples.length).toBeGreaterThan(0);
+  for (const sample of postLossSamples) {
+    expect(quaternionAngle(sample.value, poseAtLoss.rotation)).toBeLessThan(0.002);
+  }
 });
 
 test('recording viewport remains operable at 760px and 375px and right drag survives resize', async ({ page }) => {

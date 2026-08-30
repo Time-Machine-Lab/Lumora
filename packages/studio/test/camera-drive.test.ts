@@ -248,6 +248,30 @@ describe('CameraDrive：键鼠驾驶积分器', () => {
     expect(Math.abs(hugeNode.rotation.y)).toBeGreaterThan(Math.abs(firstYaw));
     expect(Math.abs(hugeNode.rotation.y - firstYaw)).toBeLessThan(Math.abs(firstYaw));
   });
+
+  it('cancelLook clears queued mouse rotation without cancelling held translation', () => {
+    const drive = new CameraDrive({ mode: 'keyboard-mouse', speed: 3, smoothing: 8 });
+    const node = makeCameraNode();
+    drive.attach(node);
+    drive.press('KeyW');
+    drive.update(0.06);
+    drive.update(0.08);
+    drive.look(80, -40);
+    drive.update(1 / 60);
+
+    const rotationAtCancel = node.quaternion.clone();
+    const positionAtCancel = node.position.clone();
+    const cancelLook = (drive as CameraDrive & { cancelLook?: () => void }).cancelLook;
+    expect(cancelLook).toBeTypeOf('function');
+    if (!cancelLook) return;
+
+    cancelLook.call(drive);
+    drive.update(0.1);
+
+    expect(node.quaternion.angleTo(rotationAtCancel)).toBeLessThan(1e-9);
+    expect(node.position.distanceTo(positionAtCancel)).toBeGreaterThan(0.05);
+    expect(drive.hasInput).toBe(true);
+  });
 });
 
 describe('captureCameraSample / restoreObjectOnNode', () => {

@@ -243,6 +243,11 @@ export class CameraDrive {
     this.lookDelta.y = THREE.MathUtils.clamp(this.lookDelta.y + deltaY, -MAX_LOOK_DELTA, MAX_LOOK_DELTA);
   }
 
+  /** Clear queued pointer-look momentum without interrupting held keyboard input. */
+  cancelLook(): void {
+    this.lookDelta.set(0, 0);
+  }
+
   get hasInput(): boolean {
     return (
       this.keys.size > 0 ||
