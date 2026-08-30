@@ -179,6 +179,7 @@ export default function App() {
   // 双击/连点不再并发进入卸载流程；close() 本身是 single-flight（重复调用
   // 共享同一 in-flight 裁决），此处是 UI 层对同一问题的第一道防线
   const [closing, setClosing] = useState(false);
+  const [logOpen, setLogOpen] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const handleRef = useRef<LumoraStudioHandle | null>(null);
 
@@ -235,6 +236,16 @@ export default function App() {
         <div className="host__actions">
           <button
             type="button"
+            className="host__log-toggle"
+            data-testid="host-log-toggle"
+            aria-controls="host-event-log"
+            aria-expanded={logOpen}
+            onClick={() => setLogOpen((open) => !open)}
+          >
+            {logOpen ? '收起日志' : '事件日志'}
+          </button>
+          <button
+            type="button"
             data-testid="reopen-last-export"
             disabled={closing}
             onClick={() => {
@@ -274,8 +285,10 @@ export default function App() {
           </div>
         )}
         <aside
+          id="host-event-log"
           className="host__log"
           data-testid="host-event-log"
+          data-open={logOpen || undefined}
           tabIndex={0}
           aria-labelledby="host-event-log-heading"
         >

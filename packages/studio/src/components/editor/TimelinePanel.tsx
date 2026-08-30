@@ -11,6 +11,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronLeft, ChevronRight, Circle, Minus, Pause, Play, Plus, Square } from 'lucide-react';
 import { MAX_TIMELINE_ZOOM, MIN_TIMELINE_ZOOM } from '@lumora/core';
 import type { Project, SceneEditor } from '@lumora/core';
 import { findObject } from '@lumora/core';
@@ -133,6 +134,21 @@ export function TimelinePanel({
     if (!dragSeeking) return;
     setDragSeeking(false);
     elRulerRelease(event);
+  };
+
+  const handleRulerKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const frame = 1 / Math.max(1, state.fps);
+    let next: number | null = null;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') next = time - frame;
+    else if (event.key === 'ArrowRight' || event.key === 'ArrowUp') next = time + frame;
+    else if (event.key === 'PageUp') next = time + 1;
+    else if (event.key === 'PageDown') next = time - 1;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = state.duration;
+    if (next === null) return;
+    event.preventDefault();
+    event.stopPropagation();
+    session.seek(Math.min(state.duration, Math.max(0, next)));
   };
 
   const fitZoom = useCallback(() => {
@@ -316,10 +332,11 @@ export function TimelinePanel({
           className="lumora-timeline__play"
           data-testid="timeline-play"
           title={state.playing ? '暂停（空格）' : '播放（空格）'}
+          aria-label={state.playing ? '暂停播放' : '播放时间线'}
           disabled={state.duration <= 0 && !state.recording}
           onClick={() => session.togglePlay()}
         >
-          {state.playing ? '❚❚' : '▶'}
+          {state.playing ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
         </button>
         <button
           type="button"
@@ -334,10 +351,23 @@ export function TimelinePanel({
                   ? `停止录制（${formatShortcut(recordingShortcut)}）`
                   : `录制机位运动（${formatShortcut(recordingShortcut)}）`
           }
+          aria-label={
+            state.recordingPaused
+              ? '继续录制'
+              : state.recording
+                ? '停止录制'
+                : '开始录制机位运动'
+          }
           disabled={!selectedCamera && !state.recording}
           onClick={recordClick}
         >
-          {state.recordingPaused ? '▶' : state.recording ? '■' : '●'}
+          {state.recordingPaused ? (
+            <Play aria-hidden="true" />
+          ) : state.recording ? (
+            <Square aria-hidden="true" />
+          ) : (
+            <Circle aria-hidden="true" />
+          )}
         </button>
         <RecordingShortcutSettings
           shortcut={recordingShortcut}
@@ -442,14 +472,14 @@ export function TimelinePanel({
           />
           循环
         </label>
-        <button type="button" className="lumora-timeline__zoom" title="缩小" onClick={() => session.zoomBy(1 / 1.5)}>
-          −
+        <button type="button" className="lumora-timeline__zoom" aria-label="缩小时间线" title="缩小" onClick={() => session.zoomBy(1 / 1.5)}>
+          <Minus aria-hidden="true" />
         </button>
         <button type="button" className="lumora-timeline__zoom" title="适配时长" onClick={fitZoom}>
           适配
         </button>
-        <button type="button" className="lumora-timeline__zoom" title="放大" onClick={() => session.zoomBy(1.5)}>
-          ＋
+        <button type="button" className="lumora-timeline__zoom" aria-label="放大时间线" title="放大" onClick={() => session.zoomBy(1.5)}>
+          <Plus aria-hidden="true" />
         </button>
       </div>
       <div className="lumora-timeline__body" data-testid="timeline-body" ref={bodyRef}>
@@ -461,6 +491,14 @@ export function TimelinePanel({
             className="lumora-timeline__row lumora-timeline__row--ruler"
             data-testid="timeline-ruler"
             ref={rulerRef}
+            role="slider"
+            tabIndex={0}
+            aria-label="时间线播放头"
+            aria-valuemin={0}
+            aria-valuemax={state.duration}
+            aria-valuenow={time}
+            aria-valuetext={formatTime(time)}
+            onKeyDown={handleRulerKeyDown}
             onPointerDown={handleRulerPointerDown}
             onPointerMove={handleRulerPointerMove}
             onPointerUp={handleRulerPointerUp}
@@ -480,21 +518,28 @@ export function TimelinePanel({
             </div>
           </div>
           {project.tracks.length === 0 ? (
-            <div className="lumora-timeline__empty">尚无轨道 —— 选中一个机位后点击 ● 录制</div>
+            <div className="lumora-timeline__empty">尚无轨道 —— 选中一个机位后点击“录制”</div>
           ) : (
             project.tracks.map((track) => (
               <div
                 key={track.id}
                 className={`lumora-timeline__row lumora-timeline__lane${track.disabled ? ' lumora-timeline__lane--disabled' : ''}`}
-                data-testid={`track-lane-${track.id}`}
+                data-track-id={track.id}
                 data-track-target-path={track.targetPath}
-                onClick={() => editor.setSelection([track.objectId])}
                 title={track.disabled ? '已禁用' : undefined}
               >
                 <div className="lumora-timeline__label">
-                  <span className="lumora-timeline__lane-name">{track.name}</span>
-                  <span className="lumora-timeline__lane-channel">{CHANNEL_LABELS[track.targetPath] ?? track.targetPath}</span>
-                  <label className="lumora-check" onClick={(e) => e.stopPropagation()}>
+                  <button
+                    type="button"
+                    className="lumora-timeline__lane-select"
+                    data-testid={`track-lane-${track.id}`}
+                    aria-label={`选择轨道：${track.name}`}
+                    onClick={() => editor.setSelection([track.objectId])}
+                  >
+                    <span className="lumora-timeline__lane-name">{track.name}</span>
+                    <span className="lumora-timeline__lane-channel">{CHANNEL_LABELS[track.targetPath] ?? track.targetPath}</span>
+                  </button>
+                  <label className="lumora-check">
                     <input
                       type="checkbox"
                       checked={!!track.disabled}
@@ -513,6 +558,7 @@ export function TimelinePanel({
                       style={{ left: kf.time * zoom }}
                       data-testid={`keyframe-${track.id}-${kf.time}`}
                       data-keyframe-value={JSON.stringify(kf.value ?? null)}
+                      aria-label={`跳转至关键帧 ${formatTime(kf.time)}`}
                       title={`${formatTime(kf.time)}`}
                       onClick={(e) => {
                         e.stopPropagation();
@@ -548,31 +594,43 @@ export function TimelinePanel({
                         className="lumora-timeline__shot-move"
                         disabled={index === 0}
                         data-testid={`shot-move-left-${shot.id}`}
+                        aria-label={`向前移动分镜：${shot.name}`}
                         onClick={(e) => {
                           e.stopPropagation();
                           moveShot(index, -1);
                         }}
                       >
-                        ‹
+                        <ChevronLeft aria-hidden="true" />
                       </button>
-                      <span className="lumora-timeline__shot-name">{shot.name}</span>
+                      <button
+                        type="button"
+                        className="lumora-timeline__shot-select"
+                        aria-label={`跳转至分镜：${shot.name}`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          session.seek(shot.startTime);
+                        }}
+                      >
+                        <span className="lumora-timeline__shot-name">{shot.name}</span>
+                        {thumbs[thumbKey] ? (
+                          <img className="lumora-timeline__shot-thumb" src={thumbs[thumbKey]!} alt="" draggable={false} />
+                        ) : (
+                          <span className="lumora-timeline__shot-camera">{camera ? camera.name : '未绑定'}</span>
+                        )}
+                      </button>
                       <button
                         type="button"
                         className="lumora-timeline__shot-move"
                         disabled={index >= project.shots.length - 1}
                         data-testid={`shot-move-right-${shot.id}`}
+                        aria-label={`向后移动分镜：${shot.name}`}
                         onClick={(e) => {
                           e.stopPropagation();
                           moveShot(index, 1);
                         }}
                       >
-                        ›
+                        <ChevronRight aria-hidden="true" />
                       </button>
-                      {thumbs[thumbKey] ? (
-                        <img className="lumora-timeline__shot-thumb" src={thumbs[thumbKey]!} alt="" draggable={false} />
-                      ) : (
-                        <span className="lumora-timeline__shot-camera">{camera ? camera.name : '未绑定'}</span>
-                      )}
                     </div>
                   );
                 })}

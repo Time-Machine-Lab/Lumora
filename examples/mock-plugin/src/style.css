@@ -1,0 +1,108 @@
+.lumora-mock-console,
+.lumora-mock-ai {
+  display: flex;
+  min-height: 100%;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  color: var(--lumora-text);
+  background: var(--lumora-surface);
+}
+
+.lumora-mock-console h4,
+.lumora-mock-ai h4,
+.lumora-mock-console p,
+.lumora-mock-ai p {
+  margin: 0;
+}
+
+.lumora-mock-console h4,
+.lumora-mock-ai h4 {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.lumora-mock-console > p,
+.lumora-mock-result {
+  color: var(--lumora-text-dim);
+}
+
+.lumora-mock-actions,
+.lumora-mock-chat {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.lumora-mock-actions button,
+.lumora-mock-chat button {
+  min-height: 36px;
+  padding: 6px 12px;
+  border: 1px solid var(--lumora-border);
+  border-radius: 6px;
+  color: var(--lumora-text);
+  background: var(--lumora-surface-2);
+  font: inherit;
+  cursor: pointer;
+}
+
+.lumora-mock-actions button:hover:not(:disabled),
+.lumora-mock-chat button:hover:not(:disabled) {
+  border-color: var(--lumora-accent);
+}
+
+.lumora-mock-chat input {
+  min-width: 0;
+  min-height: 36px;
+  flex: 1 1 220px;
+  padding: 6px 10px;
+  border: 1px solid var(--lumora-border);
+  border-radius: 6px;
+  color: var(--lumora-text);
+  background: var(--lumora-bg);
+  font: inherit;
+}
+
+.lumora-mock-actions button:focus-visible,
+.lumora-mock-chat button:focus-visible,
+.lumora-mock-chat input:focus-visible {
+  outline: 2px solid var(--lumora-accent);
+  outline-offset: 2px;
+}
+
+.lumora-mock-actions button:disabled,
+.lumora-mock-chat button:disabled,
+.lumora-mock-chat input:disabled {
+  color: var(--lumora-text-disabled);
+  cursor: not-allowed;
+}
+
+.lumora-mock-result {
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid var(--lumora-border);
+  border-radius: 6px;
+  background: var(--lumora-surface-2);
+  overflow-wrap: anywhere;
+}
+
+.lumora-mock-log {
+  min-height: 72px;
+  margin: 0;
+  padding: 10px 12px 10px 28px;
+  border: 1px solid var(--lumora-border);
+  border-radius: 6px;
+  color: var(--lumora-text-dim);
+  background: var(--lumora-bg);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  overflow: auto;
+}
+
+@container (max-width: 600px) {
+  .lumora-mock-actions button,
+  .lumora-mock-chat button,
+  .lumora-mock-chat input {
+    min-height: 44px;
+  }
+}

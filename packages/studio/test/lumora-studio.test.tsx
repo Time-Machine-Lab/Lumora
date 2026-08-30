@@ -1068,14 +1068,14 @@ describe('LumoraStudio：覆盖确认模态（复审阻断 4：全应用级模�
     fireEvent.click(screen.getByText('取消'));
     expect(screen.queryByTestId('overwrite-confirm')).not.toBeInTheDocument();
     expect(screen.getByTestId('lumora-studio')).not.toHaveAttribute('inert');
-    expect(screen.getByTestId('timeline-record').textContent).toBe('●');
+    expect(screen.getByTestId('timeline-record')).toHaveAccessibleName('开始录制机位运动');
 
     // 再次进入并确认：录制开始
     fireEvent.click(screen.getByTestId('timeline-record'));
     expect(screen.getByTestId('overwrite-confirm')).toBeInTheDocument();
     fireEvent.click(screen.getByText('覆盖录制'));
     expect(screen.queryByTestId('overwrite-confirm')).not.toBeInTheDocument();
-    expect(screen.getByTestId('timeline-record').textContent).toBe('■');
+    expect(screen.getByTestId('timeline-record')).toHaveAccessibleName('停止录制');
   });
 
   it('焦点逃逸到对话框外后 Escape 仍取消模态；关闭后焦点还原到触发按钮（复审阻断 4）', async () => {

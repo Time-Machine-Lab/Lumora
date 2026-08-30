@@ -642,6 +642,7 @@ test('maps an OpenAI-compatible authentication failure without retrying or chang
 
 test('keeps OpenAI-compatible settings usable without horizontal overflow on mobile', async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 });
+  await page.getByTestId('editor-panel-objects').click();
   await page.getByTestId('panel-tab-com.lumora.openai.compatible.settings').click();
   const settings = page.getByTestId('openai-compatible-settings');
   await expect(settings).toBeVisible();

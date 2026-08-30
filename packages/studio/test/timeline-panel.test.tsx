@@ -150,15 +150,15 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     expect(view.session.setCameraControlSettings).toHaveBeenCalledWith({ mouseSensitivity: 1.4 });
   });
 
-  it('录制中：播放键显示 ■，点击停止录制；录制暂停态点击继续', () => {
+  it('录制中显示停止动作，点击停止录制；录制暂停态点击继续', () => {
     const stop = mountPanel({ state: { ...baseState(), recording: true } });
-    expect(screen.getByTestId('timeline-record').textContent).toBe('■');
+    expect(screen.getByTestId('timeline-record')).toHaveAccessibleName('停止录制');
     fireEvent.click(screen.getByTestId('timeline-record'));
     expect(stop.session.stopRecording).toHaveBeenCalledTimes(1);
     stop.unmount();
 
     const resume = mountPanel({ state: { ...baseState(), recording: true, recordingPaused: true } });
-    expect(screen.getByTestId('timeline-record').textContent).toBe('▶');
+    expect(screen.getByTestId('timeline-record')).toHaveAccessibleName('继续录制');
     fireEvent.click(screen.getByTestId('timeline-record'));
     expect(resume.session.resumeRecording).toHaveBeenCalledTimes(1);
   });
@@ -174,6 +174,26 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     fireEvent.pointerUp(ruler, { pointerId: 1 });
     fireEvent.pointerMove(ruler, { clientX: 3 * zoom, pointerId: 1 });
     expect(session.seek).toHaveBeenCalledTimes(2); // 抬起后不再跟手
+  });
+
+  it('标尺提供 slider 语义并支持 Arrow/Page/Home/End 键定位', () => {
+    const { session } = mountPanel();
+    const ruler = screen.getByTestId('timeline-ruler');
+    expect(ruler).toHaveAttribute('role', 'slider');
+    expect(ruler).toHaveAccessibleName('时间线播放头');
+    expect(ruler).toHaveAttribute('aria-valuemin', '0');
+    expect(ruler).toHaveAttribute('aria-valuemax', '3');
+
+    fireEvent.keyDown(ruler, { key: 'ArrowRight' });
+    fireEvent.keyDown(ruler, { key: 'PageUp' });
+    fireEvent.keyDown(ruler, { key: 'PageDown' });
+    fireEvent.keyDown(ruler, { key: 'End' });
+    fireEvent.keyDown(ruler, { key: 'Home' });
+    expect(session.seek).toHaveBeenNthCalledWith(1, 1 / 24);
+    expect(session.seek).toHaveBeenNthCalledWith(2, 1);
+    expect(session.seek).toHaveBeenNthCalledWith(3, 0);
+    expect(session.seek).toHaveBeenNthCalledWith(4, 3);
+    expect(session.seek).toHaveBeenNthCalledWith(5, 0);
   });
 
   it('播放头随真实 seek 移动并更新时间显示（共享坐标系：标签列右侧定位）', () => {
@@ -226,6 +246,22 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     );
     expect(screen.getByTestId('shot-block-s2').style.left).toBe('0px'); // s2 移到最前
     expect(screen.getByTestId('shot-move-right-s3')).toBeDisabled();
+  });
+
+  it('轨道选择与分镜跳转使用有名称的原生按钮，不嵌套其它交互控件', () => {
+    const view = mountPanel();
+    const trackId = view.project.tracks[0]!.id;
+    const track = screen.getByTestId(`track-lane-${trackId}`);
+    const shot = screen.getByRole('button', { name: '跳转至分镜：中段' });
+    expect(track.tagName).toBe('BUTTON');
+    expect(track).toHaveAccessibleName('选择轨道：主相机·位置');
+    expect(track.querySelector('input, button')).toBeNull();
+    expect(shot.querySelector('button')).toBeNull();
+
+    fireEvent.click(track);
+    fireEvent.click(shot);
+    expect(view.editor.getSelection()).toEqual(['cam']);
+    expect(view.session.seek).toHaveBeenCalledWith(1);
   });
 
   it('禁用开关写入轨道 disabled；点击泳道行选中机位', () => {

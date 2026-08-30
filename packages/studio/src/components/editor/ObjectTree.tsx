@@ -1,6 +1,18 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Eye,
+  EyeOff,
+  Lock,
+  LockOpen,
+  Move,
+  Plus,
+  Trash2,
+} from 'lucide-react';
+import {
   createCameraObject,
   createGroupObject,
   createLightObject,
@@ -241,6 +253,7 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
         <select
           className="lumora-select"
           data-testid="scene-switcher"
+          aria-label="活动场景"
           value={project.activeSceneId}
           onChange={(e) => {
             const result = editor.setActiveScene(e.target.value);
@@ -263,7 +276,8 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
             setAddMenuOpen((open) => !open);
           }}
         >
-          ＋ 添加
+          <Plus aria-hidden="true" />
+          添加
         </button>
         {addMenuOpen && (
           <div className="lumora-menu" data-testid="add-menu">
@@ -308,7 +322,7 @@ export function ObjectTree({ editor, project, selection, cache }: ObjectTreeProp
       <div className="lumora-tree__list" role="tree" aria-multiselectable="true">
         {roots.length === 0 && (
           <div className="lumora-tree__empty" data-testid="tree-empty">
-            场景为空 —— 点击「＋ 添加」创建对象
+            场景为空 —— 点击“添加”创建对象
           </div>
         )}
         {roots.map((object) => (
@@ -500,7 +514,9 @@ function TreeNode({
           tabIndex={-1} // 单一 tab 停靠点：行内按钮不进 Tab 顺序（APG treeview）
           aria-label={isExpanded ? '折叠' : '展开'}
         >
-          {children.length > 0 && (isExpanded ? '▾' : '▸')}
+          {children.length > 0 && (isExpanded
+            ? <ChevronDown aria-hidden="true" />
+            : <ChevronRight aria-hidden="true" />)}
         </button>
         <span className={`lumora-tree-row__type lumora-tree-row__type--${object.type}`}>
           {TYPE_LABEL[object.type]}
@@ -529,7 +545,8 @@ function TreeNode({
             type="button"
             className="lumora-icon-button"
             data-testid={`tree-visible-${object.id}`}
-            title={object.visible ? '隐藏' : '显示'}
+            aria-label={`${object.visible ? '隐藏' : '显示'} ${object.name}`}
+            title={`${object.visible ? '隐藏' : '显示'} ${object.name}`}
             onClick={(e) => {
               e.stopPropagation();
               if (e.detail > 1) return; // 双击隔离：一次双击只切换一次，不产生两步历史
@@ -539,13 +556,14 @@ function TreeNode({
             onDoubleClick={(e) => e.stopPropagation()}
             tabIndex={-1}
           >
-            {object.visible ? '显' : '隐'}
+            {object.visible ? <Eye aria-hidden="true" /> : <EyeOff aria-hidden="true" />}
           </button>
           <button
             type="button"
             className={`lumora-icon-button${object.locked ? ' lumora-icon-button--active' : ''}`}
             data-testid={`tree-lock-${object.id}`}
-            title={object.locked ? '解锁' : '锁定'}
+            aria-label={`${object.locked ? '解锁' : '锁定'} ${object.name}`}
+            title={`${object.locked ? '解锁' : '锁定'} ${object.name}`}
             onClick={(e) => {
               e.stopPropagation();
               if (e.detail > 1) return; // 双击隔离：一次双击只切换一次
@@ -555,14 +573,15 @@ function TreeNode({
             onDoubleClick={(e) => e.stopPropagation()}
             tabIndex={-1}
           >
-            {object.locked ? '锁' : '开'}
+            {object.locked ? <Lock aria-hidden="true" /> : <LockOpen aria-hidden="true" />}
           </button>
           <button
             type="button"
             className="lumora-icon-button"
             id={`tree-move-trigger-${instanceNs}-${enc(object.id)}`}
             data-testid={`tree-move-${object.id}`}
-            title="移动到"
+            aria-label={`移动 ${object.name}`}
+            title={`移动 ${object.name}`}
             aria-haspopup="menu"
             aria-expanded={moveMenuId === object.id}
             aria-controls={`tree-move-menu-${instanceNs}-${enc(object.id)}`}
@@ -573,13 +592,14 @@ function TreeNode({
             onDoubleClick={(e) => e.stopPropagation()}
             tabIndex={-1}
           >
-            移
+            <Move aria-hidden="true" />
           </button>
           <button
             type="button"
             className="lumora-icon-button lumora-icon-button--danger"
             data-testid={`tree-delete-${object.id}`}
-            title="删除"
+            aria-label={`${isDeleteConfirming ? '确认删除' : '删除'} ${object.name}`}
+            title={`${isDeleteConfirming ? '确认删除' : '删除'} ${object.name}`}
             onClick={(e) => {
               e.stopPropagation();
               if (e.detail > 1) return; // 双击隔离：双击的第二次点击不绕过确认直接删除
@@ -596,7 +616,7 @@ function TreeNode({
             tabIndex={-1}
             onBlur={() => setDeleteConfirmId(null)}
           >
-            {isDeleteConfirming ? '确认?' : '删'}
+            {isDeleteConfirming ? <Check aria-hidden="true" /> : <Trash2 aria-hidden="true" />}
           </button>
         </span>
         {moveMenuId === object.id && (

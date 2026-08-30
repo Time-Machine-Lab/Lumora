@@ -22,7 +22,7 @@ body {
 .host {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100dvh;
 }
 
 .host__bar {
@@ -48,6 +48,16 @@ body {
   background: #232834;
   color: #e8eaf0;
   cursor: pointer;
+}
+
+.host__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.host__log-toggle {
+  display: none;
 }
 
 .host__actions button:hover {
@@ -113,14 +123,59 @@ body {
 /* 窄屏：日志面板移到 Studio 下方，Studio 获得完整宽度（Studio 自身
    有 ≤900px 的三栏纵向堆叠规则，容器过窄时其内部布局无法成立） */
 @media (max-width: 900px) {
+  .host__bar {
+    min-height: 44px;
+    padding: 5px 8px;
+  }
+
+  .host__bar h1 {
+    font-size: 13px;
+    white-space: nowrap;
+  }
+
+  .host__actions {
+    min-width: 0;
+  }
+
+  .host__actions button {
+    min-width: 0;
+    padding: 5px 8px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .host__log-toggle {
+    display: inline-flex;
+  }
+
   .host__layout {
     flex-direction: column;
   }
 
   .host__log {
+    display: none;
     width: 100%;
-    height: 150px;
+    height: min(180px, 32dvh);
     border-left: none;
     border-top: 1px solid #2a2e3a;
+  }
+
+  .host__log[data-open] {
+    display: block;
+  }
+}
+
+@media (max-width: 600px) {
+  .host__bar h1 {
+    display: none;
+  }
+
+  .host__actions {
+    width: 100%;
+  }
+
+  .host__actions button {
+    flex: 1;
   }
 }

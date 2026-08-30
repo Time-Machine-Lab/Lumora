@@ -1,14 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
+import type { RefObject } from 'react';
 import type { Command } from '@lumora/core';
 import type { StudioRuntime } from '../runtime/studio-runtime';
 import { useEventRefresh } from '../hooks/use-event-refresh';
+import { ModalDialog } from './ModalDialog';
 
 interface CommandPaletteProps {
   runtime: StudioRuntime;
   onClose: () => void;
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }
 
-export function CommandPalette({ runtime, onClose }: CommandPaletteProps) {
+export function CommandPalette({ runtime, onClose, returnFocusRef }: CommandPaletteProps) {
   useEventRefresh(runtime.events, ['command:changed']);
   const [query, setQuery] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
@@ -37,21 +40,26 @@ export function CommandPalette({ runtime, onClose }: CommandPaletteProps) {
   };
 
   return (
-    <div className="lumora-modal-backdrop" onClick={onClose}>
-      <div
-        className="lumora-palette"
-        data-testid="command-palette"
-        role="dialog"
-        aria-label="命令面板"
-        onClick={(event) => event.stopPropagation()}
-        onKeyDownCapture={(event) => {
-          if (event.key !== 'Escape') return;
+    <ModalDialog
+      dialogClassName="lumora-palette"
+      dialogTestId="command-palette"
+      ariaLabelledBy="command-palette-title"
+      initialFocusRef={inputRef}
+      returnFocusRef={returnFocusRef}
+      onClose={onClose}
+      onDialogKeyDown={(event) => {
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
           event.preventDefault();
-          event.stopPropagation();
           onClose();
-        }}
-      >
+        }
+      }}
+    >
+        <header className="lumora-palette__header">
+          <h2 id="command-palette-title">命令面板</h2>
+          <label htmlFor="lumora-command-search">搜索命令</label>
+        </header>
         <input
+          id="lumora-command-search"
           ref={inputRef}
           className="lumora-palette__input"
           placeholder="输入命令名称或 id…"
@@ -59,7 +67,10 @@ export function CommandPalette({ runtime, onClose }: CommandPaletteProps) {
           data-testid="command-palette-input"
           onChange={(event) => setQuery(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === 'Enter' && commands[0]) run(commands[0]);
+            if (event.key === 'Enter' && commands[0]) {
+              event.preventDefault();
+              run(commands[0]);
+            }
           }}
         />
         <ul className="lumora-palette__list">
@@ -78,7 +89,6 @@ export function CommandPalette({ runtime, onClose }: CommandPaletteProps) {
             </li>
           ))}
         </ul>
-      </div>
-    </div>
+    </ModalDialog>
   );
 }

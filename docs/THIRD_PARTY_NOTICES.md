@@ -4,7 +4,7 @@
 
 This inventory identifies the third-party npm packages present in the locked Lumora dependency graph. It is not a replacement for the license text shipped by each package. Release artifacts must retain any license or notice files required by those packages.
 
-Locked package identities: **419**
+Locked package identities: **420**
 
 | Package | Version | License | Scope |
 | --- | --- | --- | --- |
@@ -315,6 +315,7 @@ Locked package identities: **419**
 | loupe | 3.2.1 | MIT | development |
 | lru-cache | 10.4.3 | ISC | development |
 | lru-cache | 5.1.1 | ISC | development |
+| lucide-react | 1.37.0 | ISC | runtime |
 | lz-string | 1.5.0 | MIT | development |
 | maath | 0.10.8 | MIT | runtime |
 | magic-string | 0.30.21 | MIT | development |

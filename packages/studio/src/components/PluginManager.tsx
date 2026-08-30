@@ -1,10 +1,14 @@
 import type { PluginInfo } from '@lumora/core';
+import type { RefObject } from 'react';
 import type { StudioRuntime } from '../runtime/studio-runtime';
+import { X } from 'lucide-react';
 import { useEventRefresh } from '../hooks/use-event-refresh';
+import { ModalDialog } from './ModalDialog';
 
 interface PluginManagerProps {
   runtime: StudioRuntime;
   onClose: () => void;
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }
 
 const STATE_LABELS: Record<PluginInfo['state'], string> = {
@@ -18,27 +22,29 @@ const STATE_LABELS: Record<PluginInfo['state'], string> = {
   failed: '失败',
 };
 
-export function PluginManager({ runtime, onClose }: PluginManagerProps) {
+export function PluginManager({ runtime, onClose, returnFocusRef }: PluginManagerProps) {
   useEventRefresh(runtime.events, ['plugin:state-changed', 'contribution:changed']);
   const plugins = runtime.host.listPlugins();
 
   return (
-    <div className="lumora-modal-backdrop" data-testid="plugin-manager" onClick={onClose}>
-      <div
-        className="lumora-modal"
-        role="dialog"
-        aria-label="插件管理"
-        onClick={(event) => event.stopPropagation()}
-      >
+    <ModalDialog
+      dialogClassName="lumora-modal"
+      backdropTestId="plugin-manager"
+      ariaLabelledBy="plugin-manager-title"
+      returnFocusRef={returnFocusRef}
+      onClose={onClose}
+    >
         <header className="lumora-modal__header">
-          <h2>插件管理</h2>
+          <h2 id="plugin-manager-title">插件管理</h2>
           <button
             type="button"
-            className="lumora-button"
+            className="lumora-icon-button lumora-modal__close"
             data-testid="close-plugin-manager"
+            aria-label="关闭插件管理"
+            title="关闭插件管理"
             onClick={onClose}
           >
-            关闭
+            <X aria-hidden="true" />
           </button>
         </header>
         <p className="lumora-modal__hint">插件代码在独立的错误隔离中运行；失败原因与停用入口见下表。</p>
@@ -110,7 +116,6 @@ export function PluginManager({ runtime, onClose }: PluginManagerProps) {
             </li>
           ))}
         </ul>
-      </div>
-    </div>
+    </ModalDialog>
   );
 }

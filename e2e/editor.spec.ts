@@ -41,7 +41,15 @@ async function countGizmoPixels(page: Page): Promise<number> {
 
 test.beforeEach(async ({ page }) => {
   await page.goto('/');
-  await page.getByTestId('open-sample-project').click();
+  const openSample = page.getByTestId('open-sample-project');
+  if (!(await openSample.isVisible())) {
+    await page.getByTestId('toolbar-more').click();
+    await expect(openSample).toBeVisible();
+  }
+  await openSample.click();
+  if (!(await page.getByTestId('tree-row-sample-group').isVisible())) {
+    await page.getByTestId('editor-panel-objects').click();
+  }
   await expect(page.getByTestId('tree-row-sample-group')).toBeVisible();
 });
 
@@ -342,13 +350,13 @@ test('M3 树行键盘动作：V/L 切换可见/锁定，Delete 全局快捷键�
   await row('sample-cube').click();
   await row('sample-cube').focus();
 
-  // L：锁定（按钮文本翻转为「锁」）；V：隐藏（「隐」）——行内按钮等效快捷键
+  // L/V 切换后，图标按钮的可访问名称同步表达下一步动作。
   await page.keyboard.press('l');
-  await expect(page.getByTestId('tree-lock-sample-cube')).toHaveText('锁');
+  await expect(page.getByTestId('tree-lock-sample-cube')).toHaveAccessibleName('解锁 立方体');
   await page.keyboard.press('v');
-  await expect(page.getByTestId('tree-visible-sample-cube')).toHaveText('隐');
+  await expect(page.getByTestId('tree-visible-sample-cube')).toHaveAccessibleName('显示 立方体');
   await page.keyboard.press('l');
-  await expect(page.getByTestId('tree-lock-sample-cube')).toHaveText('开');
+  await expect(page.getByTestId('tree-lock-sample-cube')).toHaveAccessibleName('锁定 立方体');
   // Delete：宿主全局快捷键（选中行上直接删除，撤销可恢复）
   await page.keyboard.press('Delete');
   await expect(row('sample-cube')).not.toBeVisible();
@@ -360,7 +368,7 @@ test('M3 按钮双击隔离：双击不绕过删除确认、不触发行重命�
   // 双击删除按钮：第一次点击只进入确认态，双击的第二次点击被隔离 → 对象仍在
   await page.getByTestId('tree-delete-sample-light').dblclick();
   await expect(page.getByTestId('tree-row-sample-light')).toBeVisible();
-  await expect(page.getByTestId('tree-delete-sample-light')).toHaveText('确认?');
+  await expect(page.getByTestId('tree-delete-sample-light')).toHaveAccessibleName('确认删除 主光');
   // 双击按钮不触发行级 dblclick（不进入重命名）
   await expect(page.getByTestId('tree-rename-sample-light')).toHaveCount(0);
   // 单击确认 → 删除
@@ -369,7 +377,7 @@ test('M3 按钮双击隔离：双击不绕过删除确认、不触发行重命�
 
   // 双击可见性按钮：只切换一次（一次双击只产生一步「隐藏」，不因第二次点击回弹）
   await page.getByTestId('tree-visible-sample-cube').dblclick();
-  await expect(page.getByTestId('tree-visible-sample-cube')).toHaveText('隐');
+  await expect(page.getByTestId('tree-visible-sample-cube')).toHaveAccessibleName('显示 立方体');
   await expect(page.getByTestId('tree-rename-sample-cube')).toHaveCount(0);
 });
 
@@ -543,8 +551,10 @@ test.describe('G-10 验收：窄屏布局', () => {
     expect(scrollWidth).toBeLessThanOrEqual(innerWidth);
 
     // 窄屏下列布局仍可编辑：选中对象并修改名称提交
+    await page.getByTestId('editor-panel-properties').click();
     await page.getByTestId('inspector-name').fill('窄屏示例组');
     await page.getByTestId('inspector-name').press('Enter');
+    await page.getByTestId('editor-panel-objects').click();
     await expect(page.getByTestId('tree-row-sample-group')).toContainText('窄屏示例组');
   });
 });

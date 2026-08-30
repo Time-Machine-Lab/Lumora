@@ -307,8 +307,17 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [storyboardOpen, setStoryboardOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [editorPanel, setEditorPanel] = useState<'scene' | 'objects' | 'properties'>('scene');
   const exportButtonRef = useRef<HTMLButtonElement>(null);
+  const paletteButtonRef = useRef<HTMLButtonElement>(null);
+  const pluginButtonRef = useRef<HTMLButtonElement>(null);
+  const paletteReturnFocusRef = useRef<HTMLElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const rememberPaletteReturnFocus = useCallback(() => {
+    const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    paletteReturnFocusRef.current =
+      activeElement && activeElement !== document.body ? activeElement : paletteButtonRef.current;
+  }, []);
 
   useEffect(() => {
     const closeWorkspace = () => {
@@ -502,7 +511,10 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       if ((event.ctrlKey || event.metaKey) && key === 'k') {
         event.preventDefault();
         setStoryboardOpen(false);
-        setPaletteOpen((open) => !open);
+        setPaletteOpen((open) => {
+          if (!open) rememberPaletteReturnFocus();
+          return !open;
+        });
         return;
       }
       if (preservesNativeKeyboardSemantics(event)) return;
@@ -565,7 +577,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       window.removeEventListener('keydown', onKey);
       unregisterRoot();
     };
-  }, [runtime, exportOpen]);
+  }, [runtime, exportOpen, rememberPaletteReturnFocus]);
 
   return (
     <>
@@ -576,7 +588,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         data-workspace={storyboardOpen ? 'storyboard' : exportOpen ? 'export' : undefined}
         // 覆盖确认模态打开时整壳 inert：工具栏/对象树/视口/时间线整体不可达
         // （复审阻断 4：仅时间线内容 inert 时其余应用仍可交互）
-        inert={session.state.overwritePending || undefined}
+        inert={session.state.overwritePending || pluginManagerOpen || paletteOpen || undefined}
       >
         <Toolbar
           runtime={runtime}
@@ -586,6 +598,8 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
           storyboardOpen={storyboardOpen}
           exportOpen={exportOpen}
           exportButtonRef={exportButtonRef}
+          paletteButtonRef={paletteButtonRef}
+          pluginButtonRef={pluginButtonRef}
           onToggleStoryboard={() => {
             setPluginManagerOpen(false);
             setPaletteOpen(false);
@@ -606,12 +620,73 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
           onTogglePalette={() => {
             setStoryboardOpen(false);
             setExportOpen(false);
-            setPaletteOpen((open) => !open);
+            setPaletteOpen((open) => {
+              if (!open) rememberPaletteReturnFocus();
+              return !open;
+            });
           }}
         />
         <div className="lumora-studio__stage">
-        <div className="lumora-studio__body" inert={storyboardOpen || exportOpen || undefined}>
-          <div className="lumora-studio__sidebar">
+        <div
+          className="lumora-studio__mobile-tabs"
+          role="tablist"
+          aria-label="编辑器面板"
+          inert={storyboardOpen || exportOpen || undefined}
+        >
+          {([
+            ['scene', '场景'],
+            ['objects', '对象'],
+            ['properties', '属性'],
+          ] as const).map(([panel, label]) => (
+            <button
+              key={panel}
+              type="button"
+              role="tab"
+              id={`editor-panel-tab-${panel}`}
+              data-testid={`editor-panel-${panel}`}
+              aria-controls={`editor-panel-content-${panel}`}
+              aria-selected={editorPanel === panel}
+              tabIndex={editorPanel === panel ? 0 : -1}
+              disabled={panel !== 'scene' && !project}
+              onClick={() => setEditorPanel(panel)}
+              onKeyDown={(event) => {
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                const tabs = Array.from(
+                  event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
+                    '[role="tab"]:not(:disabled)',
+                  ) ?? [],
+                );
+                if (tabs.length === 0) return;
+                event.preventDefault();
+                event.stopPropagation();
+                const current = tabs.indexOf(event.currentTarget);
+                let next = 0;
+                if (event.key === 'End') next = tabs.length - 1;
+                else if (event.key === 'ArrowLeft') next = current <= 0 ? tabs.length - 1 : current - 1;
+                else if (event.key === 'ArrowRight') next = current === tabs.length - 1 ? 0 : current + 1;
+                const nextTab = tabs[next];
+                const nextPanel = nextTab?.dataset.editorPanel as typeof editorPanel | undefined;
+                if (!nextTab || !nextPanel) return;
+                setEditorPanel(nextPanel);
+                nextTab.focus();
+              }}
+              data-editor-panel={panel}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <div
+          className="lumora-studio__body"
+          data-editor-panel={editorPanel}
+          inert={storyboardOpen || exportOpen || undefined}
+        >
+          <div
+            className="lumora-studio__sidebar"
+            id="editor-panel-content-objects"
+            role="tabpanel"
+            aria-labelledby="editor-panel-tab-objects"
+          >
             <ObjectTree
               editor={runtime.editor}
               project={project}
@@ -624,7 +699,12 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
               onDisablePlugin={(pluginId) => void runtime.host.disable(pluginId)}
             />
           </div>
-          <main className="lumora-studio__viewport">
+          <main
+            className="lumora-studio__viewport"
+            id="editor-panel-content-scene"
+            role="tabpanel"
+            aria-labelledby="editor-panel-tab-scene"
+          >
             <div className="lumora-studio__scene-slot">
               {scene ? (
                 scene(project)
@@ -665,12 +745,19 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
               />
             )}
           </main>
-          <PropertiesPanel
-            editor={runtime.editor}
-            project={project}
-            selection={editorState.selection}
-            liveTransformStore={liveTransformStore}
-          />
+          <div
+            className="lumora-studio__inspector-slot"
+            id="editor-panel-content-properties"
+            role="tabpanel"
+            aria-labelledby="editor-panel-tab-properties"
+          >
+            <PropertiesPanel
+              editor={runtime.editor}
+              project={project}
+              selection={editorState.selection}
+              liveTransformStore={liveTransformStore}
+            />
+          </div>
         </div>
         {storyboardOpen && project && (
           <StoryboardWorkspace
@@ -698,8 +785,20 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         )}
         </div>
         <ToastHost />
-        {pluginManagerOpen && <PluginManager runtime={runtime} onClose={() => setPluginManagerOpen(false)} />}
-        {paletteOpen && <CommandPalette runtime={runtime} onClose={() => setPaletteOpen(false)} />}
+        {pluginManagerOpen && (
+          <PluginManager
+            runtime={runtime}
+            returnFocusRef={pluginButtonRef}
+            onClose={() => setPluginManagerOpen(false)}
+          />
+        )}
+        {paletteOpen && (
+          <CommandPalette
+            runtime={runtime}
+            returnFocusRef={paletteReturnFocusRef}
+            onClose={() => setPaletteOpen(false)}
+          />
+        )}
       </div>
       {session.state.overwritePending &&
         createPortal(

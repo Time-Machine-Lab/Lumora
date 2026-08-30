@@ -114,6 +114,7 @@ function NameField({
       key={object.id}
       className="lumora-inspector__name"
       data-testid="inspector-name"
+      aria-label="对象名称"
       value={draft ?? object.name}
       onChange={(e) => setDraftBoth(e.target.value)}
       onBlur={commit}
