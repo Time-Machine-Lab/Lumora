@@ -297,7 +297,6 @@ export class CameraDrive {
       const previous = this.keyDurations.get(code) ?? 0;
       const next = previous + dt;
       this.keyDurations.set(code, next);
-      if (previous < holdDelay && next >= holdDelay) this.applyTap(code);
       return Math.min(dt, Math.max(0, next - holdDelay)) / dt;
     };
     const forwardWeight = movementWeight('KeyW') - movementWeight('KeyS');

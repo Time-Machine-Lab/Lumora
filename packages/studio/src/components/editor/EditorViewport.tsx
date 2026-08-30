@@ -101,12 +101,16 @@ export function EditorViewport({
   const localExportFrameRef = useRef<ProjectFrameCapture | null>(null);
   const exportFrameRef = exportFrameRefProp ?? localExportFrameRef;
 
-  // 驾驶目标：单选机位；已有轨道机位在暂停态不驾驶（时间线接管），录制中始终可驾驶
-  const drivenCameraId = useMemo(() => {
+  // Selection chooses the idle drive target. Once recording starts, the
+  // recorder owns that identity until the session ends, even if selection changes.
+  const selectedCameraId = useMemo(() => {
     if (!project || selection.length !== 1) return null;
     const object = findObject(project, selection[0]!);
     return object && object.type === 'camera' ? object.id : null;
   }, [project, selection]);
+  const drivenCameraId = session?.state.recording
+    ? session.recorder.recordingCameraId
+    : selectedCameraId;
 
   useCameraDrive(
     session,
@@ -453,7 +457,9 @@ function useCameraDrive(
       lookClientX = event.clientX;
       lookClientY = event.clientY;
       suppressNextContextMenu = true;
+      viewportRef.current?.focus({ preventScroll: true });
       event.preventDefault();
+      event.stopPropagation();
       try {
         viewportRef.current?.setPointerCapture(event.pointerId);
       } catch {
@@ -520,7 +526,7 @@ function useCameraDrive(
     document.addEventListener('focusin', onFocusIn);
     document.addEventListener('focusout', onFocusOut);
     const viewport = viewportRef.current;
-    viewport?.addEventListener('pointerdown', onPointerDown);
+    viewport?.addEventListener('pointerdown', onPointerDown, true);
     viewport?.addEventListener('pointermove', onPointerMove);
     viewport?.addEventListener('pointerup', onPointerUp);
     viewport?.addEventListener('pointercancel', onPointerCancel);
@@ -596,7 +602,7 @@ function useCameraDrive(
       window.removeEventListener('pointercancel', onPointerCancel);
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
-      viewport?.removeEventListener('pointerdown', onPointerDown);
+      viewport?.removeEventListener('pointerdown', onPointerDown, true);
       viewport?.removeEventListener('pointermove', onPointerMove);
       viewport?.removeEventListener('pointerup', onPointerUp);
       viewport?.removeEventListener('pointercancel', onPointerCancel);

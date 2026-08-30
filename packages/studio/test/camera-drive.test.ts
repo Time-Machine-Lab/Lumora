@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import { focalLengthToFovDeg } from '@lumora/core';
 import type { SceneObjectData } from '@lumora/core';
 import {
+  CAMERA_DRIVE_LIMITS,
   CameraDrive,
   MAX_FOCAL_MM,
   MIN_FOCAL_MM,
@@ -41,6 +42,36 @@ describe('CameraDrive：键鼠驾驶积分器', () => {
     drive.release('KeyW');
 
     expect(node.position.z).toBeLessThan(5.9);
+  });
+
+  it('held movement never applies the maximum tap step when crossing holdDelay', () => {
+    const drive = new CameraDrive({
+      tapStep: CAMERA_DRIVE_LIMITS.tapStep.max,
+      holdDelay: CAMERA_DRIVE_LIMITS.holdDelay.min,
+      speed: CAMERA_DRIVE_LIMITS.speed.max,
+      smoothing: CAMERA_DRIVE_LIMITS.smoothing.max,
+    });
+    const node = makeCameraNode();
+    drive.attach(node);
+    drive.press('KeyW');
+
+    const frameSeconds = 1 / 60;
+    const positions: THREE.Vector3[] = [node.position.clone()];
+    for (let frame = 0; frame < 12; frame += 1) {
+      drive.update(frameSeconds);
+      positions.push(node.position.clone());
+    }
+    const beforeRelease = node.position.clone();
+    drive.release('KeyW');
+    positions.push(node.position.clone());
+
+    const perFrameDistances = positions.slice(1).map((position, index) =>
+      position.distanceTo(positions[index]!),
+    );
+    expect(Math.max(...perFrameDistances)).toBeLessThanOrEqual(
+      CAMERA_DRIVE_LIMITS.speed.max * frameSeconds,
+    );
+    expect(node.position.distanceTo(beforeRelease)).toBeLessThan(1e-12);
   });
 
   it('重复 keydown 不重置按住计时，且不会在释放时追加短按步进', () => {

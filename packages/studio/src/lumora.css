@@ -1546,7 +1546,7 @@
   opacity: 0.45;
 }
 
-.lumora-camera-controls__field output {
+.lumora-camera-controls__value {
   width: 28px;
   color: var(--lumora-text);
   font-variant-numeric: tabular-nums;
@@ -2283,9 +2283,25 @@
      排序作用于 .lumora-studio__body 的 flex 子项（main），
      .lumora-viewport 是 main 内部元素，order 对它无效 */
   .lumora-studio__viewport {
-    min-height: 320px;
-    flex: 1;
+    min-height: 600px;
+    flex: 0 0 auto;
     order: -1;
+  }
+
+  .lumora-studio__scene-slot {
+    flex: 1 0 280px;
+    min-height: 280px;
+  }
+}
+
+@media (max-width: 520px) {
+  .lumora-studio__viewport {
+    min-height: 620px;
+  }
+
+  .lumora-studio__scene-slot {
+    flex-basis: 220px;
+    min-height: 220px;
   }
 }
 

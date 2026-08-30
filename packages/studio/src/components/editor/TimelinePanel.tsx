@@ -376,7 +376,9 @@ export function TimelinePanel({
               value={state.cameraControls.speed}
               onChange={(event) => session.setCameraControlSettings({ speed: Number(event.target.value) })}
             />
-            <output>{state.cameraControls.speed.toFixed(1)}</output>
+            <span className="lumora-camera-controls__value" aria-hidden="true">
+              {state.cameraControls.speed.toFixed(1)}
+            </span>
           </label>
           <label className="lumora-camera-controls__field">
             <span>步长</span>
@@ -390,7 +392,9 @@ export function TimelinePanel({
               value={state.cameraControls.tapStep}
               onChange={(event) => session.setCameraControlSettings({ tapStep: Number(event.target.value) })}
             />
-            <output>{state.cameraControls.tapStep.toFixed(2)}</output>
+            <span className="lumora-camera-controls__value" aria-hidden="true">
+              {state.cameraControls.tapStep.toFixed(2)}
+            </span>
           </label>
           <label className="lumora-camera-controls__field">
             <span>视角</span>
@@ -407,7 +411,9 @@ export function TimelinePanel({
                 mouseSensitivity: Number(event.target.value),
               })}
             />
-            <output>{state.cameraControls.mouseSensitivity.toFixed(1)}</output>
+            <span className="lumora-camera-controls__value" aria-hidden="true">
+              {state.cameraControls.mouseSensitivity.toFixed(1)}
+            </span>
           </label>
         </div>
         <span className="lumora-timeline__time" data-testid="timeline-time">
