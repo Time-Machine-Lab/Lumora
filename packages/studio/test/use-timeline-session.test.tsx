@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SceneEditor, createGroupObject, createSampleProject, getProjectDuration } from '@lumora/core';
 import type { RenderHookResult } from '@testing-library/react';
 import type { CaptureNodeSample } from '../src/components/editor/camera-drive';
+import { CAMERA_DRIVE_LIMITS } from '../src/components/editor/camera-drive';
 import { useTimelineSession } from '../src/hooks/use-timeline-session';
 import type { TimelineSession } from '../src/hooks/use-timeline-session';
 
@@ -49,6 +50,32 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     expect(live().state.fps).toBe(24);
     expect(live().state.snapEnabled).toBe(true);
     expect(live().state.loopEnabled).toBe(true);
+    expect(live().state.cameraControls.mode).toBe('keyboard-mouse');
+  });
+
+  it('机位操控参数按会话保存、过滤非有限值并夹取范围，切换项目后保持', () => {
+    mount();
+    act(() => live().setCameraControlSettings({
+      mode: 'keyboard-only',
+      speed: 99,
+      tapStep: -1,
+      mouseSensitivity: Number.NaN,
+    }));
+
+    expect(live().state.cameraControls).toMatchObject({
+      mode: 'keyboard-only',
+      speed: CAMERA_DRIVE_LIMITS.speed.max,
+      tapStep: CAMERA_DRIVE_LIMITS.tapStep.min,
+      mouseSensitivity: 1,
+    });
+
+    act(() => editor.openProject({ ...createSampleProject(), uri: 'lumora://camera-controls-next' }));
+    expect(live().state.cameraControls).toMatchObject({
+      mode: 'keyboard-only',
+      speed: CAMERA_DRIVE_LIMITS.speed.max,
+      tapStep: CAMERA_DRIVE_LIMITS.tapStep.min,
+      mouseSensitivity: 1,
+    });
   });
 
   it('togglePlay 切换播放状态', () => {
@@ -109,6 +136,37 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     // 时长收敛到项目时长（含示例项目其它轨道）
     expect(live().state.duration).toBeCloseTo(getProjectDuration(editor.getProject()!), 6);
     expect(live().timeline.getTime()).toBe(0); // 播放头回到起点
+  });
+
+  it('录制提交失败时保留暂停样本并允许重试，不把失败伪装成已停止', () => {
+    mount();
+    act(() => live().setCaptureSource(() => ({ position: [1, 0, 0], rotation: [0, 0, 0], focalLength: 35 })));
+    act(() => live().startRecording('sample-camera'));
+    act(() => live().confirmOverwrite());
+    act(() => vi.advanceTimersByTime(300));
+    const commit = vi.spyOn(editor, 'commitRecordingTracks').mockReturnValue({
+      ok: false,
+      error: new Error('模拟录制提交失败'),
+    });
+
+    let failed: ReturnType<TimelineSession['stopRecording']>;
+    act(() => {
+      failed = live().stopRecording();
+    });
+    expect(failed!).toEqual({ ok: false, message: '模拟录制提交失败' });
+    expect(live().recorder.active).toBe(true);
+    expect(live().recorder.isPaused).toBe(true);
+    expect(live().state.recording).toBe(true);
+    expect(live().state.recordingPaused).toBe(true);
+
+    commit.mockRestore();
+    let retried: ReturnType<TimelineSession['stopRecording']>;
+    act(() => {
+      retried = live().stopRecording();
+    });
+    expect(retried!).toEqual({ ok: true });
+    expect(live().recorder.active).toBe(false);
+    expect(live().state.recording).toBe(false);
   });
 
   it('B1 回归：约 5s 持续录制中会话对象身份稳定 —— 驾驶输入不再被会话重建清空', () => {

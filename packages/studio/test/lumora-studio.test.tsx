@@ -9,6 +9,8 @@ import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
 import type { ProjectStorage } from '../src/persistence/project-storage';
 import { ContentCache } from '../src/components/editor/content-cache';
 import { CommandPalette } from '../src/components/CommandPalette';
+import { RECORDING_SHORTCUT_STORAGE_KEY } from '../src/components/editor/recording-shortcut';
+import { TimelineRecorder } from '../src/components/editor/timeline-recorder';
 import * as previewExport from '../src/export/preview-export';
 
 vi.mock('@react-three/fiber', () => ({
@@ -78,6 +80,17 @@ const badPlugin: PluginDescriptor = {
     entry: './dist/index.js',
   } as unknown as Manifest,
 };
+
+const EXPORT_RECORDING_SHORTCUT_CASES = [
+  { shortcut: 'default Shift+R', saved: null, target: 'body', running: false },
+  { shortcut: 'default Shift+R', saved: null, target: 'non-native', running: false },
+  { shortcut: 'default Shift+R', saved: null, target: 'body', running: true },
+  { shortcut: 'default Shift+R', saved: null, target: 'non-native', running: true },
+  { shortcut: 'custom Ctrl+Alt+R', saved: 'Ctrl+Alt+R', target: 'body', running: false },
+  { shortcut: 'custom Ctrl+Alt+R', saved: 'Ctrl+Alt+R', target: 'non-native', running: false },
+  { shortcut: 'custom Ctrl+Alt+R', saved: 'Ctrl+Alt+R', target: 'body', running: true },
+  { shortcut: 'custom Ctrl+Alt+R', saved: 'Ctrl+Alt+R', target: 'non-native', running: true },
+] as const;
 
 describe('LumoraStudio', () => {
   it('opens and closes the export workspace without changing the current project', async () => {
@@ -230,6 +243,93 @@ describe('LumoraStudio', () => {
     expect(screen.getByTestId('timeline-play')).toHaveTextContent(playBefore ?? '');
   });
 
+  it.each(EXPORT_RECORDING_SHORTCUT_CASES)(
+    'isolates $shortcut from $target while export running=$running',
+    async ({ saved, target: targetKind, running }) => {
+      const previousShortcut = localStorage.getItem(RECORDING_SHORTCUT_STORAGE_KEY);
+      if (saved) localStorage.setItem(RECORDING_SHORTCUT_STORAGE_KEY, saved);
+      else localStorage.removeItem(RECORDING_SHORTCUT_STORAGE_KEY);
+
+      let finishExport: ((blob: Blob) => void) | undefined;
+      const supportSpy = running
+        ? vi.spyOn(previewExport, 'detectWebmSupport').mockResolvedValue({
+            supported: true,
+            mimeType: 'video/webm;codecs=vp9',
+          })
+        : null;
+      const exportSpy = running
+        ? vi.spyOn(previewExport, 'recordPreviewWebm').mockImplementation(
+            () => new Promise<Blob>((resolve) => {
+              finishExport = resolve;
+            }),
+          )
+        : null;
+      const startRecording = vi.spyOn(TimelineRecorder.prototype, 'start');
+      const stopRecording = vi.spyOn(TimelineRecorder.prototype, 'stop');
+
+      try {
+        const handle = createRef<LumoraStudioHandle>();
+        const project = createSampleProject(
+          `lumora://export-recording-shortcut-${targetKind}-${running ? 'running' : 'idle'}-${saved ? 'custom' : 'default'}`,
+          'Export recording shortcut isolation',
+        );
+        render(<LumoraStudio ref={handle} initialProject={project} />);
+        await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri));
+        act(() => handle.current!.runtime.editor.setSelection(['sample-camera']));
+        fireEvent.click(screen.getByTestId('open-export-workspace'));
+        await screen.findByTestId('export-workspace');
+
+        if (running) {
+          const exportButton = await screen.findByRole('button', { name: '导出 WebM' });
+          await waitFor(() => expect(exportButton).toBeEnabled());
+          fireEvent.click(exportButton);
+          await screen.findByRole('button', { name: '取消导出' });
+        }
+
+        const target = targetKind === 'body'
+          ? document.body
+          : document.createElement('div');
+        if (targetKind === 'non-native') screen.getByTestId('lumora-studio').append(target);
+        const before = {
+          record: screen.getByTestId('timeline-record').textContent,
+          play: screen.getByTestId('timeline-play').textContent,
+          time: screen.getByTestId('timeline-time').textContent,
+          frame: screen.getByTestId('timeline-frame').textContent,
+        };
+        const key = saved
+          ? { key: 'r', code: 'KeyR', ctrlKey: true, altKey: true }
+          : { key: 'R', code: 'KeyR', shiftKey: true };
+        let defaultPreventedAtTarget = false;
+        target.addEventListener('keydown', (event) => {
+          defaultPreventedAtTarget = event.defaultPrevented;
+        }, { once: true });
+
+        expect(fireEvent.keyDown(target, key)).toBe(false);
+
+        expect(defaultPreventedAtTarget).toBe(true);
+        expect(screen.queryByTestId('overwrite-confirm')).not.toBeInTheDocument();
+        expect(startRecording).not.toHaveBeenCalled();
+        expect(stopRecording).not.toHaveBeenCalled();
+        expect({
+          record: screen.getByTestId('timeline-record').textContent,
+          play: screen.getByTestId('timeline-play').textContent,
+          time: screen.getByTestId('timeline-time').textContent,
+          frame: screen.getByTestId('timeline-frame').textContent,
+        }).toEqual(before);
+      } finally {
+        await act(async () => {
+          finishExport?.(new Blob(['webm'], { type: 'video/webm' }));
+        });
+        supportSpy?.mockRestore();
+        exportSpy?.mockRestore();
+        startRecording.mockRestore();
+        stopRecording.mockRestore();
+        if (previousShortcut === null) localStorage.removeItem(RECORDING_SHORTCUT_STORAGE_KEY);
+        else localStorage.setItem(RECORDING_SHORTCUT_STORAGE_KEY, previousShortcut);
+      }
+    },
+  );
+
   it('keeps the editor selection when Escape is pressed while export is running', async () => {
     let finishRecording: ((blob: Blob) => void) | undefined;
     const supportSpy = vi.spyOn(previewExport, 'detectWebmSupport').mockResolvedValue({
@@ -289,7 +389,7 @@ describe('LumoraStudio', () => {
 
     await waitFor(() => expect(screen.getByTestId('export-workspace')).not.toBe(oldWorkspace));
     fireEvent.click(screen.getByRole('button', { name: '导出清单' }));
-    expect(await screen.findByRole('status')).toHaveTextContent('分镜清单已导出');
+    expect(await screen.findByTestId('export-live-status')).toHaveTextContent('分镜清单已导出');
   });
 
   it('渲染壳层并激活合法插件：面板、工具栏贡献项可见', async () => {
@@ -371,6 +471,112 @@ describe('LumoraStudio', () => {
     unmount();
     await waitFor(() => expect(deactivate).toHaveBeenCalledTimes(1));
     expect(events.handlerCount).toBe(0);
+  });
+
+  it('录制开始后同一任务立即 close() 仍按 recorder.active 完成本轮停止', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://close-immediate-recording');
+    project.tracks = [];
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    await waitFor(() => expect(handle.current?.runtime.editor.getProject()?.uri).toBe(project.uri));
+    act(() => handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const stop = vi.spyOn(TimelineRecorder.prototype, 'stop');
+
+    let closing!: Promise<{ ok: boolean; message?: string }>;
+    act(() => {
+      screen.getByTestId('timeline-record').click();
+      closing = handle.current!.close();
+    });
+
+    await expect(closing).resolves.toEqual(expect.objectContaining({ ok: true }));
+    expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  it('close() 在录制提交失败时阻止 runtime.dispose，并保留样本供下一次关闭重试', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://close-recording-commit-failure');
+    project.tracks = [];
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    await waitFor(() => expect(handle.current?.runtime.editor.getProject()?.uri).toBe(project.uri));
+    act(() => handle.current!.runtime.editor.setSelection(['sample-camera']));
+    vi.spyOn(TimelineRecorder.prototype, 'snapshot').mockReturnValue({
+      position: [
+        { time: 0, value: [0, 0, 0] },
+        { time: 1, value: [1, 0, 0] },
+      ],
+      rotation: [
+        { time: 0, value: [0, 0, 0] },
+        { time: 1, value: [0, 0, 0] },
+      ],
+      focalLength: null,
+    });
+    const stop = vi.spyOn(TimelineRecorder.prototype, 'stop');
+    const commit = vi.spyOn(handle.current!.runtime.editor, 'commitRecordingTracks').mockReturnValue({
+      ok: false,
+      error: new Error('模拟录制提交失败'),
+    });
+    const dispose = vi.spyOn(handle.current!.runtime, 'dispose');
+    screen.getByTestId('timeline-record').click();
+
+    await expect(handle.current!.close()).resolves.toEqual({ ok: false, message: '模拟录制提交失败' });
+    expect(dispose).not.toHaveBeenCalled();
+    expect(stop).not.toHaveBeenCalled();
+
+    commit.mockReturnValue({ ok: true });
+    await expect(handle.current!.close()).resolves.toEqual(expect.objectContaining({ ok: true }));
+    expect(commit).toHaveBeenCalledTimes(2);
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('录制提交同步事件重入 close() 时复用已发布的 single-flight，不重复最终化', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://close-recording-reentrant');
+    project.tracks = [];
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    await waitFor(() => expect(handle.current?.runtime.editor.getProject()?.uri).toBe(project.uri));
+    act(() => handle.current!.runtime.editor.setSelection(['sample-camera']));
+    vi.spyOn(TimelineRecorder.prototype, 'snapshot').mockReturnValue({
+      position: [
+        { time: 0, value: [0, 0, 0] },
+        { time: 1, value: [1, 0, 0] },
+      ],
+      rotation: [],
+      focalLength: null,
+    });
+    const commit = vi.spyOn(handle.current!.runtime.editor, 'commitRecordingTracks');
+    screen.getByTestId('timeline-record').click();
+    let reentered: Promise<{ ok: boolean; message?: string }> | null = null;
+    const sub = handle.current!.runtime.editor.events.on('project:changed', () => {
+      reentered ??= handle.current!.close();
+    });
+
+    const first = handle.current!.close();
+    await expect(first).resolves.toEqual(expect.objectContaining({ ok: true }));
+    expect(reentered).toBe(first);
+    expect(commit).toHaveBeenCalledTimes(1);
+    sub.dispose();
+  });
+
+  it('录制最终化意外抛错时 close() 返回类型化失败并清除 single-flight 以便重试', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://close-recording-throw');
+    project.tracks = [];
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    await waitFor(() => expect(handle.current?.runtime.editor.getProject()?.uri).toBe(project.uri));
+    act(() => handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const snapshot = vi.spyOn(TimelineRecorder.prototype, 'snapshot').mockImplementation(() => {
+      throw new Error('模拟最终化异常');
+    });
+    const dispose = vi.spyOn(handle.current!.runtime, 'dispose');
+    screen.getByTestId('timeline-record').click();
+
+    await expect(handle.current!.close()).resolves.toEqual({ ok: false, message: '模拟最终化异常' });
+    expect(dispose).not.toHaveBeenCalled();
+
+    snapshot.mockReturnValue({ position: [], rotation: [], focalLength: null });
+    await expect(handle.current!.close()).resolves.toEqual(expect.objectContaining({ ok: true }));
+    expect(dispose).toHaveBeenCalledTimes(1);
   });
 
   it('卸载时释放失败（未解决恢复 fork）：如实上报 onCloseError、运行时保留可恢复、缓存不释放；解决后经 handle.close() 重试成功（第三十轮严重 6）', async () => {

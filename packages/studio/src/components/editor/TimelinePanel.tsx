@@ -16,6 +16,10 @@ import type { Project, SceneEditor } from '@lumora/core';
 import { findObject } from '@lumora/core';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
 import { projectContentFingerprint } from './timeline-thumbnail-cache';
+import { RecordingShortcutSettings } from './RecordingShortcutSettings';
+import type { KeyboardShortcut } from './recording-shortcut';
+import { DEFAULT_RECORDING_SHORTCUT, formatShortcut } from './recording-shortcut';
+import { CAMERA_DRIVE_LIMITS } from './camera-drive';
 
 /** 标签列宽度：标尺/轨道/分镜共用，测试与坐标换算引用此常量 */
 export const TIMELINE_LABEL_WIDTH = 186;
@@ -33,6 +37,8 @@ export interface TimelinePanelProps {
   captureReady?: boolean;
   /** Monotonic generation for scene-tree rebuilds and deferred render-content settlement. */
   captureGeneration?: number;
+  recordingShortcut?: KeyboardShortcut;
+  onRecordingShortcutChange?(shortcut: KeyboardShortcut): boolean;
 }
 
 const CHANNEL_LABELS: Record<string, string> = {
@@ -76,6 +82,8 @@ export function TimelinePanel({
   captureRef,
   captureReady,
   captureGeneration = 0,
+  recordingShortcut = DEFAULT_RECORDING_SHORTCUT,
+  onRecordingShortcutChange = () => false,
 }: TimelinePanelProps) {
   const { timeline, state } = session;
   const time = usePlayheadTime(session);
@@ -319,18 +327,95 @@ export function TimelinePanel({
           data-testid="timeline-record"
           title={
             !selectedCamera && !state.recording
-              ? '选中一个机位后开始录制'
+              ? `选中一个机位后开始录制（${formatShortcut(recordingShortcut)}）`
               : state.recordingPaused
-                ? '继续录制'
+                ? `继续录制（${formatShortcut(recordingShortcut)}）`
                 : state.recording
-                  ? '停止录制'
-                  : '录制机位运动'
+                  ? `停止录制（${formatShortcut(recordingShortcut)}）`
+                  : `录制机位运动（${formatShortcut(recordingShortcut)}）`
           }
           disabled={!selectedCamera && !state.recording}
           onClick={recordClick}
         >
           {state.recordingPaused ? '▶' : state.recording ? '■' : '●'}
         </button>
+        <RecordingShortcutSettings
+          shortcut={recordingShortcut}
+          onChange={onRecordingShortcutChange}
+        />
+        <div className="lumora-camera-controls" data-testid="camera-control-settings">
+          <div className="lumora-camera-controls__modes" role="group" aria-label="机位操控模式">
+            <button
+              type="button"
+              className="lumora-camera-controls__mode"
+              aria-label="键盘移动 + 鼠标视角"
+              aria-pressed={state.cameraControls.mode === 'keyboard-mouse'}
+              onClick={() => session.setCameraControlSettings({ mode: 'keyboard-mouse' })}
+            >
+              键鼠
+            </button>
+            <button
+              type="button"
+              className="lumora-camera-controls__mode"
+              aria-label="纯键盘操控"
+              aria-pressed={state.cameraControls.mode === 'keyboard-only'}
+              onClick={() => session.setCameraControlSettings({ mode: 'keyboard-only' })}
+            >
+              键盘
+            </button>
+          </div>
+          <label className="lumora-camera-controls__field">
+            <span>速度</span>
+            <input
+              type="range"
+              aria-label="连续移动速度"
+              data-testid="camera-control-speed"
+              min={CAMERA_DRIVE_LIMITS.speed.min}
+              max={CAMERA_DRIVE_LIMITS.speed.max}
+              step="0.1"
+              value={state.cameraControls.speed}
+              onChange={(event) => session.setCameraControlSettings({ speed: Number(event.target.value) })}
+            />
+            <span className="lumora-camera-controls__value" aria-hidden="true">
+              {state.cameraControls.speed.toFixed(1)}
+            </span>
+          </label>
+          <label className="lumora-camera-controls__field">
+            <span>步长</span>
+            <input
+              type="range"
+              aria-label="短按移动步长"
+              data-testid="camera-control-tap-step"
+              min={CAMERA_DRIVE_LIMITS.tapStep.min}
+              max={CAMERA_DRIVE_LIMITS.tapStep.max}
+              step="0.01"
+              value={state.cameraControls.tapStep}
+              onChange={(event) => session.setCameraControlSettings({ tapStep: Number(event.target.value) })}
+            />
+            <span className="lumora-camera-controls__value" aria-hidden="true">
+              {state.cameraControls.tapStep.toFixed(2)}
+            </span>
+          </label>
+          <label className="lumora-camera-controls__field">
+            <span>视角</span>
+            <input
+              type="range"
+              aria-label="鼠标视角灵敏度"
+              data-testid="camera-control-sensitivity"
+              min={CAMERA_DRIVE_LIMITS.mouseSensitivity.min}
+              max={CAMERA_DRIVE_LIMITS.mouseSensitivity.max}
+              step="0.1"
+              value={state.cameraControls.mouseSensitivity}
+              disabled={state.cameraControls.mode === 'keyboard-only'}
+              onChange={(event) => session.setCameraControlSettings({
+                mouseSensitivity: Number(event.target.value),
+              })}
+            />
+            <span className="lumora-camera-controls__value" aria-hidden="true">
+              {state.cameraControls.mouseSensitivity.toFixed(1)}
+            </span>
+          </label>
+        </div>
         <span className="lumora-timeline__time" data-testid="timeline-time">
           {formatTime(time)}
         </span>
@@ -402,6 +487,7 @@ export function TimelinePanel({
                 key={track.id}
                 className={`lumora-timeline__row lumora-timeline__lane${track.disabled ? ' lumora-timeline__lane--disabled' : ''}`}
                 data-testid={`track-lane-${track.id}`}
+                data-track-target-path={track.targetPath}
                 onClick={() => editor.setSelection([track.objectId])}
                 title={track.disabled ? '已禁用' : undefined}
               >
@@ -426,6 +512,7 @@ export function TimelinePanel({
                       className="lumora-timeline__keyframe"
                       style={{ left: kf.time * zoom }}
                       data-testid={`keyframe-${track.id}-${kf.time}`}
+                      data-keyframe-value={JSON.stringify(kf.value ?? null)}
                       title={`${formatTime(kf.time)}`}
                       onClick={(e) => {
                         e.stopPropagation();

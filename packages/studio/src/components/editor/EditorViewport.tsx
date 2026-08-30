@@ -101,14 +101,26 @@ export function EditorViewport({
   const localExportFrameRef = useRef<ProjectFrameCapture | null>(null);
   const exportFrameRef = exportFrameRefProp ?? localExportFrameRef;
 
-  // 驾驶目标：单选机位；已有轨道机位在暂停态不驾驶（时间线接管），录制中始终可驾驶
-  const drivenCameraId = useMemo(() => {
+  // Selection chooses the idle drive target. Once recording starts, the
+  // recorder owns that identity until the session ends, even if selection changes.
+  const selectedCameraId = useMemo(() => {
     if (!project || selection.length !== 1) return null;
     const object = findObject(project, selection[0]!);
     return object && object.type === 'camera' ? object.id : null;
   }, [project, selection]);
+  const drivenCameraId = session?.state.recording
+    ? session.recorder.recordingCameraId
+    : selectedCameraId;
 
-  useCameraDrive(session, drivenCameraId, rootRef, editor, keyboardScopeRef, driveEnabled);
+  useCameraDrive(
+    session,
+    drivenCameraId,
+    rootRef,
+    editor,
+    containerRef,
+    keyboardScopeRef,
+    driveEnabled,
+  );
 
   // 录制采样源：视口把机位节点映射为通道样本（录制期间节点由驾驶/静止接管）
   useEffect(() => {
@@ -323,6 +335,7 @@ function useCameraDrive(
   drivenCameraId: string | null,
   rootRef: React.RefObject<THREE.Group | null>,
   editor: SceneEditor,
+  viewportRef: React.RefObject<HTMLElement | null>,
   keyboardScopeRef?: React.RefObject<HTMLElement | null>,
   driveEnabled = true,
 ) {
@@ -341,8 +354,26 @@ function useCameraDrive(
     let attachedId: string | null = null;
     let attachedNode: THREE.Object3D | null = null;
     const heldKeys = new Set<string>();
+    let lookPointerId: number | null = null;
+    let lookClientX = 0;
+    let lookClientY = 0;
+    let suppressNextContextMenu = false;
+
+    const endLookGesture = () => {
+      if (lookPointerId === null) return;
+      const pointerId = lookPointerId;
+      lookPointerId = null;
+      const viewport = viewportRef.current;
+      try {
+        viewport?.releasePointerCapture(pointerId);
+      } catch {
+        // Pointer capture can already be released by the browser.
+      }
+    };
 
     const clearDrive = () => {
+      endLookGesture();
+      suppressNextContextMenu = false;
       heldKeys.clear();
       drive.stop();
       attachedId = null;
@@ -358,21 +389,111 @@ function useCameraDrive(
         drive.attach(node);
         attachedId = cameraId;
         attachedNode = node;
-        for (const code of heldKeys) drive.press(code);
+        for (const code of heldKeys) {
+          if (drive.acceptsKey(code)) drive.press(code);
+        }
       }
       return true;
     };
 
+    const canDriveCurrentCamera = (): boolean => {
+      const st = sessionRef.current?.state;
+      const cameraId = cameraIdRef.current;
+      const hasTracks =
+        !!st &&
+        !!editor.getProject()?.tracks.some(
+          (track) => track.objectId === cameraId && track.keyframes.length > 0 && !track.disabled,
+        );
+      return (
+        !!st &&
+        driveEnabledRef.current &&
+        cameraId !== null &&
+        !st.overwritePending &&
+        !st.recordingPaused &&
+        (!st.playing || st.recording) &&
+        (!hasTracks || st.recording)
+      );
+    };
+
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || !driveEnabledRef.current) return;
+      const liveSession = sessionRef.current;
+      if (liveSession) drive.setSettings(liveSession.state.cameraControls);
       const keyboardRoot = keyboardScopeRef?.current;
       if (keyboardRoot && !isKeyboardEventForStudio(keyboardRoot, event)) return;
+      if ((event.ctrlKey || event.metaKey || event.altKey) && heldKeys.size > 0) {
+        // A modifier can become active after a drive key. Hard-stop existing
+        // input and momentum so the pending browser/OS shortcut cannot keep
+        // mutating the camera while it is being handled.
+        clearDrive();
+      }
       if (preservesNativeKeyboardSemantics(event)) return;
       if (DRIVE_KEY_CODES.has(event.code)) {
+        // Ctrl/Meta/Alt combinations belong to browser/OS/application shortcuts.
+        // In particular, never consume Ctrl+W: browsers own tab closing and a
+        // page cannot reliably override that behavior.
+        if (event.ctrlKey || event.metaKey || event.altKey) return;
+        if (!drive.acceptsKey(event.code)) return;
         if (cameraIdRef.current) event.preventDefault();
         heldKeys.add(event.code);
         if (attachCurrentCamera()) drive.press(event.code);
       }
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.button !== 2) return;
+      suppressNextContextMenu = false;
+      if (lookPointerId !== null) return;
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        target.closest('button, input, select, textarea, [contenteditable="true"]')
+      ) return;
+      const liveSession = sessionRef.current;
+      if (!liveSession) return;
+      drive.setSettings(liveSession.state.cameraControls);
+      if (drive.getSettings().mode !== 'keyboard-mouse' || !canDriveCurrentCamera()) return;
+      if (!attachCurrentCamera()) return;
+      lookPointerId = event.pointerId;
+      lookClientX = event.clientX;
+      lookClientY = event.clientY;
+      suppressNextContextMenu = true;
+      viewportRef.current?.focus({ preventScroll: true });
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        viewportRef.current?.setPointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture is an enhancement; window-level terminal events still clean up.
+      }
+    };
+    const onPointerMove = (event: PointerEvent) => {
+      if (lookPointerId === null || event.pointerId !== lookPointerId) return;
+      if ((event.buttons & 2) === 0) {
+        endLookGesture();
+        return;
+      }
+      const movementX = event.movementX || event.clientX - lookClientX;
+      const movementY = event.movementY || event.clientY - lookClientY;
+      lookClientX = event.clientX;
+      lookClientY = event.clientY;
+      drive.look(movementX, movementY);
+      event.preventDefault();
+    };
+    const onPointerUp = (event: PointerEvent) => {
+      if (event.pointerId === lookPointerId) endLookGesture();
+    };
+    const onPointerCancel = (event: PointerEvent) => {
+      if (event.pointerId === lookPointerId) clearDrive();
+    };
+    const onLostPointerCapture = (event: PointerEvent) => {
+      if (event.pointerId !== lookPointerId) return;
+      drive.cancelLook();
+      endLookGesture();
+    };
+    const onContextMenu = (event: MouseEvent) => {
+      if (!suppressNextContextMenu) return;
+      event.preventDefault();
+      suppressNextContextMenu = false;
     };
     const onKeyUp = (event: KeyboardEvent) => {
       if (heldKeys.delete(event.code)) {
@@ -402,8 +523,17 @@ function useCameraDrive(
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
     window.addEventListener('blur', onBlur);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerCancel);
     document.addEventListener('focusin', onFocusIn);
     document.addEventListener('focusout', onFocusOut);
+    const viewport = viewportRef.current;
+    viewport?.addEventListener('pointerdown', onPointerDown, true);
+    viewport?.addEventListener('pointermove', onPointerMove);
+    viewport?.addEventListener('pointerup', onPointerUp);
+    viewport?.addEventListener('pointercancel', onPointerCancel);
+    viewport?.addEventListener('lostpointercapture', onLostPointerCapture);
+    viewport?.addEventListener('contextmenu', onContextMenu);
 
     const restoreIfNeeded = () => {
       if (attachedId === null || !attachedNode) return;
@@ -434,22 +564,19 @@ function useCameraDrive(
         return;
       }
       const st = sessionRef.current?.state;
-      const cameraId = cameraIdRef.current;
+      if (st) {
+        const previousMode = drive.getSettings().mode;
+        drive.setSettings(st.cameraControls);
+        if (drive.getSettings().mode !== previousMode) {
+          heldKeys.clear();
+          endLookGesture();
+        }
+      }
       // 可驾驶：选中机位 && 录制未暂停 && （暂停 || 录制中）&& 无启用轨道（录制中无视轨道；
       // 禁用轨道不阻止驾驶 —— 禁用 = 该通道暂不参与回放）
-      const hasTracks =
-        !!st &&
-        !!editor.getProject()?.tracks.some(
-          (t) => t.objectId === cameraId && t.keyframes.length > 0 && !t.disabled,
-        );
-      const canDrive =
-        !!st &&
-        cameraId !== null &&
-        !st.overwritePending &&
-        !st.recordingPaused &&
-        (!st.playing || st.recording) &&
-        (!hasTracks || st.recording);
+      const canDrive = canDriveCurrentCamera();
       if (!canDrive) {
+        endLookGesture();
         if (attachedId !== null) {
           restoreIfNeeded();
           drive.detach();
@@ -473,12 +600,20 @@ function useCameraDrive(
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('blur', onBlur);
+      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerCancel);
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
+      viewport?.removeEventListener('pointerdown', onPointerDown, true);
+      viewport?.removeEventListener('pointermove', onPointerMove);
+      viewport?.removeEventListener('pointerup', onPointerUp);
+      viewport?.removeEventListener('pointercancel', onPointerCancel);
+      viewport?.removeEventListener('lostpointercapture', onLostPointerCapture);
+      viewport?.removeEventListener('contextmenu', onContextMenu);
       restoreIfNeeded();
       clearDrive();
     };
-  }, [session, rootRef, editor, keyboardScopeRef]);
+  }, [session, rootRef, editor, viewportRef, keyboardScopeRef]);
 }
 
 /** 把当前渲染相机镜像给外层（点击拾取用） */

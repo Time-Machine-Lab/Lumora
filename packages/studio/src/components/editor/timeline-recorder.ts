@@ -83,14 +83,25 @@ export class TimelineRecorder {
     return true;
   }
 
+  /** Read the current samples without ending the recording. Used to keep the
+   * in-memory take recoverable until its atomic editor commit succeeds. */
+  snapshot(): RecorderChannels | null {
+    if (!this.active) return null;
+    const clone = (sample: TrackSample): TrackSample => ({
+      ...sample,
+      value: Array.isArray(sample.value) ? [...sample.value] : sample.value,
+    });
+    return {
+      position: this.positionSamples.map(clone),
+      rotation: this.rotationSamples.map(clone),
+      focalLength: this.focalSeen ? this.focalSamples.map(clone) : null,
+    };
+  }
+
   /** 结束录制并返回各通道样本；未在录制中返回 null */
   stop(): RecorderChannels | null {
     if (!this.active) return null;
-    const channels: RecorderChannels = {
-      position: this.positionSamples,
-      rotation: this.rotationSamples,
-      focalLength: this.focalSeen ? this.focalSamples : null,
-    };
+    const channels = this.snapshot()!;
     this.cameraId = null;
     this.projectUri = null;
     this.paused = true;

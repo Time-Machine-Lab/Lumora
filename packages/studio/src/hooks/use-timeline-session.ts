@@ -19,6 +19,11 @@ import {
 import type { SceneEditor, TrackData, TrackKeyframeData, TrackTargetPath } from '@lumora/core';
 import { TimelineRecorder } from '../components/editor/timeline-recorder';
 import type { CaptureSource } from '../components/editor/timeline-recorder';
+import {
+  DEFAULT_CAMERA_DRIVE_SETTINGS,
+  normalizeCameraDriveSettings,
+} from '../components/editor/camera-drive';
+import type { CameraDriveSettings } from '../components/editor/camera-drive';
 import { showToast } from '../components/editor/toasts';
 
 export type RecorderChannel = 'position' | 'rotation' | 'focalLength';
@@ -42,7 +47,10 @@ export interface TimelineSessionState {
   zoom: number;
   snapEnabled: boolean;
   loopEnabled: boolean;
+  cameraControls: CameraDriveSettings;
 }
+
+export type StopRecordingResult = { ok: true } | { ok: false; message: string };
 
 export interface TimelineSession {
   timeline: TimelineController;
@@ -56,14 +64,15 @@ export interface TimelineSession {
   setSnap(enabled: boolean): void;
   setLoop(enabled: boolean): void;
   setCaptureSource(source: CaptureSource | null): void;
+  setCameraControlSettings(settings: Partial<CameraDriveSettings>): void;
   /** 开始录制指定机位；已有录制轨道时进入覆盖确认 */
   startRecording(cameraObjectId: string): void;
   confirmOverwrite(): void;
   cancelOverwrite(): void;
   /** 恢复暂停中的录制（同时恢复播放） */
   resumeRecording(): void;
-  /** 结束录制：抽稀并原子提交各通道轨道 */
-  stopRecording(): void;
+  /** 结束录制：抽稀并原子提交各通道轨道；失败时保留暂停样本供重试 */
+  stopRecording(): StopRecordingResult;
 }
 
 export function useTimelineSession(editor: SceneEditor): TimelineSession {
@@ -84,6 +93,7 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     zoom: timeline.getZoom(),
     snapEnabled: timeline.isSnapEnabled(),
     loopEnabled: timeline.isLoopEnabled(),
+    cameraControls: { ...DEFAULT_CAMERA_DRIVE_SETTINGS },
   }));
 
   const pendingRecordingRef = useRef<{ sessionToken: number; cameraId: string } | null>(null);
@@ -324,6 +334,13 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     [recorder],
   );
 
+  const setCameraControlSettings = useCallback((settings: Partial<CameraDriveSettings>) => {
+    setState((current) => ({
+      ...current,
+      cameraControls: normalizeCameraDriveSettings(settings, current.cameraControls),
+    }));
+  }, []);
+
   const beginRecording = useCallback(
     (cameraObjectId: string) => {
       const project = editor.getProject();
@@ -413,9 +430,11 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     }
   }, [captureRecordingOperation, isRecordingOperationCurrent, recorder, timeline]);
 
-  const stopRecording = useCallback(() => {
-    if (!recorder.active) return;
+  const stopRecording = useCallback((): StopRecordingResult => {
+    if (!recorder.active) return { ok: true };
     recordingOperationGenerationRef.current += 1;
+    recorder.pause();
+    timeline.pause();
     // 录制绑定会话令牌已过期（项目切换/重开，含同 URI 重开）→ 仅停止并丢弃
     // 样本：更早注册的 listener 在 project:changed 同步阶段触达 stopRecording
     // 时，本 hook 的取消分支尚未执行，此检查兜底旧会话样本不进入新项目
@@ -426,15 +445,11 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       recordedSessionTokenRef.current = null;
       recordedProjectUriRef.current = null;
       setState((s) => ({ ...s, recording: false, recordingPaused: false }));
-      timeline.pause();
-      return;
+      return { ok: true };
     }
     const cameraObjectId = recorder.recordingCameraId;
     const projectUri = recorder.boundProjectUri;
-    const channels = recorder.stop();
-    recordedSessionTokenRef.current = null;
-    recordedProjectUriRef.current = null;
-    setState((s) => ({ ...s, recording: false, recordingPaused: false }));
+    const channels = recorder.snapshot();
     // 停止时重验绑定身份：项目已切换或相机已删除 → 丢弃样本，不提交
     const project = editor.getProject();
     const camera =
@@ -458,13 +473,21 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       if (tracks.length > 0) {
         // 一次原子批量提交：三通道同生共死，失败不留下半提交（审查第 7 项）
         const result = editor.commitRecordingTracks(tracks, '录制关键帧');
-        if (!result.ok) showToast(result.error.message, 'error');
+        if (!result.ok) {
+          showToast(result.error.message, 'error');
+          setState((s) => ({ ...s, recording: true, recordingPaused: true, playing: false }));
+          return { ok: false, message: result.error.message };
+        }
       }
     }
-    timeline.pause();
+    recorder.stop();
+    recordedSessionTokenRef.current = null;
+    recordedProjectUriRef.current = null;
+    setState((s) => ({ ...s, recording: false, recordingPaused: false, playing: false }));
     const current = editor.getProject();
     if (current) timeline.setDuration(getProjectDuration(current));
     timeline.seek(0);
+    return { ok: true };
   }, [editor, recorder, timeline]);
 
   /** 会话对象稳定：仅 state 字段随渲染原地更新。下游 effect 以整个 session 为
@@ -485,6 +508,7 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       setSnap,
       setLoop,
       setCaptureSource,
+      setCameraControlSettings,
       startRecording,
       confirmOverwrite,
       cancelOverwrite,

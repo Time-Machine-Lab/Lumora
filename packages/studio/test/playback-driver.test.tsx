@@ -12,6 +12,7 @@ import {
 import type { Project, SceneObjectData } from '@lumora/core';
 import { PlaybackDriver } from '../src/components/editor/PlaybackDriver';
 import { TimelineRecorder } from '../src/components/editor/timeline-recorder';
+import { DEFAULT_CAMERA_DRIVE_SETTINGS } from '../src/components/editor/camera-drive';
 import { buildScene, findNode } from '../src/components/editor/scene-builder';
 import type { TimelineSession } from '../src/hooks/use-timeline-session';
 import type { RefObject } from 'react';
@@ -69,6 +70,7 @@ function makeSession(timeline: TimelineController, recorder: TimelineRecorder): 
       zoom: timeline.getZoom(),
       snapEnabled: timeline.isSnapEnabled(),
       loopEnabled: timeline.isLoopEnabled(),
+      cameraControls: { ...DEFAULT_CAMERA_DRIVE_SETTINGS },
     },
     togglePlay: () => {},
     pause: () => {},
@@ -78,11 +80,12 @@ function makeSession(timeline: TimelineController, recorder: TimelineRecorder): 
     setSnap: () => {},
     setLoop: () => {},
     setCaptureSource: () => {},
+    setCameraControlSettings: () => {},
     startRecording: () => {},
     confirmOverwrite: () => {},
     cancelOverwrite: () => {},
     resumeRecording: () => {},
-    stopRecording: () => {},
+    stopRecording: () => ({ ok: true }),
   };
 }
 

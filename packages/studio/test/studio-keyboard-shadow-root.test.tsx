@@ -6,6 +6,7 @@ import { createSampleProject } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import { LumoraStudio } from '../src/components/LumoraStudio';
 import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
+import { CameraDrive } from '../src/components/editor/camera-drive';
 import { findNode } from '../src/components/editor/scene-builder';
 
 const r3fHarness = vi.hoisted(() => ({ scenes: [] as THREE.Group[] }));
@@ -143,17 +144,22 @@ describe('Studio keyboard routing across ShadowRoot boundaries', () => {
 
     act(() => editor.setSelection(['sample-camera']));
     const camera = findNode(studio.scene, 'sample-camera')!;
+    const press = vi.spyOn(CameraDrive.prototype, 'press');
     await act(async () => delay(60));
     const before = camera.position.clone();
     act(() => {
       dispatchComposedKey(focusTarget, 'keydown', { key: 'w', code: 'KeyW' });
     });
-    await act(async () => delay(120));
+    const drive = press.mock.instances[press.mock.instances.length - 1] as unknown as CameraDrive;
     act(() => {
+      drive.update(0.06);
+      drive.update(0.08);
+      drive.update(0.1);
       dispatchComposedKey(focusTarget, 'keyup', { key: 'w', code: 'KeyW' });
     });
 
-    expect(camera.position.distanceTo(before)).toBeGreaterThan(0.01);
+    expect(camera.position.distanceTo(before)).toBeGreaterThan(0.15);
+    expect(camera.position.distanceTo(before)).toBeLessThan(0.25);
   });
 
   it('preserves native editing and drive keys for controls inside the ShadowRoot Studio', async () => {
@@ -376,6 +382,20 @@ describe('Studio keyboard routing across ShadowRoot boundaries', () => {
     expect(editor.getSelection()).toEqual(['sample-cube']);
     expect(editor.getProject()?.objects.some((object) => object.id === 'sample-cube')).toBe(true);
     expect(within(studio.root).queryByTestId('command-palette')).not.toBeInTheDocument();
+  });
+
+  it('keeps recording shortcut settings open for pointer events inside the ShadowRoot dialog', async () => {
+    const studio = await mountShadowStudio('lumora://shadow-shortcut-settings');
+    const scope = within(studio.root);
+    await act(async () => scope.getByTestId('recording-shortcut-settings').click());
+    const dialog = scope.getByTestId('recording-shortcut-dialog');
+    const keySelect = within(dialog).getByTestId('recording-shortcut-key');
+
+    act(() => {
+      keySelect.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, composed: true }));
+    });
+
+    expect(scope.getByTestId('recording-shortcut-dialog')).toBeInTheDocument();
   });
 
   it.each([
