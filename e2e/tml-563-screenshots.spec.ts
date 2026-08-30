@@ -4,6 +4,7 @@ import { expect, test } from '@playwright/test';
 import type { Browser, Page } from '@playwright/test';
 
 const OUTPUT_DIR = resolve('docs/evidence/tml-563/round3-after');
+const CURRENT_OUTPUT_DIR = resolve('docs/evidence/tml-563/after');
 
 async function clickToolbarItem(page: Page, testId: string) {
   const item = page.getByTestId(testId);
@@ -31,6 +32,23 @@ async function prepareShortShot(page: Page) {
   await page.getByTitle('适配时长').click();
 }
 
+async function prepareAdjacentShortShots(page: Page) {
+  await openSampleProject(page);
+  await page.getByTestId('open-storyboard-workspace').click();
+  await page.getByTestId('storyboard-tab-adopted').click();
+  const shots = page.getByTestId('storyboard-adopted-shot');
+  for (let index = 0; index < 2; index += 1) {
+    const duration = shots.nth(index).locator('input[type="number"]');
+    await duration.fill('0.1');
+    await duration.press('Tab');
+  }
+  await page.keyboard.press('Escape');
+  const targets = page.locator('[data-testid^="shot-block-"]');
+  await targets.nth(1).click();
+  await page.locator('[data-testid^="shot-move-left-"]:not([disabled])').click();
+  await page.getByTitle('适配时长').click();
+}
+
 async function prepareOverwrite(page: Page) {
   await openSampleProject(page);
   await page.getByTestId('editor-panel-objects').click();
@@ -40,9 +58,9 @@ async function prepareOverwrite(page: Page) {
   await expect(page.getByTestId('overwrite-confirm')).toBeVisible();
 }
 
-async function capture(page: Page, filename: string) {
+async function capture(page: Page, filename: string, outputDir = OUTPUT_DIR) {
   await page.screenshot({
-    path: resolve(OUTPUT_DIR, filename),
+    path: resolve(outputDir, filename),
     animations: 'disabled',
   });
 }
@@ -53,6 +71,7 @@ async function captureScenario(
   filename: string,
   arrange: (page: Page) => Promise<void>,
   url = '/',
+  outputDir = OUTPUT_DIR,
 ) {
   const context = await browser.newContext({ viewport });
   const page = await context.newPage();
@@ -60,7 +79,7 @@ async function captureScenario(
     await page.goto(url);
     await arrange(page);
     await page.waitForTimeout(300);
-    await capture(page, filename);
+    await capture(page, filename, outputDir);
   } finally {
     await context.close();
   }
@@ -271,5 +290,37 @@ test('captures the TML-563 round 3 before/after matrix', async ({ browser }) => 
       });
       expect(contained).toBe(true);
     },
+  );
+});
+
+test('captures refreshed TML-563 states 14 and 15', async ({ browser }) => {
+  mkdirSync(CURRENT_OUTPUT_DIR, { recursive: true });
+
+  await captureScenario(
+    browser,
+    { width: 667, height: 375 },
+    '14-mobile-landscape-log-open-667x375.png',
+    async (page) => {
+      await openSampleProject(page);
+      await page.getByTestId('host-log-toggle').click();
+      await expect(page.getByTestId('host-log-close')).toBeFocused();
+    },
+    '/',
+    CURRENT_OUTPUT_DIR,
+  );
+
+  await captureScenario(
+    browser,
+    { width: 375, height: 667 },
+    '15-mobile-fit-shot-controls-375x667.png',
+    async (page) => {
+      await prepareAdjacentShortShots(page);
+      await expect.poll(() => page.getByTestId('timeline-body').evaluate((body) => body.scrollLeft)).toBe(0);
+      await page.getByTestId('timeline-body').evaluate((body) => {
+        body.scrollTop = body.scrollHeight;
+      });
+    },
+    '/',
+    CURRENT_OUTPUT_DIR,
   );
 });

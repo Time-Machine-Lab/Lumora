@@ -177,12 +177,14 @@ export function TimelinePanel({
   };
 
   const fitZoom = useCallback(() => {
-    const viewport = bodyRef.current?.clientWidth ?? 800;
+    const body = bodyRef.current;
+    const viewport = body?.clientWidth ?? 800;
     const width = Math.max(50, viewport - TIMELINE_LABEL_WIDTH);
     const duration = Math.max(0.1, state.duration);
     session.setZoom(
       Math.min(MAX_TIMELINE_ZOOM, Math.max(MIN_TIMELINE_ZOOM, width / duration)),
     );
+    if (body) body.scrollLeft = 0;
   }, [session, state.duration]);
 
   // 缩略图：串行截取缺失分镜（一次 seek → 双 RAF → capture → 下一分镜），
@@ -356,14 +358,19 @@ export function TimelinePanel({
   // Preserve time-proportional strips while packing minimum-size selection targets without overlap.
   const shotLayouts = useMemo(() => {
     let nextTargetLeft = 0;
-    return project.shots.map((shot) => {
-      const visualLeft = shot.startTime * zoom;
-      const visualWidth = Math.max(3, (shot.endTime - shot.startTime) * zoom);
-      const width = Math.max(SHOT_TARGET_SIZE, visualWidth);
-      const left = Math.max(visualLeft, nextTargetLeft);
-      nextTargetLeft = left + width;
-      return { shot, left, width, visualLeft, visualWidth };
-    });
+    return project.shots
+      .map((shot, sourceIndex) => ({ shot, sourceIndex }))
+      .sort((a, b) => a.shot.startTime - b.shot.startTime
+        || a.shot.endTime - b.shot.endTime
+        || a.sourceIndex - b.sourceIndex)
+      .map(({ shot }) => {
+        const visualLeft = shot.startTime * zoom;
+        const visualWidth = Math.max(3, (shot.endTime - shot.startTime) * zoom);
+        const width = Math.max(SHOT_TARGET_SIZE, visualWidth);
+        const left = Math.max(visualLeft, nextTargetLeft);
+        nextTargetLeft = left + width;
+        return { shot, left, width, visualLeft, visualWidth };
+      });
   }, [project.shots, zoom]);
 
   const toggleTrackDisabled = useCallback(

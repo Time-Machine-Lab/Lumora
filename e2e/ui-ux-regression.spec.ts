@@ -32,7 +32,14 @@ async function expectFirstTwoShotTargetsToBeDisjoint(page: import('@playwright/t
   await shots.first().scrollIntoViewIfNeeded();
   const geometry = await shots.evaluateAll((elements) => elements.slice(0, 2).map((element) => {
     const rect = element.getBoundingClientRect();
+    const body = document.querySelector<HTMLElement>('[data-testid="timeline-body"]')!.getBoundingClientRect();
+    const label = document.querySelector<HTMLElement>('.lumora-timeline__label--shots')!.getBoundingClientRect();
     const center = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    const points = [
+      { x: rect.left + 1, y: center.y },
+      center,
+      { x: rect.right - 1, y: center.y },
+    ];
     return {
       left: rect.left,
       right: rect.right,
@@ -41,7 +48,11 @@ async function expectFirstTwoShotTargetsToBeDisjoint(page: import('@playwright/t
       width: rect.width,
       height: rect.height,
       center,
-      ownsCenter: document.elementFromPoint(center.x, center.y)?.closest('[data-testid^="shot-block-"]') === element,
+      points,
+      fullyVisible: rect.left >= label.right - 0.5 && rect.right <= body.right + 0.5,
+      ownsPoints: points.every((point) =>
+        document.elementFromPoint(point.x, point.y)?.closest('[data-testid^="shot-block-"]') === element,
+      ),
     };
   }));
   expect(geometry).toHaveLength(2);
@@ -50,7 +61,7 @@ async function expectFirstTwoShotTargetsToBeDisjoint(page: import('@playwright/t
   const overlapWidth = Math.max(0, Math.min(first!.right, second!.right) - Math.max(first!.left, second!.left));
   const overlapHeight = Math.max(0, Math.min(first!.bottom, second!.bottom) - Math.max(first!.top, second!.top));
   expect(overlapWidth * overlapHeight).toBe(0);
-  expect(geometry.every(({ ownsCenter }) => ownsCenter)).toBe(true);
+  expect(geometry.every(({ fullyVisible, ownsPoints }) => fullyVisible && ownsPoints)).toBe(true);
 
   const durationGeometry = await durations.evaluateAll((elements) => elements.slice(0, 2).map((element) => {
     const rect = element.getBoundingClientRect();
@@ -59,9 +70,11 @@ async function expectFirstTwoShotTargetsToBeDisjoint(page: import('@playwright/t
   expect(durationGeometry.every(({ width }) => width >= 3)).toBe(true);
   expect(Math.abs(durationGeometry[0]!.right - durationGeometry[1]!.left)).toBeLessThanOrEqual(1);
 
-  for (const [index, { center }] of geometry.entries()) {
-    await page.mouse.click(center.x, center.y);
-    await expect(shots.nth(index)).toHaveAttribute('aria-pressed', 'true');
+  for (const [index, { points }] of geometry.entries()) {
+    for (const point of points) {
+      await page.mouse.click(point.x, point.y);
+      await expect(shots.nth(index)).toHaveAttribute('aria-pressed', 'true');
+    }
   }
 }
 
@@ -209,6 +222,7 @@ test('375 adjacent 0.1s shots keep disjoint 44px targets at fit, zoom-out, and m
   await shots.nth(1).click();
   await page.locator('[data-testid^="shot-move-left-"]:not([disabled])').click();
   await page.getByRole('button', { name: '适配' }).click();
+  await expect.poll(() => page.getByTestId('timeline-body').evaluate((body) => body.scrollLeft)).toBe(0);
   await expectFirstTwoShotTargetsToBeDisjoint(page);
 
   await page.getByTitle('缩小').click();
@@ -303,8 +317,49 @@ test('375 storyboard close and delete controls use 44px icon targets', async ({ 
 
 test('667x375 expanded host log keeps a complete keyframe target and shot row inside Timeline', async ({ page }) => {
   await page.setViewportSize({ width: 667, height: 375 });
-  await page.getByTestId('host-log-toggle').click();
-  await expect(page.getByTestId('host-event-log')).toBeVisible();
+  const toggle = page.getByTestId('host-log-toggle');
+  await toggle.focus();
+  await toggle.click();
+  const log = page.getByTestId('host-event-log');
+  const close = page.getByTestId('host-log-close');
+  await expect(log).toBeVisible();
+  await expect(log).toHaveAttribute('role', 'dialog');
+  await expect(log).toHaveAttribute('aria-modal', 'true');
+  await expect(page.getByTestId('host-studio-region')).toHaveAttribute('inert', '');
+  await expect(close).toBeFocused();
+  const closeBox = await close.boundingBox();
+  expect(closeBox?.width ?? 0).toBeGreaterThanOrEqual(44);
+  expect(closeBox?.height ?? 0).toBeGreaterThanOrEqual(44);
+
+  for (let index = 0; index < 4; index += 1) {
+    await page.keyboard.press(index % 2 === 0 ? 'Tab' : 'Shift+Tab');
+    expect(await log.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+  }
+
+  const obscuredControls = await page.evaluate(() => {
+    const drawer = document.querySelector<HTMLElement>('[data-testid="host-event-log"]')!.getBoundingClientRect();
+    const controls = Array.from(document.querySelectorAll<HTMLElement>(
+      '[data-testid="host-studio-region"] button, [data-testid="host-studio-region"] input, [data-testid="host-studio-region"] [tabindex]',
+    )).filter((element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && rect.left < drawer.right && rect.right > drawer.left
+        && rect.top < drawer.bottom && rect.bottom > drawer.top;
+    });
+    return {
+      count: controls.length,
+      allInert: controls.every((element) => element.closest('[inert]') !== null),
+      allCovered: controls.every((element) => {
+        const rect = element.getBoundingClientRect();
+        const x = Math.max(drawer.left + 1, Math.min(drawer.right - 1, rect.left + rect.width / 2));
+        const y = Math.max(drawer.top + 1, Math.min(drawer.bottom - 1, rect.top + rect.height / 2));
+        const hit = document.elementFromPoint(x, y);
+        return hit?.closest('[data-testid="host-event-log"]') !== null;
+      }),
+    };
+  });
+  expect(obscuredControls.count).toBeGreaterThan(0);
+  expect(obscuredControls.allInert).toBe(true);
+  expect(obscuredControls.allCovered).toBe(true);
 
   await page.getByTestId('timeline-body').evaluate((element) => {
     element.scrollTop = 0;
@@ -331,6 +386,7 @@ test('667x375 expanded host log keeps a complete keyframe target and shot row in
         bottom: keyframe.bottom,
         width: keyframe.width,
         height: keyframe.height,
+        isInert: keyframeElement.closest('[inert]') !== null,
         ownsCenter: document.elementFromPoint(keyframeCenter.x, keyframeCenter.y)?.closest('.lumora-timeline__keyframe') === keyframeElement,
       },
     };
@@ -343,7 +399,8 @@ test('667x375 expanded host log keeps a complete keyframe target and shot row in
   expect(geometry.keyframe.height).toBeGreaterThanOrEqual(44);
   expect(geometry.keyframe.top).toBeGreaterThanOrEqual(geometry.ruler.bottom - 1);
   expect(geometry.keyframe.bottom).toBeLessThanOrEqual(geometry.body.bottom + 1);
-  expect(geometry.keyframe.ownsCenter).toBe(true);
+  expect(geometry.keyframe.isInert).toBe(true);
+  expect(geometry.keyframe.ownsCenter).toBe(false);
 
   await page.getByTestId('timeline-body').evaluate((element) => {
     element.scrollTop = element.scrollHeight;
@@ -364,6 +421,7 @@ test('667x375 expanded host log keeps a complete keyframe target and shot row in
         top: shotTarget.top,
         bottom: shotTarget.bottom,
         height: shotTarget.height,
+        isInert: shotTargetElement.closest('[inert]') !== null,
         ownsCenter: document.elementFromPoint(shotCenter.x, shotCenter.y)?.closest('[data-testid^="shot-block-"]') === shotTargetElement,
       },
     };
@@ -374,7 +432,19 @@ test('667x375 expanded host log keeps a complete keyframe target and shot row in
   expect(bottomGeometry.shotTarget.height).toBeGreaterThanOrEqual(44);
   expect(bottomGeometry.shotTarget.top).toBeGreaterThanOrEqual(bottomGeometry.rulerBottom - 1);
   expect(bottomGeometry.shotTarget.bottom).toBeLessThanOrEqual(bottomGeometry.bodyBottom + 1);
-  expect(bottomGeometry.shotTarget.ownsCenter).toBe(true);
+  expect(bottomGeometry.shotTarget.isInert).toBe(true);
+  expect(bottomGeometry.shotTarget.ownsCenter).toBe(false);
+
+  await page.keyboard.press('Escape');
+  await expect(log).toBeHidden();
+  await expect(page.getByTestId('host-studio-region')).not.toHaveAttribute('inert', '');
+  await expect(toggle).toBeFocused();
+  expect(await page.evaluate(() => {
+    const shot = document.querySelector<HTMLElement>('[data-testid^="shot-block-"]')!;
+    const rect = shot.getBoundingClientRect();
+    return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
+      ?.closest('[data-testid^="shot-block-"]') === shot;
+  })).toBe(true);
 });
 
 test('375x667 expanded host log keeps the complete timeline inside Studio', async ({ page }) => {

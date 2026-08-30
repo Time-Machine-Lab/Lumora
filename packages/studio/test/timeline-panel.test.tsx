@@ -233,6 +233,21 @@ describe('TimelinePanel：运输控制、标尺、泳道与分镜', () => {
     expect(view.session.setZoom).toHaveBeenCalledWith((375 - TIMELINE_LABEL_WIDTH) / 3);
   });
 
+  it('合法非时间序导入按 startTime 稳定排列命中目标并保持时长条坐标', () => {
+    const project = makeProject();
+    project.shots = [project.shots[2]!, project.shots[0]!, project.shots[1]!];
+    mountPanel({}, [], false, project);
+
+    expect(screen.getAllByTestId(/^shot-block-/).map((shot) => shot.dataset.testid)).toEqual([
+      'shot-block-s1',
+      'shot-block-s2',
+      'shot-block-s3',
+    ]);
+    expect(screen.getByTestId('shot-duration-s1').style.left).toBe('0px');
+    expect(screen.getByTestId('shot-duration-s2').style.left).toBe(`${baseState().zoom}px`);
+    expect(screen.getByTestId('shot-duration-s3').style.left).toBe(`${baseState().zoom * 2}px`);
+  });
+
   it('分镜比例区块只负责选中，选中分镜的跳转与重排动作固定在标签列', () => {
     const view = mountPanel();
     fireEvent.click(screen.getByTestId('shot-block-s2'));

@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { X } from 'lucide-react';
 import { createSampleProject } from '@lumora/core';
 import type { Manifest, PluginDescriptor, Project } from '@lumora/core';
 import { LumoraStudio } from '@lumora/studio';
@@ -208,8 +210,46 @@ export default function App() {
   const [logOpen, setLogOpen] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const handleRef = useRef<LumoraStudioHandle | null>(null);
+  const logToggleRef = useRef<HTMLButtonElement>(null);
+  const logDialogRef = useRef<HTMLElement>(null);
 
   const appendLog = (line: string) => setLog((lines) => [...lines.slice(-49), line]);
+
+  const closeLog = useCallback(() => {
+    setLogOpen(false);
+    requestAnimationFrame(() => logToggleRef.current?.focus());
+  }, []);
+
+  useEffect(() => {
+    if (!logOpen) return;
+    const frame = requestAnimationFrame(() => {
+      logDialogRef.current?.querySelector<HTMLButtonElement>('[data-testid="host-log-close"]')?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [logOpen]);
+
+  const handleLogKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      closeLog();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const focusable = Array.from(
+      event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), [href], input:not(:disabled), [tabindex="0"]'),
+    );
+    if (focusable.length === 0) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0]!;
+    const last = focusable[focusable.length - 1]!;
+    if ((event.shiftKey && document.activeElement === first) || (!event.shiftKey && document.activeElement === last)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    }
+  };
 
   useEffect(() => {
     if (!mounted) return;
@@ -261,12 +301,16 @@ export default function App() {
         <h1>Lumora 嵌入宿主示例</h1>
         <div className="host__actions">
           <button
+            ref={logToggleRef}
             type="button"
             className="host__log-toggle"
             data-testid="host-log-toggle"
             aria-controls="host-event-log"
             aria-expanded={logOpen}
-            onClick={() => setLogOpen((open) => !open)}
+            onClick={() => {
+              if (logOpen) closeLog();
+              else setLogOpen(true);
+            }}
           >
             {logOpen ? '收起日志' : '事件日志'}
           </button>
@@ -296,32 +340,52 @@ export default function App() {
         </div>
       </header>
       <div className="host__layout">
-        {mounted ? (
-          <LumoraStudio
-            ref={handleRef}
-            plugins={PLUGINS}
-            hostVersion="0.1.0"
-            storage={STORAGE}
-            pluginSettingsNamespace="embedded-host"
-            className="host__studio"
-            initialProject={ROUND3_REVIEW_FIXTURE?.startsWith('tml-563-round3')
-              ? createRound3ReviewProject(ROUND3_REVIEW_FIXTURE === 'tml-563-round3-dense')
-              : undefined}
-          />
-        ) : (
-          <div className="host__placeholder" data-testid="studio-placeholder">
-            Studio 已卸载 —— WebGL 场景、插件贡献项与事件订阅均已释放
-          </div>
-        )}
+        <div className="host__studio-region" data-testid="host-studio-region" inert={logOpen || undefined}>
+          {mounted ? (
+            <LumoraStudio
+              ref={handleRef}
+              plugins={PLUGINS}
+              hostVersion="0.1.0"
+              storage={STORAGE}
+              pluginSettingsNamespace="embedded-host"
+              className="host__studio"
+              initialProject={ROUND3_REVIEW_FIXTURE?.startsWith('tml-563-round3')
+                ? createRound3ReviewProject(ROUND3_REVIEW_FIXTURE === 'tml-563-round3-dense')
+                : undefined}
+            />
+          ) : (
+            <div className="host__placeholder" data-testid="studio-placeholder">
+              Studio 已卸载 —— WebGL 场景、插件贡献项与事件订阅均已释放
+            </div>
+          )}
+        </div>
         <aside
+          ref={logDialogRef}
           id="host-event-log"
           className="host__log"
           data-testid="host-event-log"
           data-open={logOpen || undefined}
-          tabIndex={0}
+          role={logOpen ? 'dialog' : undefined}
+          aria-modal={logOpen || undefined}
+          tabIndex={logOpen ? -1 : 0}
           aria-labelledby="host-event-log-heading"
+          onKeyDown={logOpen ? handleLogKeyDown : undefined}
         >
-          <h2 id="host-event-log-heading">宿主事件日志</h2>
+          <div className="host__log-header">
+            <h2 id="host-event-log-heading">宿主事件日志</h2>
+            {logOpen && (
+              <button
+                type="button"
+                className="host__log-close"
+                data-testid="host-log-close"
+                aria-label="关闭事件日志"
+                title="关闭事件日志"
+                onClick={closeLog}
+              >
+                <X aria-hidden="true" />
+              </button>
+            )}
+          </div>
           <ul data-testid="event-log">
             {log.map((line, index) => (
               <li key={`${index}-${line}`}>{line}</li>

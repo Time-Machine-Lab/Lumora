@@ -8,6 +8,8 @@ npx playwright test e2e/tml-563-screenshots.spec.ts --project=chromium
 
 Each after image uses a fresh browser context so project persistence and runtime locks cannot leak between captures.
 
+States 14 and 15 were regenerated after the final review gates. State 14 captures the modal log drawer with its 44px close target and focus boundary; state 15 captures Fit with zero horizontal scroll and fully reachable 44px short-shot targets. Their inert, Escape/focus-restoration, edge-hit, and geometry assertions are enforced by `e2e/ui-ux-regression.spec.ts`.
+
 | ID | State and viewport | Before | After |
 | --- | --- | --- | --- |
 | 01 | Editor, selected cube, 1440x900 | [Before](before/01-desktop-editor-1440x900.png) | [After](after/01-desktop-editor-1440x900.png) |

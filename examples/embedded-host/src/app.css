@@ -70,6 +70,13 @@ body {
   min-height: 0;
 }
 
+.host__studio-region {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
 .host__studio {
   flex: 1;
   min-width: 0;
@@ -165,6 +172,47 @@ body {
   .host__log[data-open] {
     display: block;
   }
+}
+
+.host__log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.host__log-header h2 {
+  margin: 0;
+}
+
+.host__log-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid #3b4152;
+  border-radius: 6px;
+  background: #232834;
+  color: #e8eaf0;
+  cursor: pointer;
+}
+
+.host__log-close:hover {
+  background: #2b3140;
+}
+
+.host__log-close:focus-visible {
+  outline: 2px solid #4dabf7;
+  outline-offset: 2px;
+}
+
+.host__log-close svg {
+  width: 20px;
+  height: 20px;
 }
 
 .host__fixture-studio {
