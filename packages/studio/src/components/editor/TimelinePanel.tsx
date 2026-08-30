@@ -26,6 +26,7 @@ import { CAMERA_DRIVE_LIMITS } from './camera-drive';
 export const TIMELINE_LABEL_WIDTH = 186;
 const KEYFRAME_TARGET_SIZE = 44;
 const MAX_KEYFRAME_ROWS = 2;
+const SHOT_TARGET_SIZE = 44;
 
 interface SingleKeyframeTarget {
   kind: 'single';
@@ -351,6 +352,19 @@ export function TimelinePanel({
     }
     return [track.id, { targets, rowCount }] as const;
   })), [project.tracks, zoom]);
+
+  // Preserve time-proportional strips while packing minimum-size selection targets without overlap.
+  const shotLayouts = useMemo(() => {
+    let nextTargetLeft = 0;
+    return project.shots.map((shot) => {
+      const visualLeft = shot.startTime * zoom;
+      const visualWidth = Math.max(3, (shot.endTime - shot.startTime) * zoom);
+      const width = Math.max(SHOT_TARGET_SIZE, visualWidth);
+      const left = Math.max(visualLeft, nextTargetLeft);
+      nextTargetLeft = left + width;
+      return { shot, left, width, visualLeft, visualWidth };
+    });
+  }, [project.shots, zoom]);
 
   const toggleTrackDisabled = useCallback(
     (trackId: string, disabled: boolean) => {
@@ -710,16 +724,24 @@ export function TimelinePanel({
                 )}
               </div>
               <div className="lumora-timeline__time-area">
-                {project.shots.map((shot) => {
+                {shotLayouts.map(({ shot, visualLeft, visualWidth }) => (
+                  <span
+                    key={`duration-${shot.id}`}
+                    className={`lumora-timeline__shot-duration${selectedShotId === shot.id ? ' lumora-timeline__shot-duration--selected' : ''}`}
+                    style={{ left: visualLeft, width: visualWidth }}
+                    data-testid={`shot-duration-${shot.id}`}
+                    aria-hidden="true"
+                  />
+                ))}
+                {shotLayouts.map(({ shot, left, width }) => {
                   const camera = shot.cameraObjectId ? findObject(project, shot.cameraObjectId) : null;
-                  const width = Math.max(3, (shot.endTime - shot.startTime) * zoom);
                   const thumbKey = `${thumbGeneration}:${shot.id}`;
                   return (
                     <button
                       type="button"
                       key={shot.id}
                       className={`lumora-timeline__shot${selectedShotId === shot.id ? ' lumora-timeline__shot--selected' : ''}`}
-                      style={{ left: shot.startTime * zoom, width }}
+                      style={{ left, width }}
                       data-testid={`shot-block-${shot.id}`}
                       aria-label={`选择分镜：${shot.name}`}
                       aria-pressed={selectedShotId === shot.id}

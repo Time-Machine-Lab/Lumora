@@ -1953,8 +1953,9 @@
 
 .lumora-timeline__shot {
   position: absolute;
-  top: 6px;
-  bottom: 6px;
+  top: 3px;
+  height: 44px;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -1968,6 +1969,19 @@
   color: var(--lumora-text);
   font: inherit;
   text-align: left;
+}
+
+.lumora-timeline__shot-duration {
+  position: absolute;
+  bottom: 3px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--lumora-text-dim);
+  pointer-events: none;
+}
+
+.lumora-timeline__shot-duration--selected {
+  background: var(--lumora-accent);
 }
 
 .lumora-timeline__shot--selected {
@@ -2633,8 +2647,8 @@
   }
 
   .lumora-timeline {
-    flex: 0 1 72px;
-    max-height: 72px;
+    flex: 0 0 120px;
+    max-height: 120px;
     overflow: hidden;
   }
 

@@ -14,10 +14,55 @@ async function sampledColorCount(page: import('@playwright/test').Page) {
   return { colors: colors.size, width: image.width, height: image.height };
 }
 
-async function clickToolbarItem(page: import('@playwright/test').Page, testId: string) {
-  const item = page.getByTestId(testId);
-  if (!(await item.isVisible())) await page.getByTestId('toolbar-more').click();
+async function clickToolbarItem(
+  page: import('@playwright/test').Page,
+  testId: string,
+  scope: import('@playwright/test').Page | import('@playwright/test').Locator = page,
+) {
+  const item = scope.getByTestId(testId);
+  if (!(await item.isVisible())) await scope.getByTestId('toolbar-more').click();
   await item.click();
+}
+
+async function expectFirstTwoShotTargetsToBeDisjoint(page: import('@playwright/test').Page) {
+  const shots = page.locator('[data-testid^="shot-block-"]');
+  const durations = page.locator('[data-testid^="shot-duration-"]');
+  await expect(shots).toHaveCount(3);
+  await expect(durations).toHaveCount(3);
+  await shots.first().scrollIntoViewIfNeeded();
+  const geometry = await shots.evaluateAll((elements) => elements.slice(0, 2).map((element) => {
+    const rect = element.getBoundingClientRect();
+    const center = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    return {
+      left: rect.left,
+      right: rect.right,
+      top: rect.top,
+      bottom: rect.bottom,
+      width: rect.width,
+      height: rect.height,
+      center,
+      ownsCenter: document.elementFromPoint(center.x, center.y)?.closest('[data-testid^="shot-block-"]') === element,
+    };
+  }));
+  expect(geometry).toHaveLength(2);
+  expect(geometry.every(({ width, height }) => width >= 44 && height >= 44)).toBe(true);
+  const [first, second] = geometry;
+  const overlapWidth = Math.max(0, Math.min(first!.right, second!.right) - Math.max(first!.left, second!.left));
+  const overlapHeight = Math.max(0, Math.min(first!.bottom, second!.bottom) - Math.max(first!.top, second!.top));
+  expect(overlapWidth * overlapHeight).toBe(0);
+  expect(geometry.every(({ ownsCenter }) => ownsCenter)).toBe(true);
+
+  const durationGeometry = await durations.evaluateAll((elements) => elements.slice(0, 2).map((element) => {
+    const rect = element.getBoundingClientRect();
+    return { left: rect.left, right: rect.right, width: rect.width };
+  }));
+  expect(durationGeometry.every(({ width }) => width >= 3)).toBe(true);
+  expect(Math.abs(durationGeometry[0]!.right - durationGeometry[1]!.left)).toBeLessThanOrEqual(1);
+
+  for (const [index, { center }] of geometry.entries()) {
+    await page.mouse.click(center.x, center.y);
+    await expect(shots.nth(index)).toHaveAttribute('aria-pressed', 'true');
+  }
 }
 
 test.beforeEach(async ({ page }) => {
@@ -146,6 +191,33 @@ test('375 fit zoom shows the whole duration and keeps selected-shot actions in t
   expect(await actions.evaluate((element) => getComputedStyle(element.parentElement!).position)).toBe('sticky');
 });
 
+test('375 adjacent 0.1s shots keep disjoint 44px targets at fit, zoom-out, and minimum zoom', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 667 });
+  await page.getByTestId('open-storyboard-workspace').click();
+  await page.getByTestId('storyboard-tab-adopted').click();
+  const adoptedShots = page.getByTestId('storyboard-adopted-shot');
+  await expect(adoptedShots).toHaveCount(3);
+  for (let index = 0; index < 2; index += 1) {
+    const duration = adoptedShots.nth(index).locator('input[type="number"]');
+    await duration.fill('0.1');
+    await duration.press('Tab');
+  }
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('storyboard-workspace')).toBeHidden();
+
+  const shots = page.locator('[data-testid^="shot-block-"]');
+  await shots.nth(1).click();
+  await page.locator('[data-testid^="shot-move-left-"]:not([disabled])').click();
+  await page.getByRole('button', { name: '适配' }).click();
+  await expectFirstTwoShotTargetsToBeDisjoint(page);
+
+  await page.getByTitle('缩小').click();
+  await expectFirstTwoShotTargetsToBeDisjoint(page);
+
+  for (let index = 0; index < 12; index += 1) await page.getByTitle('缩小').click();
+  await expectFirstTwoShotTargetsToBeDisjoint(page);
+});
+
 test('375 exact 60fps adjacent keyframes have disjoint hitboxes and own both visible centers', async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 667 });
   await page.goto('/?fixture=tml-563-round3');
@@ -229,26 +301,80 @@ test('375 storyboard close and delete controls use 44px icon targets', async ({ 
   await expect(deletes.first().locator('svg.lucide-trash-2')).toBeVisible();
 });
 
-test('667x375 expanded host log keeps both Scene and Timeline inside Studio', async ({ page }) => {
+test('667x375 expanded host log keeps a complete keyframe target and shot row inside Timeline', async ({ page }) => {
   await page.setViewportSize({ width: 667, height: 375 });
   await page.getByTestId('host-log-toggle').click();
   await expect(page.getByTestId('host-event-log')).toBeVisible();
+
+  await page.getByTestId('timeline-body').evaluate((element) => {
+    element.scrollTop = 0;
+  });
 
   const geometry = await page.evaluate(() => {
     const rect = (selector: string) => document.querySelector<HTMLElement>(selector)!.getBoundingClientRect();
     const studio = rect('[data-testid="lumora-studio"]');
     const scene = rect('[data-testid="lumora-viewport"]');
     const timeline = rect('[data-testid="lumora-timeline"]');
+    const body = rect('[data-testid="timeline-body"]');
+    const ruler = rect('[data-testid="timeline-ruler"]');
+    const keyframeElement = document.querySelector<HTMLElement>('.lumora-timeline__keyframe')!;
+    const keyframe = keyframeElement.getBoundingClientRect();
+    const keyframeCenter = { x: keyframe.left + keyframe.width / 2, y: keyframe.top + keyframe.height / 2 };
     return {
       studio: { top: studio.top, bottom: studio.bottom },
       scene: { top: scene.top, bottom: scene.bottom, height: scene.height },
       timeline: { top: timeline.top, bottom: timeline.bottom, height: timeline.height },
+      body: { top: body.top, bottom: body.bottom, height: body.height },
+      ruler: { bottom: ruler.bottom },
+      keyframe: {
+        top: keyframe.top,
+        bottom: keyframe.bottom,
+        width: keyframe.width,
+        height: keyframe.height,
+        ownsCenter: document.elementFromPoint(keyframeCenter.x, keyframeCenter.y)?.closest('.lumora-timeline__keyframe') === keyframeElement,
+      },
     };
   });
   expect(geometry.scene.height).toBeGreaterThanOrEqual(100);
-  expect(geometry.timeline.height).toBeGreaterThanOrEqual(48);
+  expect(geometry.timeline.height).toBeGreaterThanOrEqual(118);
   expect(geometry.scene.top).toBeGreaterThanOrEqual(geometry.studio.top);
   expect(geometry.timeline.bottom).toBeLessThanOrEqual(geometry.studio.bottom + 1);
+  expect(geometry.keyframe.width).toBeGreaterThanOrEqual(44);
+  expect(geometry.keyframe.height).toBeGreaterThanOrEqual(44);
+  expect(geometry.keyframe.top).toBeGreaterThanOrEqual(geometry.ruler.bottom - 1);
+  expect(geometry.keyframe.bottom).toBeLessThanOrEqual(geometry.body.bottom + 1);
+  expect(geometry.keyframe.ownsCenter).toBe(true);
+
+  await page.getByTestId('timeline-body').evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  const bottomGeometry = await page.evaluate(() => {
+    const rect = (selector: string) => document.querySelector<HTMLElement>(selector)!.getBoundingClientRect();
+    const body = rect('[data-testid="timeline-body"]');
+    const ruler = rect('[data-testid="timeline-ruler"]');
+    const shots = rect('[data-testid="timeline-shots"]');
+    const shotTargetElement = document.querySelector<HTMLElement>('[data-testid^="shot-block-"]')!;
+    const shotTarget = shotTargetElement.getBoundingClientRect();
+    const shotCenter = { x: shotTarget.left + shotTarget.width / 2, y: shotTarget.top + shotTarget.height / 2 };
+    return {
+      bodyBottom: body.bottom,
+      rulerBottom: ruler.bottom,
+      shots: { top: shots.top, bottom: shots.bottom, height: shots.height },
+      shotTarget: {
+        top: shotTarget.top,
+        bottom: shotTarget.bottom,
+        height: shotTarget.height,
+        ownsCenter: document.elementFromPoint(shotCenter.x, shotCenter.y)?.closest('[data-testid^="shot-block-"]') === shotTargetElement,
+      },
+    };
+  });
+  expect(bottomGeometry.shots.height).toBeGreaterThanOrEqual(58);
+  expect(bottomGeometry.shots.top).toBeGreaterThanOrEqual(bottomGeometry.rulerBottom - 1);
+  expect(bottomGeometry.shots.bottom).toBeLessThanOrEqual(bottomGeometry.bodyBottom + 1);
+  expect(bottomGeometry.shotTarget.height).toBeGreaterThanOrEqual(44);
+  expect(bottomGeometry.shotTarget.top).toBeGreaterThanOrEqual(bottomGeometry.rulerBottom - 1);
+  expect(bottomGeometry.shotTarget.bottom).toBeLessThanOrEqual(bottomGeometry.bodyBottom + 1);
+  expect(bottomGeometry.shotTarget.ownsCenter).toBe(true);
 });
 
 test('375x667 expanded host log keeps the complete timeline inside Studio', async ({ page }) => {
@@ -420,9 +546,11 @@ test('plugin toggles keep browser focus through active, disabled, and failed tra
 test('two Studio instances route Escape to the top portal only', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto('/?fixture=dual-studio');
+  const studios = page.getByTestId('lumora-studio');
+  await expect(studios).toHaveCount(2);
   const openers = page.getByTestId('open-plugin-manager');
   await expect(openers).toHaveCount(2);
-  await openers.first().click();
+  await clickToolbarItem(page, 'open-plugin-manager', studios.first());
   const lowerDialog = page.getByRole('dialog', { name: '插件管理' }).first();
   await openers.nth(1).evaluate((button) => button.click());
   await expect(page.getByRole('dialog', { name: '插件管理' })).toHaveCount(2);
