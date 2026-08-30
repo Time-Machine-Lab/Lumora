@@ -316,7 +316,17 @@ function useCameraDrive(
       ) {
         return;
       }
+      if ((event.ctrlKey || event.metaKey || event.altKey) && heldKeys.size > 0) {
+        // A modifier can become active after a drive key. Hard-stop existing
+        // input and momentum so the pending browser/OS shortcut cannot keep
+        // mutating the camera while it is being handled.
+        clearDrive();
+      }
       if (DRIVE_KEY_CODES.has(event.code)) {
+        // Ctrl/Meta/Alt combinations belong to browser/OS/application shortcuts.
+        // In particular, never consume Ctrl+W: browsers own tab closing and a
+        // page cannot reliably override that behavior.
+        if (event.ctrlKey || event.metaKey || event.altKey) return;
         if (cameraIdRef.current) event.preventDefault();
         if (attachCurrentCamera()) {
           heldKeys.add(event.code);

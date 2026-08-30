@@ -82,7 +82,7 @@ function makeSession(timeline: TimelineController, recorder: TimelineRecorder): 
     confirmOverwrite: () => {},
     cancelOverwrite: () => {},
     resumeRecording: () => {},
-    stopRecording: () => {},
+    stopRecording: () => ({ ok: true }),
   };
 }
 

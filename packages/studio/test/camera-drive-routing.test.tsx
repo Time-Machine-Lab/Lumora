@@ -96,6 +96,7 @@ async function mountStudio(uri: string): Promise<{
 
 beforeEach(() => {
   r3fHarness.scenes = [];
+  localStorage.clear();
 });
 
 afterEach(() => {
@@ -103,6 +104,121 @@ afterEach(() => {
 });
 
 describe('camera drive keyboard routing', () => {
+  it('does not consume Ctrl+W or move the recording camera', async () => {
+    const studio = await mountStudio('lumora://drive-browser-shortcut');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    await act(async () => delay(60));
+    const before = camera.position.clone();
+    const closeTab = new KeyboardEvent('keydown', {
+      bubbles: true,
+      cancelable: true,
+      key: 'w',
+      code: 'KeyW',
+      ctrlKey: true,
+    });
+
+    studio.root.dispatchEvent(closeTab);
+    await act(async () => delay(120));
+
+    expect(closeTab.defaultPrevented).toBe(false);
+    expect(camera.position.distanceTo(before)).toBeLessThan(1e-9);
+  });
+
+  it('hard-stops a held drive key when a protected modifier becomes active', async () => {
+    const studio = await mountStudio('lumora://drive-held-before-modifier');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    await act(async () => delay(60));
+
+    fireEvent.keyDown(studio.root, { key: 'w', code: 'KeyW' });
+    await act(async () => delay(120));
+    fireEvent.keyDown(studio.root, { key: 'Control', code: 'ControlLeft', ctrlKey: true });
+    const atModifier = camera.position.clone();
+    await act(async () => delay(160));
+    fireEvent.keyUp(studio.root, { key: 'w', code: 'KeyW', ctrlKey: true });
+    fireEvent.keyUp(studio.root, { key: 'Control', code: 'ControlLeft' });
+
+    expect(camera.position.distanceTo(atModifier)).toBeLessThan(1e-9);
+  });
+
+  it('uses Shift+R as the documented default recording shortcut', async () => {
+    const studio = await mountStudio('lumora://recording-default-shortcut');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const record = within(studio.root).getByTestId('timeline-record');
+
+    expect(record).toHaveAttribute('title', expect.stringContaining('Shift+R'));
+    fireEvent.keyDown(studio.root, { key: 'R', code: 'KeyR', shiftKey: true });
+
+    expect(await screen.findByTestId('overwrite-confirm')).toBeInTheDocument();
+  });
+
+  it('rejects Ctrl+W in recording shortcut settings without persisting it', async () => {
+    const studio = await mountStudio('lumora://recording-shortcut-settings');
+    fireEvent.click(within(studio.root).getByTestId('recording-shortcut-settings'));
+    const dialog = await screen.findByTestId('recording-shortcut-dialog');
+
+    fireEvent.change(within(dialog).getByTestId('recording-shortcut-key'), {
+      target: { value: 'w' },
+    });
+    fireEvent.click(within(dialog).getByLabelText('Ctrl'));
+    fireEvent.click(within(dialog).getByLabelText('Shift'));
+
+    expect(within(dialog).getByRole('alert')).toHaveTextContent('Ctrl+W');
+    expect(within(dialog).getByTestId('recording-shortcut-save')).toBeDisabled();
+    expect(localStorage.getItem('lumora.recording-shortcut.v1')).toBeNull();
+  });
+
+  it('rejects drive and command-palette conflicts in recording shortcut settings', async () => {
+    const studio = await mountStudio('lumora://recording-app-shortcut-conflicts');
+    fireEvent.click(within(studio.root).getByTestId('recording-shortcut-settings'));
+    const dialog = await screen.findByTestId('recording-shortcut-dialog');
+    const key = within(dialog).getByTestId('recording-shortcut-key');
+
+    fireEvent.change(key, { target: { value: 'w' } });
+    expect(within(dialog).getByRole('alert')).toHaveTextContent('Shift+W');
+    expect(within(dialog).getByTestId('recording-shortcut-save')).toBeDisabled();
+
+    fireEvent.change(key, { target: { value: 'k' } });
+    fireEvent.click(within(dialog).getByLabelText('Ctrl'));
+    expect(within(dialog).getByRole('alert')).toHaveTextContent('Ctrl+Shift+K');
+    expect(within(dialog).getByTestId('recording-shortcut-save')).toBeDisabled();
+    expect(localStorage.getItem('lumora.recording-shortcut.v1')).toBeNull();
+  });
+
+  it('protects active and pending-save recordings but not clean projects on beforeunload', async () => {
+    const studio = await mountStudio('lumora://recording-beforeunload');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    await waitFor(() =>
+      expect(within(studio.root).getByTestId('save-state-badge')).toHaveTextContent('已保存'),
+    );
+
+    const clean = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(clean);
+    expect(clean.defaultPrevented).toBe(false);
+
+    fireEvent.click(within(studio.root).getByTestId('timeline-record'));
+    fireEvent.click(await screen.findByText('覆盖录制'));
+    await waitFor(() => expect(within(studio.root).getByTestId('timeline-record')).toHaveTextContent('■'));
+    const active = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(active);
+    expect(active.defaultPrevented).toBe(true);
+
+    await act(async () => delay(80));
+    fireEvent.click(within(studio.root).getByTestId('timeline-record'));
+    const pendingSave = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(pendingSave);
+    expect(pendingSave.defaultPrevented).toBe(true);
+
+    await waitFor(
+      () => expect(within(studio.root).getByTestId('save-state-badge')).toHaveTextContent('已保存'),
+      { timeout: 4000 },
+    );
+    const saved = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(saved);
+    expect(saved.defaultPrevented).toBe(false);
+  });
+
   it('a drive key inside Studio A moves only A when two Studio instances are mounted', async () => {
     const a = await mountStudio('lumora://drive-a');
     const b = await mountStudio('lumora://drive-b');
@@ -257,9 +373,18 @@ describe('camera drive keyboard routing', () => {
     fireEvent.keyUp(window, { key: 's', code: 'KeyS' });
     fireEvent.keyDown(confirm, { key: 'w', code: 'KeyW' });
     fireEvent.keyDown(confirm, { key: 'ArrowLeft', code: 'ArrowLeft' });
+    const closeTab = new KeyboardEvent('keydown', {
+      bubbles: true,
+      cancelable: true,
+      key: 'w',
+      code: 'KeyW',
+      ctrlKey: true,
+    });
+    confirm.dispatchEvent(closeTab);
     await act(async () => delay(120));
 
     expect(camera.position.distanceTo(atOpen)).toBeLessThan(1e-9);
+    expect(closeTab.defaultPrevented).toBe(false);
     expect(screen.getByTestId('overwrite-confirm')).toBeInTheDocument();
   });
 });

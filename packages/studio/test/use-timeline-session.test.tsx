@@ -111,6 +111,37 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     expect(live().timeline.getTime()).toBe(0); // 播放头回到起点
   });
 
+  it('录制提交失败时保留暂停样本并允许重试，不把失败伪装成已停止', () => {
+    mount();
+    act(() => live().setCaptureSource(() => ({ position: [1, 0, 0], rotation: [0, 0, 0], focalLength: 35 })));
+    act(() => live().startRecording('sample-camera'));
+    act(() => live().confirmOverwrite());
+    act(() => vi.advanceTimersByTime(300));
+    const commit = vi.spyOn(editor, 'commitRecordingTracks').mockReturnValue({
+      ok: false,
+      error: new Error('模拟录制提交失败'),
+    });
+
+    let failed: ReturnType<TimelineSession['stopRecording']>;
+    act(() => {
+      failed = live().stopRecording();
+    });
+    expect(failed!).toEqual({ ok: false, message: '模拟录制提交失败' });
+    expect(live().recorder.active).toBe(true);
+    expect(live().recorder.isPaused).toBe(true);
+    expect(live().state.recording).toBe(true);
+    expect(live().state.recordingPaused).toBe(true);
+
+    commit.mockRestore();
+    let retried: ReturnType<TimelineSession['stopRecording']>;
+    act(() => {
+      retried = live().stopRecording();
+    });
+    expect(retried!).toEqual({ ok: true });
+    expect(live().recorder.active).toBe(false);
+    expect(live().state.recording).toBe(false);
+  });
+
   it('B1 回归：约 5s 持续录制中会话对象身份稳定 —— 驾驶输入不再被会话重建清空', () => {
     mount();
     const session = live();

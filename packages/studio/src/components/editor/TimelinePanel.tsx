@@ -16,6 +16,9 @@ import type { Project, SceneEditor } from '@lumora/core';
 import { findObject } from '@lumora/core';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
 import { projectContentFingerprint } from './timeline-thumbnail-cache';
+import { RecordingShortcutSettings } from './RecordingShortcutSettings';
+import type { KeyboardShortcut } from './recording-shortcut';
+import { DEFAULT_RECORDING_SHORTCUT, formatShortcut } from './recording-shortcut';
 
 /** 标签列宽度：标尺/轨道/分镜共用，测试与坐标换算引用此常量 */
 export const TIMELINE_LABEL_WIDTH = 186;
@@ -33,6 +36,8 @@ export interface TimelinePanelProps {
   captureReady?: boolean;
   /** Monotonic generation for scene-tree rebuilds and deferred render-content settlement. */
   captureGeneration?: number;
+  recordingShortcut?: KeyboardShortcut;
+  onRecordingShortcutChange?(shortcut: KeyboardShortcut): boolean;
 }
 
 const CHANNEL_LABELS: Record<string, string> = {
@@ -76,6 +81,8 @@ export function TimelinePanel({
   captureRef,
   captureReady,
   captureGeneration = 0,
+  recordingShortcut = DEFAULT_RECORDING_SHORTCUT,
+  onRecordingShortcutChange = () => false,
 }: TimelinePanelProps) {
   const { timeline, state } = session;
   const time = usePlayheadTime(session);
@@ -319,18 +326,22 @@ export function TimelinePanel({
           data-testid="timeline-record"
           title={
             !selectedCamera && !state.recording
-              ? '选中一个机位后开始录制'
+              ? `选中一个机位后开始录制（${formatShortcut(recordingShortcut)}）`
               : state.recordingPaused
-                ? '继续录制'
+                ? `继续录制（${formatShortcut(recordingShortcut)}）`
                 : state.recording
-                  ? '停止录制'
-                  : '录制机位运动'
+                  ? `停止录制（${formatShortcut(recordingShortcut)}）`
+                  : `录制机位运动（${formatShortcut(recordingShortcut)}）`
           }
           disabled={!selectedCamera && !state.recording}
           onClick={recordClick}
         >
           {state.recordingPaused ? '▶' : state.recording ? '■' : '●'}
         </button>
+        <RecordingShortcutSettings
+          shortcut={recordingShortcut}
+          onChange={onRecordingShortcutChange}
+        />
         <span className="lumora-timeline__time" data-testid="timeline-time">
           {formatTime(time)}
         </span>

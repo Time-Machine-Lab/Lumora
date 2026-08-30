@@ -1,12 +1,14 @@
 import { forwardRef, useCallback, useEffect, useId, useImperativeHandle, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { ReactNode } from 'react';
+import { findObject } from '@lumora/core';
 import type { PluginDescriptor, Project } from '@lumora/core';
 import { createStudioRuntime } from '../runtime/studio-runtime';
 import type { StudioRuntime } from '../runtime/studio-runtime';
 import { BrowserPluginSettingsStorage } from '../runtime/browser-plugin-settings';
 import { useSceneEditor } from '../hooks/use-scene-editor';
 import { useTimelineSession } from '../hooks/use-timeline-session';
+import type { AutosaveState } from '../persistence/autosave';
 import type { StorageBackend } from '../persistence/project-storage';
 import { PanelHost } from './panels/PanelHost';
 import { Toolbar } from './Toolbar';
@@ -20,6 +22,12 @@ import { StoryboardWorkspace } from './storyboard/StoryboardWorkspace';
 import { ToastHost, showToast } from './editor/toasts';
 import { ContentCache } from './editor/content-cache';
 import { DRIVE_KEY_CODES } from './editor/camera-drive';
+import type { KeyboardShortcut } from './editor/recording-shortcut';
+import {
+  loadRecordingShortcut,
+  matchesShortcut,
+  saveRecordingShortcut,
+} from './editor/recording-shortcut';
 import { isKeyboardEventForStudio, registerStudioKeyboardRoot } from './studio-keyboard-scope';
 import '../lumora.css';
 
@@ -120,6 +128,38 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   const session = useTimelineSession(runtime.editor);
   const sessionRef = useRef(session);
   sessionRef.current = session;
+  const [recordingShortcut, setRecordingShortcut] = useState(() => loadRecordingShortcut());
+  const recordingShortcutRef = useRef(recordingShortcut);
+  recordingShortcutRef.current = recordingShortcut;
+  const handleRecordingShortcutChange = useCallback((shortcut: KeyboardShortcut) => {
+    if (!saveRecordingShortcut(shortcut)) return false;
+    setRecordingShortcut(shortcut);
+    return true;
+  }, []);
+  const [saveState, setSaveState] = useState<AutosaveState>({ status: 'idle' });
+
+  useEffect(() => {
+    const sub = runtime.persistence.events.on('save-state', ({ state }) => setSaveState(state));
+    return () => {
+      void sub.dispose();
+    };
+  }, [runtime.persistence.events]);
+
+  const protectBeforeUnload =
+    session.state.recording ||
+    saveState.status === 'dirty' ||
+    saveState.status === 'saving' ||
+    saveState.status === 'error' ||
+    saveState.status === 'memory';
+  useEffect(() => {
+    if (!protectBeforeUnload) return;
+    const preventDataLoss = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = 'Lumora 仍有未保存的录制内容';
+    };
+    window.addEventListener('beforeunload', preventDataLoss);
+    return () => window.removeEventListener('beforeunload', preventDataLoss);
+  }, [protectBeforeUnload]);
   // 覆盖确认模态（复审阻断 4）：提升到壳层根级，打开时整壳 inert（工具栏/对象树/
   // 视口/时间线整体不可达），模态经 portal 挂到 body 脱离 inert 子树
   const overwriteModalRef = useRef<HTMLDivElement>(null);
@@ -150,7 +190,8 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         key === '3' ||
         ((event.ctrlKey || event.metaKey) &&
           (key === 'k' || key === 'z' || key === 'y' || key === 'd')) ||
-        DRIVE_KEY_CODES.has(event.code)
+        matchesShortcut(event, recordingShortcutRef.current) ||
+        (DRIVE_KEY_CODES.has(event.code) && !event.ctrlKey && !event.metaKey && !event.altKey)
       );
     };
     const onKeyDownCapture = (event: KeyboardEvent) => {
@@ -258,37 +299,49 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   const closeInFlightRef = useRef<Promise<{ ok: boolean; message?: string }> | null>(null);
   const close = useCallback((): Promise<{ ok: boolean; message?: string }> => {
     if (closeInFlightRef.current) return closeInFlightRef.current;
-    closeInFlightRef.current = (async (): Promise<{ ok: boolean; message?: string }> => {
-      let outcome: { ok: boolean; message?: string };
-      try {
-        outcome = await runtime.dispose();
-      } catch (error) {
-        outcome = { ok: false, message: error instanceof Error ? error.message : String(error) };
-      }
-      // preflight 失败（冲刷失败 / 未解决恢复 fork）：运行时无任何 teardown，
-      // 完整可编辑 —— 宿主保持挂载重试，缓存也不释放（第三十轮严重 6 语义）
-      if (!outcome.ok) return outcome;
-      // 终态 commit 已收敛（runtime 已终态释放）：缓存释放是终态的最后一步。
-      // cache.dispose 契约为 best-effort 不抛错（内部逐资源清理，第三十三轮
-      // 阻断 3）—— 意外拒绝归一后仍返回成功：运行态已收敛，卸载不受阻。
-      // 修复前 cache 抛错返回 {ok:false}，但 runtime 已销毁：宿主保持挂载
-      // 面对「可编辑但不可保存」死壳，重试时跳过缓存释放假报成功。
-      // 第三十四轮严重 5：逐层聚合 —— runtime 的 {ok:true, message}（store/
-      // host 终态失败明细）与 cache 顶层异常全部并入 message 透传，修复前
-      // 无条件返回裸 {ok:true} 连续丢弃诊断
-      const messages: string[] = [];
-      if (outcome.message) messages.push(outcome.message);
-      if (!cacheDisposedRef.current) {
-        try {
-          cache.dispose();
-        } catch (error) {
-          messages.push(`缓存资源释放失败：${error instanceof Error ? error.message : String(error)}`);
+    // Defer the body so the shared promise is published before any synchronous
+    // recording commit can emit an event that re-enters close(). The outer
+    // catch also preserves the typed-result contract for unexpected finalizer
+    // failures and lets the caller retry with the retained recorder samples.
+    const inFlight: Promise<{ ok: boolean; message?: string }> = Promise.resolve()
+      .then(async (): Promise<{ ok: boolean; message?: string }> => {
+        // recorder.active is synchronous, while state.recording can lag a start
+        // by one render. Finalization is two-phase: a failed atomic commit keeps
+        // the paused samples in memory and blocks runtime teardown for retry.
+        const activeSession = sessionRef.current;
+        if (activeSession.recorder.active) {
+          const recordingOutcome = activeSession.stopRecording();
+          if (!recordingOutcome.ok) return recordingOutcome;
         }
-        cacheDisposedRef.current = true;
-      }
-      return messages.length === 0 ? { ok: true } : { ok: true, message: messages.join('；') };
-    })();
-    const inFlight = closeInFlightRef.current;
+        const outcome = await runtime.dispose();
+        // preflight 失败（冲刷失败 / 未解决恢复 fork）：运行时无任何 teardown，
+        // 完整可编辑 —— 宿主保持挂载重试，缓存也不释放（第三十轮严重 6 语义）
+        if (!outcome.ok) return outcome;
+        // 终态 commit 已收敛（runtime 已终态释放）：缓存释放是终态的最后一步。
+        // cache.dispose 契约为 best-effort 不抛错（内部逐资源清理，第三十三轮
+        // 阻断 3）—— 意外拒绝归一后仍返回成功：运行态已收敛，卸载不受阻。
+        // 修复前 cache 抛错返回 {ok:false}，但 runtime 已销毁：宿主保持挂载
+        // 面对「可编辑但不可保存」死壳，重试时跳过缓存释放假报成功。
+        // 第三十四轮严重 5：逐层聚合 —— runtime 的 {ok:true, message}（store/
+        // host 终态失败明细）与 cache 顶层异常全部并入 message 透传，修复前
+        // 无条件返回裸 {ok:true} 连续丢弃诊断
+        const messages: string[] = [];
+        if (outcome.message) messages.push(outcome.message);
+        if (!cacheDisposedRef.current) {
+          try {
+            cache.dispose();
+          } catch (error) {
+            messages.push(`缓存资源释放失败：${error instanceof Error ? error.message : String(error)}`);
+          }
+          cacheDisposedRef.current = true;
+        }
+        return messages.length === 0 ? { ok: true } : { ok: true, message: messages.join('；') };
+      })
+      .catch((error): { ok: false; message: string } => ({
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      }));
+    closeInFlightRef.current = inFlight;
     // 失败：清空缓存允许重试 —— 仅当 ref 仍指向本次结果（并发调用共享同一
     // promise，慢成员 settle 时不得清掉已在重试的新一轮）
     void inFlight.then((settled) => {
@@ -403,6 +456,22 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         return;
       }
       const editor = runtime.editor;
+      if (matchesShortcut(event, recordingShortcutRef.current)) {
+        event.preventDefault();
+        if (event.repeat) return;
+        const activeSession = sessionRef.current;
+        if (activeSession.state.recording) {
+          if (activeSession.state.recordingPaused) activeSession.resumeRecording();
+          else activeSession.stopRecording();
+          return;
+        }
+        const project = editor.getProject();
+        const selection = editor.getSelection();
+        const selected = project && selection.length === 1 ? findObject(project, selection[0]!) : null;
+        if (selected?.type === 'camera') activeSession.startRecording(selected.id);
+        else showToast('请先选择一个机位再开始录制', 'error');
+        return;
+      }
       if ((event.ctrlKey || event.metaKey) && key === 'z') {
         event.preventDefault();
         const result = event.shiftKey ? editor.redo() : editor.undo();
@@ -525,6 +594,8 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
                 captureRef={captureRef}
                 captureReady={captureReady}
                 captureGeneration={captureGeneration}
+                recordingShortcut={recordingShortcut}
+                onRecordingShortcutChange={handleRecordingShortcutChange}
               />
             )}
           </main>

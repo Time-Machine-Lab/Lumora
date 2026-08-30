@@ -9,6 +9,7 @@ import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
 import type { ProjectStorage } from '../src/persistence/project-storage';
 import { ContentCache } from '../src/components/editor/content-cache';
 import { CommandPalette } from '../src/components/CommandPalette';
+import { TimelineRecorder } from '../src/components/editor/timeline-recorder';
 
 vi.mock('@react-three/fiber', () => ({
   Canvas: ({ children }: { children?: React.ReactNode }) => (
@@ -158,6 +159,112 @@ describe('LumoraStudio', () => {
     unmount();
     await waitFor(() => expect(deactivate).toHaveBeenCalledTimes(1));
     expect(events.handlerCount).toBe(0);
+  });
+
+  it('录制开始后同一任务立即 close() 仍按 recorder.active 完成本轮停止', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://close-immediate-recording');
+    project.tracks = [];
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    await waitFor(() => expect(handle.current?.runtime.editor.getProject()?.uri).toBe(project.uri));
+    act(() => handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const stop = vi.spyOn(TimelineRecorder.prototype, 'stop');
+
+    let closing!: Promise<{ ok: boolean; message?: string }>;
+    act(() => {
+      screen.getByTestId('timeline-record').click();
+      closing = handle.current!.close();
+    });
+
+    await expect(closing).resolves.toEqual(expect.objectContaining({ ok: true }));
+    expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  it('close() 在录制提交失败时阻止 runtime.dispose，并保留样本供下一次关闭重试', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://close-recording-commit-failure');
+    project.tracks = [];
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    await waitFor(() => expect(handle.current?.runtime.editor.getProject()?.uri).toBe(project.uri));
+    act(() => handle.current!.runtime.editor.setSelection(['sample-camera']));
+    vi.spyOn(TimelineRecorder.prototype, 'snapshot').mockReturnValue({
+      position: [
+        { time: 0, value: [0, 0, 0] },
+        { time: 1, value: [1, 0, 0] },
+      ],
+      rotation: [
+        { time: 0, value: [0, 0, 0] },
+        { time: 1, value: [0, 0, 0] },
+      ],
+      focalLength: null,
+    });
+    const stop = vi.spyOn(TimelineRecorder.prototype, 'stop');
+    const commit = vi.spyOn(handle.current!.runtime.editor, 'commitRecordingTracks').mockReturnValue({
+      ok: false,
+      error: new Error('模拟录制提交失败'),
+    });
+    const dispose = vi.spyOn(handle.current!.runtime, 'dispose');
+    screen.getByTestId('timeline-record').click();
+
+    await expect(handle.current!.close()).resolves.toEqual({ ok: false, message: '模拟录制提交失败' });
+    expect(dispose).not.toHaveBeenCalled();
+    expect(stop).not.toHaveBeenCalled();
+
+    commit.mockReturnValue({ ok: true });
+    await expect(handle.current!.close()).resolves.toEqual(expect.objectContaining({ ok: true }));
+    expect(commit).toHaveBeenCalledTimes(2);
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('录制提交同步事件重入 close() 时复用已发布的 single-flight，不重复最终化', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://close-recording-reentrant');
+    project.tracks = [];
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    await waitFor(() => expect(handle.current?.runtime.editor.getProject()?.uri).toBe(project.uri));
+    act(() => handle.current!.runtime.editor.setSelection(['sample-camera']));
+    vi.spyOn(TimelineRecorder.prototype, 'snapshot').mockReturnValue({
+      position: [
+        { time: 0, value: [0, 0, 0] },
+        { time: 1, value: [1, 0, 0] },
+      ],
+      rotation: [],
+      focalLength: null,
+    });
+    const commit = vi.spyOn(handle.current!.runtime.editor, 'commitRecordingTracks');
+    screen.getByTestId('timeline-record').click();
+    let reentered: Promise<{ ok: boolean; message?: string }> | null = null;
+    const sub = handle.current!.runtime.editor.events.on('project:changed', () => {
+      reentered ??= handle.current!.close();
+    });
+
+    const first = handle.current!.close();
+    await expect(first).resolves.toEqual(expect.objectContaining({ ok: true }));
+    expect(reentered).toBe(first);
+    expect(commit).toHaveBeenCalledTimes(1);
+    sub.dispose();
+  });
+
+  it('录制最终化意外抛错时 close() 返回类型化失败并清除 single-flight 以便重试', async () => {
+    const handle = createRef<LumoraStudioHandle>();
+    const project = createSampleProject('lumora://close-recording-throw');
+    project.tracks = [];
+    render(<LumoraStudio ref={handle} initialProject={project} />);
+    await waitFor(() => expect(handle.current?.runtime.editor.getProject()?.uri).toBe(project.uri));
+    act(() => handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const snapshot = vi.spyOn(TimelineRecorder.prototype, 'snapshot').mockImplementation(() => {
+      throw new Error('模拟最终化异常');
+    });
+    const dispose = vi.spyOn(handle.current!.runtime, 'dispose');
+    screen.getByTestId('timeline-record').click();
+
+    await expect(handle.current!.close()).resolves.toEqual({ ok: false, message: '模拟最终化异常' });
+    expect(dispose).not.toHaveBeenCalled();
+
+    snapshot.mockReturnValue({ position: [], rotation: [], focalLength: null });
+    await expect(handle.current!.close()).resolves.toEqual(expect.objectContaining({ ok: true }));
+    expect(dispose).toHaveBeenCalledTimes(1);
   });
 
   it('卸载时释放失败（未解决恢复 fork）：如实上报 onCloseError、运行时保留可恢复、缓存不释放；解决后经 handle.close() 重试成功（第三十轮严重 6）', async () => {
