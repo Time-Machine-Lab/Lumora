@@ -15,15 +15,19 @@ const REQUIRED_RESERVED_SHORTCUTS = [
   'Ctrl+Shift+B',
   'Ctrl+Shift+O',
   'Ctrl+Shift+D',
+  'Alt+E',
   'Alt+F',
   'Alt+Space',
   'Cmd+D',
+  'Cmd+Alt+B',
   'Cmd+H',
   'Cmd+M',
   'Cmd+Space',
   'Cmd+Shift+B',
   'Cmd+Shift+D',
   'Cmd+Shift+P',
+  'Cmd+Shift+[',
+  'Cmd+Shift+]',
 ] as const;
 
 describe('recording shortcut policy', () => {
@@ -62,21 +66,29 @@ describe('recording shortcut policy', () => {
   });
 
   it('reports and refuses every required high-risk fixture without writing storage', () => {
-    for (const value of REQUIRED_RESERVED_SHORTCUTS) {
-      const shortcut = parseShortcut(value);
-      expect(shortcut, value).not.toBeNull();
-      expect(validateRecordingShortcut(shortcut!), value).toMatch(/浏览器/);
+    const localStorageSetItem = vi.spyOn(Storage.prototype, 'setItem');
+    try {
+      for (const value of REQUIRED_RESERVED_SHORTCUTS) {
+        const shortcut = parseShortcut(value);
+        expect(shortcut, value).not.toBeNull();
+        expect(validateRecordingShortcut(shortcut!), value).toMatch(/浏览器/);
 
-      const storage = {
-        getItem: vi.fn(() => null),
-        setItem: vi.fn(),
-      };
-      expect(saveRecordingShortcut(shortcut!, storage), value).toBe(false);
-      expect(storage.setItem, value).not.toHaveBeenCalled();
+        const storage = {
+          getItem: vi.fn(() => null),
+          setItem: vi.fn(),
+        };
+        expect(saveRecordingShortcut(shortcut!, storage), value).toBe(false);
+        expect(storage.setItem, value).not.toHaveBeenCalled();
 
+        localStorage.removeItem(RECORDING_SHORTCUT_STORAGE_KEY);
+        localStorageSetItem.mockClear();
+        expect(saveRecordingShortcut(shortcut!), value).toBe(false);
+        expect(localStorageSetItem, value).not.toHaveBeenCalled();
+        expect(localStorage.getItem(RECORDING_SHORTCUT_STORAGE_KEY), value).toBeNull();
+      }
+    } finally {
+      localStorageSetItem.mockRestore();
       localStorage.removeItem(RECORDING_SHORTCUT_STORAGE_KEY);
-      expect(saveRecordingShortcut(shortcut!), value).toBe(false);
-      expect(localStorage.getItem(RECORDING_SHORTCUT_STORAGE_KEY), value).toBeNull();
     }
   });
 

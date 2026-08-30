@@ -9,6 +9,7 @@ import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
 import type { ProjectStorage } from '../src/persistence/project-storage';
 import { ContentCache } from '../src/components/editor/content-cache';
 import { CommandPalette } from '../src/components/CommandPalette';
+import { RECORDING_SHORTCUT_STORAGE_KEY } from '../src/components/editor/recording-shortcut';
 import { TimelineRecorder } from '../src/components/editor/timeline-recorder';
 import * as previewExport from '../src/export/preview-export';
 
@@ -79,6 +80,17 @@ const badPlugin: PluginDescriptor = {
     entry: './dist/index.js',
   } as unknown as Manifest,
 };
+
+const EXPORT_RECORDING_SHORTCUT_CASES = [
+  { shortcut: 'default Shift+R', saved: null, target: 'body', running: false },
+  { shortcut: 'default Shift+R', saved: null, target: 'non-native', running: false },
+  { shortcut: 'default Shift+R', saved: null, target: 'body', running: true },
+  { shortcut: 'default Shift+R', saved: null, target: 'non-native', running: true },
+  { shortcut: 'custom Ctrl+Alt+R', saved: 'Ctrl+Alt+R', target: 'body', running: false },
+  { shortcut: 'custom Ctrl+Alt+R', saved: 'Ctrl+Alt+R', target: 'non-native', running: false },
+  { shortcut: 'custom Ctrl+Alt+R', saved: 'Ctrl+Alt+R', target: 'body', running: true },
+  { shortcut: 'custom Ctrl+Alt+R', saved: 'Ctrl+Alt+R', target: 'non-native', running: true },
+] as const;
 
 describe('LumoraStudio', () => {
   it('opens and closes the export workspace without changing the current project', async () => {
@@ -230,6 +242,93 @@ describe('LumoraStudio', () => {
     expect(editor.getSelection()).toEqual(['sample-camera']);
     expect(screen.getByTestId('timeline-play')).toHaveTextContent(playBefore ?? '');
   });
+
+  it.each(EXPORT_RECORDING_SHORTCUT_CASES)(
+    'isolates $shortcut from $target while export running=$running',
+    async ({ saved, target: targetKind, running }) => {
+      const previousShortcut = localStorage.getItem(RECORDING_SHORTCUT_STORAGE_KEY);
+      if (saved) localStorage.setItem(RECORDING_SHORTCUT_STORAGE_KEY, saved);
+      else localStorage.removeItem(RECORDING_SHORTCUT_STORAGE_KEY);
+
+      let finishExport: ((blob: Blob) => void) | undefined;
+      const supportSpy = running
+        ? vi.spyOn(previewExport, 'detectWebmSupport').mockResolvedValue({
+            supported: true,
+            mimeType: 'video/webm;codecs=vp9',
+          })
+        : null;
+      const exportSpy = running
+        ? vi.spyOn(previewExport, 'recordPreviewWebm').mockImplementation(
+            () => new Promise<Blob>((resolve) => {
+              finishExport = resolve;
+            }),
+          )
+        : null;
+      const startRecording = vi.spyOn(TimelineRecorder.prototype, 'start');
+      const stopRecording = vi.spyOn(TimelineRecorder.prototype, 'stop');
+
+      try {
+        const handle = createRef<LumoraStudioHandle>();
+        const project = createSampleProject(
+          `lumora://export-recording-shortcut-${targetKind}-${running ? 'running' : 'idle'}-${saved ? 'custom' : 'default'}`,
+          'Export recording shortcut isolation',
+        );
+        render(<LumoraStudio ref={handle} initialProject={project} />);
+        await waitFor(() => expect(handle.current?.runtime.getProject()?.uri).toBe(project.uri));
+        act(() => handle.current!.runtime.editor.setSelection(['sample-camera']));
+        fireEvent.click(screen.getByTestId('open-export-workspace'));
+        await screen.findByTestId('export-workspace');
+
+        if (running) {
+          const exportButton = await screen.findByRole('button', { name: '导出 WebM' });
+          await waitFor(() => expect(exportButton).toBeEnabled());
+          fireEvent.click(exportButton);
+          await screen.findByRole('button', { name: '取消导出' });
+        }
+
+        const target = targetKind === 'body'
+          ? document.body
+          : document.createElement('div');
+        if (targetKind === 'non-native') screen.getByTestId('lumora-studio').append(target);
+        const before = {
+          record: screen.getByTestId('timeline-record').textContent,
+          play: screen.getByTestId('timeline-play').textContent,
+          time: screen.getByTestId('timeline-time').textContent,
+          frame: screen.getByTestId('timeline-frame').textContent,
+        };
+        const key = saved
+          ? { key: 'r', code: 'KeyR', ctrlKey: true, altKey: true }
+          : { key: 'R', code: 'KeyR', shiftKey: true };
+        let defaultPreventedAtTarget = false;
+        target.addEventListener('keydown', (event) => {
+          defaultPreventedAtTarget = event.defaultPrevented;
+        }, { once: true });
+
+        expect(fireEvent.keyDown(target, key)).toBe(false);
+
+        expect(defaultPreventedAtTarget).toBe(true);
+        expect(screen.queryByTestId('overwrite-confirm')).not.toBeInTheDocument();
+        expect(startRecording).not.toHaveBeenCalled();
+        expect(stopRecording).not.toHaveBeenCalled();
+        expect({
+          record: screen.getByTestId('timeline-record').textContent,
+          play: screen.getByTestId('timeline-play').textContent,
+          time: screen.getByTestId('timeline-time').textContent,
+          frame: screen.getByTestId('timeline-frame').textContent,
+        }).toEqual(before);
+      } finally {
+        await act(async () => {
+          finishExport?.(new Blob(['webm'], { type: 'video/webm' }));
+        });
+        supportSpy?.mockRestore();
+        exportSpy?.mockRestore();
+        startRecording.mockRestore();
+        stopRecording.mockRestore();
+        if (previousShortcut === null) localStorage.removeItem(RECORDING_SHORTCUT_STORAGE_KEY);
+        else localStorage.setItem(RECORDING_SHORTCUT_STORAGE_KEY, previousShortcut);
+      }
+    },
+  );
 
   it('keeps the editor selection when Escape is pressed while export is running', async () => {
     let finishRecording: ((blob: Blob) => void) | undefined;

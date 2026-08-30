@@ -19,7 +19,17 @@ Each project runs the same acceptance scenarios:
 2. Accepting `beforeunload` during an active recording loses the uncommitted samples and restores the pre-recording IndexedDB/rendered timeline fingerprint.
 3. A stopped and saved recording closes without a warning, then restores the same track IDs, target paths, keyframe times, and persisted keyframe values after reopening.
 
-The independent unit fixture additionally rejects and refuses to persist `Ctrl+Shift+B`, `Ctrl+Shift+O`, `Ctrl+Shift+D`, `Alt+F`, `Alt+Space`, `Cmd+D`, `Cmd+H`, `Cmd+M`, `Cmd+Space`, `Cmd+Shift+B`, `Cmd+Shift+D`, and `Cmd+Shift+P` without deriving expectations from the production policy table.
+The independent unit fixture additionally rejects and refuses to persist `Ctrl+Shift+B`, `Ctrl+Shift+O`, `Ctrl+Shift+D`, `Alt+E`, `Alt+F`, `Alt+Space`, `Cmd+D`, `Cmd+Alt+B`, `Cmd+H`, `Cmd+M`, `Cmd+Space`, `Cmd+Shift+B`, `Cmd+Shift+D`, `Cmd+Shift+P`, `Cmd+Shift+[`, and `Cmd+Shift+]` without deriving expectations from the production policy table. Every case asserts an explicit validation error, `save=false`, zero storage-adapter writes, and zero `localStorage` writes.
+
+## Reserved Alias Audit
+
+The policy pairs the browser actions that expose more than one documented or review-required shortcut so an alias cannot bypass validation:
+
+- Chrome/Windows browser menu: `Alt+E` and `Alt+F`.
+- Chrome/macOS bookmark manager: `Cmd+Alt+B`, alongside the bookmark-bar shortcut `Cmd+Shift+B`.
+- Safari/macOS previous and next tab: `Cmd+Shift+[` and `Cmd+Shift+]`; Safari's official shortcut guide also lists `Control+Shift+Tab` and `Control+Tab`, which are already rejected by the generic `Ctrl+Tab` / `Ctrl+Shift+Tab` policy entries.
+
+Safari's official macOS shortcut guide was reachable during this audit and confirms the tab aliases above. The Chrome Help shortcut page was not reachable from this environment after two attempts, so the two Chrome aliases are covered against the review-required matrix and independent regression fixture rather than claimed as a live official-page verification.
 
 ## Setup Note
 

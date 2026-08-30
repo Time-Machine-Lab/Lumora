@@ -76,6 +76,13 @@ function isStudioEditingShortcut(event: KeyboardEvent): boolean {
   );
 }
 
+function isExportIsolatedShortcut(
+  event: KeyboardEvent,
+  recordingShortcut: KeyboardShortcut,
+): boolean {
+  return isStudioEditingShortcut(event) || matchesShortcut(event, recordingShortcut);
+}
+
 export interface LumoraStudioProps {
   /** 挂载时注册的插件描述符；注册按声明顺序串行执行 */
   plugins?: PluginDescriptor[];
@@ -459,7 +466,10 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     const root = rootRef.current;
     if (!root) return;
     const onKeyDownCapture = (event: KeyboardEvent) => {
-      if (!isKeyboardEventForStudio(root, event) || !isStudioEditingShortcut(event)) return;
+      if (
+        !isKeyboardEventForStudio(root, event) ||
+        !isExportIsolatedShortcut(event, recordingShortcutRef.current)
+      ) return;
       if (!preservesNativeKeyboardSemantics(event)) event.preventDefault();
     };
     // Mark editor-only shortcuts before viewport listeners can consume drive keys.
@@ -479,7 +489,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     const unregisterRoot = registerStudioKeyboardRoot(root);
     const onKey = (event: KeyboardEvent) => {
       if (!isKeyboardEventForStudio(root, event)) return;
-      if (exportOpen && isStudioEditingShortcut(event)) {
+      if (exportOpen && isExportIsolatedShortcut(event, recordingShortcutRef.current)) {
         if (preservesNativeKeyboardSemantics(event)) return;
         event.preventDefault();
         event.stopImmediatePropagation();
