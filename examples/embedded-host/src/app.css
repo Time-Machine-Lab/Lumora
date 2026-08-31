@@ -20,12 +20,19 @@ body {
 }
 
 .host {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  grid-template-rows: auto minmax(0, 1fr);
   height: 100dvh;
 }
 
+.host__inertable-root {
+  display: contents;
+}
+
 .host__bar {
+  grid-column: 1 / -1;
+  grid-row: 1;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -65,6 +72,8 @@ body {
 }
 
 .host__layout {
+  grid-column: 1;
+  grid-row: 2;
   display: flex;
   flex: 1;
   min-height: 0;
@@ -93,6 +102,8 @@ body {
 }
 
 .host__log {
+  grid-column: 2;
+  grid-row: 2;
   width: 340px;
   flex-shrink: 0;
   overflow: auto;
@@ -131,6 +142,11 @@ body {
 /* 窄屏：日志面板移到 Studio 下方，Studio 获得完整宽度（Studio 自身
    有 ≤900px 的三栏纵向堆叠规则，容器过窄时其内部布局无法成立） */
 @media (max-width: 900px) {
+  .host {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr) auto;
+  }
+
   .host__bar {
     min-height: 44px;
     padding: 5px 8px;
@@ -162,6 +178,8 @@ body {
   }
 
   .host__log {
+    grid-column: 1;
+    grid-row: 3;
     display: none;
     width: 100%;
     height: min(180px, 32dvh);
@@ -225,17 +243,18 @@ body {
 }
 
 @media (max-width: 900px) and (max-height: 500px) {
-  .host__layout {
+  .host {
     position: relative;
   }
 
   .host__log {
-    position: absolute;
+    position: fixed;
     z-index: 80;
-    top: 0;
+    top: 44px;
+    bottom: 0;
     right: 0;
     width: min(260px, 40vw);
-    height: 100%;
+    height: auto;
     padding-block: 6px;
     border-top: none;
     border-left: 1px solid #2a2e3a;

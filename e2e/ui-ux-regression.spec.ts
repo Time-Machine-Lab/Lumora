@@ -386,7 +386,7 @@ test('667x375 expanded host log keeps a complete keyframe target and shot row in
   await expect(log).toBeVisible();
   await expect(log).toHaveAttribute('role', 'dialog');
   await expect(log).toHaveAttribute('aria-modal', 'true');
-  await expect(page.getByTestId('host-studio-region')).toHaveAttribute('inert', '');
+  await expect(page.getByTestId('host-inertable-root')).toHaveAttribute('inert', '');
   await expect(close).toBeFocused();
   const closeBox = await close.boundingBox();
   expect(closeBox?.width ?? 0).toBeGreaterThanOrEqual(44);
@@ -498,7 +498,7 @@ test('667x375 expanded host log keeps a complete keyframe target and shot row in
 
   await page.keyboard.press('Escape');
   await expect(log).toBeHidden();
-  await expect(page.getByTestId('host-studio-region')).not.toHaveAttribute('inert', '');
+  await expect(page.getByTestId('host-inertable-root')).not.toHaveAttribute('inert', '');
   await expect(toggle).toBeFocused();
   expect(await page.evaluate(() => {
     const shot = document.querySelector<HTMLElement>('[data-testid^="shot-block-"]')!;
@@ -513,11 +513,11 @@ test('667x375 host log modal contains all host focus and keeps global Escape ava
   const toggle = page.getByTestId('host-log-toggle');
   const log = page.getByTestId('host-event-log');
   const close = page.getByTestId('host-log-close');
-  const header = page.locator('.host__bar');
+  const background = page.getByTestId('host-inertable-root');
   const reopen = page.getByTestId('reopen-last-export');
   await toggle.click();
   await expect(close).toBeFocused();
-  await expect(header).toHaveAttribute('inert', '');
+  await expect(background).toHaveAttribute('inert', '');
 
   const eventCount = await page.getByTestId('event-log').locator('li').count();
   const reopenBox = await reopen.boundingBox();
@@ -538,7 +538,7 @@ test('667x375 host log modal contains all host focus and keeps global Escape ava
   await page.mouse.click(viewportBox!.x + 20, viewportBox!.y + 20);
   await page.keyboard.press('Escape');
   await expect(log).toBeHidden();
-  await expect(header).not.toHaveAttribute('inert', '');
+  await expect(background).not.toHaveAttribute('inert', '');
   await expect(toggle).toBeFocused();
 });
 
@@ -724,6 +724,38 @@ test('two Studio instances route Escape to the top portal only', async ({ page }
 
   await expect(page.getByRole('dialog', { name: '插件管理' })).toHaveCount(1);
   await expect(lowerDialog).toBeVisible();
+});
+
+test('host log modal removes both Studio instances from interaction and the AX tree', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'CDP accessibility assertions require Chromium');
+  await page.setViewportSize({ width: 667, height: 375 });
+  await page.goto('/?fixture=dual-studio');
+  const studios = page.getByTestId('lumora-studio');
+  await expect(studios).toHaveCount(2);
+  await page.getByTestId('host-log-toggle').click();
+
+  const dialog = page.getByTestId('host-event-log');
+  const close = page.getByTestId('host-log-close');
+  const secondProjectButton = studios.nth(1).getByTestId('project-menu');
+  await expect(dialog).toHaveAttribute('aria-modal', 'true');
+  await expect(close).toBeFocused();
+  await expect(page.getByTestId('host-inertable-root')).toHaveAttribute('inert', '');
+  expect.soft(await secondProjectButton.evaluate((button) => button.closest('[inert]') !== null)).toBe(true);
+
+  const cdp = await page.context().newCDPSession(page);
+  const { root } = await cdp.send('DOM.getDocument');
+  const { nodeId } = await cdp.send('DOM.querySelector', {
+    nodeId: root.nodeId,
+    selector: '[data-testid="dual-studio-fixture"] [data-testid="project-menu"]',
+  });
+  const { nodes } = await cdp.send('Accessibility.getPartialAXTree', { nodeId, fetchRelatives: false });
+  expect.soft(nodes[0]?.ignored).toBe(true);
+  expect.soft(nodes[0]?.ignoredReasons?.some((reason) => reason.name === 'inertElement')).toBe(true);
+
+  await secondProjectButton.evaluate((button: HTMLButtonElement) => button.click());
+  await expect.soft(studios.nth(1).getByTestId('project-menu-dropdown')).toBeHidden();
+  await expect(dialog).toBeVisible();
+  await expect(close).toBeFocused();
 });
 
 test('overwrite confirmation participates in the shared modal stack below a later command palette', async ({ page }) => {

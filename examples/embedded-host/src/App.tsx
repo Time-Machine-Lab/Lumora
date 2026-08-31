@@ -266,14 +266,22 @@ export default function App() {
       event.stopPropagation();
       focusDialog();
     };
+    const handleDocumentClick = (event: MouseEvent) => {
+      if (logDialogRef.current?.contains(event.target as Node)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      focusDialog();
+    };
     document.addEventListener('keydown', handleDocumentKeyDown, true);
     document.addEventListener('focusin', handleDocumentFocusIn, true);
     document.addEventListener('pointerdown', handleDocumentPointerDown, true);
+    document.addEventListener('click', handleDocumentClick, true);
     return () => {
       cancelAnimationFrame(frame);
       document.removeEventListener('keydown', handleDocumentKeyDown, true);
       document.removeEventListener('focusin', handleDocumentFocusIn, true);
       document.removeEventListener('pointerdown', handleDocumentPointerDown, true);
+      document.removeEventListener('click', handleDocumentClick, true);
     };
   }, [closeLog, logOpen]);
 
@@ -346,105 +354,107 @@ export default function App() {
 
   return (
     <div className="host">
-      <header className="host__bar" inert={logOpen || undefined}>
-        <h1>Lumora 嵌入宿主示例</h1>
-        <div className="host__actions">
-          <button
-            ref={logToggleRef}
-            type="button"
-            className="host__log-toggle"
-            data-testid="host-log-toggle"
-            aria-controls="host-event-log"
-            aria-expanded={logOpen}
-            onClick={() => {
-              if (logOpen) closeLog();
-              else setLogOpen(true);
-            }}
-          >
-            {logOpen ? '收起日志' : '事件日志'}
-          </button>
-          <button
-            type="button"
-            data-testid="reopen-last-export"
-            disabled={closing}
-            onClick={() => {
-              const raw = localStorage.getItem('lumora.demo.last-export');
-              if (!raw) {
-                appendLog('没有可重开的导出（请先在 Studio 中导出场景）');
-                return;
-              }
-              try {
-                const project = JSON.parse(raw);
-                handleRef.current?.runtime.openProject(project);
-              } catch {
-                appendLog('重开失败：导出数据无法解析');
-              }
-            }}
-          >
-            重开上次导出（新运行时）
-          </button>
-          <button type="button" data-testid="studio-mount-toggle" disabled={closing} onClick={toggleMount}>
-            {closing ? '正在释放资源…' : mounted ? '卸载 Studio（释放资源）' : '重新挂载 Studio'}
-          </button>
-        </div>
-      </header>
-      <div className="host__layout">
-        <div className="host__studio-region" data-testid="host-studio-region" inert={logOpen || undefined}>
-          {mounted ? (
-            <LumoraStudio
-              ref={handleRef}
-              plugins={PLUGINS}
-              hostVersion="0.1.0"
-              storage={STORAGE}
-              pluginSettingsNamespace="embedded-host"
-              className="host__studio"
-              initialProject={INITIAL_REVIEW_PROJECT}
-            />
-          ) : (
-            <div className="host__placeholder" data-testid="studio-placeholder">
-              Studio 已卸载 —— WebGL 场景、插件贡献项与事件订阅均已释放
-            </div>
-          )}
-        </div>
-        <aside
-          ref={logDialogRef}
-          id="host-event-log"
-          className="host__log"
-          data-testid="host-event-log"
-          data-open={logOpen || undefined}
-          role={logOpen ? 'dialog' : undefined}
-          aria-modal={logOpen || undefined}
-          tabIndex={logOpen ? -1 : 0}
-          aria-labelledby="host-event-log-heading"
-          onKeyDown={logOpen ? handleLogKeyDown : undefined}
-        >
-          <div className="host__log-header">
-            <h2 id="host-event-log-heading">宿主事件日志</h2>
-            {logOpen && (
-              <button
-                type="button"
-                className="host__log-close"
-                data-testid="host-log-close"
-                aria-label="关闭事件日志"
-                title="关闭事件日志"
-                onClick={closeLog}
-              >
-                <X aria-hidden="true" />
-              </button>
+      <div className="host__inertable-root" data-testid="host-inertable-root" inert={logOpen || undefined}>
+        <header className="host__bar">
+          <h1>Lumora 嵌入宿主示例</h1>
+          <div className="host__actions">
+            <button
+              ref={logToggleRef}
+              type="button"
+              className="host__log-toggle"
+              data-testid="host-log-toggle"
+              aria-controls="host-event-log"
+              aria-expanded={logOpen}
+              onClick={() => {
+                if (logOpen) closeLog();
+                else setLogOpen(true);
+              }}
+            >
+              {logOpen ? '收起日志' : '事件日志'}
+            </button>
+            <button
+              type="button"
+              data-testid="reopen-last-export"
+              disabled={closing}
+              onClick={() => {
+                const raw = localStorage.getItem('lumora.demo.last-export');
+                if (!raw) {
+                  appendLog('没有可重开的导出（请先在 Studio 中导出场景）');
+                  return;
+                }
+                try {
+                  const project = JSON.parse(raw);
+                  handleRef.current?.runtime.openProject(project);
+                } catch {
+                  appendLog('重开失败：导出数据无法解析');
+                }
+              }}
+            >
+              重开上次导出（新运行时）
+            </button>
+            <button type="button" data-testid="studio-mount-toggle" disabled={closing} onClick={toggleMount}>
+              {closing ? '正在释放资源…' : mounted ? '卸载 Studio（释放资源）' : '重新挂载 Studio'}
+            </button>
+          </div>
+        </header>
+        <div className="host__layout">
+          <div className="host__studio-region" data-testid="host-studio-region">
+            {mounted ? (
+              <LumoraStudio
+                ref={handleRef}
+                plugins={PLUGINS}
+                hostVersion="0.1.0"
+                storage={STORAGE}
+                pluginSettingsNamespace="embedded-host"
+                className="host__studio"
+                initialProject={INITIAL_REVIEW_PROJECT}
+              />
+            ) : (
+              <div className="host__placeholder" data-testid="studio-placeholder">
+                Studio 已卸载 —— WebGL 场景、插件贡献项与事件订阅均已释放
+              </div>
             )}
           </div>
-          <ul data-testid="event-log">
-            {log.map((line, index) => (
-              <li key={`${index}-${line}`}>{line}</li>
-            ))}
-          </ul>
-        </aside>
-      </div>
-      {DUAL_STUDIO_FIXTURE && (
-        <div className="host__fixture-studio" data-testid="dual-studio-fixture">
-          <LumoraStudio hostVersion="0.1.0" />
         </div>
-      )}
+        {DUAL_STUDIO_FIXTURE && (
+          <div className="host__fixture-studio" data-testid="dual-studio-fixture">
+            <LumoraStudio hostVersion="0.1.0" />
+          </div>
+        )}
+      </div>
+      <aside
+        ref={logDialogRef}
+        id="host-event-log"
+        className="host__log"
+        data-testid="host-event-log"
+        data-open={logOpen || undefined}
+        role={logOpen ? 'dialog' : undefined}
+        aria-modal={logOpen || undefined}
+        tabIndex={logOpen ? -1 : 0}
+        aria-labelledby="host-event-log-heading"
+        onKeyDown={logOpen ? handleLogKeyDown : undefined}
+      >
+        <div className="host__log-header">
+          <h2 id="host-event-log-heading">宿主事件日志</h2>
+          {logOpen && (
+            <button
+              type="button"
+              className="host__log-close"
+              data-testid="host-log-close"
+              aria-label="关闭事件日志"
+              title="关闭事件日志"
+              onClick={closeLog}
+            >
+              <X aria-hidden="true" />
+            </button>
+          )}
+        </div>
+        <ul data-testid="event-log">
+          {log.map((line, index) => (
+            <li key={`${index}-${line}`}>{line}</li>
+          ))}
+        </ul>
+      </aside>
     </div>
   );
 }
