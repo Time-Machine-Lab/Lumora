@@ -176,7 +176,7 @@ const DEBUG_FULL = new URLSearchParams(window.location.search).get('debug') === 
 /** 本地存储后端选择：?storage=opfs 使用 OPFS，缺省 IndexedDB（持久化门面可切换，TML-53 范围项） */
 const STORAGE = new URLSearchParams(window.location.search).get('storage') === 'opfs' ? 'opfs' : 'indexeddb';
 const DUAL_STUDIO_FIXTURE = new URLSearchParams(window.location.search).get('fixture') === 'dual-studio';
-const ROUND3_REVIEW_FIXTURE = new URLSearchParams(window.location.search).get('fixture');
+const REVIEW_FIXTURE = new URLSearchParams(window.location.search).get('fixture');
 
 function createRound3ReviewProject(dense = false): Project {
   const project = createSampleProject('lumora://tml-563-round3', 'TML-563 60fps 回归');
@@ -201,6 +201,25 @@ function createRound3ReviewProject(dense = false): Project {
   };
 }
 
+function createTimelineEdgeReviewProject(): Project {
+  const project = createSampleProject('lumora://tml-563-timeline-edges', 'TML-563 timeline edge cases');
+  const [short, long, late] = project.shots;
+  return {
+    ...project,
+    shots: [
+      { ...late!, id: 'review-late', name: 'Late shot', startTime: 2, endTime: 3 },
+      { ...short!, id: 'review-short', name: 'Short overlap', startTime: 0, endTime: 1 },
+      { ...long!, id: 'review-long', name: 'Long overlap', startTime: 0, endTime: 2 },
+    ],
+  };
+}
+
+const INITIAL_REVIEW_PROJECT = REVIEW_FIXTURE === 'tml-563-timeline-edges'
+  ? createTimelineEdgeReviewProject()
+  : REVIEW_FIXTURE?.startsWith('tml-563-round3')
+    ? createRound3ReviewProject(REVIEW_FIXTURE === 'tml-563-round3-dense')
+    : undefined;
+
 export default function App() {
   const [mounted, setMounted] = useState(true);
   // 第三十一轮严重 3：卸载进行中（close() 未 settle）时禁用触发按钮 ——
@@ -222,11 +241,41 @@ export default function App() {
 
   useEffect(() => {
     if (!logOpen) return;
-    const frame = requestAnimationFrame(() => {
-      logDialogRef.current?.querySelector<HTMLButtonElement>('[data-testid="host-log-close"]')?.focus();
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [logOpen]);
+    const focusDialog = () => {
+      const dialog = logDialogRef.current;
+      if (!dialog || dialog.contains(document.activeElement)) return;
+      dialog.querySelector<HTMLButtonElement>('[data-testid="host-log-close"]')?.focus();
+    };
+    const frame = requestAnimationFrame(focusDialog);
+    const handleDocumentKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        closeLog();
+      } else if (event.key === 'Tab' && !logDialogRef.current?.contains(event.target as Node)) {
+        event.preventDefault();
+        focusDialog();
+      }
+    };
+    const handleDocumentFocusIn = (event: FocusEvent) => {
+      if (!logDialogRef.current?.contains(event.target as Node)) focusDialog();
+    };
+    const handleDocumentPointerDown = (event: PointerEvent) => {
+      if (logDialogRef.current?.contains(event.target as Node)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      focusDialog();
+    };
+    document.addEventListener('keydown', handleDocumentKeyDown, true);
+    document.addEventListener('focusin', handleDocumentFocusIn, true);
+    document.addEventListener('pointerdown', handleDocumentPointerDown, true);
+    return () => {
+      cancelAnimationFrame(frame);
+      document.removeEventListener('keydown', handleDocumentKeyDown, true);
+      document.removeEventListener('focusin', handleDocumentFocusIn, true);
+      document.removeEventListener('pointerdown', handleDocumentPointerDown, true);
+    };
+  }, [closeLog, logOpen]);
 
   const handleLogKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.key === 'Escape') {
@@ -297,7 +346,7 @@ export default function App() {
 
   return (
     <div className="host">
-      <header className="host__bar">
+      <header className="host__bar" inert={logOpen || undefined}>
         <h1>Lumora 嵌入宿主示例</h1>
         <div className="host__actions">
           <button
@@ -349,9 +398,7 @@ export default function App() {
               storage={STORAGE}
               pluginSettingsNamespace="embedded-host"
               className="host__studio"
-              initialProject={ROUND3_REVIEW_FIXTURE?.startsWith('tml-563-round3')
-                ? createRound3ReviewProject(ROUND3_REVIEW_FIXTURE === 'tml-563-round3-dense')
-                : undefined}
+              initialProject={INITIAL_REVIEW_PROJECT}
             />
           ) : (
             <div className="host__placeholder" data-testid="studio-placeholder">

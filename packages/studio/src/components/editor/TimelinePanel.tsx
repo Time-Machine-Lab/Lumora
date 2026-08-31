@@ -309,20 +309,27 @@ export function TimelinePanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- missing 由 deps 覆盖推导
   }, [project, thumbs, timeline, captureRef, captureReady, state.playing, state.recording, editor, thumbGeneration]);
 
+  const orderedShots = useMemo(() => project.shots
+    .map((shot, sourceIndex) => ({ shot, sourceIndex }))
+    .sort((a, b) => a.shot.startTime - b.shot.startTime
+      || a.shot.endTime - b.shot.endTime
+      || a.sourceIndex - b.sourceIndex)
+    .map(({ shot }) => shot), [project.shots]);
+
   const moveShot = useCallback(
     (index: number, direction: -1 | 1) => {
-      const ids = project.shots.map((s) => s.id);
+      const ids = orderedShots.map((shot) => shot.id);
       const swapIndex = index + direction;
       if (swapIndex < 0 || swapIndex >= ids.length) return;
       const swapped = [...ids];
       [swapped[index]!, swapped[swapIndex]!] = [swapped[swapIndex]!, swapped[index]!];
       editor.reorderShots(swapped);
     },
-    [editor, project.shots],
+    [editor, orderedShots],
   );
 
-  const selectedShotIndex = project.shots.findIndex((shot) => shot.id === selectedShotId);
-  const selectedShot = selectedShotIndex >= 0 ? project.shots[selectedShotIndex]! : null;
+  const selectedShotIndex = orderedShots.findIndex((shot) => shot.id === selectedShotId);
+  const selectedShot = selectedShotIndex >= 0 ? orderedShots[selectedShotIndex]! : null;
 
   const keyframeLayouts = useMemo(() => new Map(project.tracks.map((track) => {
     const sorted = track.keyframes
@@ -358,20 +365,15 @@ export function TimelinePanel({
   // Preserve time-proportional strips while packing minimum-size selection targets without overlap.
   const shotLayouts = useMemo(() => {
     let nextTargetLeft = 0;
-    return project.shots
-      .map((shot, sourceIndex) => ({ shot, sourceIndex }))
-      .sort((a, b) => a.shot.startTime - b.shot.startTime
-        || a.shot.endTime - b.shot.endTime
-        || a.sourceIndex - b.sourceIndex)
-      .map(({ shot }) => {
-        const visualLeft = shot.startTime * zoom;
-        const visualWidth = Math.max(3, (shot.endTime - shot.startTime) * zoom);
-        const width = Math.max(SHOT_TARGET_SIZE, visualWidth);
-        const left = Math.max(visualLeft, nextTargetLeft);
-        nextTargetLeft = left + width;
-        return { shot, left, width, visualLeft, visualWidth };
-      });
-  }, [project.shots, zoom]);
+    return orderedShots.map((shot) => {
+      const visualLeft = shot.startTime * zoom;
+      const visualWidth = Math.max(3, (shot.endTime - shot.startTime) * zoom);
+      const width = Math.max(SHOT_TARGET_SIZE, visualWidth);
+      const left = Math.max(visualLeft, nextTargetLeft);
+      nextTargetLeft = left + width;
+      return { shot, left, width, visualLeft, visualWidth };
+    });
+  }, [orderedShots, zoom]);
 
   const toggleTrackDisabled = useCallback(
     (trackId: string, disabled: boolean) => {
@@ -720,7 +722,7 @@ export function TimelinePanel({
                     <button
                       type="button"
                       className="lumora-timeline__shot-move"
-                      disabled={selectedShotIndex >= project.shots.length - 1}
+                      disabled={selectedShotIndex >= orderedShots.length - 1}
                       data-testid={`shot-move-right-${selectedShot.id}`}
                       aria-label={`向后移动分镜：${selectedShot.name}`}
                       onClick={() => moveShot(selectedShotIndex, 1)}

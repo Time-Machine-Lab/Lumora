@@ -232,6 +232,67 @@ test('375 adjacent 0.1s shots keep disjoint 44px targets at fit, zoom-out, and m
   await expectFirstTwoShotTargetsToBeDisjoint(page);
 });
 
+test('out-of-order imported shots use chronological action boundaries and reorder order', async ({ page }) => {
+  await page.goto('/?fixture=tml-563-timeline-edges');
+  const shots = page.locator('[data-testid^="shot-block-review-"]');
+  await expect(shots).toHaveCount(3);
+  await expect.poll(() => shots.evaluateAll((elements) => elements.map((element) => element.getAttribute('data-testid'))))
+    .toEqual([
+      'shot-block-review-short',
+      'shot-block-review-long',
+      'shot-block-review-late',
+    ]);
+
+  await page.getByTestId('shot-block-review-short').click();
+  await expect(page.getByTestId('shot-move-left-review-short')).toBeDisabled();
+  await expect(page.getByTestId('shot-move-right-review-short')).toBeEnabled();
+
+  await page.getByTestId('shot-block-review-late').click();
+  await expect(page.getByTestId('shot-move-left-review-late')).toBeEnabled();
+  await expect(page.getByTestId('shot-move-right-review-late')).toBeDisabled();
+
+  await page.getByTestId('shot-block-review-long').click();
+  await page.getByTestId('shot-move-left-review-long').click();
+  await expect.poll(() => shots.evaluateAll((elements) => elements.map((element) => element.getAttribute('data-testid'))))
+    .toEqual([
+      'shot-block-review-long',
+      'shot-block-review-short',
+      'shot-block-review-late',
+    ]);
+  await expect(page.getByTestId('shot-duration-review-long')).toHaveCSS('left', '0px');
+  await expect(page.getByTestId('shot-move-left-review-long')).toBeDisabled();
+});
+
+test('selected overlapping shot duration remains visibly accented', async ({ page }) => {
+  await page.goto('/?fixture=tml-563-timeline-edges');
+  await page.getByTestId('shot-block-review-short').click();
+  await page.getByTestId('timeline-body').evaluate((body) => {
+    body.scrollLeft = 0;
+    body.scrollTop = body.scrollHeight;
+  });
+  const selected = page.getByTestId('shot-duration-review-short');
+  const covering = page.getByTestId('shot-duration-review-long');
+  const metrics = await selected.evaluate((element, coveringElement) => {
+    const rect = element.getBoundingClientRect();
+    const coveringRect = (coveringElement as HTMLElement).getBoundingClientRect();
+    const labelRect = document.querySelector<HTMLElement>('.lumora-timeline__label--shots')!.getBoundingClientRect();
+    const sampleX = Math.min(rect.right - 2, Math.max(rect.left + 2, labelRect.right + 2));
+    const color = getComputedStyle(element).backgroundColor.match(/\d+/g)!.slice(0, 3).map(Number);
+    return {
+      x: sampleX,
+      y: rect.top + rect.height / 2,
+      color,
+      overlap: Math.max(0, Math.min(rect.right, coveringRect.right) - Math.max(rect.left, coveringRect.left)),
+      sampleInsideSelected: sampleX >= rect.left && sampleX < rect.right,
+    };
+  }, await covering.elementHandle());
+  expect(metrics.overlap).toBeGreaterThan(0);
+  expect(metrics.sampleInsideSelected).toBe(true);
+
+  const image = decodePng(await page.screenshot({ animations: 'disabled' }));
+  expect(pngPixel(image, Math.floor(metrics.x), Math.floor(metrics.y)).slice(0, 3)).toEqual(metrics.color);
+});
+
 test('375 exact 60fps adjacent keyframes have disjoint hitboxes and own both visible centers', async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 667 });
   await page.goto('/?fixture=tml-563-round3');
@@ -445,6 +506,40 @@ test('667x375 expanded host log keeps a complete keyframe target and shot row in
     return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
       ?.closest('[data-testid^="shot-block-"]') === shot;
   })).toBe(true);
+});
+
+test('667x375 host log modal contains all host focus and keeps global Escape available', async ({ page }) => {
+  await page.setViewportSize({ width: 667, height: 375 });
+  const toggle = page.getByTestId('host-log-toggle');
+  const log = page.getByTestId('host-event-log');
+  const close = page.getByTestId('host-log-close');
+  const header = page.locator('.host__bar');
+  const reopen = page.getByTestId('reopen-last-export');
+  await toggle.click();
+  await expect(close).toBeFocused();
+  await expect(header).toHaveAttribute('inert', '');
+
+  const eventCount = await page.getByTestId('event-log').locator('li').count();
+  const reopenBox = await reopen.boundingBox();
+  await page.mouse.click(
+    reopenBox!.x + reopenBox!.width / 2,
+    reopenBox!.y + reopenBox!.height / 2,
+  );
+  await expect(close).toBeFocused();
+  await expect(page.getByTestId('event-log').locator('li')).toHaveCount(eventCount);
+
+  await page.locator('body').evaluate((body) => {
+    body.tabIndex = -1;
+    body.focus();
+  });
+  await expect(close).toBeFocused();
+
+  const viewportBox = await page.getByTestId('lumora-viewport').boundingBox();
+  await page.mouse.click(viewportBox!.x + 20, viewportBox!.y + 20);
+  await page.keyboard.press('Escape');
+  await expect(log).toBeHidden();
+  await expect(header).not.toHaveAttribute('inert', '');
+  await expect(toggle).toBeFocused();
 });
 
 test('375x667 expanded host log keeps the complete timeline inside Studio', async ({ page }) => {

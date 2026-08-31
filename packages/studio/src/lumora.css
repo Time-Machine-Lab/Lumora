@@ -1973,6 +1973,7 @@
 
 .lumora-timeline__shot-duration {
   position: absolute;
+  z-index: 0;
   bottom: 3px;
   height: 4px;
   border-radius: 2px;
@@ -1981,6 +1982,7 @@
 }
 
 .lumora-timeline__shot-duration--selected {
+  z-index: 2;
   background: var(--lumora-accent);
 }
 
