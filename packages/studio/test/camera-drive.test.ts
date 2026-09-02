@@ -7,8 +7,13 @@ import {
   CameraDrive,
   MAX_FOCAL_MM,
   MIN_FOCAL_MM,
+  applyCameraWorldDelta,
   captureCameraSample,
+  hasSingularWorldTransform,
+  getWorldOrthonormalQuaternion,
+  getWorldRigidQuaternion,
   restoreObjectOnNode,
+  syncRigidCameraProxy,
 } from '../src/components/editor/camera-drive';
 
 function makeCameraNode(): THREE.PerspectiveCamera {
@@ -19,7 +24,403 @@ function makeCameraNode(): THREE.PerspectiveCamera {
   return node;
 }
 
+function makeCompensatedNearSingularCamera(): THREE.PerspectiveCamera {
+  const root = new THREE.Group();
+  root.scale.set(1, 1, 1e-9);
+  const parent = new THREE.Group();
+  parent.rotation.y = Math.PI / 4;
+  const node = makeCameraNode();
+  node.rotation.y = -Math.PI / 4;
+  root.add(parent);
+  parent.add(node);
+  root.updateMatrixWorld(true);
+  return node;
+}
+
 describe('CameraDrive：键鼠驾驶积分器', () => {
+  it('applies a world-space camera delta through a transformed parent', () => {
+    const parent = new THREE.Group();
+    parent.position.set(3, -2, 4);
+    parent.rotation.set(0.2, -0.4, 0.3);
+    parent.scale.setScalar(2);
+    const mirror = makeCameraNode();
+    mirror.position.set(0.8, 1.2, -0.6);
+    mirror.rotation.set(-0.1, 0.4, 0.2);
+    parent.add(mirror);
+    parent.updateMatrixWorld(true);
+
+    const beforePosition = mirror.getWorldPosition(new THREE.Vector3());
+    const beforeQuaternion = mirror.getWorldQuaternion(new THREE.Quaternion());
+    const previousPrimaryPosition = new THREE.Vector3(-1, 2, 5);
+    const currentPrimaryPosition = new THREE.Vector3(2, 3, 4);
+    const rotationDelta = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.15, -0.25, 0.1));
+    const previousPrimaryQuaternion = new THREE.Quaternion();
+    const currentPrimaryQuaternion = rotationDelta.clone().multiply(previousPrimaryQuaternion);
+
+    const applied = applyCameraWorldDelta(
+      mirror,
+      previousPrimaryPosition,
+      previousPrimaryQuaternion,
+      currentPrimaryPosition,
+      currentPrimaryQuaternion,
+    );
+    mirror.updateMatrixWorld(true);
+
+    const expectedPosition = beforePosition
+      .clone()
+      .add(currentPrimaryPosition.clone().sub(previousPrimaryPosition));
+    const expectedQuaternion = rotationDelta.clone().multiply(beforeQuaternion);
+    expect(applied).toBe(true);
+    expect(mirror.getWorldPosition(new THREE.Vector3()).distanceTo(expectedPosition)).toBeLessThan(1e-8);
+    expect(mirror.getWorldQuaternion(new THREE.Quaternion()).angleTo(expectedQuaternion)).toBeLessThan(1e-8);
+  });
+
+  it('keeps world direction after a rotation delta through a non-uniformly scaled parent', () => {
+    const parent = new THREE.Group();
+    parent.rotation.set(0.4, -0.7, 0.2);
+    parent.scale.set(2, 3, 0.5);
+    const mirror = makeCameraNode();
+    mirror.rotation.set(-0.2, 0.6, 0.1);
+    parent.add(mirror);
+    parent.updateMatrixWorld(true);
+
+    const beforeDirection = new THREE.Vector3(0, 0, -1).applyQuaternion(getWorldRigidQuaternion(mirror));
+    const previousPrimaryPosition = new THREE.Vector3();
+    const currentPrimaryPosition = new THREE.Vector3();
+    const rotationDelta = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.25, -0.35, 0.15));
+
+    applyCameraWorldDelta(
+      mirror,
+      previousPrimaryPosition,
+      new THREE.Quaternion(),
+      currentPrimaryPosition,
+      rotationDelta,
+    );
+    mirror.updateMatrixWorld(true);
+    const expectedDirection = beforeDirection.clone().applyQuaternion(rotationDelta).normalize();
+    const actualDirection = new THREE.Vector3(0, 0, -1).applyQuaternion(getWorldRigidQuaternion(mirror));
+    expect(actualDirection.angleTo(expectedDirection)).toBeLessThan(1e-8);
+  });
+
+  it('rotates a nested camera around the world Y axis instead of its parent-local axis', () => {
+    const parent = new THREE.Group();
+    parent.rotation.set(0.2, 0.7, 0.3);
+    const node = makeCameraNode();
+    parent.add(node);
+    parent.updateMatrixWorld(true);
+    const drive = new CameraDrive({ mode: 'keyboard-only', rotateSpeed: 1, smoothing: 30 });
+    drive.attach(node);
+    drive.press('ArrowRight');
+    const before = parent.quaternion.clone().multiply(node.quaternion);
+    drive.update(0.4);
+    const after = parent.quaternion.clone().multiply(node.quaternion).normalize();
+    const expected = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), 0.4).multiply(before);
+
+    expect(after.angleTo(expected)).toBeLessThan(1e-4);
+  });
+
+  it('keeps a directly driven camera world-facing under a non-uniformly scaled parent', () => {
+    const parent = new THREE.Group();
+    parent.rotation.set(0.4, 0.7, -0.3);
+    parent.scale.set(2, 3, 0.5);
+    const node = makeCameraNode();
+    node.rotation.set(-0.2, 0.6, 0.1);
+    parent.add(node);
+    parent.updateMatrixWorld(true);
+    const drive = new CameraDrive({ mode: 'keyboard-only', rotateSpeed: 1, smoothing: 30 });
+    drive.attach(node);
+    const before = new THREE.Vector3(0, 0, -1).applyQuaternion(getWorldRigidQuaternion(node));
+    drive.press('ArrowRight');
+    drive.update(0.4);
+    node.updateMatrixWorld(true);
+    const after = new THREE.Vector3(0, 0, -1).applyQuaternion(getWorldRigidQuaternion(node));
+    const expected = before
+      .applyAxisAngle(new THREE.Vector3(0, 1, 0), 0.4)
+      .normalize();
+
+    expect(after.angleTo(expected)).toBeLessThan(1e-4);
+  });
+
+  it('keeps a directly driven camera world-facing under a reflected parent', () => {
+    const parent = new THREE.Group();
+    parent.rotation.set(0.2, 0.7, 0.3);
+    parent.scale.set(-1, 1, 1);
+    const node = makeCameraNode();
+    node.rotation.set(0.1, -0.2, 0.3);
+    parent.add(node);
+    parent.updateMatrixWorld(true);
+    const drive = new CameraDrive({ mode: 'keyboard-only', rotateSpeed: 1, smoothing: 30 });
+    drive.attach(node);
+    const before = new THREE.Vector3(0, 0, -1).applyQuaternion(getWorldRigidQuaternion(node));
+    drive.press('ArrowRight');
+    drive.update(0.4);
+    node.updateMatrixWorld(true);
+    const after = new THREE.Vector3(0, 0, -1).applyQuaternion(getWorldRigidQuaternion(node));
+    const expected = before
+      .applyAxisAngle(new THREE.Vector3(0, 1, 0), 0.4)
+      .normalize();
+
+    expect(after.angleTo(expected)).toBeLessThan(1e-4);
+  });
+
+  it('preserves a complete rigid world basis under a non-uniformly scaled parent', () => {
+    const parent = new THREE.Group();
+    parent.rotation.set(0.4, -0.7, 0.2);
+    parent.scale.set(2, 3, 0.5);
+    const node = makeCameraNode();
+    node.rotation.set(-0.2, 0.6, 0.1);
+    parent.add(node);
+    parent.updateMatrixWorld(true);
+    const drive = new CameraDrive({ mode: 'keyboard-only', rotateSpeed: 1, smoothing: 30 });
+    drive.attach(node);
+    const beforeQuaternion = getWorldRigidQuaternion(node);
+    const beforeForward = new THREE.Vector3(0, 0, -1).applyQuaternion(beforeQuaternion);
+    const beforeUp = new THREE.Vector3(0, 1, 0).applyQuaternion(beforeQuaternion);
+    const beforeRight = new THREE.Vector3(1, 0, 0).applyQuaternion(beforeQuaternion);
+    drive.press('ArrowUp');
+    drive.update(0.35);
+    node.updateMatrixWorld(true);
+    const afterQuaternion = getWorldRigidQuaternion(node);
+    const afterForward = new THREE.Vector3(0, 0, -1).applyQuaternion(afterQuaternion);
+    const afterUp = new THREE.Vector3(0, 1, 0).applyQuaternion(afterQuaternion);
+    const afterRight = new THREE.Vector3(1, 0, 0).applyQuaternion(afterQuaternion);
+    const expectedForward = beforeForward.clone().applyAxisAngle(beforeRight, -0.35).normalize();
+    const expectedUp = beforeUp.clone().applyAxisAngle(beforeRight, -0.35).normalize();
+    const expectedRight = beforeRight.clone().applyAxisAngle(beforeRight, -0.35).normalize();
+
+    expect(afterForward.angleTo(expectedForward)).toBeLessThan(1e-4);
+    expect(afterUp.angleTo(expectedUp)).toBeLessThan(1e-4);
+    expect(afterRight.angleTo(expectedRight)).toBeLessThan(1e-4);
+    expect(Math.abs(afterUp.dot(afterRight))).toBeLessThan(1e-10);
+    expect(Math.abs(afterForward.dot(afterRight))).toBeLessThan(1e-10);
+  });
+
+  it('uses world-space distance for tap movement under a transformed parent', () => {
+    const parent = new THREE.Group();
+    parent.rotation.set(0.4, -0.7, 0.2);
+    parent.scale.set(2, 3, 0.5);
+    const node = makeCameraNode();
+    node.rotation.set(-0.2, 0.6, 0.1);
+    parent.add(node);
+    parent.updateMatrixWorld(true);
+    const beforePosition = node.getWorldPosition(new THREE.Vector3());
+    const beforeForward = new THREE.Vector3(0, 0, -1).applyQuaternion(getWorldRigidQuaternion(node));
+    const drive = new CameraDrive({ tapStep: 0.1, holdDelay: 0.12 });
+    drive.attach(node);
+    drive.press('KeyW');
+    drive.release('KeyW');
+    node.updateMatrixWorld(true);
+
+    const expected = beforePosition.clone().addScaledVector(beforeForward, 0.1);
+    expect(node.getWorldPosition(new THREE.Vector3()).distanceTo(expected)).toBeLessThan(1e-8);
+  });
+
+  it('uses world-space speed for held movement under a transformed parent', () => {
+    const parent = new THREE.Group();
+    parent.rotation.set(0.4, -0.7, 0.2);
+    parent.scale.set(2, 3, 0.5);
+    const node = makeCameraNode();
+    node.rotation.set(-0.2, 0.6, 0.1);
+    parent.add(node);
+    parent.updateMatrixWorld(true);
+    const beforePosition = node.getWorldPosition(new THREE.Vector3());
+    const beforeForward = new THREE.Vector3(0, 0, -1).applyQuaternion(getWorldRigidQuaternion(node));
+    const drive = new CameraDrive({ speed: 1, smoothing: 30, holdDelay: 0.12 });
+    drive.attach(node);
+    drive.press('KeyW');
+    drive.update(0.4);
+    node.updateMatrixWorld(true);
+
+    const displacement = node.getWorldPosition(new THREE.Vector3()).sub(beforePosition);
+    expect(displacement.length()).toBeCloseTo(0.28, 5);
+    expect(displacement.normalize().angleTo(beforeForward)).toBeLessThan(1e-8);
+  });
+
+  it('uses the exact rigid hierarchy pose for viewport and capture proxies', () => {
+    const parent = new THREE.Group();
+    parent.rotation.set(0.4, -0.7, 0.2);
+    parent.scale.set(2, 3, 0.5);
+    const node = makeCameraNode();
+    node.rotation.set(-0.2, 0.6, 0.1);
+    parent.add(node);
+    parent.updateMatrixWorld(true);
+    node.fov = 38;
+    node.zoom = 1.25;
+    const viewportProxy = new THREE.PerspectiveCamera();
+    const captureProxy = new THREE.PerspectiveCamera();
+    expect(syncRigidCameraProxy(node, viewportProxy, 2)).toBe(true);
+    expect(syncRigidCameraProxy(node, captureProxy, 2)).toBe(true);
+
+    const expectedQuaternion = getWorldRigidQuaternion(node);
+    const expectedPosition = node.getWorldPosition(new THREE.Vector3());
+    for (const axis of [
+      new THREE.Vector3(1, 0, 0),
+      new THREE.Vector3(0, 1, 0),
+      new THREE.Vector3(0, 0, -1),
+    ]) {
+      const expected = axis.clone().applyQuaternion(expectedQuaternion);
+      expect(axis.clone().applyQuaternion(viewportProxy.quaternion).angleTo(expected)).toBeLessThan(1e-8);
+      expect(axis.clone().applyQuaternion(captureProxy.quaternion).angleTo(expected)).toBeLessThan(1e-8);
+    }
+    expect(viewportProxy.position.distanceTo(expectedPosition)).toBeLessThan(1e-8);
+    expect(captureProxy.position.distanceTo(viewportProxy.position)).toBeLessThan(1e-8);
+    expect(captureProxy.quaternion.angleTo(viewportProxy.quaternion)).toBeLessThan(1e-8);
+    expect(viewportProxy.fov).toBe(38);
+    expect(viewportProxy.zoom).toBe(1.25);
+    expect(viewportProxy.aspect).toBe(2);
+
+    const before = viewportProxy.quaternion.clone();
+    parent.rotation.y += 0.45;
+    parent.scale.set(-2, 1, 4);
+    parent.updateMatrixWorld(true);
+    expect(syncRigidCameraProxy(node, viewportProxy, 16 / 9)).toBe(true);
+    expect(viewportProxy.quaternion.angleTo(before)).toBeGreaterThan(0.1);
+    expect(viewportProxy.quaternion.angleTo(getWorldRigidQuaternion(node))).toBeLessThan(1e-8);
+    expect(getWorldOrthonormalQuaternion(node).angleTo(viewportProxy.quaternion)).toBeLessThan(1e-8);
+  });
+
+  it('treats a uniformly small invertible hierarchy as non-singular for proxies', () => {
+    const parent = new THREE.Group();
+    parent.position.set(3, -2, 4);
+    parent.rotation.set(0.2, -0.4, 0.3);
+    parent.scale.setScalar(0.001);
+    const source = makeCameraNode();
+    parent.add(source);
+    parent.updateMatrixWorld(true);
+    const proxy = new THREE.PerspectiveCamera();
+
+    expect(hasSingularWorldTransform(source)).toBe(false);
+    expect(syncRigidCameraProxy(source, proxy, 16 / 9)).toBe(true);
+    expect(proxy.position.distanceTo(source.getWorldPosition(new THREE.Vector3()))).toBeLessThan(1e-8);
+    expect(proxy.position.toArray().every(Number.isFinite)).toBe(true);
+  });
+
+  it('rejects transforms whose determinant underflows to a zero inverse', () => {
+    const parent = new THREE.Group();
+    parent.scale.setScalar(1e-108);
+    const source = makeCameraNode();
+    parent.add(source);
+    parent.updateMatrixWorld(true);
+
+    expect(hasSingularWorldTransform(source)).toBe(true);
+  });
+
+  it('drives a camera through a uniformly small invertible hierarchy', () => {
+    const parent = new THREE.Group();
+    parent.rotation.set(0.2, -0.4, 0.3);
+    parent.scale.setScalar(0.001);
+    const node = makeCameraNode();
+    parent.add(node);
+    parent.updateMatrixWorld(true);
+    const drive = new CameraDrive({ speed: 2, smoothing: 30, holdDelay: 0 });
+    drive.attach(node);
+    const beforePosition = node.getWorldPosition(new THREE.Vector3());
+
+    drive.press('KeyW');
+    drive.update(0.2);
+    parent.updateMatrixWorld(true);
+
+    expect(drive.hasInput).toBe(true);
+    expect(node.getWorldPosition(new THREE.Vector3()).distanceTo(beforePosition)).toBeGreaterThan(0.01);
+  });
+
+  it('flags a compensated descendant when an ancestor inverse is unusable', () => {
+    const node = makeCompensatedNearSingularCamera();
+
+    expect(hasSingularWorldTransform(node.parent!)).toBe(true);
+    expect(hasSingularWorldTransform(node)).toBe(true);
+  });
+
+  it('clears stalled translation when an ancestor inverse is unusable', () => {
+    const node = makeCompensatedNearSingularCamera();
+    const drive = new CameraDrive({ speed: 2, smoothing: 30, holdDelay: 0.05 });
+    drive.attach(node);
+    const beforePosition = node.position.clone();
+
+    drive.press('KeyW');
+    drive.update(0.2);
+
+    expect(node.position.distanceTo(beforePosition)).toBeLessThan(1e-9);
+    expect(drive.hasInput).toBe(false);
+  });
+
+  it('keeps mixed camera input atomic when an ancestor inverse is unusable', () => {
+    const node = makeCompensatedNearSingularCamera();
+    const drive = new CameraDrive({
+      mode: 'keyboard-only',
+      speed: 2,
+      rotateSpeed: 1,
+      smoothing: 30,
+      holdDelay: 0.05,
+    });
+    drive.attach(node);
+    const beforePosition = node.position.clone();
+    const beforeQuaternion = node.quaternion.clone();
+    const beforeFov = node.fov;
+    const beforeFocal = (node.userData as Record<string, unknown>).focalLength;
+
+    drive.press('KeyW');
+    drive.press('ArrowRight');
+    drive.press('BracketRight');
+    drive.update(0.2);
+
+    expect(node.position.distanceTo(beforePosition)).toBeLessThan(1e-9);
+    expect(node.quaternion.angleTo(beforeQuaternion)).toBeLessThan(1e-9);
+    expect(node.fov).toBe(beforeFov);
+    expect((node.userData as Record<string, unknown>).focalLength).toBe(beforeFocal);
+    expect(drive.hasInput).toBe(false);
+  });
+
+  it('leaves a mirrored camera finite when its parent transform is singular', () => {
+    const parent = new THREE.Group();
+    parent.position.set(3, -2, 4);
+    parent.rotation.set(0.2, -0.4, 0.3);
+    parent.scale.set(0, 3, 0.5);
+    const mirror = makeCameraNode();
+    parent.add(mirror);
+    parent.updateMatrixWorld(true);
+    const beforePosition = mirror.position.clone();
+    const beforeQuaternion = mirror.quaternion.clone();
+
+    const applied = applyCameraWorldDelta(
+      mirror,
+      new THREE.Vector3(-1, 2, 5),
+      new THREE.Quaternion(),
+      new THREE.Vector3(2, 3, 4),
+      new THREE.Quaternion().setFromEuler(new THREE.Euler(0.15, -0.25, 0.1)),
+    );
+
+    expect(applied).toBe(false);
+    expect(mirror.position.toArray().every(Number.isFinite)).toBe(true);
+    expect(mirror.quaternion.toArray().every(Number.isFinite)).toBe(true);
+    expect(mirror.position.distanceTo(beforePosition)).toBeLessThan(1e-9);
+    expect(mirror.quaternion.angleTo(beforeQuaternion)).toBeLessThan(1e-9);
+  });
+
+  it('clears held input and momentum when an ancestor becomes singular', () => {
+    const parent = new THREE.Group();
+    const node = makeCameraNode();
+    parent.add(node);
+    parent.updateMatrixWorld(true);
+    const drive = new CameraDrive({ speed: 2, smoothing: 30, holdDelay: 0.05 });
+    drive.attach(node);
+    drive.press('KeyW');
+    drive.update(0.2);
+    expect(drive.hasInput).toBe(true);
+
+    parent.scale.x = 0;
+    parent.updateMatrixWorld(true);
+    const blockedPosition = node.position.clone();
+    drive.update(0.1);
+    expect(drive.hasInput).toBe(false);
+    expect(node.position.distanceTo(blockedPosition)).toBeLessThan(1e-9);
+
+    parent.scale.x = 1;
+    parent.updateMatrixWorld(true);
+    drive.update(0.4);
+    expect(node.position.distanceTo(blockedPosition)).toBeLessThan(1e-9);
+  });
+
   it('短按移动键只产生一次确定的本地轴步进', () => {
     const drive = new CameraDrive({ tapStep: 0.1, holdDelay: 0.12, speed: 2.5 });
     const node = makeCameraNode();
@@ -42,6 +443,79 @@ describe('CameraDrive：键鼠驾驶积分器', () => {
     drive.release('KeyW');
 
     expect(node.position.z).toBeLessThan(5.9);
+  });
+
+  it('refreshes dirty ancestors before blocking rotation and focal writes', () => {
+    const parent = new THREE.Group();
+    const node = makeCameraNode();
+    parent.add(node);
+    parent.updateMatrixWorld(true);
+    const drive = new CameraDrive({ speed: 2, smoothing: 30, holdDelay: 0.05 });
+    drive.attach(node);
+    drive.press('KeyW');
+    drive.press('BracketRight');
+    drive.look(20, -10);
+
+    parent.scale.x = 0;
+    const blockedPosition = node.position.clone();
+    const blockedQuaternion = node.quaternion.clone();
+    const blockedFov = node.fov;
+    const blockedFocal = (node.userData as Record<string, unknown>).focalLength;
+    drive.update(0.2);
+
+    expect(node.position.distanceTo(blockedPosition)).toBeLessThan(1e-9);
+    expect(node.quaternion.angleTo(blockedQuaternion)).toBeLessThan(1e-9);
+    expect(node.fov).toBe(blockedFov);
+    expect((node.userData as Record<string, unknown>).focalLength).toBe(blockedFocal);
+    expect(drive.hasInput).toBe(false);
+  });
+
+  it('refreshes a dirty singular mirror parent before applying a world delta', () => {
+    const parent = new THREE.Group();
+    const mirror = makeCameraNode();
+    parent.add(mirror);
+    parent.updateMatrixWorld(true);
+    const blockedPosition = mirror.position.clone();
+    const blockedQuaternion = mirror.quaternion.clone();
+
+    parent.scale.x = 0;
+    applyCameraWorldDelta(
+      mirror,
+      new THREE.Vector3(),
+      new THREE.Quaternion(),
+      new THREE.Vector3(1, 2, 3),
+      new THREE.Quaternion().setFromEuler(new THREE.Euler(0.1, 0.2, 0.3)),
+    );
+
+    expect(mirror.position.distanceTo(blockedPosition)).toBeLessThan(1e-9);
+    expect(mirror.quaternion.angleTo(blockedQuaternion)).toBeLessThan(1e-9);
+  });
+
+  it('rejects proxy capture immediately after an ancestor becomes singular', () => {
+    const parent = new THREE.Group();
+    const source = makeCameraNode();
+    parent.add(source);
+    parent.updateMatrixWorld(true);
+    const proxy = new THREE.PerspectiveCamera();
+    expect(syncRigidCameraProxy(source, proxy, 16 / 9)).toBe(true);
+    const blockedPosition = proxy.position.clone();
+    const blockedQuaternion = proxy.quaternion.clone();
+
+    parent.scale.x = 0;
+
+    expect(syncRigidCameraProxy(source, proxy, 16 / 9)).toBe(false);
+    expect(proxy.position.distanceTo(blockedPosition)).toBeLessThan(1e-9);
+    expect(proxy.quaternion.angleTo(blockedQuaternion)).toBeLessThan(1e-9);
+  });
+
+  it('normalizes rigid proxy scale so focal settings remain the optical control', () => {
+    const source = makeCameraNode();
+    source.scale.set(2, 3, 4);
+    const proxy = new THREE.PerspectiveCamera();
+    proxy.scale.set(5, 6, 7);
+
+    expect(syncRigidCameraProxy(source, proxy, 16 / 9)).toBe(true);
+    expect(proxy.scale.toArray()).toEqual([1, 1, 1]);
   });
 
   it('held movement never applies the maximum tap step when crossing holdDelay', () => {
@@ -142,6 +616,22 @@ describe('CameraDrive：键鼠驾驶积分器', () => {
     drive.update(0.5);
     drive.update(0.5);
     expect(node.position.z).toBeCloseTo(frozen.z, 10);
+  });
+
+  it('cancelTranslationMomentum clears released-key drift while keeping the target attached', () => {
+    const drive = new CameraDrive({ smoothing: 8 });
+    const node = makeCameraNode();
+    drive.attach(node);
+    drive.press('KeyW');
+    drive.update(0.2);
+    drive.release('KeyW');
+    drive.cancelTranslationMomentum();
+    const frozen = node.position.clone();
+
+    drive.update(0.5);
+
+    expect(node.position.distanceTo(frozen)).toBeLessThan(1e-9);
+    expect(drive.hasInput).toBe(false);
   });
 
   it('方向键偏航/俯仰：左转绕世界 Y，抬头绕局部 X', () => {

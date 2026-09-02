@@ -89,7 +89,7 @@ function makeSession(timeline: TimelineController, recorder: TimelineRecorder): 
   };
 }
 
-function harness(project: Project) {
+function harness(project: Project, rootReady = true) {
   const editor = new SceneEditor();
   editor.openProject(project);
   const timeline = new TimelineController();
@@ -97,14 +97,36 @@ function harness(project: Project) {
   timeline.setDuration(3);
   const recorder = new TimelineRecorder();
   const root = buildScene(project, 16 / 9);
-  const rootRef = { current: root } as RefObject<THREE.Group | null>;
+  const rootRef = { current: rootReady ? root : null } as RefObject<THREE.Group | null>;
   const skipIdsRef = { current: null } as RefObject<Set<string> | null>;
   const session = makeSession(timeline, recorder);
-  const rendered = render(
-    <PlaybackDriver session={session} editor={editor} rootRef={rootRef} skipIdsRef={skipIdsRef} />,
+  let sceneRootGeneration = rootReady ? 1 : 0;
+  const driver = () => (
+    <PlaybackDriver
+      session={session}
+      editor={editor}
+      rootRef={rootRef}
+      skipIdsRef={skipIdsRef}
+      sceneRootGeneration={sceneRootGeneration}
+    />
   );
+  const rendered = render(driver());
   const node = findNode(root, 'cam')!;
-  return { editor, timeline, recorder, session, node, unmount: rendered.unmount };
+  const signalRootReady = () => {
+    rootRef.current = root;
+    sceneRootGeneration += 1;
+    rendered.rerender(driver());
+  };
+  return {
+    editor,
+    timeline,
+    recorder,
+    session,
+    node,
+    skipIdsRef,
+    signalRootReady,
+    unmount: rendered.unmount,
+  };
 }
 
 describe('PlaybackDriver：时间引擎驱动的场景回放', () => {
@@ -162,6 +184,90 @@ describe('PlaybackDriver：时间引擎驱动的场景回放', () => {
     expect(node.position.y).toBeCloseTo(1.6);
   });
 
+  it('evaluates the initial playhead at t=0 without requiring a seek', () => {
+    const { timeline, node } = harness(makeProject());
+
+    expect(timeline.getTime()).toBe(0);
+    expect(node.position.x).toBeCloseTo(0);
+    expect(node.position.y).toBeCloseTo(1);
+    expect(node.position.z).toBeCloseTo(2);
+  });
+
+  it('evaluates t=0 when the scene root reports ready after multiple frames', async () => {
+    const { timeline, node, signalRootReady } = harness(makeProject(), false);
+
+    expect(timeline.getTime()).toBe(0);
+    expect(node.position.y).toBeCloseTo(1.6);
+    await act(
+      async () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+    expect(node.position.y).toBeCloseTo(1.6);
+
+    act(() => signalRootReady());
+
+    expect(node.position.x).toBeCloseTo(0);
+    expect(node.position.y).toBeCloseTo(1);
+    expect(node.position.z).toBeCloseTo(2);
+  });
+
+  it('restores a track channel when it is disabled after the playhead has evaluated it', async () => {
+    const { editor, timeline, node } = harness(makeProject());
+    act(() => timeline.seek(1));
+    expect(node.position.x).toBeCloseTo(2);
+
+    const trackId = editor.getProject()!.tracks[0]!.id;
+    act(() => editor.updateTrack(trackId, (track) => ({ ...track, disabled: true }), 'disable evaluated track'));
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 30)));
+
+    expect(node.position.x).toBeCloseTo(0);
+    expect(node.position.y).toBeCloseTo(1.6);
+    expect(node.position.z).toBeCloseTo(6);
+  });
+
+  it('restores a removed track after gizmo ownership temporarily blocks restoration', async () => {
+    const { editor, timeline, node, skipIdsRef } = harness(makeProject(true));
+    act(() => timeline.seek(1));
+    expect(node.position.x).toBeCloseTo(2);
+    expect(node.userData.focalLength).toBeCloseTo(75);
+
+    skipIdsRef.current = new Set(['cam']);
+    const trackId = editor.getProject()!.tracks[0]!.id;
+    act(() => editor.updateTrack(trackId, (track) => ({ ...track, disabled: true }), 'disable while dragging'));
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 30)));
+    expect(node.position.x).toBeCloseTo(2);
+
+    skipIdsRef.current = null;
+    act(() => timeline.seek(1.5));
+
+    expect(node.position.x).toBeCloseTo(0);
+    expect(node.position.y).toBeCloseTo(1.6);
+    expect(node.position.z).toBeCloseTo(6);
+    expect(node.userData.focalLength).toBeCloseTo(87.5);
+    expect((node as THREE.PerspectiveCamera).fov).toBeCloseTo(focalLengthToFovDeg(87.5), 6);
+  });
+
+  it('restores a removed camera track after recording ownership ends', async () => {
+    const { editor, timeline, recorder, node } = harness(makeProject());
+    act(() => timeline.seek(1));
+    expect(node.position.x).toBeCloseTo(2);
+
+    recorder.start('cam', 'lumora://playback');
+    const trackId = editor.getProject()!.tracks[0]!.id;
+    act(() => editor.updateTrack(trackId, (track) => ({ ...track, disabled: true }), 'disable while recording'));
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 30)));
+    expect(node.position.x).toBeCloseTo(2);
+
+    recorder.stop();
+    act(() => timeline.seek(1.5));
+
+    expect(node.position.x).toBeCloseTo(0);
+    expect(node.position.y).toBeCloseTo(1.6);
+    expect(node.position.z).toBeCloseTo(6);
+  });
+
   it('录制机位由驾驶接管：录制期间不应用也不还原', () => {
     const { timeline, recorder, node } = harness(makeProject());
     act(() => timeline.seek(1));
@@ -182,5 +288,18 @@ describe('PlaybackDriver：时间引擎驱动的场景回放', () => {
     act(() => timeline.seek(1));
     expect(node.userData.focalLength).toBe(75);
     expect((node as unknown as THREE.PerspectiveCamera).fov).toBeCloseTo(focalLengthToFovDeg(75), 6);
+  });
+
+  it('reapplies the paused playhead when the editor view changes', () => {
+    const { editor, timeline, node } = harness(makeProject());
+    act(() => timeline.seek(1));
+    expect(node.position.x).toBeCloseTo(2);
+    node.position.set(9, 9, 9);
+
+    act(() => editor.setViewMode({ cameraObjectId: 'cam' }));
+
+    expect(node.position.x).toBeCloseTo(2);
+    expect(node.position.y).toBeCloseTo(1);
+    expect(node.position.z).toBeCloseTo(2);
   });
 });

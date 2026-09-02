@@ -45,6 +45,21 @@ async function hideViewportOverlays(page: Page): Promise<void> {
   }
 }
 
+async function focusViewportByKeyboard(page: Page): Promise<void> {
+  const viewport = page.getByTestId('lumora-viewport');
+  for (let index = 0; index < 100; index += 1) {
+    await page.keyboard.press('Tab');
+    if (await viewport.evaluate((element) => document.activeElement === element)) break;
+  }
+  await expect(viewport).toBeFocused();
+  const focusStyle = await viewport.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return { outlineStyle: style.outlineStyle, outlineWidth: style.outlineWidth };
+  });
+  expect(focusStyle.outlineStyle).not.toBe('none');
+  expect(parseFloat(focusStyle.outlineWidth)).toBeGreaterThan(0);
+}
+
 /** 画布截图：先等一帧渲染（seek/暂停后场景经 rAF 重绘） */
 async function canvasShot(page: Page): Promise<Buffer> {
   await page.waitForTimeout(120);
@@ -152,6 +167,199 @@ async function expectShotLeft(page: Page, shotId: string, expectedPx: number): P
   expect(Math.abs(actual - expectedPx)).toBeLessThan(1);
 }
 
+test('idle director view drives the rendered camera and reports its heading', async ({ page }) => {
+  const viewport = page.getByTestId('lumora-viewport');
+  await expect(page.getByTestId('view-mode-select')).toHaveValue('director');
+  await hideViewportOverlays(page);
+  await focusViewportByKeyboard(page);
+
+  const indicator = page.getByTestId('camera-direction-indicator');
+  const status = page.getByTestId('camera-direction-status');
+  const arrow = page.locator('.lumora-camera-direction__arrow');
+  await expect(indicator).toBeVisible();
+  await expect(status).toHaveText(/^Heading \d+ deg \| Pitch [+-]?\d+ deg$/);
+  await expect(arrow).toBeVisible();
+  const viewportBounds = await viewport.boundingBox();
+  const indicatorBounds = await indicator.boundingBox();
+  if (!viewportBounds || !indicatorBounds) throw new Error('direction indicator bounds are unavailable');
+  expect(indicatorBounds.x).toBeGreaterThanOrEqual(viewportBounds.x);
+  expect(indicatorBounds.x + indicatorBounds.width).toBeLessThanOrEqual(viewportBounds.x + viewportBounds.width);
+  expect(indicatorBounds.y).toBeGreaterThanOrEqual(viewportBounds.y);
+  expect(indicatorBounds.y + indicatorBounds.height).toBeLessThanOrEqual(viewportBounds.y + viewportBounds.height);
+  const initialStatus = await status.textContent();
+  const initialArrowTransform = await arrow.evaluate((element) => (element as HTMLElement).style.transform);
+  const beforeDrive = await canvasShot(page);
+
+  await page.keyboard.down('w');
+  await page.waitForTimeout(220);
+  await page.keyboard.up('w');
+  await page.waitForTimeout(100);
+  const afterDrive = await canvasShot(page);
+  expect(await pixelDiffRatio(page, beforeDrive, afterDrive)).toBeGreaterThan(0.005);
+
+  const box = await viewport.boundingBox();
+  if (!box) throw new Error('viewport is unavailable');
+  await page.mouse.move(box.x + box.width * 0.5, box.y + box.height * 0.55);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(box.x + box.width * 0.68, box.y + box.height * 0.45, { steps: 6 });
+  await page.mouse.up({ button: 'right' });
+  await expect(status).not.toHaveText(initialStatus ?? '');
+  await expect.poll(() => arrow.evaluate((element) => (element as HTMLElement).style.transform))
+    .not.toBe(initialArrowTransform);
+});
+
+test('director free-drive orientation remains stable across pixel and line-mode wheel gestures', async ({ page }) => {
+  const viewport = page.getByTestId('lumora-viewport');
+  await hideViewportOverlays(page);
+  await focusViewportByKeyboard(page);
+  const status = page.getByTestId('camera-direction-status');
+  const box = await viewport.boundingBox();
+  if (!box) throw new Error('viewport is unavailable');
+
+  await page.mouse.move(box.x + box.width * 0.5, box.y + box.height * 0.55);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(box.x + box.width * 0.7, box.y + box.height * 0.45, { steps: 6 });
+  await page.mouse.up({ button: 'right' });
+  // Pointer-look smoothing must settle before OrbitControls is authoritative again.
+  await page.waitForTimeout(1_600);
+  await expect(status).toHaveText(/Heading \d+ deg \| Pitch [+-]?\d+ deg/);
+  const afterLook = await status.textContent();
+  const beforeWheel = await cameraPose(page, '__rendered__');
+
+  await page.mouse.wheel(0, 240);
+  await page.waitForTimeout(500);
+
+  await expect(status).toHaveText(afterLook ?? '');
+  const afterWheel = await cameraPose(page, '__rendered__');
+  expect(vectorDistance(afterWheel.position, beforeWheel.position)).toBeGreaterThan(0.01);
+  expect(quaternionAngle(afterWheel.rotation, beforeWheel.rotation)).toBeLessThan(0.001);
+
+  await page.locator('canvas').first().dispatchEvent('wheel', {
+    deltaY: -3,
+    deltaMode: 1,
+    clientX: box.x + box.width * 0.5,
+    clientY: box.y + box.height * 0.55,
+  });
+  await page.waitForTimeout(500);
+
+  const afterLineWheel = await cameraPose(page, '__rendered__');
+  expect(vectorDistance(afterLineWheel.position, afterWheel.position)).toBeGreaterThan(0.01);
+  expect(quaternionAngle(afterLineWheel.rotation, afterWheel.rotation)).toBeLessThan(0.001);
+  await expect(status).toHaveText(afterLook ?? '');
+
+  const beforeFractionalWheel = afterLineWheel;
+  for (let index = 0; index < 8; index += 1) {
+    await page.locator('canvas').first().dispatchEvent('wheel', {
+      deltaY: 0.75,
+      deltaMode: 0,
+      clientX: box.x + box.width * 0.5,
+      clientY: box.y + box.height * 0.55,
+    });
+  }
+  await page.waitForTimeout(500);
+
+  const afterFractionalWheel = await cameraPose(page, '__rendered__');
+  expect(vectorDistance(afterFractionalWheel.position, beforeFractionalWheel.position)).toBeGreaterThan(0.01);
+  expect(quaternionAngle(afterFractionalWheel.rotation, beforeFractionalWheel.rotation)).toBeLessThan(0.001);
+  await expect(status).toHaveText(afterLook ?? '');
+});
+
+test('director keyboard-only mode ignores pointer and wheel input while preserving arrow rotation', async ({ page }) => {
+  const modeButton = page.getByRole('button', { name: '纯键盘操控' });
+  await modeButton.click();
+  await expect(modeButton).toHaveAttribute('aria-pressed', 'true');
+
+  const viewport = page.getByTestId('lumora-viewport');
+  const canvas = page.locator('.lumora-viewport canvas');
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error('viewport canvas is unavailable');
+  await page.waitForTimeout(120);
+  const start = await cameraPose(page, '__rendered__');
+
+  await page.mouse.move(box.x + box.width * 0.45, box.y + box.height * 0.5);
+  await page.mouse.down({ button: 'left' });
+  await page.mouse.move(box.x + box.width * 0.7, box.y + box.height * 0.35, { steps: 6 });
+  await page.mouse.up({ button: 'left' });
+  await page.mouse.wheel(0, 240);
+  for (let index = 0; index < 8; index += 1) {
+    await canvas.dispatchEvent('wheel', {
+      deltaY: 0.75,
+      deltaMode: 0,
+      clientX: box.x + box.width * 0.5,
+      clientY: box.y + box.height * 0.5,
+    });
+  }
+  await page.waitForTimeout(500);
+
+  const afterPointer = await cameraPose(page, '__rendered__');
+  expect(vectorDistance(afterPointer.position, start.position)).toBeLessThan(0.001);
+  expect(quaternionAngle(afterPointer.rotation, start.rotation)).toBeLessThan(0.001);
+
+  await focusViewportByKeyboard(page);
+  await page.keyboard.down('ArrowLeft');
+  await page.waitForTimeout(260);
+  await page.keyboard.up('ArrowLeft');
+  await page.waitForTimeout(100);
+
+  const afterArrow = await cameraPose(page, '__rendered__');
+  expect(vectorDistance(afterArrow.position, afterPointer.position)).toBeLessThan(0.01);
+  expect(quaternionAngle(afterArrow.rotation, afterPointer.rotation)).toBeGreaterThan(0.03);
+  await expect(viewport).toBeFocused();
+});
+
+test('director OrbitControls requires a fresh pointerdown after an input-mode boundary', async ({ page }) => {
+  const canvas = page.locator('.lumora-viewport canvas');
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error('viewport canvas is unavailable');
+  const keyboardOnly = page.getByRole('button', { name: '纯键盘操控' });
+  const keyboardMouse = page.getByRole('button', { name: '键盘移动 + 鼠标视角' });
+
+  const startX = box.x + box.width * 0.7;
+  const startY = box.y + box.height * 0.3;
+  await expect(page.getByTestId('camera-pose-readout')).not.toHaveText('');
+  await page.mouse.move(startX, startY);
+  await page.keyboard.down('Shift');
+  await page.mouse.down({ button: 'left' });
+  await page.mouse.move(startX - 60, startY + 30, { steps: 4 });
+  await page.mouse.up({ button: 'left' });
+  await page.keyboard.up('Shift');
+  await page.waitForTimeout(500);
+  const beforeGesture = await cameraPose(page, '__rendered__');
+  await page.mouse.move(startX, startY);
+  await page.mouse.down({ button: 'left' });
+  await page.mouse.move(startX - 30, startY + 15, { steps: 3 });
+  await page.waitForTimeout(120);
+  const duringGesture = await cameraPose(page, '__rendered__');
+  expect(quaternionAngle(duringGesture.rotation, beforeGesture.rotation)).toBeGreaterThan(0.01);
+  await page.waitForTimeout(1_600);
+  const beforeBoundary = await cameraPose(page, '__rendered__');
+
+  await keyboardOnly.evaluate((button) => (button as HTMLButtonElement).click());
+  await expect(keyboardOnly).toHaveAttribute('aria-pressed', 'true');
+  await page.waitForTimeout(100);
+  await keyboardMouse.evaluate((button) => (button as HTMLButtonElement).click());
+  await expect(keyboardMouse).toHaveAttribute('aria-pressed', 'true');
+  await page.waitForTimeout(100);
+
+  const afterBoundary = await cameraPose(page, '__rendered__');
+  expect(vectorDistance(afterBoundary.position, beforeBoundary.position)).toBeLessThan(0.01);
+  expect(quaternionAngle(afterBoundary.rotation, beforeBoundary.rotation)).toBeLessThan(0.001);
+  await page.mouse.move(box.x + box.width * 0.25, box.y + box.height * 0.7, { steps: 6 });
+  await page.waitForTimeout(300);
+  const afterStaleMove = await cameraPose(page, '__rendered__');
+  expect(vectorDistance(afterStaleMove.position, afterBoundary.position)).toBeLessThan(0.001);
+  expect(quaternionAngle(afterStaleMove.rotation, afterBoundary.rotation)).toBeLessThan(0.001);
+  await page.mouse.up({ button: 'left' });
+
+  await page.mouse.move(startX, startY);
+  await page.mouse.down({ button: 'left' });
+  await page.mouse.move(box.x + box.width * 0.45, box.y + box.height * 0.55, { steps: 6 });
+  await page.mouse.up({ button: 'left' });
+  await page.waitForTimeout(300);
+  const afterFreshDrag = await cameraPose(page, '__rendered__');
+  expect(quaternionAngle(afterFreshDrag.rotation, afterStaleMove.rotation)).toBeGreaterThan(0.03);
+});
+
 test('overwrite confirmation portal retains resolved Studio theme styles', async ({ page }) => {
   await page.getByTestId('tree-row-sample-camera').click();
   await page.getByTestId('timeline-record').click();
@@ -184,7 +392,10 @@ test('overwrite confirmation portal retains resolved Studio theme styles', async
   await page.getByText('取消').click();
 });
 
-test('offscreen capture preserves a non-default cube face/mip and encodes real WebGL pixels upright', async ({ page }) => {
+test('offscreen capture preserves a non-default cube face/mip and encodes real WebGL pixels upright', async ({ page }, testInfo) => {
+  // This regression imports source modules through Vite's /@fs endpoint,
+  // which is intentionally unavailable in the production preview server.
+  test.skip(testInfo.project.name === 'edge-preview', 'source-module import requires the Vite dev server');
   const frameCaptureUrl = `/@fs/${resolve('packages/studio/src/components/editor/frame-capture.ts').replace(/\\/g, '/')}`;
   const threeUrl = `/@fs/${resolve('node_modules/three/build/three.module.js').replace(/\\/g, '/')}`;
   const result = await page.evaluate(
@@ -667,6 +878,7 @@ test('recording viewport remains operable at 760px and 375px and right drag surv
       const scene = document.querySelector<HTMLElement>('.lumora-studio__scene-slot')!.getBoundingClientRect();
       const viewportRect = document.querySelector<HTMLElement>('[data-testid="lumora-viewport"]')!.getBoundingClientRect();
       const toolbar = document.querySelector<HTMLElement>('[data-testid="viewport-toolbar"]')!.getBoundingClientRect();
+      const direction = document.querySelector<HTMLElement>('[data-testid="camera-direction-indicator"]')!.getBoundingClientRect();
       return {
         scene: { top: scene.top, right: scene.right, bottom: scene.bottom, left: scene.left, height: scene.height },
         viewport: {
@@ -683,6 +895,14 @@ test('recording viewport remains operable at 760px and 375px and right drag surv
           left: toolbar.left,
           height: toolbar.height,
         },
+        direction: {
+          top: direction.top,
+          right: direction.right,
+          bottom: direction.bottom,
+          left: direction.left,
+          width: direction.width,
+          height: direction.height,
+        },
         horizontalOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
       };
     });
@@ -693,6 +913,12 @@ test('recording viewport remains operable at 760px and 375px and right drag surv
     expect(measurements.toolbar.right).toBeLessThanOrEqual(measurements.scene.right);
     expect(measurements.toolbar.top).toBeGreaterThanOrEqual(measurements.scene.top);
     expect(measurements.toolbar.bottom).toBeLessThanOrEqual(measurements.scene.bottom - 24);
+    expect(measurements.direction.width).toBeGreaterThan(0);
+    expect(measurements.direction.height).toBeGreaterThan(0);
+    expect(measurements.direction.left).toBeGreaterThanOrEqual(measurements.viewport.left);
+    expect(measurements.direction.right).toBeLessThanOrEqual(measurements.viewport.right);
+    expect(measurements.direction.top).toBeGreaterThanOrEqual(measurements.viewport.top);
+    expect(measurements.direction.bottom).toBeLessThanOrEqual(measurements.viewport.bottom);
   };
 
   await expectOperableViewport(760, 800, 280);

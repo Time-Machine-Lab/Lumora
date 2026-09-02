@@ -16,7 +16,7 @@ import {
   evaluateTrack,
   focalLengthToFovDeg,
 } from '@lumora/core';
-import type { SceneEditor, TrackTargetPath, TrackKeyframeValue } from '@lumora/core';
+import type { Project, SceneEditor, TrackTargetPath, TrackKeyframeValue } from '@lumora/core';
 import type { RefObject } from 'react';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
 import { findNode } from './scene-builder';
@@ -26,8 +26,21 @@ export interface PlaybackDriverProps {
   session: TimelineSession;
   editor: SceneEditor;
   rootRef: RefObject<THREE.Group | null>;
+  /** Increments whenever SceneContent installs or replaces the scene root. */
+  sceneRootGeneration: number;
   /** gizmo 拖拽中的对象 id：拖拽期间不覆盖节点（结束后提交会自然收敛） */
   skipIdsRef: RefObject<Set<string> | null>;
+}
+
+function collectActiveTrackTargets(project: Project): Map<string, Set<TrackTargetPath>> {
+  const active = new Map<string, Set<TrackTargetPath>>();
+  for (const track of project.tracks) {
+    if (track.disabled || track.keyframes.length === 0) continue;
+    const targets = active.get(track.objectId);
+    if (targets) targets.add(track.targetPath);
+    else active.set(track.objectId, new Set([track.targetPath]));
+  }
+  return active;
 }
 
 function applyTrackValue(node: THREE.Object3D, targetPath: TrackTargetPath, value: TrackKeyframeValue): void {
@@ -58,24 +71,69 @@ function applyTrackValue(node: THREE.Object3D, targetPath: TrackTargetPath, valu
   }
 }
 
-export function PlaybackDriver({ session, editor, rootRef, skipIdsRef }: PlaybackDriverProps) {
+export function PlaybackDriver({
+  session,
+  editor,
+  rootRef,
+  sceneRootGeneration,
+  skipIdsRef,
+}: PlaybackDriverProps) {
   const rootRefRef = useRef(rootRef);
   rootRefRef.current = rootRef;
   const skipRef = useRef(skipIdsRef);
   skipRef.current = skipIdsRef;
+  const applyRef = useRef<() => void>(() => undefined);
   // session.timeline / session.recorder 是稳定的实例（会话内部 useRef），
   // 事件订阅只依赖它们，状态驱动的 session 重建不引起重复订阅
   const { timeline, recorder } = session;
 
   useEffect(() => {
     let pendingRaf = 0;
+    let previousActiveTargets = new Map<string, Set<TrackTargetPath>>();
+    const pendingRestoreTargets = new Map<string, Set<TrackTargetPath>>();
 
-    const apply = () => {
+    const apply = (): void => {
       const root = rootRefRef.current.current;
       const project = editor.getProject();
-      if (!root || !project) return;
+      if (!project) {
+        previousActiveTargets = new Map();
+        pendingRestoreTargets.clear();
+        return;
+      }
+      if (!root) return;
       const time = timeline.getTime();
       const skip = skipRef.current.current;
+      const activeTargets = collectActiveTrackTargets(project);
+      for (const [objectId, previousTargets] of previousActiveTargets) {
+        const currentTargets = activeTargets.get(objectId);
+        for (const targetPath of previousTargets) {
+          if (currentTargets?.has(targetPath)) continue;
+          const pendingTargets = pendingRestoreTargets.get(objectId);
+          if (pendingTargets) pendingTargets.add(targetPath);
+          else pendingRestoreTargets.set(objectId, new Set([targetPath]));
+        }
+      }
+      previousActiveTargets = activeTargets;
+
+      for (const [objectId, pendingTargets] of pendingRestoreTargets) {
+        const currentTargets = activeTargets.get(objectId);
+        for (const targetPath of currentTargets ?? []) pendingTargets.delete(targetPath);
+        if (pendingTargets.size === 0) {
+          pendingRestoreTargets.delete(objectId);
+          continue;
+        }
+        if (skip?.has(objectId)) continue;
+        if (recorder.active && objectId === recorder.recordingCameraId) continue;
+        const object = project.objects.find((candidate) => candidate.id === objectId);
+        if (!object) {
+          pendingRestoreTargets.delete(objectId);
+          continue;
+        }
+        const node = findNode(root, objectId);
+        if (!node) continue;
+        restoreObjectOnNode(node, object);
+        pendingRestoreTargets.delete(objectId);
+      }
       for (const track of project.tracks) {
         if (track.disabled) continue;
         if (recorder.active && track.objectId === recorder.recordingCameraId) continue;
@@ -86,6 +144,15 @@ export function PlaybackDriver({ session, editor, rootRef, skipIdsRef }: Playbac
         if (!evaluated) continue;
         applyTrackValue(node, track.targetPath, evaluated.value);
       }
+    };
+    applyRef.current = apply;
+
+    const scheduleApply = () => {
+      cancelAnimationFrame(pendingRaf);
+      pendingRaf = requestAnimationFrame(() => {
+        pendingRaf = 0;
+        apply();
+      });
     };
 
     const restore = () => {
@@ -109,17 +176,23 @@ export function PlaybackDriver({ session, editor, rootRef, skipIdsRef }: Playbac
       }),
       editor.events.on('project:changed', () => {
         // 提交后 scene sync 先把节点还原为项目位姿，驱动在下一帧把轨道值盖回
-        cancelAnimationFrame(pendingRaf);
-        pendingRaf = requestAnimationFrame(apply);
+        scheduleApply();
       }),
+      editor.events.on('view:changed', apply),
     ];
+    apply();
     return () => {
       cancelAnimationFrame(pendingRaf);
+      applyRef.current = () => undefined;
       for (const sub of subs) sub.dispose();
       // 显式退出时间线（组件卸载）→ 还原全部节点到项目静态位姿
       restore();
     };
   }, [timeline, recorder, editor]);
+
+  useEffect(() => {
+    applyRef.current();
+  }, [sceneRootGeneration]);
 
   return null;
 }

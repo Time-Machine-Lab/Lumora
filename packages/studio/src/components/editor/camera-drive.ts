@@ -95,6 +95,7 @@ export function normalizeCameraDriveSettings(
 
 export const MIN_FOCAL_MM = 8;
 export const MAX_FOCAL_MM = 200;
+export const SINGULAR_CAMERA_WARNING = 'Camera cannot be driven because an ancestor transform is singular.';
 
 const KEY_FORWARD = ['KeyW'];
 const KEY_BACK = ['KeyS'];
@@ -145,6 +146,205 @@ export const DRIVE_KEY_CODES: ReadonlySet<string> = new Set([
   ...KEY_BOOST,
   ...KEY_SLOW,
 ]);
+
+/** Apply a rigid camera delta in world space while preserving a nested node's local transform. */
+export function applyCameraWorldDelta(
+  mirrorNode: THREE.Object3D,
+  previousPrimaryPosition: THREE.Vector3,
+  previousPrimaryQuaternion: THREE.Quaternion,
+  currentPrimaryPosition: THREE.Vector3,
+  currentPrimaryQuaternion: THREE.Quaternion,
+): boolean {
+  const translationDelta = currentPrimaryPosition.clone().sub(previousPrimaryPosition);
+  const rotationDelta = currentPrimaryQuaternion
+    .clone()
+    .multiply(previousPrimaryQuaternion.clone().invert())
+    .normalize();
+  const parent = mirrorNode.parent;
+  mirrorNode.updateWorldMatrix(true, false);
+  const parentTransform = parent ? getWorldTransformInfo(parent) : null;
+  if (parent && !parentTransform?.invertible) return false;
+  const worldPosition = mirrorNode.getWorldPosition(new THREE.Vector3()).add(translationDelta);
+  const worldQuaternion = getWorldRigidQuaternion(mirrorNode)
+    .premultiply(rotationDelta)
+    .normalize();
+  if (parent) {
+    worldPosition.applyMatrix4(parentTransform!.inverse);
+    if (!isFiniteVector(worldPosition)) return false;
+  }
+  setWorldRigidQuaternion(mirrorNode, worldQuaternion);
+  mirrorNode.position.copy(worldPosition);
+  return true;
+}
+
+export function getWorldRigidQuaternion(object: THREE.Object3D, result = new THREE.Quaternion()): THREE.Quaternion {
+  const chain: THREE.Object3D[] = [];
+  for (let current: THREE.Object3D | null = object; current; current = current.parent) chain.push(current);
+  result.identity();
+  for (let index = chain.length - 1; index >= 0; index -= 1) result.multiply(chain[index]!.quaternion);
+  return result.normalize();
+}
+
+function setWorldRigidQuaternion(target: THREE.Object3D, worldQuaternion: THREE.Quaternion): void {
+  const localQuaternion = worldQuaternion.clone();
+  if (target.parent) localQuaternion.premultiply(getWorldRigidQuaternion(target.parent).invert());
+  target.quaternion.copy(localQuaternion.normalize());
+}
+
+function rotateOnWorldAxis(target: THREE.Object3D, axis: THREE.Vector3, angle: number): void {
+  const worldQuaternion = getWorldRigidQuaternion(target).premultiply(
+    new THREE.Quaternion().setFromAxisAngle(axis, angle),
+  );
+  setWorldRigidQuaternion(target, worldQuaternion);
+}
+
+function rotateOnLocalAxis(target: THREE.Object3D, angle: number): void {
+  const worldQuaternion = getWorldRigidQuaternion(target);
+  const worldRight = new THREE.Vector3(1, 0, 0).applyQuaternion(worldQuaternion);
+  worldQuaternion.premultiply(new THREE.Quaternion().setFromAxisAngle(worldRight, angle));
+  setWorldRigidQuaternion(target, worldQuaternion);
+}
+
+interface WorldTransformInfo {
+  invertible: boolean;
+  needsBasis: boolean;
+  inverse: THREE.Matrix4;
+  inverseLinear: THREE.Matrix3;
+}
+
+function getWorldTransformInfo(object: THREE.Object3D): WorldTransformInfo {
+  object.updateWorldMatrix(true, false);
+  const elements = object.matrixWorld.elements;
+  const scaleX = Math.hypot(elements[0]!, elements[1]!, elements[2]!);
+  const scaleY = Math.hypot(elements[4]!, elements[5]!, elements[6]!);
+  const scaleZ = Math.hypot(elements[8]!, elements[9]!, elements[10]!);
+  const right = new THREE.Vector3(elements[0]!, elements[1]!, elements[2]!).multiplyScalar(1 / scaleX);
+  const up = new THREE.Vector3(elements[4]!, elements[5]!, elements[6]!).multiplyScalar(1 / scaleY);
+  const forward = new THREE.Vector3(elements[8]!, elements[9]!, elements[10]!).multiplyScalar(1 / scaleZ);
+  const basisDeterminant = right.dot(new THREE.Vector3().crossVectors(up, forward));
+  const inverse = object.matrixWorld.clone().invert();
+  const inverseIsNonZero = inverse.elements.some((value) => value !== 0);
+  const invertible =
+    scaleX > 0 &&
+    scaleY > 0 &&
+    scaleZ > 0 &&
+    Number.isFinite(basisDeterminant) &&
+    Math.abs(basisDeterminant) >= 1e-8 &&
+    inverse.elements.every((value) => Number.isFinite(value)) &&
+    inverseIsNonZero;
+  if (!invertible) {
+    return {
+      invertible: false,
+      needsBasis: true,
+      inverse: new THREE.Matrix4(),
+      inverseLinear: new THREE.Matrix3(),
+    };
+  }
+  const largest = Math.max(scaleX, scaleY, scaleZ);
+  const smallest = Math.min(scaleX, scaleY, scaleZ);
+  const nonOrthogonal =
+    Math.abs(right.dot(up)) > 1e-5 ||
+    Math.abs(right.dot(forward)) > 1e-5 ||
+    Math.abs(up.dot(forward)) > 1e-5;
+  const matrixQuaternion = object.getWorldQuaternion(new THREE.Quaternion());
+  const rigidQuaternion = getWorldRigidQuaternion(object);
+  const signedRotation = matrixQuaternion.angleTo(rigidQuaternion) > 1e-5;
+  const needsBasis =
+    basisDeterminant < 0 ||
+    (largest > 0 && largest - smallest > 1e-6 * largest) ||
+    nonOrthogonal ||
+    signedRotation;
+  return {
+    invertible: true,
+    needsBasis,
+    inverse,
+    inverseLinear: new THREE.Matrix3().setFromMatrix4(inverse),
+  };
+}
+
+export function hasNonRigidWorldTransform(object: THREE.Object3D): boolean {
+  const info = getWorldTransformInfo(object);
+  return !info.invertible || info.needsBasis;
+}
+
+export function hasSingularWorldTransform(object: THREE.Object3D): boolean {
+  for (let current: THREE.Object3D | null = object; current; current = current.parent) {
+    if (!getWorldTransformInfo(current).invertible) return true;
+  }
+  return false;
+}
+
+function getWorldBasis(target: THREE.Object3D): {
+  right: THREE.Vector3;
+  up: THREE.Vector3;
+  forward: THREE.Vector3;
+} {
+  const quaternion = getWorldRigidQuaternion(target);
+  const right = new THREE.Vector3(1, 0, 0).applyQuaternion(quaternion);
+  const up = new THREE.Vector3(0, 1, 0).applyQuaternion(quaternion);
+  const forward = new THREE.Vector3(0, 0, target instanceof THREE.Camera ? -1 : 1).applyQuaternion(quaternion);
+  return { right, up, forward };
+}
+
+/** Return the hierarchy's rigid pose without allowing ancestor scale or shear to distort camera roll. */
+export function getWorldOrthonormalQuaternion(
+  object: THREE.Object3D,
+  result = new THREE.Quaternion(),
+): THREE.Quaternion {
+  return getWorldRigidQuaternion(object, result);
+}
+
+/** Synchronize a stable, unparented render/capture camera from a scene camera's rigid world pose. */
+export function syncRigidCameraProxy(
+  source: THREE.PerspectiveCamera,
+  proxy: THREE.PerspectiveCamera,
+  aspect: number,
+): boolean {
+  if (!getWorldTransformInfo(source).invertible) return false;
+  const worldPosition = source.getWorldPosition(new THREE.Vector3());
+  if (!isFiniteVector(worldPosition)) return false;
+  proxy.position.copy(worldPosition);
+  getWorldRigidQuaternion(source, proxy.quaternion);
+  proxy.scale.set(1, 1, 1);
+  proxy.fov = source.fov;
+  proxy.aspect = aspect;
+  proxy.near = source.near;
+  proxy.far = source.far;
+  proxy.zoom = source.zoom;
+  proxy.focus = source.focus;
+  proxy.filmGauge = source.filmGauge;
+  proxy.filmOffset = source.filmOffset;
+  proxy.updateProjectionMatrix();
+  proxy.updateMatrixWorld(true);
+  return true;
+}
+
+function getWorldMovementBasis(target: THREE.Object3D): {
+  right: THREE.Vector3;
+  forward: THREE.Vector3;
+} {
+  target.updateWorldMatrix(true, false);
+  const basis = getWorldBasis(target);
+  return { right: basis.right, forward: basis.forward };
+}
+
+function applyWorldTranslation(target: THREE.Object3D, worldDelta: THREE.Vector3): boolean {
+  if (!isFiniteVector(worldDelta)) return false;
+  if (!target.parent) {
+    target.position.add(worldDelta);
+    return true;
+  }
+  const parentTransform = getWorldTransformInfo(target.parent);
+  if (!parentTransform.invertible) return false;
+  const localDelta = worldDelta.clone().applyMatrix3(parentTransform.inverseLinear);
+  if (!isFiniteVector(localDelta)) return false;
+  target.position.add(localDelta);
+  return true;
+}
+
+function isFiniteVector(vector: THREE.Vector3): boolean {
+  return Number.isFinite(vector.x) && Number.isFinite(vector.y) && Number.isFinite(vector.z);
+}
 
 function isHeld(keys: Set<string>, codes: string[]): boolean {
   return codes.some((code) => keys.has(code));
@@ -248,6 +448,11 @@ export class CameraDrive {
     this.lookDelta.set(0, 0);
   }
 
+  /** Clear released-key drift without detaching the current camera target. */
+  cancelTranslationMomentum(): void {
+    this.velocity.set(0, 0, 0);
+  }
+
   get hasInput(): boolean {
     return (
       this.keys.size > 0 ||
@@ -262,17 +467,22 @@ export class CameraDrive {
   private applyTap(code: string): void {
     const target = this.target;
     if (!target) return;
+    if (hasSingularWorldTransform(target)) {
+      this.clearMotion();
+      return;
+    }
     const boost = isHeld(this.keys, KEY_BOOST) ? 3 : 1;
     const slow = isHeld(this.keys, KEY_SLOW) ? 0.25 : 1;
     const step = this.settings.tapStep * boost * slow;
-    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(target.quaternion);
-    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(target.quaternion);
-    if (KEY_FORWARD.includes(code)) target.position.addScaledVector(forward, step);
-    else if (KEY_BACK.includes(code)) target.position.addScaledVector(forward, -step);
-    else if (KEY_RIGHT.includes(code)) target.position.addScaledVector(right, step);
-    else if (KEY_LEFT.includes(code)) target.position.addScaledVector(right, -step);
-    else if (KEY_UP.includes(code)) target.position.y += step;
-    else if (KEY_DOWN.includes(code)) target.position.y -= step;
+    const { forward, right } = getWorldMovementBasis(target);
+    const worldDelta = new THREE.Vector3();
+    if (KEY_FORWARD.includes(code)) worldDelta.copy(forward).multiplyScalar(step);
+    else if (KEY_BACK.includes(code)) worldDelta.copy(forward).multiplyScalar(-step);
+    else if (KEY_RIGHT.includes(code)) worldDelta.copy(right).multiplyScalar(step);
+    else if (KEY_LEFT.includes(code)) worldDelta.copy(right).multiplyScalar(-step);
+    else if (KEY_UP.includes(code)) worldDelta.copy(UP_VECTOR).multiplyScalar(step);
+    else if (KEY_DOWN.includes(code)) worldDelta.copy(UP_VECTOR).multiplyScalar(-step);
+    if (!applyWorldTranslation(target, worldDelta)) this.clearMotion();
   }
 
   private readFocal(node: THREE.Object3D): number {
@@ -288,14 +498,17 @@ export class CameraDrive {
     if (!target) return;
     const dt = Number.isFinite(deltaSeconds) && deltaSeconds > 0 ? deltaSeconds : 0;
     if (dt <= 0) return;
+    if (hasSingularWorldTransform(target)) {
+      this.clearMotion();
+      return;
+    }
     const { speed, holdDelay, rotateSpeed, mouseSensitivity, smoothing } = this.settings;
     const k = 1 - Math.exp(-smoothing * dt);
     const boost = isHeld(this.keys, KEY_BOOST) ? 3 : 1;
     const slow = isHeld(this.keys, KEY_SLOW) ? 0.25 : 1;
     const scale = speed * boost * slow;
 
-    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(target.quaternion);
-    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(target.quaternion);
+    const { forward, right } = getWorldMovementBasis(target);
     const targetVelocity = new THREE.Vector3();
     const movementWeight = (code: string): number => {
       if (!this.keys.has(code)) return 0;
@@ -311,24 +524,27 @@ export class CameraDrive {
     targetVelocity.addScaledVector(right, scale * rightWeight);
     targetVelocity.y += scale * upWeight;
     this.velocity.lerp(targetVelocity, k);
-    target.position.addScaledVector(this.velocity, dt);
+    if (!applyWorldTranslation(target, this.velocity.clone().multiplyScalar(dt))) {
+      this.clearMotion();
+      return;
+    }
 
     const targetYaw = (isHeld(this.keys, KEY_YAW_LEFT) ? -1 : 0) + (isHeld(this.keys, KEY_YAW_RIGHT) ? 1 : 0);
     const targetPitch = (isHeld(this.keys, KEY_PITCH_UP) ? -1 : 0) + (isHeld(this.keys, KEY_PITCH_DOWN) ? 1 : 0);
     this.yawSpeed = lerp(this.yawSpeed, targetYaw * rotateSpeed, k);
     this.pitchSpeed = lerp(this.pitchSpeed, targetPitch * rotateSpeed, k);
     if (Math.abs(this.yawSpeed) > 1e-9) {
-      target.rotateOnWorldAxis(UP_VECTOR, this.yawSpeed * dt);
+      rotateOnWorldAxis(target, UP_VECTOR, this.yawSpeed * dt);
     }
     if (Math.abs(this.pitchSpeed) > 1e-9) {
-      target.rotateX(this.pitchSpeed * dt);
+      rotateOnLocalAxis(target, this.pitchSpeed * dt);
     }
 
     if (this.settings.mode === 'keyboard-mouse' && this.lookDelta.lengthSq() > 1e-9) {
       const yaw = -this.lookDelta.x * k * mouseSensitivity * LOOK_RADIANS_PER_PIXEL;
       const pitch = this.lookDelta.y * k * mouseSensitivity * LOOK_RADIANS_PER_PIXEL;
-      target.rotateOnWorldAxis(UP_VECTOR, yaw);
-      target.rotateX(pitch);
+      rotateOnWorldAxis(target, UP_VECTOR, yaw);
+      rotateOnLocalAxis(target, pitch);
       this.lookDelta.multiplyScalar(1 - k);
       if (this.lookDelta.lengthSq() < 1e-6) this.lookDelta.set(0, 0);
     }

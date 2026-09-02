@@ -1357,6 +1357,104 @@
   height: 100%;
 }
 
+.lumora-viewport:focus-visible {
+  outline: 2px solid var(--lumora-accent);
+  outline-offset: -2px;
+}
+
+.lumora-camera-direction {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  max-width: calc(100% - 24px);
+  min-height: 34px;
+  padding: 5px 9px;
+  border: 1px solid var(--lumora-border);
+  border-radius: 6px;
+  background: rgba(20, 22, 31, 0.88);
+  color: var(--lumora-text);
+  font-size: 11px;
+  line-height: 1.2;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.lumora-camera-direction__compass {
+  position: relative;
+  display: block;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  border-radius: 50%;
+}
+
+.lumora-camera-direction__compass::before,
+.lumora-camera-direction__compass::after {
+  position: absolute;
+  content: '';
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.lumora-camera-direction__compass::before {
+  top: 3px;
+  bottom: 3px;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+}
+
+.lumora-camera-direction__compass::after {
+  top: 50%;
+  right: 3px;
+  left: 3px;
+  height: 1px;
+  transform: translateY(-50%);
+}
+
+.lumora-camera-direction__arrow {
+  position: absolute;
+  top: 2px;
+  left: 9px;
+  width: 2px;
+  height: 9px;
+  border-radius: 1px;
+  background: var(--lumora-accent);
+  transform-origin: 1px 9px;
+}
+
+.lumora-camera-direction__status {
+  min-width: 148px;
+  color: var(--lumora-text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.lumora-camera-direction__warning {
+  min-width: 0;
+  max-width: 260px;
+  color: #f0b36b;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.lumora-camera-direction__announcement {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .lumora-viewport-toolbar {
   position: absolute;
   top: 10px;
