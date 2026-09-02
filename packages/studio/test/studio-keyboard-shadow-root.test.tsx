@@ -9,7 +9,10 @@ import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
 import { CameraDrive } from '../src/components/editor/camera-drive';
 import { findNode } from '../src/components/editor/scene-builder';
 
-const r3fHarness = vi.hoisted(() => ({ scenes: [] as THREE.Group[] }));
+const r3fHarness = vi.hoisted(() => ({
+  scenes: [] as THREE.Group[],
+  cameras: [] as THREE.PerspectiveCamera[],
+}));
 
 vi.mock('@react-three/fiber', async () => {
   const React = await import('react');
@@ -40,6 +43,7 @@ vi.mock('@react-three/fiber', async () => {
           viewport: { dpr: 1 },
         };
         r3fHarness.scenes.push(stateRef.current.scene);
+        r3fHarness.cameras.push(stateRef.current.camera);
       }
       return (
         <Context.Provider value={stateRef.current}>
@@ -106,11 +110,13 @@ async function mountShadowStudio(uri: string) {
     shadowRoot,
     root: within(container).getByTestId('lumora-studio'),
     scene: r3fHarness.scenes[sceneIndex]!,
+    renderedCamera: r3fHarness.cameras[sceneIndex]!,
   };
 }
 
 beforeEach(() => {
   r3fHarness.scenes = [];
+  r3fHarness.cameras = [];
 });
 
 afterEach(() => {
@@ -143,7 +149,7 @@ describe('Studio keyboard routing across ShadowRoot boundaries', () => {
     expect(deleteSelection).toHaveBeenCalledTimes(1);
 
     act(() => editor.setSelection(['sample-camera']));
-    const camera = findNode(studio.scene, 'sample-camera')!;
+    const camera = studio.renderedCamera;
     const press = vi.spyOn(CameraDrive.prototype, 'press');
     await act(async () => delay(60));
     const before = camera.position.clone();

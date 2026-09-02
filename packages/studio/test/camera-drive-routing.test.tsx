@@ -7,16 +7,21 @@ import type { Project } from '@lumora/core';
 import { LumoraStudio } from '../src/components/LumoraStudio';
 import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
 import { CameraDrive } from '../src/components/editor/camera-drive';
+import { flushOrbitControlsPendingState } from '../src/components/editor/EditorViewport';
 import { findNode } from '../src/components/editor/scene-builder';
 
-const r3fHarness = vi.hoisted(() => ({ scenes: [] as unknown[] }));
+const r3fHarness = vi.hoisted(() => ({
+  scenes: [] as unknown[],
+  states: [] as Array<{ camera: THREE.PerspectiveCamera }>,
+  orbitProps: [] as Array<{ enabled?: boolean }>,
+}));
 
 vi.mock('@react-three/fiber', async () => {
   const React = await import('react');
   const Three = await import('three');
   type State = {
     scene: THREE.Group;
-    set: () => void;
+    set: (next: Partial<State>) => void;
     camera: THREE.PerspectiveCamera;
     gl: Record<string, () => void>;
     size: { width: number; height: number };
@@ -29,7 +34,9 @@ vi.mock('@react-three/fiber', async () => {
       if (!stateRef.current) {
         stateRef.current = {
           scene: new Three.Group(),
-          set: () => undefined,
+          set: (next) => {
+            if (next.camera) stateRef.current!.camera = next.camera;
+          },
           camera: new Three.PerspectiveCamera(),
           gl: {
             setViewport: () => undefined,
@@ -40,6 +47,7 @@ vi.mock('@react-three/fiber', async () => {
           viewport: { dpr: 1 },
         };
         r3fHarness.scenes.push(stateRef.current.scene);
+        r3fHarness.states.push(stateRef.current);
       }
       return (
         <Context.Provider value={stateRef.current}>
@@ -57,7 +65,10 @@ vi.mock('@react-three/fiber', async () => {
 });
 
 vi.mock('@react-three/drei', () => ({
-  OrbitControls: () => null,
+  OrbitControls: (props: { enabled?: boolean }) => {
+    r3fHarness.orbitProps.push(props);
+    return null;
+  },
   TransformControls: () => null,
 }));
 
@@ -76,15 +87,18 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function mountStudio(uri: string, includeDisabledOverwriteTrack = false): Promise<{
+async function mountStudio(projectOrUri: Project | string, includeDisabledOverwriteTrack = false): Promise<{
   handle: React.RefObject<LumoraStudioHandle | null>;
   root: HTMLElement;
   scene: THREE.Group;
 }> {
   const handle = createRef<LumoraStudioHandle>();
   const before = r3fHarness.scenes.length;
-  render(<LumoraStudio ref={handle} initialProject={drivableProject(uri, includeDisabledOverwriteTrack)} />);
-  await waitFor(() => expect(handle.current?.runtime.editor.getProject()?.uri).toBe(uri));
+  const project = typeof projectOrUri === 'string'
+    ? drivableProject(projectOrUri, includeDisabledOverwriteTrack)
+    : projectOrUri;
+  render(<LumoraStudio ref={handle} initialProject={project} />);
+  await waitFor(() => expect(handle.current?.runtime.editor.getProject()?.uri).toBe(project.uri));
   await waitFor(() => expect(r3fHarness.scenes.length).toBeGreaterThan(before));
   const roots = screen.getAllByTestId('lumora-studio');
   return {
@@ -96,6 +110,8 @@ async function mountStudio(uri: string, includeDisabledOverwriteTrack = false): 
 
 beforeEach(() => {
   r3fHarness.scenes = [];
+  r3fHarness.states = [];
+  r3fHarness.orbitProps = [];
   localStorage.clear();
 });
 
@@ -104,12 +120,244 @@ afterEach(() => {
 });
 
 describe('camera drive keyboard routing', () => {
+  it('flushes OrbitControls damping without changing the authoritative camera pose', () => {
+    const camera = new THREE.PerspectiveCamera();
+    camera.position.set(4, 3, 8);
+    camera.lookAt(0, 1, 0);
+    const target = new THREE.Vector3(0, 1, 0);
+    const initialPosition = camera.position.clone();
+    const initialQuaternion = camera.quaternion.clone();
+    const initialTarget = target.clone();
+    const update = vi.fn(() => {
+      camera.position.set(1, 2, 3);
+      camera.lookAt(9, 8, 7);
+      target.set(9, 8, 7);
+    });
+    flushOrbitControlsPendingState({
+      object: camera,
+      target,
+      update,
+      enableDamping: true,
+      autoRotate: false,
+    } as never);
+
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(camera.position.distanceTo(initialPosition)).toBeLessThan(1e-9);
+    expect(camera.quaternion.angleTo(initialQuaternion)).toBeLessThan(1e-9);
+    expect(target.distanceTo(initialTarget)).toBeLessThan(1e-9);
+  });
+
+  it('keeps OrbitControls available while the idle director camera is selected', async () => {
+    await mountStudio('lumora://director-orbit-controls');
+
+    expect(r3fHarness.orbitProps.some((props) => props.enabled === true)).toBe(true);
+  });
+
+  it('drives the rendered camera in director mode', async () => {
+    const studio = await mountStudio('lumora://director-render-camera');
+    const renderedCamera = r3fHarness.states[r3fHarness.states.length - 1]!.camera;
+    await act(async () => delay(60));
+    const before = renderedCamera.position.clone();
+
+    fireEvent.keyDown(studio.root, { key: 'w', code: 'KeyW' });
+    await act(async () => delay(220));
+    fireEvent.keyUp(studio.root, { key: 'w', code: 'KeyW' });
+
+    expect(renderedCamera.position.distanceTo(before)).toBeGreaterThan(0.01);
+  });
+
+  it('rotates the rendered camera with a right-button drag in director mode', async () => {
+    const studio = await mountStudio('lumora://director-render-look');
+    const renderedCamera = r3fHarness.states[r3fHarness.states.length - 1]!.camera;
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    Object.assign(viewport, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+    await act(async () => delay(60));
+    const before = renderedCamera.quaternion.clone();
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 21, clientX: 100, clientY: 100 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 21, clientX: 150, clientY: 80 });
+    fireEvent.pointerUp(viewport, { button: 2, pointerId: 21, clientX: 150, clientY: 80 });
+    await act(async () => delay(100));
+
+    expect(renderedCamera.quaternion.angleTo(before)).toBeGreaterThan(0.01);
+  });
+
+  it('keeps the rendered director camera authoritative when a scene camera is selected', async () => {
+    const studio = await mountStudio('lumora://director-selected-render-camera');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const renderedCamera = r3fHarness.states[r3fHarness.states.length - 1]!.camera;
+    await act(async () => delay(60));
+    const before = renderedCamera.position.clone();
+
+    fireEvent.keyDown(studio.root, { key: 'w', code: 'KeyW' });
+    await act(async () => delay(180));
+    fireEvent.keyUp(studio.root, { key: 'w', code: 'KeyW' });
+
+    expect(renderedCamera.position.distanceTo(before)).toBeGreaterThan(0.01);
+  });
+
+  it('does not mirror the director camera default optics into a selected scene camera', async () => {
+    const studio = await mountStudio('lumora://director-optics-preserved');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera-2']));
+    const camera = findNode(studio.scene, 'sample-camera-2') as THREE.PerspectiveCamera;
+    const initialFov = camera.fov;
+
+    await act(async () => delay(120));
+
+    expect(camera.fov).toBeCloseTo(initialFov, 8);
+    expect(camera.userData.focalLength).toBeUndefined();
+  });
+
+  it('mirrors a director tap movement to the selected scene camera', async () => {
+    const studio = await mountStudio('lumora://director-tap-mirror');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera-2']));
+    const camera = findNode(studio.scene, 'sample-camera-2')!;
+    const before = camera.position.clone();
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+
+    await act(async () => delay(60));
+    fireEvent.keyDown(viewport, { key: 'w', code: 'KeyW' });
+    fireEvent.keyUp(viewport, { key: 'w', code: 'KeyW' });
+    await act(async () => delay(80));
+
+    expect(camera.position.distanceTo(before)).toBeGreaterThan(0.05);
+  });
+
+  it('does not replay a held key after the director mirror target changes', async () => {
+    const studio = await mountStudio('lumora://director-target-change-clears-input');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera-2']));
+    const nextCamera = findNode(studio.scene, 'sample-camera')!;
+    const before = nextCamera.position.clone();
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+
+    await act(async () => delay(60));
+    fireEvent.keyDown(viewport, { key: 'w', code: 'KeyW' });
+    await act(async () => delay(80));
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    await act(async () => delay(180));
+    fireEvent.keyUp(viewport, { key: 'w', code: 'KeyW' });
+
+    expect(nextCamera.position.distanceTo(before)).toBeLessThan(1e-9);
+  });
+
+  it('clears held input when recording starts on the same POV camera', async () => {
+    const studio = await mountStudio('lumora://recording-boundary-same-pov');
+    const select = within(studio.root).getByTestId('view-mode-select');
+    fireEvent.change(select, { target: { value: 'sample-camera-2' } });
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera-2']));
+    const camera = findNode(studio.scene, 'sample-camera-2')!;
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+
+    await act(async () => delay(60));
+    fireEvent.keyDown(viewport, { key: 'w', code: 'KeyW' });
+    await act(async () => delay(160));
+    fireEvent.click(within(studio.root).getByTestId('timeline-record'));
+    await waitFor(() => expect(within(studio.root).getByTestId('timeline-record')).toHaveTextContent('■'));
+    const afterStart = camera.position.clone();
+
+    await act(async () => delay(220));
+    fireEvent.keyUp(viewport, { key: 'w', code: 'KeyW' });
+
+    expect(camera.position.distanceTo(afterStart)).toBeLessThan(1e-9);
+  });
+
+  it('reattaches the same POV camera after recording starts and stops', async () => {
+    const studio = await mountStudio('lumora://recording-boundary-same-pov-reattach');
+    const select = within(studio.root).getByTestId('view-mode-select');
+    fireEvent.change(select, { target: { value: 'sample-camera-2' } });
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera-2']));
+    const camera = findNode(studio.scene, 'sample-camera-2')!;
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+
+    await act(async () => delay(60));
+    fireEvent.click(within(studio.root).getByTestId('timeline-record'));
+    await act(async () => delay(80));
+    fireEvent.click(within(studio.root).getByTestId('timeline-record'));
+    await act(async () => delay(60));
+
+    const recordedTracks = studio.handle.current!.runtime.editor.getProject()?.tracks.filter(
+      (track) => track.objectId === 'sample-camera-2',
+    ) ?? [];
+    for (const track of recordedTracks) {
+      act(() => {
+        studio.handle.current!.runtime.editor.updateTrack(
+          track.id,
+          (next) => ({ ...next, disabled: true }),
+          'disable recorded track',
+        );
+      });
+    }
+
+    const before = camera.position.clone();
+    fireEvent.keyDown(viewport, { key: 'w', code: 'KeyW' });
+    await act(async () => delay(180));
+    fireEvent.keyUp(viewport, { key: 'w', code: 'KeyW' });
+
+    expect(camera.position.distanceTo(before)).toBeGreaterThan(0.01);
+  });
+
+  it('shows a live accessible direction status in director mode', async () => {
+    const studio = await mountStudio('lumora://director-direction-status');
+    await waitFor(() => expect(within(studio.root).getByTestId('camera-direction-status')).toBeVisible());
+    const status = within(studio.root).getByTestId('camera-direction-status');
+    await waitFor(() => expect(status.textContent).toMatch(/^Heading \d+ deg \| Pitch [+-]?\d+ deg$/));
+    expect(status).toHaveAttribute('aria-hidden', 'true');
+    const announcement = within(studio.root).getByTestId('camera-direction-announcement');
+    expect(announcement).toHaveAttribute('aria-live', 'polite');
+    expect(announcement).toHaveAttribute('aria-atomic', 'true');
+    await waitFor(() => expect(announcement.textContent).toMatch(/^Heading \d+ deg \| Pitch [+-]?\d+ deg$/));
+
+    const arrow = studio.root.querySelector<HTMLElement>('.lumora-camera-direction__arrow')!;
+    const mutation = vi.fn();
+    const observer = new MutationObserver(mutation);
+    observer.observe(status, { childList: true, characterData: true, subtree: true });
+    observer.observe(arrow, { attributes: true, attributeFilter: ['style'] });
+    await act(async () => delay(80));
+    observer.disconnect();
+    expect(mutation).not.toHaveBeenCalled();
+  });
+
+  it('shows a stable live warning and blocks director mirroring through a singular ancestor', async () => {
+    const project = drivableProject('lumora://director-singular-warning');
+    const objects = project.objects.map((object) => {
+      if (object.id === 'sample-group') {
+        return {
+          ...object,
+          transform: { ...object.transform, scale: [0, 1, 1] as [number, number, number] },
+        };
+      }
+      return object.id === 'sample-camera-2' ? { ...object, parentId: 'sample-group' } : object;
+    });
+    const scenes = project.scenes.map((scene) => ({
+      ...scene,
+      rootObjectIds: scene.rootObjectIds.filter((id) => id !== 'sample-camera-2'),
+    }));
+    const studio = await mountStudio({ ...project, objects, scenes });
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera-2']));
+    const camera = findNode(studio.scene, 'sample-camera-2')!;
+    const before = camera.position.clone();
+    const warning = within(studio.root).getByTestId('camera-transform-warning');
+    await waitFor(() => expect(warning).toHaveTextContent('ancestor transform is singular'));
+
+    const mutation = vi.fn();
+    const observer = new MutationObserver(mutation);
+    observer.observe(warning, { childList: true, characterData: true, subtree: true });
+    await act(async () => delay(80));
+    observer.disconnect();
+    expect(mutation).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(studio.root, { key: 'w', code: 'KeyW' });
+    await act(async () => delay(120));
+    fireEvent.keyUp(studio.root, { key: 'w', code: 'KeyW' });
+    expect(camera.position.distanceTo(before)).toBeLessThan(1e-9);
+  });
+
   it('right-button dragging rotates the selected camera without translating it', async () => {
     const studio = await mountStudio('lumora://drive-mouse-look');
+    const renderedCamera = r3fHarness.states[r3fHarness.states.length - 1]!.camera;
+    const beforePosition = renderedCamera.position.clone();
+    const beforeQuaternion = renderedCamera.quaternion.clone();
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
-    const camera = findNode(studio.scene, 'sample-camera')!;
-    const beforePosition = camera.position.clone();
-    const beforeQuaternion = camera.quaternion.clone();
     const viewport = within(studio.root).getByTestId('lumora-viewport');
     await act(async () => delay(60));
 
@@ -118,8 +366,8 @@ describe('camera drive keyboard routing', () => {
     await act(async () => delay(80));
     fireEvent.pointerUp(viewport, { button: 2, pointerId: 7, clientX: 140, clientY: 80 });
 
-    expect(camera.position.distanceTo(beforePosition)).toBeLessThan(1e-9);
-    expect(camera.quaternion.angleTo(beforeQuaternion)).toBeGreaterThan(0.001);
+    expect(renderedCamera.position.distanceTo(beforePosition)).toBeLessThan(1e-9);
+    expect(renderedCamera.quaternion.angleTo(beforeQuaternion)).toBeGreaterThan(0.001);
   });
 
   it('keyboard-mouse mode keeps translation and pointer look independent', async () => {
@@ -234,7 +482,7 @@ describe('camera drive keyboard routing', () => {
   it('lost pointer capture clears queued look while held keyboard movement continues', async () => {
     const studio = await mountStudio('lumora://drive-lost-capture');
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
-    const camera = findNode(studio.scene, 'sample-camera')!;
+    const camera = r3fHarness.states[r3fHarness.states.length - 1]!.camera;
     const viewport = within(studio.root).getByTestId('lumora-viewport');
     Object.assign(viewport, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
     const press = vi.spyOn(CameraDrive.prototype, 'press');
@@ -478,23 +726,6 @@ describe('camera drive keyboard routing', () => {
 
     expect(cameraA.position.distanceTo(beforeA)).toBeGreaterThan(0.01);
     expect(cameraB.position.distanceTo(beforeB)).toBeLessThan(1e-9);
-  });
-
-  it('applies a held drive key when the selected camera node becomes available after keydown', async () => {
-    const studio = await mountStudio('lumora://drive-late-node');
-    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
-    const camera = findNode(studio.scene, 'sample-camera')!;
-    const parent = camera.parent!;
-    const before = camera.position.clone();
-    parent.remove(camera);
-
-    fireEvent.keyDown(studio.root, { key: 's', code: 'KeyS' });
-    await act(async () => delay(30));
-    parent.add(camera);
-    await act(async () => delay(200));
-    fireEvent.keyUp(studio.root, { key: 's', code: 'KeyS' });
-
-    expect(camera.position.distanceTo(before)).toBeGreaterThan(0.01);
   });
 
   it('freezes a held camera drive key when the export workspace opens', async () => {

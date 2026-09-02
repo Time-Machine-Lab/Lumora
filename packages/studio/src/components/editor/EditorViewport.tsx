@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import type { RootState } from '@react-three/fiber';
 import { OrbitControls, TransformControls } from '@react-three/drei';
+import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib';
 import * as THREE from 'three';
-import { findObject, fitRect, getReachableIds } from '@lumora/core';
+import { findObject, fitRect, fovDegToFocalLength, getReachableIds } from '@lumora/core';
 import type { Project, SceneEditor, TransformData, ViewState } from '@lumora/core';
 import { resolveFormat } from './content-cache';
 import type { CacheLease, ContentCache } from './content-cache';
@@ -18,7 +19,17 @@ import {
   syncScene,
 } from './scene-builder';
 import { showToast } from './toasts';
-import { CameraDrive, captureCameraSample, DRIVE_KEY_CODES, restoreObjectOnNode } from './camera-drive';
+import {
+  applyCameraWorldDelta,
+  CameraDrive,
+  captureCameraSample,
+  DRIVE_KEY_CODES,
+  getWorldRigidQuaternion,
+  hasSingularWorldTransform,
+  restoreObjectOnNode,
+  SINGULAR_CAMERA_WARNING,
+  syncRigidCameraProxy,
+} from './camera-drive';
 import { PlaybackDriver } from './PlaybackDriver';
 import { captureProjectFrame, renderProjectFrameToCanvas } from './frame-capture';
 import type { ProjectFrameCapture } from './frame-capture';
@@ -62,6 +73,15 @@ export function findObjectId(object: THREE.Object3D): string | null {
   return resolveOwnedIdAboveContent(object);
 }
 
+function normalizeEulerSignedZero(euler: THREE.Euler): void {
+  const x = Object.is(euler.x, -0) ? 0 : euler.x;
+  const y = Object.is(euler.y, -0) ? 0 : euler.y;
+  const z = Object.is(euler.z, -0) ? 0 : euler.z;
+  if (Object.is(euler.x, -0) || Object.is(euler.y, -0) || Object.is(euler.z, -0)) {
+    euler.set(x, y, z, euler.order);
+  }
+}
+
 /**
  * 3D 视口：
  * - 场景树由项目数据增量同步（scene-builder），模型内容经 ContentCache lease 挂载
@@ -87,7 +107,10 @@ export function EditorViewport({
 }: EditorViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<THREE.Group | null>(null);
+  const [sceneRootGeneration, setSceneRootGeneration] = useState(0);
   const cameraRef = useRef<THREE.Camera | null>(null);
+  const cameraTransformWarningRef = useRef<string | null>(null);
+  const cameraDriveActiveRef = useRef(false);
   const [dragging, setDragging] = useState(false);
   const [containerSize, setContainerSize] = useState<{ width: number; height: number } | null>(null);
   // 同步引用：Gizmo 的原生 pointerdown 监听先于容器 React 处理器执行，
@@ -100,6 +123,9 @@ export function EditorViewport({
   const captureRef = captureRefProp ?? localCaptureRef;
   const localExportFrameRef = useRef<ProjectFrameCapture | null>(null);
   const exportFrameRef = exportFrameRefProp ?? localExportFrameRef;
+  const handleSceneRootReady = useCallback(() => {
+    setSceneRootGeneration((generation) => generation + 1);
+  }, []);
 
   // Selection chooses the idle drive target. Once recording starts, the
   // recorder owns that identity until the session ends, even if selection changes.
@@ -108,18 +134,23 @@ export function EditorViewport({
     const object = findObject(project, selection[0]!);
     return object && object.type === 'camera' ? object.id : null;
   }, [project, selection]);
+  const povCameraId = view.viewMode !== 'director' ? view.viewMode.cameraObjectId : null;
   const drivenCameraId = session?.state.recording
     ? session.recorder.recordingCameraId
-    : selectedCameraId;
+    : povCameraId ?? selectedCameraId;
 
   useCameraDrive(
     session,
     drivenCameraId,
     rootRef,
+    cameraRef,
+    cameraDriveActiveRef,
+    cameraTransformWarningRef,
     editor,
     containerRef,
     keyboardScopeRef,
     driveEnabled,
+    view.viewMode === 'director',
   );
 
   // 录制采样源：视口把机位节点映射为通道样本（录制期间节点由驾驶/静止接管）
@@ -226,7 +257,9 @@ export function EditorViewport({
       ref={containerRef}
       className="lumora-scene lumora-viewport"
       data-testid="lumora-viewport"
-      tabIndex={-1}
+      role="region"
+      aria-label="3D scene viewport"
+      tabIndex={0}
       onPointerDown={handlePointerDown}
     >
       <Canvas
@@ -242,10 +275,17 @@ export function EditorViewport({
           rootRef={rootRef}
           project={project}
           cache={cache}
+          onRootReady={handleSceneRootReady}
           onRenderContentChange={onRenderContentChange}
         />
         {cameraView && project && (
-          <CameraRig rootRef={rootRef} cameraObjectId={cameraView} aspect={aspect} project={project} />
+          <CameraRig
+            rootRef={rootRef}
+            cameraObjectId={cameraView}
+            aspect={aspect}
+            project={project}
+            warningRef={cameraTransformWarningRef}
+          />
         )}
         <ViewportLetterbox enabled={!!cameraView && !!project} aspect={aspect} />
         <EditorGizmo
@@ -259,7 +299,17 @@ export function EditorViewport({
           playbackActive={!!session && session.state.playing}
           skipIdsRef={skipIdsRef}
         />
-        {!cameraView && <OrbitControls makeDefault enableDamping enabled={!dragging} />}
+        {!cameraView && view.viewMode === 'director' && (
+          <DirectorOrbitControls
+            enabled={
+              !dragging &&
+              !session?.state.recording &&
+              !session?.state.playing &&
+              session?.state.cameraControls.mode !== 'keyboard-only'
+            }
+            driveActiveRef={cameraDriveActiveRef}
+          />
+        )}
         <CameraProxy cameraRef={cameraRef} />
         <FrameCaptureBridge
           captureRef={captureRef}
@@ -278,17 +328,31 @@ export function EditorViewport({
       </Canvas>
       {session && (
         <>
-          <PlaybackDriver session={session} editor={editor} rootRef={rootRef} skipIdsRef={skipIdsRef} />
+          <PlaybackDriver
+            session={session}
+            editor={editor}
+            rootRef={rootRef}
+            sceneRootGeneration={sceneRootGeneration}
+            skipIdsRef={skipIdsRef}
+          />
           {/* 数值位姿读取钩子仅供 e2e 数值断言（复审一般 7）：dev 服务（e2e 即
               dev server）挂载，生产构建 tree-shake —— 60Hz JSON stringify 不进
               生产树 */}
-          {import.meta.env.DEV && <CameraPoseReadout session={session} editor={editor} rootRef={rootRef} />}
+          {(import.meta.env.DEV || import.meta.env.VITE_LUMORA_E2E === '1') && (
+            <CameraPoseReadout session={session} editor={editor} rootRef={rootRef} cameraRef={cameraRef} />
+          )}
         </>
       )}
       {cameraView && containerSize && project && (
         <GuidesOverlay rect={fitRect(containerSize.width, containerSize.height, aspect)} view={view} />
       )}
-      <ViewportToolbar editor={editor} project={project} view={view} />
+      <CameraDirectionIndicator cameraRef={cameraRef} warningRef={cameraTransformWarningRef} />
+      <ViewportToolbar
+        editor={editor}
+        project={project}
+        view={view}
+        recording={!!session?.state.recording}
+      />
     </div>
   );
 }
@@ -334,13 +398,19 @@ function useCameraDrive(
   session: TimelineSession | null,
   drivenCameraId: string | null,
   rootRef: React.RefObject<THREE.Group | null>,
+  renderedCameraRef: React.MutableRefObject<THREE.Camera | null>,
+  activityRef: React.MutableRefObject<boolean>,
+  warningRef: React.MutableRefObject<string | null>,
   editor: SceneEditor,
   viewportRef: React.RefObject<HTMLElement | null>,
   keyboardScopeRef?: React.RefObject<HTMLElement | null>,
   driveEnabled = true,
+  directorMode = false,
 ) {
   const cameraIdRef = useRef<string | null>(null);
   cameraIdRef.current = drivenCameraId;
+  const directorModeRef = useRef(directorMode);
+  directorModeRef.current = directorMode;
   const sessionRef = useRef(session);
   sessionRef.current = session;
   const driveEnabledRef = useRef(driveEnabled);
@@ -352,12 +422,22 @@ function useCameraDrive(
     let raf = 0;
     let last = performance.now();
     let attachedId: string | null = null;
+    let attachedScope: 'director' | 'recording' | 'scene' | null = null;
     let attachedNode: THREE.Object3D | null = null;
+    let mirrorId: string | null = null;
+    let mirrorNode: THREE.Object3D | null = null;
     const heldKeys = new Set<string>();
     let lookPointerId: number | null = null;
     let lookClientX = 0;
     let lookClientY = 0;
     let suppressNextContextMenu = false;
+    const previousPrimaryPosition = new THREE.Vector3();
+    const previousPrimaryQuaternion = new THREE.Quaternion();
+    const currentPrimaryPosition = new THREE.Vector3();
+    const currentPrimaryQuaternion = new THREE.Quaternion();
+    let mirrorPoseInitialized = false;
+    let previousPrimaryFov: number | null = null;
+    let previousPrimaryFocal: number | null = null;
 
     const endLookGesture = () => {
       if (lookPointerId === null) return;
@@ -377,37 +457,91 @@ function useCameraDrive(
       heldKeys.clear();
       drive.stop();
       attachedId = null;
+      attachedScope = null;
       attachedNode = null;
+      mirrorId = null;
+      mirrorNode = null;
+      mirrorPoseInitialized = false;
+      previousPrimaryFov = null;
+      previousPrimaryFocal = null;
+      activityRef.current = false;
+      warningRef.current = null;
     };
 
     const attachCurrentCamera = (): boolean => {
       const cameraId = cameraIdRef.current;
+      const recording = !!sessionRef.current?.state.recording;
+      const isDirector = directorModeRef.current && !recording;
+      const targetScope: 'director' | 'recording' | 'scene' = isDirector ? 'director' : recording ? 'recording' : 'scene';
       const root = rootRef.current;
-      const node = root && cameraId ? findNode(root, cameraId) : null;
-      if (!cameraId || !node) return false;
-      if (attachedId !== cameraId || attachedNode !== node) {
+      const node = isDirector
+        ? renderedCameraRef.current
+        : root && cameraId
+          ? findNode(root, cameraId)
+          : null;
+      const targetId = isDirector ? '__director__' : cameraId;
+      if (!targetId || !node) return false;
+      const nextMirrorNode =
+        isDirector && cameraId && root && !hasActiveTrack(cameraId) ? findNode(root, cameraId) : null;
+      const nextMirrorId = isDirector && cameraId ? cameraId : null;
+      const targetChanged =
+        attachedId !== null &&
+        (attachedId !== targetId ||
+          attachedScope !== targetScope ||
+          attachedNode !== node ||
+          mirrorId !== nextMirrorId ||
+          mirrorNode !== nextMirrorNode);
+      if (targetChanged) {
+        // A held key belongs to the previous logical target. Require a fresh
+        // keydown after view/recording transitions instead of replaying it.
+        heldKeys.clear();
+        endLookGesture();
+        drive.stop();
+      }
+      if (
+        attachedId !== targetId ||
+        attachedScope !== targetScope ||
+        attachedNode !== node ||
+        mirrorId !== nextMirrorId ||
+        mirrorNode !== nextMirrorNode
+      ) {
+        restoreIfNeeded();
         drive.attach(node);
-        attachedId = cameraId;
+        attachedId = targetId;
+        attachedScope = targetScope;
         attachedNode = node;
-        for (const code of heldKeys) {
-          if (drive.acceptsKey(code)) drive.press(code);
+        mirrorId = nextMirrorId;
+        mirrorNode = nextMirrorNode;
+        mirrorPoseInitialized = false;
+        previousPrimaryFov = null;
+        previousPrimaryFocal = null;
+        if (!targetChanged) {
+          for (const code of heldKeys) {
+            if (drive.acceptsKey(code)) drive.press(code);
+          }
         }
       }
       return true;
     };
 
+    const hasActiveTrack = (cameraId: string): boolean =>
+      !!editor.getProject()?.tracks.some(
+        (track) => track.objectId === cameraId && track.keyframes.length > 0 && !track.disabled,
+      );
+
     const canDriveCurrentCamera = (): boolean => {
       const st = sessionRef.current?.state;
       const cameraId = cameraIdRef.current;
+      const isDirector = directorModeRef.current && !st?.recording;
       const hasTracks =
         !!st &&
-        !!editor.getProject()?.tracks.some(
-          (track) => track.objectId === cameraId && track.keyframes.length > 0 && !track.disabled,
-        );
+        !isDirector &&
+        !!cameraId &&
+        hasActiveTrack(cameraId);
       return (
         !!st &&
         driveEnabledRef.current &&
-        cameraId !== null &&
+        (isDirector || cameraId !== null) &&
         !st.overwritePending &&
         !st.recordingPaused &&
         (!st.playing || st.recording) &&
@@ -434,7 +568,14 @@ function useCameraDrive(
         // page cannot reliably override that behavior.
         if (event.ctrlKey || event.metaKey || event.altKey) return;
         if (!drive.acceptsKey(event.code)) return;
-        if (cameraIdRef.current) event.preventDefault();
+        // Do not queue input while playback, export, or a paused recording owns
+        // the camera. A later state transition must not replay that key press.
+        if (!canDriveCurrentCamera()) {
+          heldKeys.clear();
+          drive.stop();
+          return;
+        }
+        if (cameraIdRef.current || directorModeRef.current) event.preventDefault();
         heldKeys.add(event.code);
         if (attachCurrentCamera()) drive.press(event.code);
       }
@@ -453,7 +594,9 @@ function useCameraDrive(
       drive.setSettings(liveSession.state.cameraControls);
       if (drive.getSettings().mode !== 'keyboard-mouse' || !canDriveCurrentCamera()) return;
       if (!attachCurrentCamera()) return;
+      drive.cancelTranslationMomentum();
       lookPointerId = event.pointerId;
+      activityRef.current = true;
       lookClientX = event.clientX;
       lookClientY = event.clientY;
       suppressNextContextMenu = true;
@@ -477,6 +620,7 @@ function useCameraDrive(
       lookClientX = event.clientX;
       lookClientY = event.clientY;
       drive.look(movementX, movementY);
+      activityRef.current = true;
       event.preventDefault();
     };
     const onPointerUp = (event: PointerEvent) => {
@@ -498,6 +642,9 @@ function useCameraDrive(
     const onKeyUp = (event: KeyboardEvent) => {
       if (heldKeys.delete(event.code)) {
         drive.release(event.code);
+        // Keep OrbitControls disabled for one frame so a short tap cannot be
+        // overwritten by its stale target before the next interactive sync.
+        activityRef.current = true;
         return;
       }
       if (event.defaultPrevented) return;
@@ -537,6 +684,9 @@ function useCameraDrive(
 
     const restoreIfNeeded = () => {
       if (attachedId === null || !attachedNode) return;
+      const restoreId = attachedId === '__director__' ? mirrorId : attachedId;
+      const restoreNode = attachedId === '__director__' ? mirrorNode : attachedNode;
+      if (!restoreId || !restoreNode) return;
       const st = sessionRef.current?.state;
       // 回放中/录制中不还原（分别由回放驱动与录制接管）；覆盖确认冻结
       // 弹窗打开瞬间的姿态，只清输入/动量，不跳回项目静态位姿。
@@ -546,13 +696,13 @@ function useCameraDrive(
       // 已把播放头时刻的值写到节点），还原静态位姿会让画面与播放头脱节
       if (
         project?.tracks.some(
-          (t) => t.objectId === attachedId && t.keyframes.length > 0 && !t.disabled,
+          (t) => t.objectId === restoreId && t.keyframes.length > 0 && !t.disabled,
         )
       ) {
         return;
       }
-      const object = project?.objects.find((o) => o.id === attachedId);
-      if (object) restoreObjectOnNode(attachedNode, object);
+      const object = project?.objects.find((o) => o.id === restoreId);
+      if (object) restoreObjectOnNode(restoreNode, object);
     };
 
     const loop = (now: number) => {
@@ -577,20 +727,87 @@ function useCameraDrive(
       const canDrive = canDriveCurrentCamera();
       if (!canDrive) {
         endLookGesture();
+        heldKeys.clear();
+        activityRef.current = false;
         if (attachedId !== null) {
           restoreIfNeeded();
-          drive.detach();
+          drive.stop();
           attachedId = null;
+          attachedScope = null;
           attachedNode = null;
+          mirrorId = null;
+          mirrorNode = null;
+          mirrorPoseInitialized = false;
+          previousPrimaryFov = null;
+          previousPrimaryFocal = null;
         }
         raf = requestAnimationFrame(loop);
         return;
       }
       if (!attachCurrentCamera()) {
+        warningRef.current = null;
         raf = requestAnimationFrame(loop);
         return;
       }
+      const primary = attachedNode;
+      const singularTransform = !!primary && (
+        hasSingularWorldTransform(primary) || (!!mirrorNode && hasSingularWorldTransform(mirrorNode))
+      );
+      warningRef.current = singularTransform ? SINGULAR_CAMERA_WARNING : null;
+      if (singularTransform) {
+        clearDrive();
+        warningRef.current = SINGULAR_CAMERA_WARNING;
+        raf = requestAnimationFrame(loop);
+        return;
+      }
+      if (primary && mirrorNode) {
+        primary.updateMatrixWorld(true);
+        if (!mirrorPoseInitialized) {
+          primary.getWorldPosition(previousPrimaryPosition);
+          getWorldRigidQuaternion(primary, previousPrimaryQuaternion);
+          if (primary instanceof THREE.PerspectiveCamera) {
+            previousPrimaryFov = primary.fov;
+            const focal = (primary.userData as Record<string, unknown>).focalLength;
+            previousPrimaryFocal = typeof focal === 'number' && Number.isFinite(focal) ? focal : null;
+          }
+          mirrorPoseInitialized = true;
+        }
+      }
       drive.update(dt);
+      if (primary && mirrorNode) {
+        primary.updateMatrixWorld(true);
+        primary.getWorldPosition(currentPrimaryPosition);
+        getWorldRigidQuaternion(primary, currentPrimaryQuaternion);
+        const mirrorApplied = applyCameraWorldDelta(
+          mirrorNode,
+          previousPrimaryPosition,
+          previousPrimaryQuaternion,
+          currentPrimaryPosition,
+          currentPrimaryQuaternion,
+        );
+        if (!mirrorApplied) {
+          clearDrive();
+          warningRef.current = SINGULAR_CAMERA_WARNING;
+          raf = requestAnimationFrame(loop);
+          return;
+        }
+        previousPrimaryPosition.copy(currentPrimaryPosition);
+        previousPrimaryQuaternion.copy(currentPrimaryQuaternion);
+        normalizeEulerSignedZero(mirrorNode.rotation);
+        if (primary instanceof THREE.PerspectiveCamera && mirrorNode instanceof THREE.PerspectiveCamera) {
+          const focal = (primary.userData as Record<string, unknown>).focalLength;
+          const currentFocal = typeof focal === 'number' && Number.isFinite(focal) ? focal : null;
+          if (primary.fov !== previousPrimaryFov || currentFocal !== previousPrimaryFocal) {
+            mirrorNode.fov = primary.fov;
+            mirrorNode.updateProjectionMatrix();
+            if (currentFocal === null) delete (mirrorNode.userData as Record<string, unknown>).focalLength;
+            else (mirrorNode.userData as Record<string, unknown>).focalLength = currentFocal;
+          }
+          previousPrimaryFov = primary.fov;
+          previousPrimaryFocal = currentFocal;
+        }
+      }
+      activityRef.current = drive.hasInput || lookPointerId !== null;
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);
@@ -613,7 +830,139 @@ function useCameraDrive(
       restoreIfNeeded();
       clearDrive();
     };
-  }, [session, rootRef, editor, viewportRef, keyboardScopeRef]);
+  }, [session, rootRef, renderedCameraRef, activityRef, warningRef, editor, viewportRef, keyboardScopeRef]);
+}
+
+function DirectorOrbitControls({
+  enabled,
+  driveActiveRef,
+}: {
+  enabled: boolean;
+  driveActiveRef: React.MutableRefObject<boolean>;
+}) {
+  const controlsRef = useRef<OrbitControlsImpl | null>(null);
+  const controlsInstanceRef = useRef<OrbitControlsImpl | null>(null);
+  const interactiveRef = useRef<boolean | null>(null);
+  const orbitTargetRef = useRef(new THREE.Vector3());
+  const enabledRef = useRef(enabled);
+  const pendingRemountStateRef = useRef<OrbitControlsRemountState | null>(null);
+  const [controlsGeneration, setControlsGeneration] = useState(0);
+  const queueRemount = useCallback((controls: OrbitControlsImpl) => {
+    pendingRemountStateRef.current = captureOrbitControlsRemountState(controls);
+    orbitTargetRef.current.copy(controls.target);
+    setControlsGeneration((generation) => generation + 1);
+  }, []);
+  const setControlsRef = useCallback((controls: OrbitControlsImpl | null) => {
+    controlsRef.current = controls;
+    const remountState = pendingRemountStateRef.current;
+    if (!controls || !remountState) return;
+    restoreOrbitControlsRemountState(controls, remountState);
+    orbitTargetRef.current.copy(remountState.target);
+    pendingRemountStateRef.current = null;
+  }, []);
+  useLayoutEffect(() => {
+    if (enabledRef.current === enabled) return;
+    enabledRef.current = enabled;
+    const controls = controlsRef.current;
+    if (!controls) return;
+    flushOrbitControlsPendingState(controls);
+    queueRemount(controls);
+  }, [enabled, queueRemount]);
+  useFrame(() => {
+    const controls = controlsRef.current;
+    if (!controls) return;
+    if (controlsInstanceRef.current !== controls) {
+      controls.target.copy(orbitTargetRef.current);
+      controlsInstanceRef.current = controls;
+      interactiveRef.current = null;
+    }
+    const interactive = enabled && !driveActiveRef.current;
+    if (interactiveRef.current !== interactive) {
+      const wasInteractive = interactiveRef.current;
+      flushOrbitControlsPendingState(controls);
+      if (interactive) {
+        const direction = new THREE.Vector3();
+        controls.object.getWorldDirection(direction);
+        const distance = controls.target.distanceTo(controls.object.position);
+        controls.target.copy(controls.object.position).addScaledVector(direction, distance > 1e-6 ? distance : 10);
+      }
+      controls.enabled = interactive;
+      interactiveRef.current = interactive;
+      if (wasInteractive === true && !interactive && enabled) {
+        queueRemount(controls);
+      }
+    }
+    orbitTargetRef.current.copy(controls.target);
+  }, -2);
+  return (
+    <OrbitControls
+      key={controlsGeneration}
+      ref={setControlsRef}
+      makeDefault
+      enableDamping
+      enabled={enabled && !driveActiveRef.current}
+    />
+  );
+}
+
+interface OrbitControlsRemountState {
+  position: THREE.Vector3;
+  quaternion: THREE.Quaternion;
+  up: THREE.Vector3;
+  target: THREE.Vector3;
+  zoom: number;
+}
+
+function captureOrbitControlsRemountState(controls: OrbitControlsImpl): OrbitControlsRemountState {
+  return {
+    position: controls.object.position.clone(),
+    quaternion: controls.object.quaternion.clone(),
+    up: controls.object.up.clone(),
+    target: controls.target.clone(),
+    zoom: controls.object.zoom,
+  };
+}
+
+function restoreOrbitControlsRemountState(
+  controls: OrbitControlsImpl,
+  state: OrbitControlsRemountState,
+): void {
+  const object = controls.object;
+  object.position.copy(state.position);
+  object.quaternion.copy(state.quaternion);
+  object.up.copy(state.up);
+  const zoomChanged = object.zoom !== state.zoom;
+  object.zoom = state.zoom;
+  controls.target.copy(state.target);
+  if (zoomChanged) object.updateProjectionMatrix();
+  object.updateMatrixWorld(true);
+}
+
+export function flushOrbitControlsPendingState(controls: OrbitControlsImpl): void {
+  const object = controls.object;
+  const position = object.position.clone();
+  const quaternion = object.quaternion.clone();
+  const up = object.up.clone();
+  const target = controls.target.clone();
+  const zoom = object.zoom;
+  const enableDamping = controls.enableDamping;
+  const autoRotate = controls.autoRotate;
+  // OrbitControls keeps damping deltas in closures and does not consume them
+  // while disabled. Run one update to drain them, then restore the authoritative
+  // camera pose so the next interaction starts from a clean state.
+  controls.enableDamping = false;
+  controls.autoRotate = false;
+  controls.update();
+  controls.enableDamping = enableDamping;
+  controls.autoRotate = autoRotate;
+  object.position.copy(position);
+  object.quaternion.copy(quaternion);
+  object.up.copy(up);
+  const zoomChanged = object.zoom !== zoom;
+  object.zoom = zoom;
+  controls.target.copy(target);
+  if (zoomChanged) object.updateProjectionMatrix();
+  object.updateMatrixWorld(true);
 }
 
 /** 把当前渲染相机镜像给外层（点击拾取用） */
@@ -623,6 +972,92 @@ function CameraProxy({ cameraRef }: { cameraRef: React.MutableRefObject<THREE.Ca
     cameraRef.current = camera;
   }, [camera, cameraRef]);
   return null;
+}
+
+function CameraDirectionIndicator({
+  cameraRef,
+  warningRef,
+}: {
+  cameraRef: React.MutableRefObject<THREE.Camera | null>;
+  warningRef?: React.MutableRefObject<string | null>;
+}) {
+  const arrowRef = useRef<HTMLSpanElement>(null);
+  const readoutRef = useRef<HTMLSpanElement>(null);
+  const statusRef = useRef<HTMLSpanElement>(null);
+  const warningElementRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    let frame = 0;
+    let lastText = '';
+    let lastVisibleText = '';
+    let lastHeading: number | null = null;
+    let lastWarning = '';
+    let lastAnnouncement = -Infinity;
+    const announcementInterval = 750;
+    const direction = new THREE.Vector3();
+    const refresh = (now: number) => {
+      const camera = cameraRef.current;
+      if (camera) {
+        camera.getWorldDirection(direction);
+        const heading = Math.round(
+          ((THREE.MathUtils.radToDeg(Math.atan2(direction.x, -direction.z)) + 360) % 360),
+        );
+        const pitch = Math.round(THREE.MathUtils.radToDeg(Math.asin(THREE.MathUtils.clamp(direction.y, -1, 1))));
+        const text = `Heading ${heading} deg | Pitch ${pitch >= 0 ? '+' : ''}${pitch} deg`;
+        if (arrowRef.current && heading !== lastHeading) {
+          arrowRef.current.style.transform = `rotate(${heading}deg)`;
+          lastHeading = heading;
+        }
+        if (readoutRef.current && text !== lastVisibleText) {
+          readoutRef.current.textContent = text;
+          lastVisibleText = text;
+        }
+        if (statusRef.current && text !== lastText && now - lastAnnouncement >= announcementInterval) {
+          statusRef.current.textContent = text;
+          lastText = text;
+          lastAnnouncement = now;
+        }
+      }
+      const warning = warningRef?.current ?? '';
+      if (warningElementRef.current && warning !== lastWarning) {
+        warningElementRef.current.textContent = warning;
+        lastWarning = warning;
+      }
+      frame = requestAnimationFrame(refresh);
+    };
+    frame = requestAnimationFrame(refresh);
+    return () => cancelAnimationFrame(frame);
+  }, [cameraRef, warningRef]);
+
+  return (
+    <div className="lumora-camera-direction" data-testid="camera-direction-indicator">
+      <span className="lumora-camera-direction__compass" aria-hidden="true">
+        <span ref={arrowRef} className="lumora-camera-direction__arrow" />
+      </span>
+      <span
+        ref={readoutRef}
+        className="lumora-camera-direction__status"
+        data-testid="camera-direction-status"
+        aria-hidden="true"
+      >
+        Heading -- deg | Pitch -- deg
+      </span>
+      <span
+        ref={statusRef}
+        className="lumora-camera-direction__announcement"
+        data-testid="camera-direction-announcement"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        Heading -- deg | Pitch -- deg
+      </span>
+      <span
+        ref={warningElementRef}
+        className="lumora-camera-direction__warning"
+        data-testid="camera-transform-warning"
+        aria-live="polite"
+      />
+    </div>
+  );
 }
 
 /**
@@ -635,10 +1070,12 @@ function CameraPoseReadout({
   session,
   editor,
   rootRef,
+  cameraRef,
 }: {
   session: TimelineSession;
   editor: SceneEditor;
   rootRef: React.RefObject<THREE.Group | null>;
+  cameraRef: React.RefObject<THREE.Camera | null>;
 }) {
   const hostRef = useRef<HTMLSpanElement>(null);
   useEffect(() => {
@@ -660,6 +1097,20 @@ function CameraPoseReadout({
           focalLength: typeof focal === 'number' && Number.isFinite(focal) ? focal : null,
         };
       }
+      const renderedCamera = cameraRef.current;
+      if (renderedCamera) {
+        renderedCamera.updateMatrixWorld(true);
+        const position = renderedCamera.getWorldPosition(new THREE.Vector3());
+        const rotation = renderedCamera.getWorldQuaternion(new THREE.Quaternion());
+        const euler = new THREE.Euler().setFromQuaternion(rotation, 'XYZ');
+        poses.__rendered__ = {
+          position: [position.x, position.y, position.z],
+          rotation: [euler.x, euler.y, euler.z],
+          focalLength: renderedCamera instanceof THREE.PerspectiveCamera
+            ? fovDegToFocalLength(renderedCamera.fov)
+            : null,
+        };
+      }
       host.textContent = JSON.stringify(poses);
     };
     const subs = [
@@ -678,7 +1129,7 @@ function CameraPoseReadout({
       cancelAnimationFrame(animationFrame);
       for (const sub of subs) sub.dispose();
     };
-  }, [session, editor, rootRef]);
+  }, [session, editor, rootRef, cameraRef]);
   return <span ref={hostRef} data-testid="camera-pose-readout" aria-hidden="true" style={{ display: 'none' }} />;
 }
 
@@ -706,11 +1157,16 @@ function FrameCaptureBridge({
   const gl = useThree((s) => s.gl);
   const scene = useThree((s) => s.scene);
   const camera = useThree((s) => s.camera);
+  const cameraProxyRef = useRef<THREE.PerspectiveCamera | null>(null);
   useEffect(() => {
     const resolveCamera = (cameraObjectId?: string | null): THREE.Camera | null => {
       if (!cameraObjectId) return camera;
       const node = rootRef.current ? findNode(rootRef.current, cameraObjectId) : null;
-      return node instanceof THREE.PerspectiveCamera ? node : null;
+      if (!(node instanceof THREE.PerspectiveCamera)) return null;
+      if (!cameraProxyRef.current) cameraProxyRef.current = new THREE.PerspectiveCamera();
+      return syncRigidCameraProxy(node, cameraProxyRef.current, aspect)
+        ? cameraProxyRef.current
+        : null;
     };
     captureRef.current = (cameraObjectId?: string | null) => {
       if (typeof gl.render !== 'function') return null;
@@ -752,12 +1208,14 @@ function SceneContent({
   rootRef,
   project,
   cache,
+  onRootReady,
   onRenderContentChange,
 }: {
   editor: SceneEditor;
   rootRef: React.MutableRefObject<THREE.Group | null>;
   project: Project | null;
   cache: ContentCache;
+  onRootReady: () => void;
   onRenderContentChange?: () => void;
 }) {
   const scene = useThree((s) => s.scene);
@@ -799,12 +1257,13 @@ function SceneContent({
       const root = buildScene(project, aspect);
       rootRef.current = root;
       scene.add(root);
+      onRootReady();
       sessionRef.current = session;
       setContentVersion((v) => v + 1);
       onRenderContentChange?.();
     }
     prevProjectRef.current = project;
-  }, [project, scene, rootRef, editor, onRenderContentChange]);
+  }, [project, scene, rootRef, editor, onRootReady, onRenderContentChange]);
 
   // 模型内容挂载：渲染消费者在使用期持有 lease（禁止裸资源旁路）——
   // 按「活动场景内 hash → 全部模型对象 id」映射，统一「先 retain，失败再 seed」：
@@ -875,11 +1334,13 @@ function CameraRig({
   cameraObjectId,
   aspect,
   project,
+  warningRef,
 }: {
   rootRef: React.MutableRefObject<THREE.Group | null>;
   cameraObjectId: string;
   aspect: number;
   project: Project;
+  warningRef: React.MutableRefObject<string | null>;
 }) {
   const set = useThree((s) => s.set);
   const camera = useThree((s) => s.camera);
@@ -888,6 +1349,8 @@ function CameraRig({
   // 把镜头相机误当导演相机装回去。useThree 必须无条件调用（Rules of
   // Hooks），只把首次订阅到的相机写进 ref
   const restoreRef = useRef<RootState['camera'] | null>(null);
+  const sourceRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const proxyRef = useRef<THREE.PerspectiveCamera | null>(null);
   if (!restoreRef.current) restoreRef.current = camera;
 
   useEffect(() => {
@@ -896,11 +1359,25 @@ function CameraRig({
     if (!node || !(node instanceof THREE.PerspectiveCamera)) return;
     node.aspect = aspect;
     node.updateProjectionMatrix();
-    set({ camera: node });
+    if (!proxyRef.current) proxyRef.current = new THREE.PerspectiveCamera();
+    sourceRef.current = node;
+    warningRef.current = hasSingularWorldTransform(node) ? SINGULAR_CAMERA_WARNING : null;
+    syncRigidCameraProxy(node, proxyRef.current, aspect);
+    set({ camera: proxyRef.current });
     return () => {
+      sourceRef.current = null;
+      warningRef.current = null;
       if (restoreRef.current) set({ camera: restoreRef.current });
     };
-  }, [cameraObjectId, aspect, project, set, rootRef]);
+  }, [cameraObjectId, aspect, project, set, rootRef, warningRef]);
+
+  useFrame(() => {
+    const source = sourceRef.current;
+    const proxy = proxyRef.current;
+    if (!source || !proxy) return;
+    warningRef.current = hasSingularWorldTransform(source) ? SINGULAR_CAMERA_WARNING : null;
+    syncRigidCameraProxy(source, proxy, aspect);
+  });
 
   return null;
 }
@@ -1094,10 +1571,12 @@ function ViewportToolbar({
   editor,
   project,
   view,
+  recording = false,
 }: {
   editor: SceneEditor;
   project: Project | null;
   view: ViewState;
+  recording?: boolean;
 }) {
   // 机位列表按活动场景隔离：只列活动场景可达集内的相机
   const reachableIds = useMemo(
@@ -1124,7 +1603,8 @@ function ViewportToolbar({
           if (value === 'director') editor.setViewMode('director');
           else editor.setViewMode({ cameraObjectId: value });
         }}
-        disabled={!project}
+        disabled={!project || recording}
+        title={recording ? 'Recording view is locked to the active recording session' : undefined}
       >
         <option value="director">导演视图</option>
         {cameras.map((camera) => (
