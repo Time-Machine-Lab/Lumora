@@ -24,7 +24,8 @@ const PACKAGES = [
 const CONSUMER_DEP_PEERS = [
   'react@^19.0.0',
   'react-dom@^19.0.0',
-  'three@^0.170.0',
+  // Keep the consumer smoke deterministic with the Three.js version used by the workspace.
+  'three@0.170.0',
   '@react-three/fiber@^9.0.0',
   '@react-three/drei@^10.0.0',
 ];
@@ -32,6 +33,7 @@ const CONSUMER_DEV_DEPS = [
   'typescript@^5.7.2',
   '@types/react@^19.0.0',
   '@types/react-dom@^19.0.0',
+  '@types/three@0.170.0',
   'vite@^6.0.3',
 ];
 

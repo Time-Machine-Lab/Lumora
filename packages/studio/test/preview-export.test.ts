@@ -782,4 +782,292 @@ describe('recordPreviewWebm', () => {
 
     expect(harness.encoder.close).toHaveBeenCalledTimes(1);
   });
+
+  it('preserves Mediabunny timing, serialized backpressure, failures, and cleanup', async () => {
+    vi.resetModules();
+    const packets: Array<{ timestamp: number; duration: number }> = [];
+    const lifecycle: string[] = [];
+    let finalized = false;
+    let cancelled = false;
+    let configureFails = false;
+    let startedOutputs = 0;
+    let encodedFrames = 0;
+    let concurrentPacketAdds = 0;
+    let maxConcurrentPacketAdds = 0;
+    let packetAddFails = false;
+    let packetGate: ReturnType<typeof deferred<void>> | null = null;
+    let packetAddStarted: ReturnType<typeof deferred<void>> | null = null;
+    let finalizeFails = false;
+    let finalizeGate: ReturnType<typeof deferred<void>> | null = null;
+    let finalizeStarted: ReturnType<typeof deferred<void>> | null = null;
+    let finalizeSettled = 0;
+    let cancelCount = 0;
+    const outputs: MockOutput[] = [];
+
+    class MockBufferTarget {
+      buffer: ArrayBuffer | null = null;
+    }
+    class MockWebMOutputFormat {}
+    class MockEncodedPacket {
+      readonly timestamp: number;
+      readonly duration: number;
+
+      constructor(timestamp: number, duration: number) {
+        this.timestamp = timestamp;
+        this.duration = duration;
+      }
+
+      static fromEncodedChunk(chunk: { timestamp: number; duration?: number }): MockEncodedPacket {
+        return new MockEncodedPacket(chunk.timestamp / 1e6, (chunk.duration ?? 0) / 1e6);
+      }
+    }
+    class MockEncodedVideoPacketSource {
+      constructor(_codec: string) {}
+      async add(packet: MockEncodedPacket): Promise<void> {
+        concurrentPacketAdds += 1;
+        maxConcurrentPacketAdds = Math.max(maxConcurrentPacketAdds, concurrentPacketAdds);
+        try {
+          lifecycle.push('packet');
+          packets.push({ timestamp: packet.timestamp, duration: packet.duration });
+          packetAddStarted?.resolve();
+          if (packetGate) await packetGate.promise;
+          if (packetAddFails) throw new Error('packet add failed');
+        } finally {
+          concurrentPacketAdds -= 1;
+        }
+      }
+    }
+    class MockOutput {
+      readonly target: MockBufferTarget;
+      state: 'pending' | 'started' | 'finalizing' | 'finalized' | 'canceled' = 'pending';
+
+      constructor(options: { target: MockBufferTarget }) {
+        this.target = options.target;
+        outputs.push(this);
+      }
+
+      addVideoTrack(_source: MockEncodedVideoPacketSource, _metadata: unknown): void {}
+
+      async start(): Promise<void> {
+        startedOutputs += 1;
+        this.state = 'started';
+      }
+
+      async finalize(): Promise<void> {
+        lifecycle.push('finalize');
+        this.state = 'finalizing';
+        finalizeStarted?.resolve();
+        try {
+          if (finalizeGate) await finalizeGate.promise;
+          if (finalizeFails) throw new Error('finalize failed');
+          this.state = 'finalized';
+          finalized = true;
+          this.target.buffer = new Uint8Array([1, 2, 3]).buffer;
+        } finally {
+          finalizeSettled += 1;
+        }
+      }
+
+      async cancel(): Promise<void> {
+        if (this.state === 'finalizing' || this.state === 'finalized') return;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        this.state = 'canceled';
+        cancelled = true;
+        cancelCount += 1;
+      }
+    }
+
+    class MockVideoFrame {
+      readonly timestamp: number;
+      readonly duration: number;
+
+      constructor(_canvas: HTMLCanvasElement, init: { timestamp: number; duration: number }) {
+        this.timestamp = init.timestamp;
+        this.duration = init.duration;
+      }
+
+      close(): void {}
+    }
+    class MockVideoEncoder {
+      readonly encodeQueueSize = 0;
+      private readonly output: (chunk: unknown, metadata: unknown) => void;
+
+      constructor(init: { output: (chunk: unknown, metadata: unknown) => void }) {
+        this.output = init.output;
+      }
+
+      configure(): void {
+        if (configureFails) throw new Error('configure failed');
+      }
+
+      encode(frame: MockVideoFrame): void {
+        encodedFrames += 1;
+        this.output({
+          type: 'key',
+          timestamp: frame.timestamp,
+          duration: frame.duration,
+          byteLength: 1,
+          copyTo: (target: Uint8Array) => target.fill(1),
+        }, { decoderConfig: { codec: 'vp8' } });
+      }
+
+      async flush(): Promise<void> {
+        lifecycle.push('encoder-flush');
+      }
+
+      close(): void {}
+
+      addEventListener(): void {}
+      removeEventListener(): void {}
+    }
+
+    vi.doMock('mediabunny', () => ({
+      BufferTarget: MockBufferTarget,
+      EncodedPacket: MockEncodedPacket,
+      EncodedVideoPacketSource: MockEncodedVideoPacketSource,
+      Output: MockOutput,
+      WebMOutputFormat: MockWebMOutputFormat,
+    }));
+
+    try {
+      vi.stubGlobal('VideoFrame', MockVideoFrame);
+      vi.stubGlobal('VideoEncoder', MockVideoEncoder);
+      const { recordPreviewWebm: recordWithMediabunny } = await import('../src/export/preview-export');
+      const blob = await recordWithMediabunny(shortPlan(), () => true);
+
+      expect(blob.size).toBe(3);
+      expect(finalized).toBe(true);
+      expect(cancelled).toBe(false);
+      expect(lifecycle.at(-1)).toBe('finalize');
+      expect(lifecycle.indexOf('encoder-flush')).toBeLessThan(lifecycle.indexOf('finalize'));
+      expect(packets).toHaveLength(7);
+      expect(packets.map(({ timestamp }) => timestamp)).toEqual([
+        0,
+        41_667 / 1e6,
+        83_333 / 1e6,
+        125_000 / 1e6,
+        166_667 / 1e6,
+        208_333 / 1e6,
+        250_000 / 1e6,
+      ]);
+      expect(packets.map(({ duration }) => duration)).toEqual([
+        41_667 / 1e6,
+        41_666 / 1e6,
+        41_667 / 1e6,
+        41_667 / 1e6,
+        41_666 / 1e6,
+        41_667 / 1e6,
+        0,
+      ]);
+
+      await expect(recordWithMediabunny(shortPlan(), () => false)).rejects.toMatchObject({
+        code: 'capture-failed',
+      });
+      expect(cancelled).toBe(true);
+
+      packetGate = deferred<void>();
+      packetAddStarted = deferred<void>();
+      encodedFrames = 0;
+      maxConcurrentPacketAdds = 0;
+      const backpressuredRecording = recordWithMediabunny(shortPlan(), () => true);
+      await packetAddStarted.promise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(encodedFrames).toBe(4);
+      expect(maxConcurrentPacketAdds).toBe(1);
+      packetGate.resolve();
+      await expect(backpressuredRecording).resolves.toHaveProperty('size', 3);
+      expect(maxConcurrentPacketAdds).toBe(1);
+      packetGate = null;
+      packetAddStarted = null;
+
+      packetAddFails = true;
+      const cancelsBeforePacketFailure = cancelCount;
+      const packetFailureOutputIndex = outputs.length;
+      await expect(recordWithMediabunny(shortPlan(), () => true)).rejects.toMatchObject({
+        code: 'encoder-failed',
+        message: 'packet add failed',
+      });
+      expect(cancelCount).toBe(cancelsBeforePacketFailure + 1);
+      expect(outputs[packetFailureOutputIndex]?.state).toBe('canceled');
+      packetAddFails = false;
+
+      finalizeFails = true;
+      finalizeGate = deferred<void>();
+      finalizeStarted = deferred<void>();
+      const finalizeFailureOutputIndex = outputs.length;
+      const finalizeSettledBeforeFailure = finalizeSettled;
+      const finalizeFailureRecording = recordWithMediabunny(shortPlan(), () => true);
+      await finalizeStarted.promise;
+      finalizeGate.resolve();
+      await expect(finalizeFailureRecording).rejects.toMatchObject({
+        code: 'encoder-failed',
+        message: 'finalize failed',
+      });
+      expect(finalizeSettled).toBe(finalizeSettledBeforeFailure + 1);
+      expect(outputs[finalizeFailureOutputIndex]?.state).toBe('finalizing');
+      finalizeFails = false;
+      finalizeGate = null;
+      finalizeStarted = null;
+
+      finalizeGate = deferred<void>();
+      finalizeStarted = deferred<void>();
+      const timeoutFinalizeOutputIndex = outputs.length;
+      const timeoutFinalizeRecording = recordWithMediabunny(shortPlan(), () => true, {
+        finalizationTimeoutMs: 5,
+      });
+      let timeoutFinalizeSettled = false;
+      void timeoutFinalizeRecording.then(
+        () => { timeoutFinalizeSettled = true; },
+        () => { timeoutFinalizeSettled = true; },
+      );
+      await finalizeStarted.promise;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(timeoutFinalizeSettled).toBe(false);
+      expect(outputs[timeoutFinalizeOutputIndex]?.state).toBe('finalizing');
+      finalizeGate.resolve();
+      await expect(timeoutFinalizeRecording).rejects.toMatchObject({
+        code: 'encoder-failed',
+        message: 'WebM 编码器收尾超时，请重试',
+      });
+      expect(outputs[timeoutFinalizeOutputIndex]?.state).toBe('finalized');
+      finalizeGate = null;
+      finalizeStarted = null;
+
+      const abortController = new AbortController();
+      finalizeGate = deferred<void>();
+      finalizeStarted = deferred<void>();
+      const abortedFinalizeOutputIndex = outputs.length;
+      const cancelsBeforeFinalizationAbort = cancelCount;
+      const abortedFinalizeRecording = recordWithMediabunny(shortPlan(), () => true, {
+        signal: abortController.signal,
+      });
+      let abortedFinalizeSettled = false;
+      void abortedFinalizeRecording.then(
+        () => { abortedFinalizeSettled = true; },
+        () => { abortedFinalizeSettled = true; },
+      );
+      await finalizeStarted.promise;
+      abortController.abort();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(abortedFinalizeSettled).toBe(false);
+      expect(outputs[abortedFinalizeOutputIndex]?.state).toBe('finalizing');
+      finalizeGate.resolve();
+      await expect(abortedFinalizeRecording).rejects.toMatchObject({ code: 'cancelled' });
+      expect(outputs[abortedFinalizeOutputIndex]?.state).toBe('finalized');
+      expect(cancelCount).toBe(cancelsBeforeFinalizationAbort);
+      finalizeGate = null;
+      finalizeStarted = null;
+
+      configureFails = true;
+      const startedBeforeConfigureFailure = startedOutputs;
+      await expect(recordWithMediabunny(shortPlan(), () => true)).rejects.toMatchObject({
+        code: 'encoder-failed',
+      });
+      expect(startedOutputs).toBe(startedBeforeConfigureFailure);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.doUnmock('mediabunny');
+      vi.resetModules();
+    }
+  });
 });

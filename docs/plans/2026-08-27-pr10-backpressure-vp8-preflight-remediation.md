@@ -6,7 +6,7 @@
 
 **Architecture:** Extend `PreviewEncoderSession` with observable queue size and an abortable dequeue wait, then gate each encode against an exported queue limit and force a browser macrotask yield after a bounded number of frames. Model VP8 support as checking/supported/unsupported, derive the exact encoder configuration from resolution and frame rate, and ignore preflight completions that no longer own the current project session or selection. Keep the existing `{uri, sessionGeneration, operationGeneration}` barriers around every resumed wait and all download/playhead/status side effects.
 
-**Tech Stack:** React 19, TypeScript, WebCodecs, `webm-muxer`, Vitest + Testing Library, Playwright Chromium, OpenSpec.
+**Tech Stack:** React 19, TypeScript, WebCodecs, Mediabunny, Vitest + Testing Library, Playwright Chromium, OpenSpec.
 
 ---
 

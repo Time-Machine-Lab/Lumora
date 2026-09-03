@@ -1,12 +1,14 @@
 # PR #10 Terminal Frame, Focus, and Race Remediation Implementation Plan
 
+> **Migration note:** The implementation originally described below used `webm-muxer`. The active exporter now uses Mediabunny's `WebMOutputFormat`, `BufferTarget`, and `EncodedVideoPacketSource`; the WebCodecs timestamp, terminal-frame, backpressure, and finalization contracts remain unchanged.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use `executing-plans` to implement this plan task-by-task.
 
 **Goal:** Produce a new fixed PR #10 head whose real WebM artifacts retain the quantized terminal frame and whose export workspace closes the remaining keyboard, focus, persistence, and stale-operation gaps.
 
 **Architecture:** Replace real-time `canvas.captureStream()`/MediaRecorder timing with WebCodecs frames carrying explicit microsecond PTS values and a WebM muxer finalized only after `VideoEncoder.flush()`. Encode an unchanged terminal frame at `N / fps`, keep the existing session and operation generations, add microtask checkpoints around externally re-entrant `seek()` and capture calls, and restore focus from the initiating control with an enabled-action fallback. Browser evidence writes downloaded WebM files to Playwright output and probes packets, final PTS, and container duration with `ffprobe`.
 
-**Tech Stack:** React 19, TypeScript, WebCodecs, `webm-muxer`, Vitest + Testing Library, Playwright Chromium, FFmpeg `ffprobe`, OpenSpec.
+**Tech Stack:** React 19, TypeScript, WebCodecs, Mediabunny, Vitest + Testing Library, Playwright Chromium, FFmpeg `ffprobe`, OpenSpec.
 
 ---
 

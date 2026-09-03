@@ -1,6 +1,12 @@
 import { getReachableIds } from '@lumora/core';
 import type { Project, ShotClipData } from '@lumora/core';
-import { ArrayBufferTarget, Muxer } from 'webm-muxer';
+import {
+  BufferTarget,
+  EncodedPacket,
+  EncodedVideoPacketSource,
+  Output,
+  WebMOutputFormat,
+} from 'mediabunny';
 
 export type PreviewResolution = '720p' | '480p';
 export type PreviewFrameRate = 24 | 30;
@@ -103,7 +109,7 @@ export interface PreviewEncoderSession {
   encodeFrame(canvas: HTMLCanvasElement, frame: PreviewEncodedFrame): void;
   waitForQueueSize(maxQueueSize: number, signal?: AbortSignal): Promise<void>;
   flush(): Promise<Blob>;
-  close(): void;
+  close(): void | Promise<void>;
 }
 
 export interface PreviewRecordingDependencies {
@@ -334,26 +340,44 @@ function defaultRecordingDependencies(): PreviewRecordingDependencies {
   return {
     createCanvas: () => document.createElement('canvas'),
     createEncoder: (plan) => {
-      const target = new ArrayBufferTarget();
       const vp9 = plan.mimeType.toLowerCase().includes('vp9');
-      const muxer = new Muxer({
+      const target = new BufferTarget();
+      const packetSource = new EncodedVideoPacketSource(vp9 ? 'vp9' : 'vp8');
+      const output = new Output({
+        format: new WebMOutputFormat(),
         target,
-        video: {
-          codec: vp9 ? 'V_VP9' : 'V_VP8',
-          width: plan.width,
-          height: plan.height,
-          frameRate: plan.fps,
-        },
-        firstTimestampBehavior: 'strict',
       });
+      output.addVideoTrack(packetSource, { frameRate: plan.fps });
+      let startPromise = Promise.resolve();
       let encoderFailure: Error | null = null;
       const encoderFailureListeners = new Set<(error: Error) => void>();
+      const capacityListeners = new Set<() => void>();
+      let packetWritePromise = Promise.resolve();
+      let finalizationPromise: Promise<void> | null = null;
+      let pendingPacketWrites = 0;
+      const reportFailure = (error: unknown) => {
+        if (encoderFailure) return;
+        encoderFailure = error instanceof Error ? error : new Error(String(error));
+        for (const listener of encoderFailureListeners) listener(encoderFailure);
+      };
       const encoder = new VideoEncoder({
-        output: (chunk, metadata) => muxer.addVideoChunk(chunk, metadata),
-        error: (error) => {
-          encoderFailure = error;
-          for (const listener of encoderFailureListeners) listener(error);
+        output: (chunk, metadata) => {
+          pendingPacketWrites += 1;
+          packetWritePromise = packetWritePromise
+            .then(async () => {
+              await startPromise;
+              if (encoderFailure) throw encoderFailure;
+              await packetSource.add(EncodedPacket.fromEncodedChunk(chunk), metadata);
+            })
+            .catch((error: unknown) => {
+              reportFailure(error);
+            })
+            .finally(() => {
+              pendingPacketWrites -= 1;
+              for (const listener of capacityListeners) listener();
+            });
         },
+        error: reportFailure,
       });
       try {
         encoder.configure(encoderConfig(plan.width, plan.height, plan.fps, plan.mimeType));
@@ -365,9 +389,11 @@ function defaultRecordingDependencies(): PreviewRecordingDependencies {
         }
         throw error;
       }
+      startPromise = output.start();
+      void startPromise.catch(reportFailure);
       return {
         get encodeQueueSize() {
-          return encoder.encodeQueueSize;
+          return encoder.encodeQueueSize + pendingPacketWrites;
         },
         encodeFrame: (canvas, frame) => {
           if (encoderFailure) throw encoderFailure;
@@ -384,13 +410,15 @@ function defaultRecordingDependencies(): PreviewRecordingDependencies {
         },
         waitForQueueSize: async (maxQueueSize, signal) => {
           if (encoderFailure) throw encoderFailure;
-          if (encoder.encodeQueueSize <= maxQueueSize) return;
+          const queueSize = () => encoder.encodeQueueSize + pendingPacketWrites;
+          if (queueSize() <= maxQueueSize) return;
           await new Promise<void>((resolve, reject) => {
             let settled = false;
             const finish = (callback: () => void) => {
               if (settled) return;
               settled = true;
               encoder.removeEventListener('dequeue', onDequeue);
+              capacityListeners.delete(onDequeue);
               encoderFailureListeners.delete(onEncoderFailure);
               signal?.removeEventListener('abort', onAbort);
               callback();
@@ -399,12 +427,13 @@ function defaultRecordingDependencies(): PreviewRecordingDependencies {
             const onDequeue = () => {
               if (encoderFailure) {
                 finish(() => reject(encoderFailure));
-              } else if (encoder.encodeQueueSize <= maxQueueSize) {
+              } else if (queueSize() <= maxQueueSize) {
                 finish(resolve);
               }
             };
             const onAbort = () => finish(() => reject(abortError()));
             encoder.addEventListener('dequeue', onDequeue);
+            capacityListeners.add(onDequeue);
             encoderFailureListeners.add(onEncoderFailure);
             signal?.addEventListener('abort', onAbort, { once: true });
             if (signal?.aborted) onAbort();
@@ -413,16 +442,34 @@ function defaultRecordingDependencies(): PreviewRecordingDependencies {
           if (encoderFailure) throw encoderFailure;
         },
         flush: async () => {
+          await startPromise;
           await encoder.flush();
           if (encoderFailure) throw encoderFailure;
-          muxer.finalize();
+          await packetWritePromise;
+          if (encoderFailure) throw encoderFailure;
+          finalizationPromise = output.finalize();
+          await finalizationPromise;
+          if (!target.buffer) throw new Error('Mediabunny did not produce an output buffer.');
           return new Blob([target.buffer], { type: plan.mimeType });
         },
-        close: () => {
+        close: async () => {
           try {
             encoder.close();
           } catch {
             // An encoder error may already have closed the codec.
+          }
+          if (finalizationPromise) {
+            try {
+              await finalizationPromise;
+            } catch (error) {
+              reportFailure(error);
+            }
+          } else if (output.state !== 'finalized' && output.state !== 'canceled') {
+            try {
+              await output.cancel();
+            } catch (error) {
+              reportFailure(error);
+            }
           }
         },
       };
@@ -569,14 +616,14 @@ export async function recordPreviewWebm(
         }
       }
     }
-    // The muxer derives duration from the last encoded PTS, so encode the
-    // unchanged canvas once at N/fps and wait for WebCodecs flush completion.
+    // Retain the unchanged canvas at N/fps as a zero-duration terminal packet.
+    // Mediabunny derives container duration from packet end timestamps.
     await waitForEncoderCapacity();
     ensureOperationCurrent();
     const terminalTimestamp = frameTimestamp(plan.totalFrames);
     encoder.encodeFrame(canvas, {
       timestamp: terminalTimestamp,
-      duration: frameTimestamp(plan.totalFrames + 1) - terminalTimestamp,
+      duration: 0,
       keyFrame: false,
     });
     ensureOperationCurrent();
@@ -623,7 +670,7 @@ export async function recordPreviewWebm(
       readableError(error, 'WebM 导出失败'),
     );
   } finally {
-    encoder.close();
+    await encoder.close();
     canvas.width = 1;
     canvas.height = 1;
   }
