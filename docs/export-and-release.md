@@ -2,6 +2,53 @@
 
 本文定义 Lumora MVP 的分镜导出契约、浏览器降级策略、性能基准方法和发布检查项。自动化结果只覆盖仓库可执行的环境；标为“人工”的项目必须由发布负责人记录浏览器版本、设备和结论。
 
+## WebM muxing implementation
+
+Lumora uses Mediabunny for WebM container writing. The Studio exporter keeps
+WebCodecs `VideoEncoder` in charge of frame production and converts each
+`EncodedVideoChunk` into a Mediabunny `EncodedPacket` before adding it to an
+`EncodedVideoPacketSource`. This preserves explicit microsecond timestamps and
+durations, while Mediabunny's `WebMOutputFormat` and `BufferTarget` provide the
+container finalization and in-memory output.
+
+The exporter still enforces a combined maximum of four frames across the
+WebCodecs queue and pending packet writes, checks cancellation and operation
+ownership around every wait, and encodes an unchanged zero-duration terminal
+packet at `N / fps`. It waits for `VideoEncoder.flush()` and pending packet
+writes, and only then awaits `Output.finalize()` and returns a Blob. Any error or
+cancellation closes the WebCodecs encoder and awaits cancellation of an output
+that has not begun finalizing. Mediabunny finalization itself is non-cancellable;
+if it has started, the exporter waits for that in-flight cleanup before returning
+the cancellation or timeout so the next export can retry cleanly.
+`finalizationTimeoutMs` is therefore a watchdog for the flush/finalization
+operation, not a hard upper bound on the caller's returned promise: if
+`Output.finalize()` is already running when the watchdog fires, the exporter
+records the timeout but waits for that promise to settle before returning.
+This is the only safe way to avoid detached writes because Mediabunny's
+`Output.cancel()` is intentionally a no-op once finalization has begun.
+
+Mediabunny is distributed under the MPL-2.0. Keep its license and attribution
+entry in `docs/THIRD_PARTY_NOTICES.md`; regenerate that inventory after every
+dependency or lockfile change and do not ship a bundle with an `UNKNOWN`
+license.
+
+### Dependency comparison
+
+| Dependency | Capability | License | npm unpacked size | Browser support | Migration risk |
+| --- | --- | --- | ---: | --- | --- |
+| `webm-muxer@5.1.4` | WebM muxing only; synchronous WebCodecs chunk handoff | MIT; deprecated and superseded | 147,682 bytes | Depends on Lumora's WebCodecs implementation | No maintenance path; retained custom timing and cleanup code |
+| `mediabunny@1.55.6` | Maintained WebM/Matroska muxing plus packet, input, and conversion APIs; tree-shakable | MPL-2.0 | 10,431,508 bytes | Modern browsers with WebCodecs; Lumora still performs explicit VP8 preflight | Larger source distribution and MPL notice; packet writes are asynchronous and must be serialized before finalization |
+
+The size figures are npm `dist.unpackedSize` values, not shipped JavaScript
+bundle sizes. Vite tree-shakes and bundles Mediabunny into the Studio artifact,
+so it is a build-time dependency rather than a dependency installed again by
+Studio consumers. This also prevents Mediabunny's pinned WebCodecs ambient type
+package from conflicting with consumer DOM libraries. The Studio build keeps
+the existing WebCodecs encoder boundary. The main compatibility risk is
+therefore the seconds-based packet API and asynchronous writer backpressure;
+regression tests cover the conversion from microsecond WebCodecs timestamps and
+the finalization barrier.
+
 ## 导出契约
 
 导出工作台默认选择全部分镜、1280 x 720 和 24fps。用户也可选择单个分镜、854 x 480 或 30fps。
@@ -15,7 +62,7 @@
 
 工作台打开及分辨率、帧率或项目会话变化后，会异步检查精确的 VP8 配置；检查完成前 WebM 按钮保持禁用并显示检查状态。不支持、检查失败或陈旧检查结果都不能进入 `configure()`，本轮不协商 VP9 回退。
 
-时间线录制进行中不允许开始 PNG 或 WebM 画面导出，避免录制机位跳过轨道求值。编码按项目中的分镜顺序逐帧推进，源时间为 `shot.startTime + frameIndex / fps`。第 `i` 个编码帧显式使用 `round(i * 1,000,000 / fps)` 微秒 PTS，其 duration 为相邻量化时间戳之差，因此文件时钟不依赖墙钟、计时器节流或渲染耗时。编码器在途队列上限为 4 帧；达到上限时等待 `dequeue` 把队列降到 3 帧后再继续，并且即使未触发背压也至少每 4 个内容帧通过计时器让出一次浏览器宏任务。每次背压等待或宏任务让步恢复后立即复核取消信号和操作所有权。`N` 个内容帧完成后，再把未改变的末帧编码到 `N / fps`，随后等待 `VideoEncoder.flush()`、完成 WebM muxer finalization，才允许下载。
+时间线录制进行中不允许开始 PNG 或 WebM 画面导出，避免录制机位跳过轨道求值。编码按项目中的分镜顺序逐帧推进，源时间为 `shot.startTime + frameIndex / fps`。第 `i` 个内容帧显式使用 `round(i * 1,000,000 / fps)` 微秒 PTS，其 duration 为相邻量化时间戳之差，因此文件时钟不依赖墙钟、计时器节流或渲染耗时。编码器和待写 packet 的合计在途队列上限为 4 帧；达到上限时等待容量降到 3 帧后再继续，并且即使未触发背压也至少每 4 个内容帧通过计时器让出一次浏览器宏任务。每次背压等待或宏任务让步恢复后立即复核取消信号和操作所有权。`N` 个内容帧完成后，再把未改变的末帧作为零时长终止 packet 编码到 `N / fps`；Mediabunny 按 packet 结束时间计算容器时长，因此该零时长可保留终止 PTS 而不额外延长一帧。随后等待 `VideoEncoder.flush()`、所有 Mediabunny packet 写入和 `Output.finalize()`，才允许下载。失败或取消时，尚未进入 finalizing 的输出等待 `Output.cancel()` 清理；若不可取消的 finalization 已开始，则等待该 promise 完成后再返回取消或超时结果。
 
 真实产物门禁使用 `ffprobe` 检查视频 packet、末 PTS 和容器 duration。`N` 个内容帧必须产生 `N + 1` 个 packet，末 PTS 和容器 duration 必须命中 `N / fps`，且容差小于四分之一帧；源时间线到量化目标的误差单独限制在半帧内，不能用该误差掩盖缺失终止帧。
 

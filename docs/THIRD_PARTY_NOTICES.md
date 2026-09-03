@@ -4,7 +4,7 @@
 
 This inventory identifies the third-party npm packages present in the locked Lumora dependency graph. It is not a replacement for the license text shipped by each package. Release artifacts must retain any license or notice files required by those packages.
 
-Locked package identities: **419**
+Locked package identities: **420**
 
 | Package | Version | License | Scope |
 | --- | --- | --- | --- |
@@ -145,7 +145,9 @@ Locked package identities: **419**
 | @types/babel__generator | 7.27.0 | MIT | development |
 | @types/babel__template | 7.4.4 | MIT | development |
 | @types/babel__traverse | 7.28.0 | MIT | development |
-| @types/dom-webcodecs | 0.1.19 | MIT | runtime |
+| @types/dom-mediacapture-transform | 0.1.12 | MIT | development |
+| @types/dom-webcodecs | 0.1.13 | MIT | development |
+| @types/dom-webcodecs | 0.1.19 | MIT | development |
 | @types/draco3d | 1.4.10 | MIT | runtime |
 | @types/estree | 1.0.9 | MIT | development |
 | @types/json-schema | 7.0.15 | MIT | development |
@@ -157,7 +159,6 @@ Locked package identities: **419**
 | @types/stats.js | 0.17.4 | MIT | runtime |
 | @types/three | 0.170.0 | MIT | runtime |
 | @types/webxr | 0.5.24 | MIT | runtime |
-| @types/wicg-file-system-access | 2020.9.8 | MIT | runtime |
 | @typescript-eslint/eslint-plugin | 8.67.0 | MIT | development |
 | @typescript-eslint/parser | 8.67.0 | MIT | development |
 | @typescript-eslint/project-service | 8.67.0 | MIT | development |
@@ -319,6 +320,7 @@ Locked package identities: **419**
 | maath | 0.10.8 | MIT | runtime |
 | magic-string | 0.30.21 | MIT | development |
 | math-intrinsics | 1.1.0 | MIT | development |
+| mediabunny | 1.55.6 | MPL-2.0 | development |
 | meshline | 3.3.1 | MIT | runtime |
 | meshoptimizer | 0.18.1 | MIT | runtime |
 | mime-db | 1.52.0 | MIT | development |
@@ -412,7 +414,6 @@ Locked package identities: **419**
 | webgl-constants | 1.1.1 | MIT | runtime |
 | webgl-sdf-generator | 1.1.1 | MIT | runtime |
 | webidl-conversions | 7.0.0 | BSD-2-Clause | development |
-| webm-muxer | 5.1.4 | MIT | runtime |
 | whatwg-encoding | 3.1.1 | MIT | development |
 | whatwg-mimetype | 4.0.0 | MIT | development |
 | whatwg-url | 14.2.0 | MIT | development |
