@@ -55,6 +55,17 @@ test('命令面板（Ctrl+K）可过滤并执行 Mock 插件命令', async ({ pa
   await expect(page.getByTestId('command-palette')).not.toBeVisible();
 });
 
+test('命令面板输入框按 Enter 执行首个匹配命令', async ({ page }) => {
+  await expect(page.getByTestId('panel-tab-com.lumora.mock.panel.console')).toBeVisible();
+  await page.keyboard.press('Control+k');
+  const input = page.getByTestId('command-palette-input');
+  await input.fill('exportScene');
+  await expect(page.getByTestId('palette-command-com.lumora.mock.exportScene')).toBeVisible();
+  await input.press('Enter');
+  await expect(page.getByTestId('command-palette')).not.toBeVisible();
+  await expect(page.getByTestId('event-log')).toContainText('command:executed');
+});
+
 test('Mock AI 面板经 services.ai 流式对话', async ({ page }) => {
   await page.getByTestId('panel-tab-com.lumora.mock.panel.ai').click();
   await expect(page.getByTestId('mock-ai-input')).toBeVisible();

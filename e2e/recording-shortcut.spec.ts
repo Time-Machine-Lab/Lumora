@@ -79,10 +79,9 @@ function renderedProjection(fingerprint: ProjectFingerprint): RenderedTrackFinge
 }
 
 async function readRenderedTimelineFingerprint(page: Page): Promise<RenderedTrackFingerprint[]> {
-  return page.locator('[data-testid^="track-lane-"]').evaluateAll((nodes) =>
+  return page.locator('[data-track-id]').evaluateAll((nodes) =>
     nodes.map((node) => {
-      const testId = node.getAttribute('data-testid') ?? '';
-      const id = testId.slice('track-lane-'.length);
+      const id = node.getAttribute('data-track-id') ?? '';
       return {
         id,
         targetPath: node.getAttribute('data-track-target-path') ?? '',
@@ -154,7 +153,7 @@ test('accepting beforeunload discards active uncommitted recording samples', asy
   await page.keyboard.press('Shift+R');
   await page.getByText('覆盖录制').click();
   const record = page.getByTestId('timeline-record');
-  await expect(record).toHaveText('■');
+  await expect(record).toHaveAccessibleName('停止录制');
   await page.keyboard.down('w');
   await page.waitForTimeout(300);
   await page.keyboard.up('w');
@@ -182,12 +181,12 @@ test('saved recordings restore the same track and keyframe fingerprint after reo
   await page.keyboard.press('Shift+R');
   await page.getByText('覆盖录制').click();
   const record = page.getByTestId('timeline-record');
-  await expect(record).toHaveText('■');
+  await expect(record).toHaveAccessibleName('停止录制');
   await page.keyboard.down('w');
   await page.waitForTimeout(300);
   await page.keyboard.up('w');
   await page.keyboard.press('Shift+R');
-  await expect(record).toHaveText('●');
+  await expect(record).toHaveAccessibleName('开始录制机位运动');
   await expect(page.getByTestId('save-state-badge')).toHaveText('已保存', { timeout: 6000 });
   const storedBeforeClose = await readStoredRecording(page);
   expect(storedBeforeClose).not.toBeNull();

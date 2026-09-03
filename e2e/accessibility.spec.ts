@@ -2,17 +2,26 @@ import AxeBuilder from '@axe-core/playwright';
 import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
 
+async function clickToolbarItem(page: Page, testId: string) {
+  const item = page.getByTestId(testId);
+  if (!(await item.isVisible())) {
+    await page.getByTestId('toolbar-more').click();
+    await expect(item).toBeVisible();
+  }
+  await item.click();
+}
+
 async function openSampleExport(page: Page) {
   await page.goto('/');
-  await page.getByTestId('open-sample-project').click();
-  await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
+  await clickToolbarItem(page, 'open-sample-project');
+  await expect(page.getByTestId('open-export-workspace')).toBeEnabled();
   await page.getByTestId('open-export-workspace').click();
   await expect(page.getByTestId('export-workspace')).toBeVisible();
 }
 
 test('host event log preserves native PageDown and Space scrolling without toggling Studio playback', async ({ page }) => {
   await page.goto('/');
-  await page.getByTestId('open-sample-project').click();
+  await clickToolbarItem(page, 'open-sample-project');
   await expect(page.getByTestId('tree-row-sample-cube')).toBeVisible();
 
   const log = page.getByTestId('host-event-log');

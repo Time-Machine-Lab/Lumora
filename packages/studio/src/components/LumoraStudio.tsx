@@ -1,5 +1,4 @@
 import { forwardRef, useCallback, useEffect, useId, useImperativeHandle, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import type { ReactNode } from 'react';
 import { findObject } from '@lumora/core';
 import type { PluginDescriptor, Project } from '@lumora/core';
@@ -14,6 +13,7 @@ import { PanelHost } from './panels/PanelHost';
 import { Toolbar } from './Toolbar';
 import { CommandPalette } from './CommandPalette';
 import { PluginManager } from './PluginManager';
+import { ModalDialog } from './ModalDialog';
 import { EditorViewport } from './editor/EditorViewport';
 import { TimelinePanel } from './editor/TimelinePanel';
 import { ObjectTree } from './editor/ObjectTree';
@@ -166,6 +166,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     return true;
   }, []);
   const [saveState, setSaveState] = useState<AutosaveState>({ status: 'idle' });
+  const overwriteTitleId = useId();
 
   useEffect(() => {
     const sub = runtime.persistence.events.on('save-state', ({ state }) => setSaveState(state));
@@ -189,102 +190,6 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
     window.addEventListener('beforeunload', preventDataLoss);
     return () => window.removeEventListener('beforeunload', preventDataLoss);
   }, [protectBeforeUnload]);
-  // 覆盖确认模态（复审阻断 4）：提升到壳层根级，打开时整壳 inert（工具栏/对象树/
-  // 视口/时间线整体不可达），模态经 portal 挂到 body 脱离 inert 子树
-  const overwriteModalRef = useRef<HTMLDivElement>(null);
-  const overwriteTriggerRef = useRef<HTMLElement | null>(null);
-  useEffect(() => {
-    if (!session.state.overwritePending) return;
-    const dialog = overwriteModalRef.current;
-    if (!dialog) return;
-    overwriteTriggerRef.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const focusables = () =>
-      Array.from(
-        dialog.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-        ),
-      );
-    focusables()[0]?.focus();
-    // 捕获阶段处理先于全局冒泡处理器，stopImmediatePropagation 使其不可达。
-    // 应用快捷键统一小写匹配：Ctrl+Shift+K 的 key 为大写 K，未小写化时泄漏到
-    // 命令面板开关（复审阻断 4）
-    const isModalEditingShortcut = (event: KeyboardEvent) => {
-      const key = event.key.toLowerCase();
-      return (
-        key === 'delete' ||
-        key === 'backspace' ||
-        key === '1' ||
-        key === '2' ||
-        key === '3' ||
-        ((event.ctrlKey || event.metaKey) &&
-          (key === 'k' || key === 'z' || key === 'y' || key === 'd')) ||
-        matchesShortcut(event, recordingShortcutRef.current) ||
-        (DRIVE_KEY_CODES.has(event.code) && !event.ctrlKey && !event.metaKey && !event.altKey)
-      );
-    };
-    const onKeyDownCapture = (event: KeyboardEvent) => {
-      // Escape 无条件取消，先于「模态外」分支判定：焦点逃逸到对话框外后
-      // Escape 不得被 outside 分支吞掉（复审阻断 4）
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        session.cancelOverwrite();
-        return;
-      }
-      const inside = event.target instanceof Node && dialog.contains(event.target);
-      if (!inside) {
-        // 模态外（含 window/document 上的按键）：一律拦截，不再穿透到全局处理器；
-        // 焦点若已逃逸到对话框外（程序性 blur 等），Tab 把它拉回首项（焦点陷阱闭环）
-        if (event.key === 'Tab') {
-          focusables()[0]?.focus();
-        }
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        return;
-      }
-      if (event.key === 'Tab') {
-        const list = focusables();
-        if (list.length === 0) {
-          event.preventDefault();
-          event.stopImmediatePropagation();
-          return;
-        }
-        const first = list[0]!;
-        const last = list[list.length - 1]!;
-        if (!dialog.contains(document.activeElement)) {
-          event.preventDefault();
-          event.stopImmediatePropagation();
-          first.focus();
-        } else if (event.shiftKey && document.activeElement === first) {
-          event.preventDefault();
-          event.stopImmediatePropagation();
-          last.focus();
-        } else if (!event.shiftKey && document.activeElement === last) {
-          event.preventDefault();
-          event.stopImmediatePropagation();
-          first.focus();
-        }
-        return;
-      }
-      if (isModalEditingShortcut(event)) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        return;
-      }
-      if (event.key === ' ') {
-        // 对话框按钮的空格激活走原生行为，只阻断冒泡到全局播放切换
-        event.stopImmediatePropagation();
-        return;
-      }
-    };
-    window.addEventListener('keydown', onKeyDownCapture, true);
-    return () => {
-      window.removeEventListener('keydown', onKeyDownCapture, true);
-      const trigger = overwriteTriggerRef.current;
-      if (trigger && trigger.isConnected) trigger.focus();
-    };
-  }, [session.state.overwritePending, session]);
   // 分镜缩略图截图通道：EditorViewport 的 FrameCaptureBridge 挂载后可用
   const captureRef = useRef<((cameraObjectId?: string | null) => string | null) | null>(null);
   const exportFrameRef = useRef<ExportFrameCapture | null>(null);
@@ -307,8 +212,17 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [storyboardOpen, setStoryboardOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [editorPanel, setEditorPanel] = useState<'scene' | 'objects' | 'properties'>('scene');
   const exportButtonRef = useRef<HTMLButtonElement>(null);
+  const paletteButtonRef = useRef<HTMLButtonElement>(null);
+  const pluginButtonRef = useRef<HTMLButtonElement>(null);
+  const paletteReturnFocusRef = useRef<HTMLElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const rememberPaletteReturnFocus = useCallback(() => {
+    const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    paletteReturnFocusRef.current =
+      activeElement && activeElement !== document.body ? activeElement : paletteButtonRef.current;
+  }, []);
 
   useEffect(() => {
     const closeWorkspace = () => {
@@ -502,7 +416,10 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       if ((event.ctrlKey || event.metaKey) && key === 'k') {
         event.preventDefault();
         setStoryboardOpen(false);
-        setPaletteOpen((open) => !open);
+        setPaletteOpen((open) => {
+          if (!open) rememberPaletteReturnFocus();
+          return !open;
+        });
         return;
       }
       if (preservesNativeKeyboardSemantics(event)) return;
@@ -565,7 +482,7 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
       window.removeEventListener('keydown', onKey);
       unregisterRoot();
     };
-  }, [runtime, exportOpen]);
+  }, [runtime, exportOpen, rememberPaletteReturnFocus]);
 
   return (
     <>
@@ -574,9 +491,6 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         className={`lumora-studio${className ? ` ${className}` : ''}`}
         data-testid="lumora-studio"
         data-workspace={storyboardOpen ? 'storyboard' : exportOpen ? 'export' : undefined}
-        // 覆盖确认模态打开时整壳 inert：工具栏/对象树/视口/时间线整体不可达
-        // （复审阻断 4：仅时间线内容 inert 时其余应用仍可交互）
-        inert={session.state.overwritePending || undefined}
       >
         <Toolbar
           runtime={runtime}
@@ -586,6 +500,8 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
           storyboardOpen={storyboardOpen}
           exportOpen={exportOpen}
           exportButtonRef={exportButtonRef}
+          paletteButtonRef={paletteButtonRef}
+          pluginButtonRef={pluginButtonRef}
           onToggleStoryboard={() => {
             setPluginManagerOpen(false);
             setPaletteOpen(false);
@@ -606,12 +522,73 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
           onTogglePalette={() => {
             setStoryboardOpen(false);
             setExportOpen(false);
-            setPaletteOpen((open) => !open);
+            setPaletteOpen((open) => {
+              if (!open) rememberPaletteReturnFocus();
+              return !open;
+            });
           }}
         />
         <div className="lumora-studio__stage">
-        <div className="lumora-studio__body" inert={storyboardOpen || exportOpen || undefined}>
-          <div className="lumora-studio__sidebar">
+        <div
+          className="lumora-studio__mobile-tabs"
+          role="tablist"
+          aria-label="编辑器面板"
+          inert={storyboardOpen || exportOpen || undefined}
+        >
+          {([
+            ['scene', '场景'],
+            ['objects', '对象'],
+            ['properties', '属性'],
+          ] as const).map(([panel, label]) => (
+            <button
+              key={panel}
+              type="button"
+              role="tab"
+              id={`editor-panel-tab-${panel}`}
+              data-testid={`editor-panel-${panel}`}
+              aria-controls={`editor-panel-content-${panel}`}
+              aria-selected={editorPanel === panel}
+              tabIndex={editorPanel === panel ? 0 : -1}
+              disabled={panel !== 'scene' && !project}
+              onClick={() => setEditorPanel(panel)}
+              onKeyDown={(event) => {
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                const tabs = Array.from(
+                  event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
+                    '[role="tab"]:not(:disabled)',
+                  ) ?? [],
+                );
+                if (tabs.length === 0) return;
+                event.preventDefault();
+                event.stopPropagation();
+                const current = tabs.indexOf(event.currentTarget);
+                let next = 0;
+                if (event.key === 'End') next = tabs.length - 1;
+                else if (event.key === 'ArrowLeft') next = current <= 0 ? tabs.length - 1 : current - 1;
+                else if (event.key === 'ArrowRight') next = current === tabs.length - 1 ? 0 : current + 1;
+                const nextTab = tabs[next];
+                const nextPanel = nextTab?.dataset.editorPanel as typeof editorPanel | undefined;
+                if (!nextTab || !nextPanel) return;
+                setEditorPanel(nextPanel);
+                nextTab.focus();
+              }}
+              data-editor-panel={panel}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <div
+          className="lumora-studio__body"
+          data-editor-panel={editorPanel}
+          inert={storyboardOpen || exportOpen || undefined}
+        >
+          <div
+            className="lumora-studio__sidebar"
+            id="editor-panel-content-objects"
+            role="tabpanel"
+            aria-labelledby="editor-panel-tab-objects"
+          >
             <ObjectTree
               editor={runtime.editor}
               project={project}
@@ -624,7 +601,12 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
               onDisablePlugin={(pluginId) => void runtime.host.disable(pluginId)}
             />
           </div>
-          <main className="lumora-studio__viewport">
+          <main
+            className="lumora-studio__viewport"
+            id="editor-panel-content-scene"
+            role="tabpanel"
+            aria-labelledby="editor-panel-tab-scene"
+          >
             <div className="lumora-studio__scene-slot">
               {scene ? (
                 scene(project)
@@ -665,12 +647,19 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
               />
             )}
           </main>
-          <PropertiesPanel
-            editor={runtime.editor}
-            project={project}
-            selection={editorState.selection}
-            liveTransformStore={liveTransformStore}
-          />
+          <div
+            className="lumora-studio__inspector-slot"
+            id="editor-panel-content-properties"
+            role="tabpanel"
+            aria-labelledby="editor-panel-tab-properties"
+          >
+            <PropertiesPanel
+              editor={runtime.editor}
+              project={project}
+              selection={editorState.selection}
+              liveTransformStore={liveTransformStore}
+            />
+          </div>
         </div>
         {storyboardOpen && project && (
           <StoryboardWorkspace
@@ -698,36 +687,45 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         )}
         </div>
         <ToastHost />
-        {pluginManagerOpen && <PluginManager runtime={runtime} onClose={() => setPluginManagerOpen(false)} />}
-        {paletteOpen && <CommandPalette runtime={runtime} onClose={() => setPaletteOpen(false)} />}
-      </div>
-      {session.state.overwritePending &&
-        createPortal(
-          <div
-            className="lumora-studio lumora-studio--portal lumora-timeline__overlay"
-            data-testid="overwrite-confirm"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="overwrite-confirm-title"
-          >
-            <div className="lumora-timeline__modal" ref={overwriteModalRef} tabIndex={-1}>
-              <p id="overwrite-confirm-title">该机位已有录制轨道，覆盖现有关键帧？</p>
-              <div className="lumora-timeline__modal-actions">
-                <button
-                  type="button"
-                  className="lumora-button lumora-button--danger"
-                  onClick={session.confirmOverwrite}
-                >
-                  覆盖录制
-                </button>
-                <button type="button" className="lumora-button" onClick={session.cancelOverwrite}>
-                  取消
-                </button>
-              </div>
-            </div>
-          </div>,
-          document.body,
+        {pluginManagerOpen && (
+          <PluginManager
+            runtime={runtime}
+            returnFocusRef={pluginButtonRef}
+            onClose={() => setPluginManagerOpen(false)}
+          />
         )}
+        {paletteOpen && (
+          <CommandPalette
+            runtime={runtime}
+            returnFocusRef={paletteReturnFocusRef}
+            onClose={() => setPaletteOpen(false)}
+          />
+        )}
+      </div>
+      {session.state.overwritePending && (
+        <ModalDialog
+          backdropClassName="lumora-timeline__overlay"
+          dialogClassName="lumora-timeline__modal"
+          dialogTestId="overwrite-confirm"
+          ariaLabelledBy={overwriteTitleId}
+          closeOnBackdrop={false}
+          onClose={session.cancelOverwrite}
+        >
+          <p id={overwriteTitleId}>该机位已有录制轨道，覆盖现有关键帧？</p>
+          <div className="lumora-timeline__modal-actions">
+            <button
+              type="button"
+              className="lumora-button lumora-button--danger"
+              onClick={session.confirmOverwrite}
+            >
+              覆盖录制
+            </button>
+            <button type="button" className="lumora-button" onClick={session.cancelOverwrite}>
+              取消
+            </button>
+          </div>
+        </ModalDialog>
+      )}
     </>
   );
 });

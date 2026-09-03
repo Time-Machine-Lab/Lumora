@@ -557,8 +557,9 @@ describe('StoryboardWorkspace', () => {
     expect(adoptedPanel).not.toBeNull();
     expect(draftPanel).not.toHaveAttribute('hidden');
     expect(adoptedPanel).toHaveAttribute('hidden');
-    expect(screen.getByRole('tabpanel')).toHaveAttribute('id', draftPanelId);
-    expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', draftTabId);
+    const workspace = screen.getByTestId('storyboard-workspace');
+    expect(within(workspace).getByRole('tabpanel')).toHaveAttribute('id', draftPanelId);
+    expect(within(workspace).getByRole('tabpanel')).toHaveAttribute('aria-labelledby', draftTabId);
 
     draftTab.focus();
     fireEvent.keyDown(draftTab, { key: 'ArrowRight' });
@@ -569,8 +570,8 @@ describe('StoryboardWorkspace', () => {
     expect(draftTab).toHaveAttribute('tabindex', '-1');
     expect(draftPanel).toHaveAttribute('hidden');
     expect(adoptedPanel).not.toHaveAttribute('hidden');
-    expect(screen.getByRole('tabpanel')).toHaveAttribute('id', adoptedPanelId);
-    expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', adoptedTabId);
+    expect(within(workspace).getByRole('tabpanel')).toHaveAttribute('id', adoptedPanelId);
+    expect(within(workspace).getByRole('tabpanel')).toHaveAttribute('aria-labelledby', adoptedTabId);
 
     fireEvent.keyDown(adoptedTab, { key: 'Home' });
     expect(draftTab).toHaveFocus();

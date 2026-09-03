@@ -106,18 +106,29 @@ describe('R8-9 多实例快捷键隔离 + 移动菜单键盘语义', () => {
   it('R8-9-T3 命令面板快捷键按实例作用域：Ctrl+K 只切换焦点所在实例', async () => {
     const a = await mountStudio();
     const b = await mountStudio();
+    const aOpener = within(a.root).getByTestId('open-command-palette');
 
     act(() => {
       a.root.dispatchEvent(key('k', { ctrlKey: true }));
     });
-    // RED：旧实现 Ctrl+K 是「全局快捷键」，两个实例的面板同时打开
-    expect(within(a.root).queryByTestId('command-palette')).not.toBeNull();
-    expect(within(b.root).queryByTestId('command-palette')).toBeNull();
+    expect(screen.getAllByTestId('command-palette')).toHaveLength(1);
+
+    // 全应用模态打开后，背景实例不能叠加第二个命令面板。
+    act(() => {
+      b.root.dispatchEvent(key('k', { ctrlKey: true }));
+    });
+    expect(screen.getAllByTestId('command-palette')).toHaveLength(1);
+
+    act(() => {
+      screen.getByTestId('command-palette').dispatchEvent(key('Escape'));
+    });
+    expect(screen.queryByTestId('command-palette')).toBeNull();
+    expect(document.activeElement).toBe(aOpener);
 
     act(() => {
       b.root.dispatchEvent(key('k', { ctrlKey: true }));
     });
-    expect(within(b.root).queryByTestId('command-palette')).not.toBeNull();
+    expect(screen.getAllByTestId('command-palette')).toHaveLength(1);
   });
 
   it('R8-9-T4 移动菜单键盘：M 打开聚焦首项，方向键导航，Enter 提交', async () => {
@@ -165,13 +176,13 @@ describe('R8-9 多实例快捷键隔离 + 移动菜单键盘语义', () => {
   });
 
   it('R8-9-T6 单实例嵌入：按键落在实例外（body）仍生效（点击画布后焦点在 body）', async () => {
-    const a = await mountStudio();
+    await mountStudio();
     act(() => {
       document.body.dispatchEvent(key('k', { ctrlKey: true }));
     });
     // RED：严格包含校验下 body 上的按键被忽略，单实例嵌入（最常见形态）的
     // Ctrl+K/Delete 等快捷键全部失效
-    expect(within(a.root).queryByTestId('command-palette')).not.toBeNull();
+    expect(screen.queryByTestId('command-palette')).not.toBeNull();
   });
 
   it('单实例嵌入不接管聚焦的宿主控件，同时保留 body 兜底', async () => {
@@ -188,12 +199,12 @@ describe('R8-9 多实例快捷键隔离 + 移动菜单键盘语义', () => {
     });
 
     expect(play).toHaveTextContent(playBefore ?? '');
-    expect(within(a.root).queryByTestId('command-palette')).toBeNull();
+    expect(screen.queryByTestId('command-palette')).toBeNull();
 
     act(() => {
       document.body.dispatchEvent(key('k', { ctrlKey: true }));
     });
-    expect(within(a.root).queryByTestId('command-palette')).not.toBeNull();
+    expect(screen.queryByTestId('command-palette')).not.toBeNull();
     hostLog.remove();
   });
 

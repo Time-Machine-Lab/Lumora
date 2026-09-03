@@ -1634,12 +1634,12 @@ test('completes the new-project release flow without unhandled browser errors', 
   await page.getByTitle('摄像机', { exact: true }).click();
 
   await page.getByTestId('timeline-record').click();
-  await expect(page.getByTestId('timeline-record')).toHaveText('■');
+  await expect(page.getByTestId('timeline-record')).toHaveAccessibleName('停止录制');
   await page.keyboard.down('w');
   await page.waitForTimeout(250);
   await page.keyboard.up('w');
   await page.getByTestId('timeline-record').click();
-  await expect(page.getByTestId('timeline-record')).toHaveText('●');
+  await expect(page.getByTestId('timeline-record')).toHaveAccessibleName('开始录制机位运动');
   await expect(page.locator('[data-testid^="track-lane-"]')).not.toHaveCount(0);
 
   await page.getByTestId('open-storyboard-workspace').click();

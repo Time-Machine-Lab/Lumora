@@ -11,6 +11,7 @@ import type {
   StoryboardDraftPayload,
   StoryboardGenerateRequest,
 } from '@lumora/plugin-sdk';
+import './style.css';
 import { MockAiChatPanel } from './panels/MockAiChatPanel';
 import { MockConsolePanel } from './panels/MockConsolePanel';
 

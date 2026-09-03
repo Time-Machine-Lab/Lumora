@@ -1,10 +1,15 @@
 import type { PluginInfo } from '@lumora/core';
+import { useId } from 'react';
+import type { RefObject } from 'react';
 import type { StudioRuntime } from '../runtime/studio-runtime';
+import { X } from 'lucide-react';
 import { useEventRefresh } from '../hooks/use-event-refresh';
+import { ModalDialog } from './ModalDialog';
 
 interface PluginManagerProps {
   runtime: StudioRuntime;
   onClose: () => void;
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }
 
 const STATE_LABELS: Record<PluginInfo['state'], string> = {
@@ -18,33 +23,48 @@ const STATE_LABELS: Record<PluginInfo['state'], string> = {
   failed: '失败',
 };
 
-export function PluginManager({ runtime, onClose }: PluginManagerProps) {
+export function PluginManager({ runtime, onClose, returnFocusRef }: PluginManagerProps) {
+  const titleId = useId();
   useEventRefresh(runtime.events, ['plugin:state-changed', 'contribution:changed']);
   const plugins = runtime.host.listPlugins();
 
   return (
-    <div className="lumora-modal-backdrop" data-testid="plugin-manager" onClick={onClose}>
-      <div
-        className="lumora-modal"
-        role="dialog"
-        aria-label="插件管理"
-        onClick={(event) => event.stopPropagation()}
-      >
+    <ModalDialog
+      dialogClassName="lumora-modal"
+      backdropTestId="plugin-manager"
+      ariaLabelledBy={titleId}
+      returnFocusRef={returnFocusRef}
+      onClose={onClose}
+    >
         <header className="lumora-modal__header">
-          <h2>插件管理</h2>
+          <h2 id={titleId}>插件管理</h2>
           <button
             type="button"
-            className="lumora-button"
+            className="lumora-icon-button lumora-modal__close"
             data-testid="close-plugin-manager"
+            aria-label="关闭插件管理"
+            title="关闭插件管理"
             onClick={onClose}
           >
-            关闭
+            <X aria-hidden="true" />
           </button>
         </header>
         <p className="lumora-modal__hint">插件代码在独立的错误隔离中运行；失败原因与停用入口见下表。</p>
         <ul className="lumora-plugin-list">
           {plugins.length === 0 && <li className="lumora-plugin-list__empty">尚未注册任何插件</li>}
-          {plugins.map((plugin) => (
+          {plugins.map((plugin) => {
+            const busy = ['registered', 'loading', 'activating', 'deactivating'].includes(plugin.state);
+            const disables = plugin.state === 'active' || plugin.state === 'failed' || plugin.state === 'deactivating';
+            const actionLabel = plugin.state === 'deactivating'
+              ? '停用中…'
+              : plugin.state === 'loading' || plugin.state === 'activating'
+                ? '启用中…'
+                : disables
+                  ? '禁用'
+                  : plugin.reason
+                    ? '重新启用'
+                    : '启用';
+            return (
             // 记录键/操作一律使用稳定唯一的 instanceId；manifest id 仅展示
             <li
               key={plugin.instanceId}
@@ -74,43 +94,33 @@ export function PluginManager({ runtime, onClose }: PluginManagerProps) {
                 </p>
               )}
               <div className="lumora-plugin-row__actions">
-                {plugin.state === 'active' && (
-                  <button
-                    type="button"
-                    className="lumora-button lumora-button--danger"
-                    data-testid={`plugin-toggle-${plugin.instanceId}`}
-                    onClick={() => void runtime.host.disable(plugin.instanceId)}
-                  >
-                    禁用
-                  </button>
-                )}
-                {(plugin.state === 'inactive' || plugin.state === 'disabled') && (
-                  <button
-                    type="button"
-                    className="lumora-button"
-                    data-testid={`plugin-toggle-${plugin.instanceId}`}
-                    onClick={() => {
-                      void runtime.host.enable(plugin.instanceId).catch(() => {});
-                    }}
-                  >
-                    {plugin.reason ? '重新启用' : '启用'}
-                  </button>
-                )}
-                {plugin.state === 'failed' && (
-                  <button
-                    type="button"
-                    className="lumora-button lumora-button--danger"
-                    data-testid={`plugin-toggle-${plugin.instanceId}`}
-                    onClick={() => void runtime.host.disable(plugin.instanceId)}
-                  >
-                    禁用
-                  </button>
-                )}
+                <button
+                  type="button"
+                  className={`lumora-button${disables ? ' lumora-button--danger' : ''}`}
+                  data-testid={`plugin-toggle-${plugin.instanceId}`}
+                  disabled={busy}
+                  aria-busy={busy || undefined}
+                  onClick={(event) => {
+                    const button = event.currentTarget;
+                    const restoreFocus = button.ownerDocument.activeElement === button;
+                    const operation = disables
+                      ? runtime.host.disable(plugin.instanceId)
+                      : runtime.host.enable(plugin.instanceId);
+                    void operation.catch(() => {}).finally(() => {
+                      if (!restoreFocus) return;
+                      requestAnimationFrame(() => {
+                        if (button.isConnected && !button.disabled) button.focus({ preventScroll: true });
+                      });
+                    });
+                  }}
+                >
+                  {actionLabel}
+                </button>
               </div>
             </li>
-          ))}
+            );
+          })}
         </ul>
-      </div>
-    </div>
+    </ModalDialog>
   );
 }

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { Trash2, X } from 'lucide-react';
 import {
   STORYBOARD_CAMERA_MOVEMENTS,
   STORYBOARD_SHOT_SIZES,
@@ -190,7 +191,7 @@ function AdoptedShotRow({
             if (!result.ok) showToast(result.error.message, 'error');
           }}
         >
-          删
+          <Trash2 aria-hidden="true" />
         </button>
       </div>
       <div className="lumora-storyboard__compact-grid">
@@ -558,7 +559,7 @@ export function StoryboardWorkspace({ runtime, project, onClose }: StoryboardWor
             </button>
           </div>
           <button type="button" className="lumora-icon-button" aria-label="关闭 AI 分镜工作台" title="关闭" onClick={close}>
-            ×
+            <X aria-hidden="true" />
           </button>
         </div>
       </header>

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Keyboard } from 'lucide-react';
 import type { KeyboardShortcut } from './recording-shortcut';
 import {
   DEFAULT_RECORDING_SHORTCUT,
@@ -84,7 +85,7 @@ export function RecordingShortcutSettings({ shortcut, onChange }: RecordingShort
           setOpen((value) => !value);
         }}
       >
-        ⌨
+        <Keyboard aria-hidden="true" />
       </button>
       {open && (
         <div

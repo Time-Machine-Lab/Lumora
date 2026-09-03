@@ -37,7 +37,7 @@ export interface TimelineControllerOptions {
 /** 默认缩放：24fps 每帧 ≈ 10px（240px/s） */
 export const DEFAULT_TIMELINE_ZOOM = 240;
 export const MIN_TIMELINE_ZOOM = 30;
-export const MAX_TIMELINE_ZOOM = 1200;
+export const MAX_TIMELINE_ZOOM = 1600;
 
 /** 时间吸附到帧边界（fps 无效/非正时原样返回） */
 export function snapTimeToFrame(time: number, fps: number): number {

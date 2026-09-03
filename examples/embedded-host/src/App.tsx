@@ -1,5 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
-import type { Manifest, PluginDescriptor } from '@lumora/core';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { X } from 'lucide-react';
+import { createSampleProject } from '@lumora/core';
+import type { Manifest, PluginDescriptor, Project } from '@lumora/core';
 import { LumoraStudio } from '@lumora/studio';
 import type { LumoraStudioHandle } from '@lumora/studio';
 import mockManifest from '@lumora/mock-plugin/lumora.plugin.json';
@@ -172,6 +175,50 @@ const DEBUG_FULL = new URLSearchParams(window.location.search).get('debug') === 
 
 /** 本地存储后端选择：?storage=opfs 使用 OPFS，缺省 IndexedDB（持久化门面可切换，TML-53 范围项） */
 const STORAGE = new URLSearchParams(window.location.search).get('storage') === 'opfs' ? 'opfs' : 'indexeddb';
+const DUAL_STUDIO_FIXTURE = new URLSearchParams(window.location.search).get('fixture') === 'dual-studio';
+const REVIEW_FIXTURE = new URLSearchParams(window.location.search).get('fixture');
+
+function createRound3ReviewProject(dense = false): Project {
+  const project = createSampleProject('lumora://tml-563-round3', 'TML-563 60fps 回归');
+  const sourceTrack = project.tracks[0]!;
+  return {
+    ...project,
+    settings: { ...project.settings, fps: 60 },
+    tracks: [{
+      ...sourceTrack,
+      id: 'review-60fps',
+      name: '60fps 相邻关键帧',
+      keyframes: dense
+        ? Array.from({ length: 60 }, (_, index) => ({
+            time: 1 + index / 60,
+            value: [index, 0, 0] as [number, number, number],
+          }))
+        : [
+            { time: 1, value: [0, 0, 0] },
+            { time: 1 + 1 / 60, value: [1, 0, 0] },
+          ],
+    }],
+  };
+}
+
+function createTimelineEdgeReviewProject(): Project {
+  const project = createSampleProject('lumora://tml-563-timeline-edges', 'TML-563 timeline edge cases');
+  const [short, long, late] = project.shots;
+  return {
+    ...project,
+    shots: [
+      { ...late!, id: 'review-late', name: 'Late shot', startTime: 2, endTime: 3 },
+      { ...short!, id: 'review-short', name: 'Short overlap', startTime: 0, endTime: 1 },
+      { ...long!, id: 'review-long', name: 'Long overlap', startTime: 0, endTime: 2 },
+    ],
+  };
+}
+
+const INITIAL_REVIEW_PROJECT = REVIEW_FIXTURE === 'tml-563-timeline-edges'
+  ? createTimelineEdgeReviewProject()
+  : REVIEW_FIXTURE?.startsWith('tml-563-round3')
+    ? createRound3ReviewProject(REVIEW_FIXTURE === 'tml-563-round3-dense')
+    : undefined;
 
 export default function App() {
   const [mounted, setMounted] = useState(true);
@@ -179,10 +226,87 @@ export default function App() {
   // 双击/连点不再并发进入卸载流程；close() 本身是 single-flight（重复调用
   // 共享同一 in-flight 裁决），此处是 UI 层对同一问题的第一道防线
   const [closing, setClosing] = useState(false);
+  const [logOpen, setLogOpen] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const handleRef = useRef<LumoraStudioHandle | null>(null);
+  const logToggleRef = useRef<HTMLButtonElement>(null);
+  const logDialogRef = useRef<HTMLElement>(null);
 
   const appendLog = (line: string) => setLog((lines) => [...lines.slice(-49), line]);
+
+  const closeLog = useCallback(() => {
+    setLogOpen(false);
+    requestAnimationFrame(() => logToggleRef.current?.focus());
+  }, []);
+
+  useEffect(() => {
+    if (!logOpen) return;
+    const focusDialog = () => {
+      const dialog = logDialogRef.current;
+      if (!dialog || dialog.contains(document.activeElement)) return;
+      dialog.querySelector<HTMLButtonElement>('[data-testid="host-log-close"]')?.focus();
+    };
+    const frame = requestAnimationFrame(focusDialog);
+    const handleDocumentKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        closeLog();
+      } else if (event.key === 'Tab' && !logDialogRef.current?.contains(event.target as Node)) {
+        event.preventDefault();
+        focusDialog();
+      }
+    };
+    const handleDocumentFocusIn = (event: FocusEvent) => {
+      if (!logDialogRef.current?.contains(event.target as Node)) focusDialog();
+    };
+    const handleDocumentPointerDown = (event: PointerEvent) => {
+      if (logDialogRef.current?.contains(event.target as Node)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      focusDialog();
+    };
+    const handleDocumentClick = (event: MouseEvent) => {
+      if (logDialogRef.current?.contains(event.target as Node)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      focusDialog();
+    };
+    document.addEventListener('keydown', handleDocumentKeyDown, true);
+    document.addEventListener('focusin', handleDocumentFocusIn, true);
+    document.addEventListener('pointerdown', handleDocumentPointerDown, true);
+    document.addEventListener('click', handleDocumentClick, true);
+    return () => {
+      cancelAnimationFrame(frame);
+      document.removeEventListener('keydown', handleDocumentKeyDown, true);
+      document.removeEventListener('focusin', handleDocumentFocusIn, true);
+      document.removeEventListener('pointerdown', handleDocumentPointerDown, true);
+      document.removeEventListener('click', handleDocumentClick, true);
+    };
+  }, [closeLog, logOpen]);
+
+  const handleLogKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      closeLog();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const focusable = Array.from(
+      event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), [href], input:not(:disabled), [tabindex="0"]'),
+    );
+    if (focusable.length === 0) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0]!;
+    const last = focusable[focusable.length - 1]!;
+    if ((event.shiftKey && document.activeElement === first) || (!event.shiftKey && document.activeElement === last)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    }
+  };
 
   useEffect(() => {
     if (!mounted) return;
@@ -230,63 +354,107 @@ export default function App() {
 
   return (
     <div className="host">
-      <header className="host__bar">
-        <h1>Lumora 嵌入宿主示例</h1>
-        <div className="host__actions">
-          <button
-            type="button"
-            data-testid="reopen-last-export"
-            disabled={closing}
-            onClick={() => {
-              const raw = localStorage.getItem('lumora.demo.last-export');
-              if (!raw) {
-                appendLog('没有可重开的导出（请先在 Studio 中导出场景）');
-                return;
-              }
-              try {
-                const project = JSON.parse(raw);
-                handleRef.current?.runtime.openProject(project);
-              } catch {
-                appendLog('重开失败：导出数据无法解析');
-              }
-            }}
-          >
-            重开上次导出（新运行时）
-          </button>
-          <button type="button" data-testid="studio-mount-toggle" disabled={closing} onClick={toggleMount}>
-            {closing ? '正在释放资源…' : mounted ? '卸载 Studio（释放资源）' : '重新挂载 Studio'}
-          </button>
+      <div className="host__inertable-root" data-testid="host-inertable-root" inert={logOpen || undefined}>
+        <header className="host__bar">
+          <h1>Lumora 嵌入宿主示例</h1>
+          <div className="host__actions">
+            <button
+              ref={logToggleRef}
+              type="button"
+              className="host__log-toggle"
+              data-testid="host-log-toggle"
+              aria-controls="host-event-log"
+              aria-expanded={logOpen}
+              onClick={() => {
+                if (logOpen) closeLog();
+                else setLogOpen(true);
+              }}
+            >
+              {logOpen ? '收起日志' : '事件日志'}
+            </button>
+            <button
+              type="button"
+              data-testid="reopen-last-export"
+              disabled={closing}
+              onClick={() => {
+                const raw = localStorage.getItem('lumora.demo.last-export');
+                if (!raw) {
+                  appendLog('没有可重开的导出（请先在 Studio 中导出场景）');
+                  return;
+                }
+                try {
+                  const project = JSON.parse(raw);
+                  handleRef.current?.runtime.openProject(project);
+                } catch {
+                  appendLog('重开失败：导出数据无法解析');
+                }
+              }}
+            >
+              重开上次导出（新运行时）
+            </button>
+            <button type="button" data-testid="studio-mount-toggle" disabled={closing} onClick={toggleMount}>
+              {closing ? '正在释放资源…' : mounted ? '卸载 Studio（释放资源）' : '重新挂载 Studio'}
+            </button>
+          </div>
+        </header>
+        <div className="host__layout">
+          <div className="host__studio-region" data-testid="host-studio-region">
+            {mounted ? (
+              <LumoraStudio
+                ref={handleRef}
+                plugins={PLUGINS}
+                hostVersion="0.1.0"
+                storage={STORAGE}
+                pluginSettingsNamespace="embedded-host"
+                className="host__studio"
+                initialProject={INITIAL_REVIEW_PROJECT}
+              />
+            ) : (
+              <div className="host__placeholder" data-testid="studio-placeholder">
+                Studio 已卸载 —— WebGL 场景、插件贡献项与事件订阅均已释放
+              </div>
+            )}
+          </div>
         </div>
-      </header>
-      <div className="host__layout">
-        {mounted ? (
-          <LumoraStudio
-            ref={handleRef}
-            plugins={PLUGINS}
-            hostVersion="0.1.0"
-            storage={STORAGE}
-            pluginSettingsNamespace="embedded-host"
-            className="host__studio"
-          />
-        ) : (
-          <div className="host__placeholder" data-testid="studio-placeholder">
-            Studio 已卸载 —— WebGL 场景、插件贡献项与事件订阅均已释放
+        {DUAL_STUDIO_FIXTURE && (
+          <div className="host__fixture-studio" data-testid="dual-studio-fixture">
+            <LumoraStudio hostVersion="0.1.0" />
           </div>
         )}
-        <aside
-          className="host__log"
-          data-testid="host-event-log"
-          tabIndex={0}
-          aria-labelledby="host-event-log-heading"
-        >
-          <h2 id="host-event-log-heading">宿主事件日志</h2>
-          <ul data-testid="event-log">
-            {log.map((line, index) => (
-              <li key={`${index}-${line}`}>{line}</li>
-            ))}
-          </ul>
-        </aside>
       </div>
+      <aside
+        ref={logDialogRef}
+        id="host-event-log"
+        className="host__log"
+        data-testid="host-event-log"
+        data-open={logOpen || undefined}
+        role={logOpen ? 'dialog' : undefined}
+        aria-modal={logOpen || undefined}
+        tabIndex={logOpen ? -1 : 0}
+        aria-labelledby="host-event-log-heading"
+        onKeyDown={logOpen ? handleLogKeyDown : undefined}
+      >
+        <div className="host__log-header">
+          <h2 id="host-event-log-heading">宿主事件日志</h2>
+          {logOpen && (
+            <button
+              type="button"
+              className="host__log-close"
+              data-testid="host-log-close"
+              aria-label="关闭事件日志"
+              title="关闭事件日志"
+              onClick={closeLog}
+            >
+              <X aria-hidden="true" />
+            </button>
+          )}
+        </div>
+        <ul data-testid="event-log">
+          {log.map((line, index) => (
+            <li key={`${index}-${line}`}>{line}</li>
+          ))}
+        </ul>
+      </aside>
     </div>
   );
 }

@@ -11,8 +11,9 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronLeft, ChevronRight, Circle, LocateFixed, Minus, Pause, Play, Plus, Square } from 'lucide-react';
 import { MAX_TIMELINE_ZOOM, MIN_TIMELINE_ZOOM } from '@lumora/core';
-import type { Project, SceneEditor } from '@lumora/core';
+import type { Project, SceneEditor, TrackKeyframeData } from '@lumora/core';
 import { findObject } from '@lumora/core';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
 import { projectContentFingerprint } from './timeline-thumbnail-cache';
@@ -23,6 +24,24 @@ import { CAMERA_DRIVE_LIMITS } from './camera-drive';
 
 /** 标签列宽度：标尺/轨道/分镜共用，测试与坐标换算引用此常量 */
 export const TIMELINE_LABEL_WIDTH = 186;
+const KEYFRAME_TARGET_SIZE = 44;
+const MAX_KEYFRAME_ROWS = 2;
+const SHOT_TARGET_SIZE = 44;
+
+interface SingleKeyframeTarget {
+  kind: 'single';
+  keyframe: TrackKeyframeData;
+  row: number;
+}
+
+interface ClusteredKeyframeTarget {
+  kind: 'cluster';
+  key: string;
+  keyframes: TrackKeyframeData[];
+  left: number;
+}
+
+type KeyframeTarget = SingleKeyframeTarget | ClusteredKeyframeTarget;
 
 export interface TimelinePanelProps {
   session: TimelineSession;
@@ -101,6 +120,13 @@ export function TimelinePanel({
   const rulerRef = useRef<HTMLDivElement>(null);
   const rulerCanvasRef = useRef<HTMLDivElement>(null);
   const [dragSeeking, setDragSeeking] = useState(false);
+  const [selectedShotId, setSelectedShotId] = useState<string | null>(() => project.shots[0]?.id ?? null);
+  const keyframeClusterCursorsRef = useRef(new Map<string, number>());
+
+  useEffect(() => {
+    if (selectedShotId && project.shots.some((shot) => shot.id === selectedShotId)) return;
+    setSelectedShotId(project.shots[0]?.id ?? null);
+  }, [project.shots, selectedShotId]);
 
   const seekFromEvent = useCallback(
     (clientX: number) => {
@@ -135,11 +161,30 @@ export function TimelinePanel({
     elRulerRelease(event);
   };
 
+  const handleRulerKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const frame = 1 / Math.max(1, state.fps);
+    let next: number | null = null;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') next = time - frame;
+    else if (event.key === 'ArrowRight' || event.key === 'ArrowUp') next = time + frame;
+    else if (event.key === 'PageUp') next = time + 1;
+    else if (event.key === 'PageDown') next = time - 1;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = state.duration;
+    if (next === null) return;
+    event.preventDefault();
+    event.stopPropagation();
+    session.seek(Math.min(state.duration, Math.max(0, next)));
+  };
+
   const fitZoom = useCallback(() => {
-    const viewport = bodyRef.current?.clientWidth ?? 800;
+    const body = bodyRef.current;
+    const viewport = body?.clientWidth ?? 800;
     const width = Math.max(50, viewport - TIMELINE_LABEL_WIDTH);
     const duration = Math.max(0.1, state.duration);
-    session.setZoom(Math.min(MAX_TIMELINE_ZOOM, Math.max(MIN_TIMELINE_ZOOM, width / duration)));
+    session.setZoom(
+      Math.min(MAX_TIMELINE_ZOOM, Math.max(MIN_TIMELINE_ZOOM, width / duration)),
+    );
+    if (body) body.scrollLeft = 0;
   }, [session, state.duration]);
 
   // 缩略图：串行截取缺失分镜（一次 seek → 双 RAF → capture → 下一分镜），
@@ -264,17 +309,71 @@ export function TimelinePanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- missing 由 deps 覆盖推导
   }, [project, thumbs, timeline, captureRef, captureReady, state.playing, state.recording, editor, thumbGeneration]);
 
+  const orderedShots = useMemo(() => project.shots
+    .map((shot, sourceIndex) => ({ shot, sourceIndex }))
+    .sort((a, b) => a.shot.startTime - b.shot.startTime
+      || a.shot.endTime - b.shot.endTime
+      || a.sourceIndex - b.sourceIndex)
+    .map(({ shot }) => shot), [project.shots]);
+
   const moveShot = useCallback(
     (index: number, direction: -1 | 1) => {
-      const ids = project.shots.map((s) => s.id);
+      const ids = orderedShots.map((shot) => shot.id);
       const swapIndex = index + direction;
       if (swapIndex < 0 || swapIndex >= ids.length) return;
       const swapped = [...ids];
       [swapped[index]!, swapped[swapIndex]!] = [swapped[swapIndex]!, swapped[index]!];
       editor.reorderShots(swapped);
     },
-    [editor, project.shots],
+    [editor, orderedShots],
   );
+
+  const selectedShotIndex = orderedShots.findIndex((shot) => shot.id === selectedShotId);
+  const selectedShot = selectedShotIndex >= 0 ? orderedShots[selectedShotIndex]! : null;
+
+  const keyframeLayouts = useMemo(() => new Map(project.tracks.map((track) => {
+    const sorted = track.keyframes
+      .map((keyframe) => ({ keyframe, left: keyframe.time * zoom }))
+      .sort((a, b) => a.keyframe.time - b.keyframe.time);
+    const groups: typeof sorted[] = [];
+    for (const entry of sorted) {
+      const group = groups[groups.length - 1];
+      if (!group || entry.left - group[0]!.left >= KEYFRAME_TARGET_SIZE) groups.push([entry]);
+      else group.push(entry);
+    }
+
+    const targets: KeyframeTarget[] = [];
+    let rowCount = 1;
+    for (const group of groups) {
+      if (group.length <= MAX_KEYFRAME_ROWS) {
+        rowCount = Math.max(rowCount, group.length);
+        group.forEach(({ keyframe }, row) => targets.push({ kind: 'single', keyframe, row }));
+        continue;
+      }
+      const first = group[0]!;
+      const last = group[group.length - 1]!;
+      targets.push({
+        kind: 'cluster',
+        key: `${track.id}:${first.keyframe.time}:${last.keyframe.time}:${group.length}`,
+        keyframes: group.map(({ keyframe }) => keyframe),
+        left: first.left,
+      });
+    }
+    return [track.id, { targets, rowCount }] as const;
+  })), [project.tracks, zoom]);
+
+  // Preserve time-proportional strips while packing minimum-size selection targets without overlap.
+  const shotLayouts = useMemo(() => {
+    let nextTargetLeft = 0;
+    return orderedShots.map((shot) => {
+      const visualLeft = shot.startTime * zoom;
+      const visualWidth = Math.max(3, (shot.endTime - shot.startTime) * zoom);
+      const width = Math.max(SHOT_TARGET_SIZE, visualWidth);
+      const left = Math.max(visualLeft, nextTargetLeft);
+      nextTargetLeft = left + width;
+      return { shot, left, width, visualLeft, visualWidth };
+    });
+  }, [orderedShots, zoom]);
 
   const toggleTrackDisabled = useCallback(
     (trackId: string, disabled: boolean) => {
@@ -316,10 +415,11 @@ export function TimelinePanel({
           className="lumora-timeline__play"
           data-testid="timeline-play"
           title={state.playing ? '暂停（空格）' : '播放（空格）'}
+          aria-label={state.playing ? '暂停播放' : '播放时间线'}
           disabled={state.duration <= 0 && !state.recording}
           onClick={() => session.togglePlay()}
         >
-          {state.playing ? '❚❚' : '▶'}
+          {state.playing ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
         </button>
         <button
           type="button"
@@ -334,10 +434,23 @@ export function TimelinePanel({
                   ? `停止录制（${formatShortcut(recordingShortcut)}）`
                   : `录制机位运动（${formatShortcut(recordingShortcut)}）`
           }
+          aria-label={
+            state.recordingPaused
+              ? '继续录制'
+              : state.recording
+                ? '停止录制'
+                : '开始录制机位运动'
+          }
           disabled={!selectedCamera && !state.recording}
           onClick={recordClick}
         >
-          {state.recordingPaused ? '▶' : state.recording ? '■' : '●'}
+          {state.recordingPaused ? (
+            <Play aria-hidden="true" />
+          ) : state.recording ? (
+            <Square aria-hidden="true" />
+          ) : (
+            <Circle aria-hidden="true" />
+          )}
         </button>
         <RecordingShortcutSettings
           shortcut={recordingShortcut}
@@ -442,14 +555,14 @@ export function TimelinePanel({
           />
           循环
         </label>
-        <button type="button" className="lumora-timeline__zoom" title="缩小" onClick={() => session.zoomBy(1 / 1.5)}>
-          −
+        <button type="button" className="lumora-timeline__zoom" aria-label="缩小时间线" title="缩小" onClick={() => session.zoomBy(1 / 1.5)}>
+          <Minus aria-hidden="true" />
         </button>
         <button type="button" className="lumora-timeline__zoom" title="适配时长" onClick={fitZoom}>
           适配
         </button>
-        <button type="button" className="lumora-timeline__zoom" title="放大" onClick={() => session.zoomBy(1.5)}>
-          ＋
+        <button type="button" className="lumora-timeline__zoom" aria-label="放大时间线" title="放大" onClick={() => session.zoomBy(1.5)}>
+          <Plus aria-hidden="true" />
         </button>
       </div>
       <div className="lumora-timeline__body" data-testid="timeline-body" ref={bodyRef}>
@@ -461,6 +574,14 @@ export function TimelinePanel({
             className="lumora-timeline__row lumora-timeline__row--ruler"
             data-testid="timeline-ruler"
             ref={rulerRef}
+            role="slider"
+            tabIndex={0}
+            aria-label="时间线播放头"
+            aria-valuemin={0}
+            aria-valuemax={state.duration}
+            aria-valuenow={time}
+            aria-valuetext={formatTime(time)}
+            onKeyDown={handleRulerKeyDown}
             onPointerDown={handleRulerPointerDown}
             onPointerMove={handleRulerPointerMove}
             onPointerUp={handleRulerPointerUp}
@@ -480,21 +601,32 @@ export function TimelinePanel({
             </div>
           </div>
           {project.tracks.length === 0 ? (
-            <div className="lumora-timeline__empty">尚无轨道 —— 选中一个机位后点击 ● 录制</div>
+            <div className="lumora-timeline__empty">尚无轨道 —— 选中一个机位后点击“录制”</div>
           ) : (
-            project.tracks.map((track) => (
+            project.tracks.map((track) => {
+              const layout = keyframeLayouts.get(track.id)!;
+              return (
               <div
                 key={track.id}
                 className={`lumora-timeline__row lumora-timeline__lane${track.disabled ? ' lumora-timeline__lane--disabled' : ''}`}
-                data-testid={`track-lane-${track.id}`}
+                data-testid={`track-row-${track.id}`}
+                data-track-id={track.id}
                 data-track-target-path={track.targetPath}
-                onClick={() => editor.setSelection([track.objectId])}
                 title={track.disabled ? '已禁用' : undefined}
+                style={{ height: layout.rowCount * KEYFRAME_TARGET_SIZE }}
               >
                 <div className="lumora-timeline__label">
-                  <span className="lumora-timeline__lane-name">{track.name}</span>
-                  <span className="lumora-timeline__lane-channel">{CHANNEL_LABELS[track.targetPath] ?? track.targetPath}</span>
-                  <label className="lumora-check" onClick={(e) => e.stopPropagation()}>
+                  <button
+                    type="button"
+                    className="lumora-timeline__lane-select"
+                    data-testid={`track-lane-${track.id}`}
+                    aria-label={`选择轨道：${track.name}`}
+                    onClick={() => editor.setSelection([track.objectId])}
+                  >
+                    <span className="lumora-timeline__lane-name">{track.name}</span>
+                    <span className="lumora-timeline__lane-channel">{CHANNEL_LABELS[track.targetPath] ?? track.targetPath}</span>
+                  </button>
+                  <label className="lumora-check">
                     <input
                       type="checkbox"
                       checked={!!track.disabled}
@@ -505,75 +637,136 @@ export function TimelinePanel({
                   </label>
                 </div>
                 <div className="lumora-timeline__time-area">
-                  {track.keyframes.map((kf) => (
-                    <button
-                      key={kf.time}
-                      type="button"
-                      className="lumora-timeline__keyframe"
-                      style={{ left: kf.time * zoom }}
-                      data-testid={`keyframe-${track.id}-${kf.time}`}
-                      data-keyframe-value={JSON.stringify(kf.value ?? null)}
-                      title={`${formatTime(kf.time)}`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        session.seek(kf.time);
-                      }}
-                    />
-                  ))}
+                  {layout.targets.map((target) => {
+                    if (target.kind === 'single') {
+                      const { keyframe } = target;
+                      return (
+                        <button
+                          key={keyframe.time}
+                          type="button"
+                          className="lumora-timeline__keyframe"
+                          style={{
+                            left: keyframe.time * zoom,
+                            top: target.row * KEYFRAME_TARGET_SIZE + KEYFRAME_TARGET_SIZE / 2,
+                          }}
+                          data-testid={`keyframe-${track.id}-${keyframe.time}`}
+                          data-keyframe-value={JSON.stringify(keyframe.value ?? null)}
+                          aria-label={`跳转至关键帧 ${formatTime(keyframe.time)}`}
+                          title={`${formatTime(keyframe.time)}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            session.seek(keyframe.time);
+                          }}
+                        />
+                      );
+                    }
+
+                    return (
+                      <button
+                        key={target.key}
+                        type="button"
+                        className="lumora-timeline__keyframe lumora-timeline__keyframe--cluster"
+                        style={{ left: target.left, top: KEYFRAME_TARGET_SIZE / 2 }}
+                        data-testid={`keyframe-cluster-${track.id}-${target.keyframes[0]!.time}`}
+                        data-keyframe-count={target.keyframes.length}
+                        aria-label={`关键帧组，共 ${target.keyframes.length} 帧；重复激活可依次跳转`}
+                        title={`${formatTime(target.keyframes[0]!.time)}–${formatTime(target.keyframes[target.keyframes.length - 1]!.time)} · ${target.keyframes.length} 帧`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          const cursor = keyframeClusterCursorsRef.current.get(target.key) ?? 0;
+                          session.seek(target.keyframes[cursor % target.keyframes.length]!.time);
+                          keyframeClusterCursorsRef.current.set(target.key, (cursor + 1) % target.keyframes.length);
+                        }}
+                      >
+                        {target.keyframes.length > 99 ? '99+' : target.keyframes.length}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
-            ))
+              );
+            })
           )}
           {project.shots.length === 0 ? (
             <div className="lumora-timeline__empty">尚无分镜</div>
           ) : (
             <div className="lumora-timeline__row lumora-timeline__row--shots" data-testid="timeline-shots">
-              <div className="lumora-timeline__label lumora-timeline__label--shots">分镜</div>
+              <div className="lumora-timeline__label lumora-timeline__label--shots">
+                <span>分镜</span>
+                {selectedShot && (
+                  <div
+                    className="lumora-timeline__shot-actions"
+                    data-testid="selected-shot-actions"
+                    role="group"
+                    aria-label={`分镜操作：${selectedShot.name}`}
+                  >
+                    <button
+                      type="button"
+                      className="lumora-timeline__shot-move"
+                      disabled={selectedShotIndex === 0}
+                      data-testid={`shot-move-left-${selectedShot.id}`}
+                      aria-label={`向前移动分镜：${selectedShot.name}`}
+                      onClick={() => moveShot(selectedShotIndex, -1)}
+                    >
+                      <ChevronLeft aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      className="lumora-timeline__shot-move"
+                      data-testid={`shot-jump-${selectedShot.id}`}
+                      aria-label={`跳转至分镜：${selectedShot.name}`}
+                      onClick={() => session.seek(selectedShot.startTime)}
+                    >
+                      <LocateFixed aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      className="lumora-timeline__shot-move"
+                      disabled={selectedShotIndex >= orderedShots.length - 1}
+                      data-testid={`shot-move-right-${selectedShot.id}`}
+                      aria-label={`向后移动分镜：${selectedShot.name}`}
+                      onClick={() => moveShot(selectedShotIndex, 1)}
+                    >
+                      <ChevronRight aria-hidden="true" />
+                    </button>
+                  </div>
+                )}
+              </div>
               <div className="lumora-timeline__time-area">
-                {project.shots.map((shot, index) => {
+                {shotLayouts.map(({ shot, visualLeft, visualWidth }) => (
+                  <span
+                    key={`duration-${shot.id}`}
+                    className={`lumora-timeline__shot-duration${selectedShotId === shot.id ? ' lumora-timeline__shot-duration--selected' : ''}`}
+                    style={{ left: visualLeft, width: visualWidth }}
+                    data-testid={`shot-duration-${shot.id}`}
+                    aria-hidden="true"
+                  />
+                ))}
+                {shotLayouts.map(({ shot, left, width }) => {
                   const camera = shot.cameraObjectId ? findObject(project, shot.cameraObjectId) : null;
-                  const width = Math.max(3, (shot.endTime - shot.startTime) * zoom);
                   const thumbKey = `${thumbGeneration}:${shot.id}`;
                   return (
-                    <div
+                    <button
+                      type="button"
                       key={shot.id}
-                      className="lumora-timeline__shot"
-                      style={{ left: shot.startTime * zoom, width }}
+                      className={`lumora-timeline__shot${selectedShotId === shot.id ? ' lumora-timeline__shot--selected' : ''}`}
+                      style={{ left, width }}
                       data-testid={`shot-block-${shot.id}`}
-                      onClick={() => session.seek(shot.startTime)}
+                      aria-label={`选择分镜：${shot.name}`}
+                      aria-pressed={selectedShotId === shot.id}
+                      onClick={() => {
+                        setSelectedShotId(shot.id);
+                        session.seek(shot.startTime);
+                      }}
                       title={camera ? `机位：${camera.name}` : '未绑定机位'}
                     >
-                      <button
-                        type="button"
-                        className="lumora-timeline__shot-move"
-                        disabled={index === 0}
-                        data-testid={`shot-move-left-${shot.id}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          moveShot(index, -1);
-                        }}
-                      >
-                        ‹
-                      </button>
                       <span className="lumora-timeline__shot-name">{shot.name}</span>
-                      <button
-                        type="button"
-                        className="lumora-timeline__shot-move"
-                        disabled={index >= project.shots.length - 1}
-                        data-testid={`shot-move-right-${shot.id}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          moveShot(index, 1);
-                        }}
-                      >
-                        ›
-                      </button>
                       {thumbs[thumbKey] ? (
                         <img className="lumora-timeline__shot-thumb" src={thumbs[thumbKey]!} alt="" draggable={false} />
                       ) : (
                         <span className="lumora-timeline__shot-camera">{camera ? camera.name : '未绑定'}</span>
                       )}
-                    </div>
+                    </button>
                   );
                 })}
               </div>

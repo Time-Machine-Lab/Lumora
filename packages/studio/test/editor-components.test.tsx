@@ -132,13 +132,21 @@ describe('ObjectTree：对象层级交互', () => {
     const editor = makeEditor();
     render(<TreeHarness editor={editor} cache={noopCache()} />);
 
+    expect(screen.getByTestId('tree-visible-sample-cube')).toHaveAccessibleName('隐藏 立方体');
+    expect(screen.getByTestId('tree-lock-sample-cube')).toHaveAccessibleName('锁定 立方体');
+    expect(screen.getByTestId('tree-move-sample-cube')).toHaveAccessibleName('移动 立方体');
+    expect(screen.getByTestId('tree-delete-sample-cube')).toHaveAccessibleName('删除 立方体');
+
     fireEvent.click(screen.getByTestId('tree-visible-sample-cube'));
     expect(findObject(editor, 'sample-cube')?.visible).toBe(false);
+    expect(screen.getByTestId('tree-visible-sample-cube')).toHaveAccessibleName('显示 立方体');
     fireEvent.click(screen.getByTestId('tree-lock-sample-cube'));
     expect(findObject(editor, 'sample-cube')?.locked).toBe(true);
+    expect(screen.getByTestId('tree-lock-sample-cube')).toHaveAccessibleName('解锁 立方体');
     // 解锁后两步删除：先点「删」出现「确认?」，再点确认
     fireEvent.click(screen.getByTestId('tree-lock-sample-cube'));
     fireEvent.click(screen.getByTestId('tree-delete-sample-cube'));
+    expect(screen.getByTestId('tree-delete-sample-cube')).toHaveAccessibleName('确认删除 立方体');
     fireEvent.click(screen.getByTestId('tree-delete-sample-cube'));
     expect(findObject(editor, 'sample-cube')).toBeUndefined();
 
@@ -175,6 +183,7 @@ describe('PropertiesPanel：数值属性编辑', () => {
     render(<InspectorHarness editor={editor} />);
 
     const name = screen.getByTestId('inspector-name');
+    expect(name).toHaveAccessibleName('对象名称');
     fireEvent.change(name, { target: { value: '改名方块' } });
     fireEvent.blur(name);
     expect(findObject(editor, 'sample-cube')?.name).toBe('改名方块');
@@ -302,6 +311,8 @@ describe('EditorViewport 集成：相机视图与 Gizmo 模式', () => {
     await screen.findByTestId('lumora-studio');
     fireEvent.click(screen.getByTestId('open-sample-project'));
     await waitFor(() => expect(screen.getByTestId('view-mode-select')).not.toBeDisabled());
+    expect(screen.getByTestId('scene-switcher')).toHaveAccessibleName('活动场景');
+    expect(screen.getByTestId('view-mode-select')).toHaveAccessibleName('视图模式');
 
     expect(screen.queryByTestId('lumora-guides')).not.toBeInTheDocument();
     const modeSelect = screen.getByTestId('view-mode-select');

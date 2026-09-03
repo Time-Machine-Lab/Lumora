@@ -1597,6 +1597,7 @@ function ViewportToolbar({
       <select
         className="lumora-select"
         data-testid="view-mode-select"
+        aria-label="视图模式"
         value={cameraView ?? 'director'}
         onChange={(e) => {
           const value = e.target.value;

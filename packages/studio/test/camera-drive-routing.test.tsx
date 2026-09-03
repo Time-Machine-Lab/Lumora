@@ -687,7 +687,7 @@ describe('camera drive keyboard routing', () => {
 
     fireEvent.click(within(studio.root).getByTestId('timeline-record'));
     fireEvent.click(await screen.findByText('覆盖录制'));
-    await waitFor(() => expect(within(studio.root).getByTestId('timeline-record')).toHaveTextContent('■'));
+    await waitFor(() => expect(within(studio.root).getByTestId('timeline-record')).toHaveAccessibleName('停止录制'));
     const active = new Event('beforeunload', { cancelable: true });
     window.dispatchEvent(active);
     expect(active.defaultPrevented).toBe(true);

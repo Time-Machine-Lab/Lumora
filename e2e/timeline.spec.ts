@@ -27,7 +27,7 @@ async function startRecording(page: Page): Promise<void> {
   await page.getByTestId('timeline-record').click();
   await expect(page.getByTestId('overwrite-confirm')).toBeVisible();
   await page.getByText('覆盖录制').click();
-  await expect(page.getByTestId('timeline-record')).toHaveText('■');
+  await expect(page.getByTestId('timeline-record')).toHaveAccessibleName('停止录制');
   const viewport = page.getByTestId('lumora-viewport');
   await viewport.click({ position: { x: 2, y: 2 }, modifiers: ['Control'] });
   await expect(viewport).toBeFocused();
@@ -363,14 +363,14 @@ test('director OrbitControls requires a fresh pointerdown after an input-mode bo
 test('overwrite confirmation portal retains resolved Studio theme styles', async ({ page }) => {
   await page.getByTestId('tree-row-sample-camera').click();
   await page.getByTestId('timeline-record').click();
-  const overlay = page.getByTestId('overwrite-confirm');
-  await expect(overlay).toBeVisible();
+  const modal = page.getByTestId('overwrite-confirm');
+  await expect(modal).toBeVisible();
 
-  const styles = await overlay.evaluate((element) => {
-    const overlayStyle = getComputedStyle(element);
-    const modal = element.querySelector<HTMLElement>('.lumora-timeline__modal')!;
-    const button = modal.querySelector<HTMLElement>('.lumora-button')!;
-    const modalStyle = getComputedStyle(modal);
+  const styles = await modal.evaluate((element) => {
+    const overlay = element.closest<HTMLElement>('.lumora-modal-backdrop')!;
+    const overlayStyle = getComputedStyle(overlay);
+    const button = element.querySelector<HTMLElement>('.lumora-button')!;
+    const modalStyle = getComputedStyle(element);
     const buttonStyle = getComputedStyle(button);
     return {
       surfaceVariable: overlayStyle.getPropertyValue('--lumora-surface-2').trim(),
@@ -696,7 +696,7 @@ test('recording control: keyboard-mouse mode records deterministic tap, smooth h
 
   await page.getByTestId('timeline-record').click();
   await expect(page.getByTestId('timeline-time')).toHaveText('00:00.00');
-  const positionLane = page.getByTestId('track-lane-sample-track-camera-dolly');
+  const positionLane = page.locator('[data-track-id="sample-track-camera-dolly"]');
   const rotationLane = page.locator('.lumora-timeline__lane').filter({ hasText: '录制主摄像机·旋转' });
   await expect(positionLane).toHaveCount(1);
   await expect(rotationLane).toHaveCount(1);
@@ -985,7 +985,7 @@ test('AC2 浏览器级：按住驾驶键时页面失焦 → 相机 transform 冻
   // 冻结在失焦瞬间（与 moving 帧之间隔了 300ms 的持续驾驶，位移必定可辨）
   await page.waitForTimeout(300);
   await page.evaluate(() => window.dispatchEvent(new Event('blur')));
-  await expect(page.getByTestId('timeline-record')).toHaveText('▶'); // 进入暂停态
+  await expect(page.getByTestId('timeline-record')).toHaveAccessibleName('继续录制');
   await page.waitForTimeout(600);
   const frozen1 = await canvasShot(page);
   await page.waitForTimeout(400);
@@ -996,7 +996,7 @@ test('AC2 浏览器级：按住驾驶键时页面失焦 → 相机 transform 冻
   // 松开按键 → 恢复录制 → 停止
   await page.keyboard.up('s');
   await page.getByTestId('timeline-record').click(); // ▶ = 恢复
-  await expect(page.getByTestId('timeline-record')).toHaveText('■');
+  await expect(page.getByTestId('timeline-record')).toHaveAccessibleName('停止录制');
   await page.waitForTimeout(200);
   await page.getByTestId('timeline-record').click(); // 停止
 });
