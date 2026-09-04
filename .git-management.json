@@ -1,0 +1,11 @@
+{
+  "policy_version": 1,
+  "default_branch": "main",
+  "branch_pattern": "^(ai|feat|fix|refactor|chore)/.+$",
+  "required_pr_metadata": ["task_id", "run_id"],
+  "required_checks": ["ci", "git-governance"],
+  "required_approvals": 1,
+  "require_resolved_conversations": true,
+  "require_up_to_date_branch": true,
+  "merge_method": "squash"
+}

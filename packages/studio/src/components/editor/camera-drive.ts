@@ -6,7 +6,7 @@
 
 import * as THREE from 'three';
 import { focalLengthToFovDeg, fovDegToFocalLength } from '@lumora/core';
-import type { SceneObjectData } from '@lumora/core';
+import type { SceneObjectData, TrackData } from '@lumora/core';
 import { applyTransform } from './scene-builder';
 
 export type CameraControlMode = 'keyboard-mouse' | 'keyboard-only';
@@ -46,6 +46,11 @@ export const CAMERA_DRIVE_LIMITS = Object.freeze({
   mouseSensitivity: Object.freeze({ min: 0.1, max: 3 }),
   smoothing: Object.freeze({ min: 1, max: 30 }),
 });
+
+/** A non-empty enabled track owns its bound camera channel during playback/seek. */
+export function isCameraTakeoverTrack(track: TrackData, cameraId: string): boolean {
+  return track.objectId === cameraId && track.keyframes.length > 0 && !track.disabled;
+}
 
 function bounded(value: number | undefined, fallback: number, min: number, max: number): number {
   return typeof value === 'number' && Number.isFinite(value)

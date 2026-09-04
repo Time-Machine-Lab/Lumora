@@ -679,6 +679,13 @@
   font-size: 12px;
 }
 
+.lumora-export__header .lumora-export__camera-notice {
+  max-width: 620px;
+  color: var(--lumora-warning, #ffd166);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
 .lumora-export__layout {
   display: grid;
   grid-template-columns: minmax(280px, 360px) minmax(380px, 1fr);
@@ -1597,6 +1604,13 @@
   border-radius: 6px;
 }
 
+.lumora-camera-controls__title {
+  flex: 0 0 auto;
+  color: var(--lumora-text);
+  font-size: 11px;
+  font-weight: 600;
+}
+
 .lumora-camera-controls__mode {
   height: 22px;
   padding: 0 7px;
@@ -1649,6 +1663,35 @@
   color: var(--lumora-text);
   font-variant-numeric: tabular-nums;
   text-align: right;
+}
+
+.lumora-camera-controls__status {
+  min-width: 0;
+  flex: 1 1 260px;
+  color: var(--lumora-text-dim);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.lumora-camera-controls__status--blocked {
+  color: var(--lumora-warning, #ffd166);
+}
+
+.lumora-camera-controls__locate {
+  margin-left: 6px;
+  padding: 1px 5px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+
+.lumora-camera-controls__locate:focus-visible {
+  outline: 2px solid var(--lumora-accent);
+  outline-offset: 1px;
 }
 
 .lumora-recording-shortcut__dialog {

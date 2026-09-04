@@ -208,6 +208,47 @@ test('idle director view drives the rendered camera and reports its heading', as
     .not.toBe(initialArrowTransform);
 });
 
+test('camera takeover guidance and viewport context-menu suppression follow the active owner', async ({ page }) => {
+  const viewport = page.getByTestId('lumora-viewport');
+  const contextMenuIsPrevented = () => viewport.evaluate((element) => {
+    const event = new MouseEvent('contextmenu', {
+      bubbles: true,
+      cancelable: true,
+      button: 2,
+    });
+    element.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
+
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('view-mode-select').selectOption('sample-camera');
+  const status = page.getByTestId('camera-control-status');
+  await expect(status).toContainText('主摄像机推镜');
+  await expect(status).toContainText('主摄像机变焦');
+  await expect(status).not.toContainText('立方体旋转');
+  expect(await contextMenuIsPrevented()).toBe(true);
+
+  await page.getByRole('button', { name: '定位到接管轨道' }).click();
+  await expect(page.getByTestId('track-disabled-sample-track-camera-dolly')).toBeFocused();
+  await page.getByTestId('track-disabled-sample-track-camera-dolly').check();
+  await page.getByTestId('track-disabled-sample-track-camera-focus').check();
+  await expect(status).toHaveText('机位“主摄像机”可手动操控。');
+
+  await page.getByTestId('timeline-play').click();
+  await expect(status).toHaveText('播放正在接管机位。暂停播放后可手动操控。');
+  expect(await contextMenuIsPrevented()).toBe(true);
+  await page.getByTestId('timeline-play').click();
+
+  await page.getByTestId('open-export-workspace').click();
+  await expect(page.getByTestId('export-workspace')).toBeVisible();
+  const exportStatus = page.getByTestId('export-camera-control-status');
+  await expect(exportStatus).toBeVisible();
+  await expect(exportStatus).toHaveText(
+    '导出工作区正在接管视口。关闭工作区即可恢复手动操控；导出进行中请先取消或等待完成。',
+  );
+  expect(await contextMenuIsPrevented()).toBe(true);
+});
+
 test('director free-drive orientation remains stable across pixel and line-mode wheel gestures', async ({ page }) => {
   const viewport = page.getByTestId('lumora-viewport');
   await hideViewportOverlays(page);

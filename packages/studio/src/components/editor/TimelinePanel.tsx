@@ -12,14 +12,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { MAX_TIMELINE_ZOOM, MIN_TIMELINE_ZOOM } from '@lumora/core';
-import type { Project, SceneEditor } from '@lumora/core';
+import type { Project, SceneEditor, ViewState } from '@lumora/core';
 import { findObject } from '@lumora/core';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
 import { projectContentFingerprint } from './timeline-thumbnail-cache';
 import { RecordingShortcutSettings } from './RecordingShortcutSettings';
 import type { KeyboardShortcut } from './recording-shortcut';
 import { DEFAULT_RECORDING_SHORTCUT, formatShortcut } from './recording-shortcut';
-import { CAMERA_DRIVE_LIMITS } from './camera-drive';
+import { CAMERA_DRIVE_LIMITS, isCameraTakeoverTrack } from './camera-drive';
 
 /** 标签列宽度：标尺/轨道/分镜共用，测试与坐标换算引用此常量 */
 export const TIMELINE_LABEL_WIDTH = 186;
@@ -29,6 +29,9 @@ export interface TimelinePanelProps {
   editor: SceneEditor;
   project: Project;
   selection: string[];
+  view?: ViewState;
+  /** False while a workspace such as export owns the viewport. */
+  driveEnabled?: boolean;
   /** 视口截图通道（FrameCaptureBridge 注册）；null = 不可截图（测试/无 Canvas）。
    *  可选参数 = 分镜绑定机位 id：传参时按该机位渲染，缺省渲染当前相机 */
   captureRef: React.RefObject<((cameraObjectId?: string | null) => string | null) | null>;
@@ -79,6 +82,8 @@ export function TimelinePanel({
   editor,
   project,
   selection,
+  view = editor.getView(),
+  driveEnabled = true,
   captureRef,
   captureReady,
   captureGeneration = 0,
@@ -97,7 +102,25 @@ export function TimelinePanel({
     return object && object.type === 'camera' ? object : null;
   }, [project, selection]);
 
+  const driveCamera = useMemo(() => {
+    const cameraId = state.recording
+      ? session.recorder.recordingCameraId
+      : view.viewMode === 'director'
+        ? null
+        : view.viewMode.cameraObjectId;
+    if (!cameraId) return null;
+    const object = findObject(project, cameraId);
+    return object?.type === 'camera' ? object : null;
+  }, [project, session.recorder.recordingCameraId, state.recording, view.viewMode]);
+  const takeoverTracks = useMemo(
+    () => driveCamera && !state.recording
+      ? project.tracks.filter((track) => isCameraTakeoverTrack(track, driveCamera.id))
+      : [],
+    [driveCamera, project.tracks, state.recording],
+  );
+
   const bodyRef = useRef<HTMLDivElement>(null);
+  const trackLaneRefs = useRef(new Map<string, HTMLDivElement>());
   const rulerRef = useRef<HTMLDivElement>(null);
   const rulerCanvasRef = useRef<HTMLDivElement>(null);
   const [dragSeeking, setDragSeeking] = useState(false);
@@ -283,6 +306,52 @@ export function TimelinePanel({
     [editor],
   );
 
+  const locateTakeoverTrack = useCallback(() => {
+    const firstTrack = takeoverTracks[0];
+    if (!firstTrack) return;
+    const lane = trackLaneRefs.current.get(firstTrack.id);
+    if (!lane) return;
+    lane.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+    lane.querySelector<HTMLInputElement>('input[type="checkbox"]')?.focus();
+  }, [takeoverTracks]);
+
+  let driveStatus: React.ReactNode;
+  let driveBlocked = false;
+  if (!driveEnabled) {
+    driveBlocked = true;
+    driveStatus = '导出工作区正在接管视口。关闭导出工作区后可手动操控。';
+  } else if (state.overwritePending) {
+    driveBlocked = true;
+    driveStatus = '正在等待录制覆盖确认。完成或取消确认后可手动操控。';
+  } else if (state.recordingPaused) {
+    driveBlocked = true;
+    driveStatus = '录制已暂停。继续录制后可手动操控。';
+  } else if (state.playing && !state.recording) {
+    driveBlocked = true;
+    driveStatus = '播放正在接管机位。暂停播放后可手动操控。';
+  } else if (takeoverTracks.length > 0 && driveCamera) {
+    driveBlocked = true;
+    driveStatus = (
+      <>
+        启用轨道{takeoverTracks.map((track, index) => (
+          <span key={track.id}>{index > 0 ? '、' : ''}“{track.name}”</span>
+        ))}正在接管机位“{driveCamera.name}”。禁用这些轨道后可手动操控。
+        <button
+          type="button"
+          className="lumora-camera-controls__locate"
+          aria-label="定位到接管轨道"
+          onClick={locateTakeoverTrack}
+        >
+          定位轨道
+        </button>
+      </>
+    );
+  } else if (driveCamera) {
+    driveStatus = `机位“${driveCamera.name}”可手动操控。`;
+  } else {
+    driveStatus = '导演视图可手动操控。';
+  }
+
   const recordClick = () => {
     if (state.recording) {
       if (state.recordingPaused) session.resumeRecording();
@@ -343,7 +412,12 @@ export function TimelinePanel({
           shortcut={recordingShortcut}
           onChange={onRecordingShortcutChange}
         />
-        <div className="lumora-camera-controls" data-testid="camera-control-settings">
+        <div
+          className="lumora-camera-controls"
+          data-testid="camera-control-settings"
+          aria-label="机位操控"
+        >
+          <span className="lumora-camera-controls__title">机位操控</span>
           <div className="lumora-camera-controls__modes" role="group" aria-label="机位操控模式">
             <button
               type="button"
@@ -415,6 +489,13 @@ export function TimelinePanel({
               {state.cameraControls.mouseSensitivity.toFixed(1)}
             </span>
           </label>
+          <span
+            className={`lumora-camera-controls__status${driveBlocked ? ' lumora-camera-controls__status--blocked' : ''}`}
+            data-testid="camera-control-status"
+            aria-live="polite"
+          >
+            {driveStatus}
+          </span>
         </div>
         <span className="lumora-timeline__time" data-testid="timeline-time">
           {formatTime(time)}
@@ -485,6 +566,10 @@ export function TimelinePanel({
             project.tracks.map((track) => (
               <div
                 key={track.id}
+                ref={(node) => {
+                  if (node) trackLaneRefs.current.set(track.id, node);
+                  else trackLaneRefs.current.delete(track.id);
+                }}
                 className={`lumora-timeline__row lumora-timeline__lane${track.disabled ? ' lumora-timeline__lane--disabled' : ''}`}
                 data-testid={`track-lane-${track.id}`}
                 data-track-target-path={track.targetPath}

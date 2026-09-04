@@ -438,7 +438,7 @@ describe('camera drive keyboard routing', () => {
     expect(camera.quaternion.angleTo(beforePointer)).toBeGreaterThan(0.001);
   });
 
-  it('scopes pointer capture and context-menu suppression to an active camera-look gesture', async () => {
+  it('suppresses the viewport context menu while keeping pointer capture scoped to camera look', async () => {
     const studio = await mountStudio('lumora://drive-pointer-lifecycle');
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
     const viewport = within(studio.root).getByTestId('lumora-viewport');
@@ -449,7 +449,7 @@ describe('camera drive keyboard routing', () => {
     await act(async () => delay(60));
 
     const idleContextMenu = fireEvent.contextMenu(viewport);
-    expect(idleContextMenu).toBe(true);
+    expect(idleContextMenu).toBe(false);
     fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 9, clientX: 10, clientY: 10 });
     expect(setPointerCapture).toHaveBeenCalledWith(9);
     fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 9, clientX: 30, clientY: 20 });
@@ -457,7 +457,7 @@ describe('camera drive keyboard routing', () => {
     fireEvent.pointerUp(viewport, { button: 2, pointerId: 9, clientX: 30, clientY: 20 });
     expect(releasePointerCapture).toHaveBeenCalledWith(9);
     expect(fireEvent.contextMenu(viewport)).toBe(false);
-    expect(fireEvent.contextMenu(viewport)).toBe(true);
+    expect(fireEvent.contextMenu(viewport)).toBe(false);
 
     fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 10, clientX: 30, clientY: 20 });
     fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 10, clientX: 45, clientY: 30 });
@@ -477,6 +477,98 @@ describe('camera drive keyboard routing', () => {
     const callsAtWindowRelease = look.mock.calls.length;
     fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 12, clientX: 100, clientY: 60 });
     expect(look).toHaveBeenCalledTimes(callsAtWindowRelease);
+  });
+
+  it.each(['track', 'playback', 'export'] as const)(
+    'suppresses the viewport context menu while %s disables camera drive',
+    async (owner) => {
+      const project = owner === 'track'
+        ? createSampleProject()
+        : drivableProject(`lumora://drive-context-menu-${owner}`);
+      const studio = await mountStudio(project);
+      act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+      fireEvent.change(within(studio.root).getByTestId('view-mode-select'), {
+        target: { value: 'sample-camera' },
+      });
+      const viewport = within(studio.root).getByTestId('lumora-viewport');
+
+      if (owner === 'playback') {
+        fireEvent.click(within(studio.root).getByTestId('timeline-play'));
+      } else if (owner === 'export') {
+        fireEvent.click(within(studio.root).getByTestId('open-export-workspace'));
+        await screen.findByTestId('export-workspace');
+      }
+
+      expect(fireEvent.contextMenu(viewport)).toBe(false);
+    },
+  );
+
+  it('identifies and locates only the enabled tracks taking over the current camera', async () => {
+    const studio = await mountStudio(createSampleProject());
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    fireEvent.change(within(studio.root).getByTestId('view-mode-select'), {
+      target: { value: 'sample-camera' },
+    });
+
+    const status = within(studio.root).getByTestId('camera-control-status');
+    expect(status).toHaveTextContent('主摄像机推镜');
+    expect(status).toHaveTextContent('主摄像机变焦');
+    expect(status).toHaveTextContent('禁用这些轨道后可手动操控');
+    expect(status).not.toHaveTextContent('立方体旋转');
+
+    const firstLane = within(studio.root).getByTestId('track-lane-sample-track-camera-dolly');
+    const scrollIntoView = vi.fn();
+    Object.assign(firstLane, { scrollIntoView });
+    fireEvent.click(within(studio.root).getByRole('button', { name: '定位到接管轨道' }));
+
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', behavior: 'smooth' });
+    expect(within(firstLane).getByTestId('track-disabled-sample-track-camera-dolly')).toHaveFocus();
+
+    fireEvent.click(within(firstLane).getByTestId('track-disabled-sample-track-camera-dolly'));
+    expect(status).not.toHaveTextContent('主摄像机推镜');
+    expect(status).toHaveTextContent('主摄像机变焦');
+    fireEvent.click(within(studio.root).getByTestId('track-disabled-sample-track-camera-focus'));
+    expect(status).toHaveTextContent('机位“主摄像机”可手动操控');
+  });
+
+  it('does not report an unrelated object track as a camera takeover', async () => {
+    const studio = await mountStudio(createSampleProject());
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera-2']));
+    fireEvent.change(within(studio.root).getByTestId('view-mode-select'), {
+      target: { value: 'sample-camera-2' },
+    });
+
+    const status = within(studio.root).getByTestId('camera-control-status');
+    expect(status).toHaveTextContent('机位“俯拍机位”可手动操控');
+    expect(status).not.toHaveTextContent('立方体旋转');
+    expect(within(studio.root).queryByRole('button', { name: '定位到接管轨道' })).not.toBeInTheDocument();
+  });
+
+  it('explains that playback must be paused before camera drive resumes', async () => {
+    const studio = await mountStudio('lumora://drive-playback-status');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    fireEvent.change(within(studio.root).getByTestId('view-mode-select'), {
+      target: { value: 'sample-camera' },
+    });
+    fireEvent.click(within(studio.root).getByTestId('timeline-play'));
+
+    expect(within(studio.root).getByTestId('camera-control-status')).toHaveTextContent(
+      '播放正在接管机位。暂停播放后可手动操控。',
+    );
+  });
+
+  it('explains that the export workspace must close before camera drive resumes', async () => {
+    const studio = await mountStudio('lumora://drive-export-status');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    fireEvent.change(within(studio.root).getByTestId('view-mode-select'), {
+      target: { value: 'sample-camera' },
+    });
+    fireEvent.click(within(studio.root).getByTestId('open-export-workspace'));
+    await screen.findByTestId('export-workspace');
+
+    expect(within(studio.root).getByTestId('camera-control-status')).toHaveTextContent(
+      '导出工作区正在接管视口。关闭导出工作区后可手动操控。',
+    );
   });
 
   it('lost pointer capture clears queued look while held keyboard movement continues', async () => {

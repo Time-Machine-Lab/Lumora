@@ -26,6 +26,7 @@ import {
   DRIVE_KEY_CODES,
   getWorldRigidQuaternion,
   hasSingularWorldTransform,
+  isCameraTakeoverTrack,
   restoreObjectOnNode,
   SINGULAR_CAMERA_WARNING,
   syncRigidCameraProxy,
@@ -261,6 +262,7 @@ export function EditorViewport({
       aria-label="3D scene viewport"
       tabIndex={0}
       onPointerDown={handlePointerDown}
+      onContextMenu={(event) => event.preventDefault()}
     >
       <Canvas
         dpr={[1, 2]}
@@ -430,7 +432,6 @@ function useCameraDrive(
     let lookPointerId: number | null = null;
     let lookClientX = 0;
     let lookClientY = 0;
-    let suppressNextContextMenu = false;
     const previousPrimaryPosition = new THREE.Vector3();
     const previousPrimaryQuaternion = new THREE.Quaternion();
     const currentPrimaryPosition = new THREE.Vector3();
@@ -453,7 +454,6 @@ function useCameraDrive(
 
     const clearDrive = () => {
       endLookGesture();
-      suppressNextContextMenu = false;
       heldKeys.clear();
       drive.stop();
       attachedId = null;
@@ -525,9 +525,7 @@ function useCameraDrive(
     };
 
     const hasActiveTrack = (cameraId: string): boolean =>
-      !!editor.getProject()?.tracks.some(
-        (track) => track.objectId === cameraId && track.keyframes.length > 0 && !track.disabled,
-      );
+      !!editor.getProject()?.tracks.some((track) => isCameraTakeoverTrack(track, cameraId));
 
     const canDriveCurrentCamera = (): boolean => {
       const st = sessionRef.current?.state;
@@ -582,7 +580,6 @@ function useCameraDrive(
     };
     const onPointerDown = (event: PointerEvent) => {
       if (event.button !== 2) return;
-      suppressNextContextMenu = false;
       if (lookPointerId !== null) return;
       const target = event.target;
       if (
@@ -599,7 +596,6 @@ function useCameraDrive(
       activityRef.current = true;
       lookClientX = event.clientX;
       lookClientY = event.clientY;
-      suppressNextContextMenu = true;
       viewportRef.current?.focus({ preventScroll: true });
       event.preventDefault();
       event.stopPropagation();
@@ -633,11 +629,6 @@ function useCameraDrive(
       if (event.pointerId !== lookPointerId) return;
       drive.cancelLook();
       endLookGesture();
-    };
-    const onContextMenu = (event: MouseEvent) => {
-      if (!suppressNextContextMenu) return;
-      event.preventDefault();
-      suppressNextContextMenu = false;
     };
     const onKeyUp = (event: KeyboardEvent) => {
       if (heldKeys.delete(event.code)) {
@@ -680,7 +671,6 @@ function useCameraDrive(
     viewport?.addEventListener('pointerup', onPointerUp);
     viewport?.addEventListener('pointercancel', onPointerCancel);
     viewport?.addEventListener('lostpointercapture', onLostPointerCapture);
-    viewport?.addEventListener('contextmenu', onContextMenu);
 
     const restoreIfNeeded = () => {
       if (attachedId === null || !attachedNode) return;
@@ -695,9 +685,7 @@ function useCameraDrive(
       // 绑定机位已有启用轨道：节点由轨道求值接管（回放驱动最后一次 apply
       // 已把播放头时刻的值写到节点），还原静态位姿会让画面与播放头脱节
       if (
-        project?.tracks.some(
-          (t) => t.objectId === restoreId && t.keyframes.length > 0 && !t.disabled,
-        )
+        project?.tracks.some((track) => isCameraTakeoverTrack(track, restoreId))
       ) {
         return;
       }
@@ -826,7 +814,6 @@ function useCameraDrive(
       viewport?.removeEventListener('pointerup', onPointerUp);
       viewport?.removeEventListener('pointercancel', onPointerCancel);
       viewport?.removeEventListener('lostpointercapture', onLostPointerCapture);
-      viewport?.removeEventListener('contextmenu', onContextMenu);
       restoreIfNeeded();
       clearDrive();
     };

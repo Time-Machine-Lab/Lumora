@@ -584,6 +584,13 @@ export function ExportWorkspace({
           <p data-testid="export-summary">
             {selectedShots.length} 个分镜 · {selectedDuration.toFixed(2)} 秒
           </p>
+          <p
+            className="lumora-export__camera-notice"
+            data-testid="export-camera-control-status"
+            role="note"
+          >
+            导出工作区正在接管视口。关闭工作区即可恢复手动操控；导出进行中请先取消或等待完成。
+          </p>
         </div>
         <button
           ref={closeRef}
