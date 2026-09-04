@@ -80,53 +80,96 @@ function useViewportContextMenuGuard(viewportRef: React.RefObject<HTMLElement | 
     const viewport = viewportRef.current;
     if (!viewport) return;
     let gesturePointerId: number | null = null;
-    let expiryTimer: number | null = null;
-    const clearGesture = () => {
-      gesturePointerId = null;
-      if (expiryTimer !== null) {
-        globalThis.clearTimeout(expiryTimer);
-        expiryTimer = null;
+    let gestureExpiryTimer: number | null = null;
+    let pendingContextMenu = false;
+    let pendingContextMenuTimer: number | null = null;
+
+    const clearGestureExpiry = () => {
+      if (gestureExpiryTimer !== null) {
+        globalThis.clearTimeout(gestureExpiryTimer);
+        gestureExpiryTimer = null;
       }
     };
-    const armGesture = (pointerId: number) => {
-      gesturePointerId = pointerId;
-      if (expiryTimer !== null) globalThis.clearTimeout(expiryTimer);
-      expiryTimer = globalThis.setTimeout(clearGesture, 2_000);
+    const clearPendingContextMenu = () => {
+      pendingContextMenu = false;
+      if (pendingContextMenuTimer !== null) {
+        globalThis.clearTimeout(pendingContextMenuTimer);
+        pendingContextMenuTimer = null;
+      }
     };
-    const isInteractiveTarget = (target: EventTarget | null) =>
-      target instanceof HTMLElement &&
-      !!target.closest('button, input, select, textarea, [contenteditable="true"]');
-    const onPointerDown = (event: PointerEvent) => {
+    const clearAll = () => {
+      gesturePointerId = null;
+      clearGestureExpiry();
+      clearPendingContextMenu();
+    };
+    const armGesture = (pointerId: number) => {
+      clearPendingContextMenu();
+      gesturePointerId = pointerId;
+      clearGestureExpiry();
+      // A stuck pointer stream is abnormal; normal long presses remain armed
+      // until pointerup/pointercancel rather than expiring after two seconds.
+      gestureExpiryTimer = globalThis.setTimeout(() => {
+        gesturePointerId = null;
+        gestureExpiryTimer = null;
+      }, 5 * 60_000);
+    };
+    const eventPath = (event: Event): EventTarget[] => {
+      const path = event.composedPath?.();
+      return path && path.length > 0 ? path : event.target ? [event.target] : [];
+    };
+    const isWithinViewport = (event: Event): boolean => {
+      const path = eventPath(event);
+      if (path.includes(viewport)) return true;
       const target = event.target;
-      if (event.button !== 2 || !(target instanceof Node) || !viewport.contains(target) || isInteractiveTarget(target)) return;
+      return target instanceof Node && (target === viewport || viewport.contains(target));
+    };
+    const isInteractiveTarget = (event: Event): boolean => eventPath(event).some((entry) => {
+      if (!(entry instanceof Element)) return false;
+      return entry.matches('button, input, select, textarea, [contenteditable="true"]') ||
+        entry.closest('button, input, select, textarea, [contenteditable="true"]') !== null;
+    });
+    const onPointerDown = (event: PointerEvent) => {
+      // A new pointer sequence cannot belong to the context menu that was
+      // expected after the previous release.
+      clearPendingContextMenu();
+      if (event.button !== 2 || !isWithinViewport(event) || isInteractiveTarget(event)) return;
       armGesture(event.pointerId);
     };
     const onPointerUp = (event: PointerEvent) => {
       if (event.pointerId !== gesturePointerId) return;
-      // Keep the marker until the browser emits contextmenu, which can target
-      // the element under the release point rather than the viewport.
+      gesturePointerId = null;
+      clearGestureExpiry();
+      pendingContextMenu = true;
+      if (pendingContextMenuTimer !== null) globalThis.clearTimeout(pendingContextMenuTimer);
+      pendingContextMenuTimer = globalThis.setTimeout(clearPendingContextMenu, 10_000);
     };
     const onPointerCancel = (event: PointerEvent) => {
-      if (event.pointerId === gesturePointerId) clearGesture();
+      if (event.pointerId === gesturePointerId) clearAll();
     };
     const onContextMenu = (event: MouseEvent) => {
-      const target = event.target;
-      const insideViewport = target instanceof Node && viewport.contains(target);
-      if (gesturePointerId !== null || insideViewport) {
+      if (gesturePointerId !== null || pendingContextMenu || isWithinViewport(event)) {
         event.preventDefault();
-        clearGesture();
+        clearAll();
       }
+    };
+    const onWindowBlur = () => clearAll();
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') clearAll();
     };
     window.addEventListener('pointerdown', onPointerDown, true);
     window.addEventListener('pointerup', onPointerUp, true);
     window.addEventListener('pointercancel', onPointerCancel, true);
     window.addEventListener('contextmenu', onContextMenu, true);
+    window.addEventListener('blur', onWindowBlur);
+    document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
-      clearGesture();
+      clearAll();
       window.removeEventListener('pointerdown', onPointerDown, true);
       window.removeEventListener('pointerup', onPointerUp, true);
       window.removeEventListener('pointercancel', onPointerCancel, true);
       window.removeEventListener('contextmenu', onContextMenu, true);
+      window.removeEventListener('blur', onWindowBlur);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, [viewportRef]);
 }

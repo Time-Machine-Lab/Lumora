@@ -54,6 +54,8 @@ export function isCameraTakeoverTrack(track: TrackData, cameraId: string): boole
 
 export interface CameraDriveBlockerInput {
   driveEnabled: boolean;
+  /** Whether the export operation is actively running (the workspace cannot close yet). */
+  exportRunning?: boolean;
   overwritePending: boolean;
   recordingPaused: boolean;
   playing: boolean;
@@ -78,7 +80,9 @@ export function getCameraDriveBlockers(input: CameraDriveBlockerInput): CameraDr
   if (!input.driveEnabled) {
     blockers.push({
       kind: 'export',
-      message: '导出工作区正在接管视口；关闭导出工作区后可手动操控。',
+      message: input.exportRunning
+        ? '导出正在运行；请先取消或等待完成，再关闭导出，之后可手动操控。'
+        : '导出工作区正在接管视口；关闭导出工作区后可手动操控。',
     });
   }
   if (input.overwritePending) {

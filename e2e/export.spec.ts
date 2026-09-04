@@ -1342,6 +1342,10 @@ test('proves live camera drive sensitivity before isolating editor shortcuts whi
 
   await page.getByRole('button', { name: '导出 WebM' }).click();
   await expect(page.getByLabel('导出进度')).not.toHaveJSProperty('value', 0);
+  await expect(page.getByRole('button', { name: '关闭导出' })).toBeDisabled();
+  await expect(page.getByTestId('export-camera-control-status')).toContainText(
+    '先取消或等待完成，再关闭导出',
+  );
   await pressEditorShortcuts();
   await expect(page.getByTestId('command-palette')).toHaveCount(0);
   await expect(rows).toHaveCount(rowCount);

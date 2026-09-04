@@ -6,7 +6,7 @@ import { createSampleProject } from '@lumora/core';
 import type { Project } from '@lumora/core';
 import { LumoraStudio } from '../src/components/LumoraStudio';
 import type { LumoraStudioHandle } from '../src/components/LumoraStudio';
-import { CameraDrive } from '../src/components/editor/camera-drive';
+import { CameraDrive, getCameraDriveBlockers } from '../src/components/editor/camera-drive';
 import { flushOrbitControlsPendingState } from '../src/components/editor/EditorViewport';
 import { findNode } from '../src/components/editor/scene-builder';
 
@@ -474,6 +474,13 @@ describe('camera drive keyboard routing', () => {
 
     fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 12, clientX: 80, clientY: 50 });
     fireEvent.pointerUp(window, { button: 2, pointerId: 12, clientX: 90, clientY: 55 });
+    expect(fireEvent.contextMenu(document.body)).toBe(false);
+    expect(fireEvent.contextMenu(document.body)).toBe(true);
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 13, clientX: 80, clientY: 50 });
+    fireEvent.pointerUp(window, { button: 2, pointerId: 13, clientX: 90, clientY: 55 });
+    fireEvent.pointerDown(document.body, { button: 2, buttons: 2, pointerId: 14 });
+    expect(fireEvent.contextMenu(document.body)).toBe(true);
     const callsAtWindowRelease = look.mock.calls.length;
     fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 12, clientX: 100, clientY: 60 });
     expect(look).toHaveBeenCalledTimes(callsAtWindowRelease);
@@ -590,6 +597,23 @@ describe('camera drive keyboard routing', () => {
       '播放正在接管机位；暂停播放后可手动操控。',
     );
     expect(within(studio.root).getByTestId('camera-control-status')).toHaveTextContent('主摄像机推镜');
+  });
+
+  it('uses an explicit cancel-or-wait message while export is running', () => {
+    const [blocker] = getCameraDriveBlockers({
+      driveEnabled: false,
+      exportRunning: true,
+      overwritePending: false,
+      recordingPaused: false,
+      playing: true,
+      recording: false,
+      cameraId: 'sample-camera',
+      cameraName: '主摄像机',
+      tracks: [],
+    });
+
+    expect(blocker?.kind).toBe('export');
+    expect(blocker?.message).toContain('先取消或等待完成，再关闭导出');
   });
 
   it('defines the current POV as the camera view, independent of tree selection in director mode', async () => {

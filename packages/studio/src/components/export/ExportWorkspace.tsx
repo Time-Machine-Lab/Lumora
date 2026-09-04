@@ -157,6 +157,8 @@ export function ExportWorkspace({
       ? detectedSupport.support
       : CHECKING_WEBM_SUPPORT
   );
+  const busy = activeOperation !== null;
+  const running = activeOperation?.kind === 'webm';
   const view = runtime.editor.getView();
   const povCamera = useMemo(() => {
     if (view.viewMode === 'director') return null;
@@ -166,6 +168,7 @@ export function ExportWorkspace({
   const cameraDriveBlockers = useMemo(
     () => getCameraDriveBlockers({
       driveEnabled: false,
+      exportRunning: running,
       overwritePending: session.state.overwritePending,
       recordingPaused: session.state.recordingPaused,
       playing: session.state.playing,
@@ -174,7 +177,7 @@ export function ExportWorkspace({
       cameraName: povCamera?.name ?? null,
       tracks: project.tracks,
     }),
-    [povCamera, project.tracks, session.state.overwritePending, session.state.playing, session.state.recording, session.state.recordingPaused],
+    [povCamera, project.tracks, running, session.state.overwritePending, session.state.playing, session.state.recording, session.state.recordingPaused],
   );
 
   useEffect(() => {
@@ -363,8 +366,6 @@ export function ExportWorkspace({
     0,
   );
   const exporters = runtime.host.contributions.getExporters();
-  const busy = activeOperation !== null;
-  const running = activeOperation?.kind === 'webm';
   const aspect = project.settings.aspect[0] / project.settings.aspect[1];
   const liveStatus = liveAnnouncement.status;
   const politeLiveMessage = liveStatus.kind === 'error'
