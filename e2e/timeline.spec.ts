@@ -466,6 +466,21 @@ test('mouse vertical inversion reverses only pitch and resets an active gesture'
   const freshAfter = await dragVertically();
   expect(quaternionAngle(freshAfter.rotation, afterStaleMove.rotation)).toBeGreaterThan(0.01);
 
+  await page.mouse.move(startX, startY);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(startX, startY + 20);
+  const poseAtDoubleToggle = await stableCameraPose(page);
+  await invertMouseY.evaluate((input) => {
+    (input as HTMLInputElement).click();
+    (input as HTMLInputElement).click();
+  });
+  await expect(invertMouseY).toBeChecked();
+  await page.mouse.move(startX, startY + 70, { steps: 5 });
+  await page.waitForTimeout(300);
+  const afterDoubleToggle = await cameraPose(page);
+  expect(quaternionAngle(afterDoubleToggle.rotation, poseAtDoubleToggle.rotation)).toBeLessThan(0.001);
+  await page.mouse.up({ button: 'right' });
+
   await page.reload();
   await page.getByTestId('open-sample-project').click();
   await expect(page.getByTestId('camera-control-invert-mouse-y')).not.toBeChecked();
@@ -483,6 +498,28 @@ test('mouse vertical inversion keeps a touch-sized target on narrow screens', as
 
   await hitTarget.click({ position: { x: bounds!.width - 2, y: bounds!.height - 2 } });
   await expect(invertMouseY).toBeChecked();
+});
+
+test('mouse vertical inversion keeps a touch-sized target in a narrow embedded host', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const studio = page.getByTestId('lumora-studio');
+  await studio.evaluate((element) => {
+    element.style.width = '400px';
+    element.style.maxWidth = '400px';
+    element.style.flex = '0 0 400px';
+  });
+
+  const stage = studio.locator('.lumora-studio__stage');
+  const stageBounds = await stage.boundingBox();
+  expect(stageBounds).not.toBeNull();
+  expect(stageBounds!.width).toBeLessThanOrEqual(520);
+
+  const invertMouseY = page.getByTestId('camera-control-invert-mouse-y');
+  const hitTarget = invertMouseY.locator('..');
+  await expect(invertMouseY).toBeVisible();
+  const bounds = await hitTarget.boundingBox();
+  expect(bounds).not.toBeNull();
+  expect(bounds!.height).toBeGreaterThanOrEqual(44);
 });
 
 test('suppresses an out-of-bounds release from an open ShadowRoot viewport', async ({ page }) => {

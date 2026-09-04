@@ -521,7 +521,9 @@ function useCameraDrive(
 
   useEffect(() => {
     if (!session) return;
-    const drive = new CameraDrive();
+    const initialSettingsSnapshot = session.getCameraControlSettingsSnapshot();
+    const drive = new CameraDrive(initialSettingsSnapshot.settings);
+    let syncedInvertMouseYRevision = initialSettingsSnapshot.invertMouseYRevision;
     let raf = 0;
     let last = performance.now();
     let attachedId: string | null = null;
@@ -554,15 +556,17 @@ function useCameraDrive(
     };
 
     const syncDriveSettings = () => {
-      const cameraControls = sessionRef.current?.state.cameraControls;
-      if (!cameraControls) return;
+      const snapshot = sessionRef.current?.getCameraControlSettingsSnapshot();
+      if (!snapshot) return;
       const previousSettings = drive.getSettings();
-      drive.setSettings(cameraControls);
+      const invertMouseYChanged = snapshot.invertMouseYRevision !== syncedInvertMouseYRevision;
+      drive.setSettings(snapshot.settings);
       const nextSettings = drive.getSettings();
+      syncedInvertMouseYRevision = snapshot.invertMouseYRevision;
       if (nextSettings.mode !== previousSettings.mode) {
         heldKeys.clear();
         endLookGesture();
-      } else if (nextSettings.invertMouseY !== previousSettings.invertMouseY) {
+      } else if (invertMouseYChanged) {
         drive.cancelLook();
         endLookGesture();
       }
@@ -721,6 +725,7 @@ function useCameraDrive(
       }
     };
     const onPointerMove = (event: PointerEvent) => {
+      syncDriveSettings();
       if (lookPointerId === null || event.pointerId !== lookPointerId) return;
       if ((event.buttons & 2) === 0) {
         endLookGesture();

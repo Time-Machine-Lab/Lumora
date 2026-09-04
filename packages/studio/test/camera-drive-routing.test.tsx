@@ -407,6 +407,34 @@ describe('camera drive keyboard routing', () => {
     expect(camera.quaternion.angleTo(rotationBeforeFreshGesture)).toBeGreaterThan(0.001);
   });
 
+  it('requires a fresh right-button gesture after mouse inversion is toggled twice in one batch', async () => {
+    const studio = await mountStudio('lumora://drive-invert-mouse-y-double-toggle');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    const releasePointerCapture = vi.fn();
+    Object.assign(viewport, {
+      setPointerCapture: vi.fn(),
+      releasePointerCapture,
+    });
+    const look = vi.spyOn(CameraDrive.prototype, 'look');
+    await act(async () => delay(60));
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 41, clientX: 100, clientY: 100 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 41, clientX: 120, clientY: 110 });
+    expect(look).toHaveBeenCalledTimes(1);
+
+    const invertMouseY = within(studio.root).getByRole('checkbox', { name: '鼠标垂直反转' });
+    act(() => {
+      invertMouseY.click();
+      invertMouseY.click();
+      fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 41, clientX: 150, clientY: 140 });
+    });
+
+    expect(invertMouseY).not.toBeChecked();
+    expect(releasePointerCapture).toHaveBeenCalledWith(41);
+    expect(look).toHaveBeenCalledTimes(1);
+  });
+
   it('keyboard-mouse mode keeps translation and pointer look independent', async () => {
     const studio = await mountStudio('lumora://drive-independent-inputs');
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
@@ -454,9 +482,10 @@ describe('camera drive keyboard routing', () => {
     expect(otherCamera.position.distanceTo(otherStart)).toBeLessThan(1e-9);
   });
 
-  it('keyboard-only mode ignores pointer look and rotates with arrow keys', async () => {
+  it('keyboard-only mode ignores inverted pointer look and rotates with arrow keys', async () => {
     const studio = await mountStudio('lumora://drive-keyboard-only');
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    fireEvent.click(within(studio.root).getByRole('checkbox', { name: '鼠标垂直反转' }));
     fireEvent.click(within(studio.root).getByRole('button', { name: '纯键盘操控' }));
     const camera = findNode(studio.scene, 'sample-camera')!;
     const beforePointer = camera.quaternion.clone();
@@ -473,6 +502,22 @@ describe('camera drive keyboard routing', () => {
     await act(async () => delay(100));
     fireEvent.keyUp(studio.root, { key: 'ArrowLeft', code: 'ArrowLeft' });
     expect(camera.quaternion.angleTo(beforePointer)).toBeGreaterThan(0.001);
+  });
+
+  it('keeps the settled camera attached when switching to keyboard-only mode', async () => {
+    const studio = await mountStudio('lumora://drive-keyboard-only-settled-attachment');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    await act(async () => delay(60));
+
+    fireEvent.click(within(studio.root).getByRole('button', { name: '纯键盘操控' }));
+    await act(async () => delay(40));
+    const beforeArrow = camera.quaternion.clone();
+    fireEvent.keyDown(studio.root, { key: 'ArrowLeft', code: 'ArrowLeft' });
+    await act(async () => delay(100));
+    fireEvent.keyUp(studio.root, { key: 'ArrowLeft', code: 'ArrowLeft' });
+
+    expect(camera.quaternion.angleTo(beforeArrow)).toBeGreaterThan(0.001);
   });
 
   it('suppresses the viewport context menu while keeping pointer capture scoped to camera look', async () => {

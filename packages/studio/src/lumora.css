@@ -1683,6 +1683,12 @@
   }
 }
 
+@container (max-width: 520px) {
+  .lumora-camera-controls__invert {
+    min-height: 44px;
+  }
+}
+
 .lumora-camera-controls__value {
   width: 28px;
   color: var(--lumora-text);

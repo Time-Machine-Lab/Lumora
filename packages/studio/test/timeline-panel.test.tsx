@@ -80,6 +80,10 @@ function mountPanel(
     setLoop: vi.fn(),
     setCaptureSource: vi.fn(),
     setCameraControlSettings: vi.fn(),
+    getCameraControlSettingsSnapshot: vi.fn(() => ({
+      settings: { ...session.state.cameraControls },
+      invertMouseYRevision: 0,
+    })),
     startRecording: vi.fn(),
     confirmOverwrite: vi.fn(),
     cancelOverwrite: vi.fn(),
