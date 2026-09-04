@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        if: hashFiles('go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node
+        if: hashFiles('package.json') != '' && hashFiles('bun.lockb') == '' && hashFiles('bun.lock') == ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Setup Bun
+        if: hashFiles('bun.lockb') != '' || hashFiles('bun.lock') != ''
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Run project checks
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f Makefile ]] && grep -qE '^ci:' Makefile; then
+            make ci
+            exit 0
+          fi
+
+          if [[ -f go.mod ]]; then
+            go test ./...
+            exit 0
+          fi
+
+          if [[ -f package.json ]]; then
+            if [[ -f bun.lockb || -f bun.lock ]]; then
+              bun install --frozen-lockfile
+              if node -e 'const p=require("./package.json"); process.exit(p.scripts && p.scripts.build ? 0 : 1)'; then
+                bun run build
+              fi
+            else
+              npm ci
+              if node -e 'const p=require("./package.json"); process.exit(p.scripts && p.scripts.build ? 0 : 1)'; then
+                npm run build
+              fi
+            fi
+            exit 0
+          fi
+
+          echo "No standard project command detected. Add a Makefile ci target or update this workflow."

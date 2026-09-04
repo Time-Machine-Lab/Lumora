@@ -1,0 +1,30 @@
+name: git-governance
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  governance:
+    name: git-governance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Test policy validator
+        run: python -m unittest discover -s .github/scripts -p "test_*.py"
+
+      - name: Validate pull request
+        shell: bash
+        run: |
+          python .github/scripts/validate_pr.py \
+            --event "$GITHUB_EVENT_PATH" \
+            --policy .git-management.json
