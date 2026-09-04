@@ -703,6 +703,58 @@ describe('CameraDrive：键鼠驾驶积分器', () => {
     expect(drive.hasInput).toBe(true);
   });
 
+  it('鼠标垂直反转默认为关闭，开启后只反转俯仰方向', () => {
+    const normal = new CameraDrive({
+      mode: 'keyboard-mouse',
+      invertMouseY: false,
+      mouseSensitivity: 1,
+      smoothing: 30,
+    });
+    const inverted = new CameraDrive({
+      mode: 'keyboard-mouse',
+      invertMouseY: true,
+      mouseSensitivity: 1,
+      smoothing: 30,
+    });
+    const normalNode = makeCameraNode();
+    const invertedNode = makeCameraNode();
+    normal.attach(normalNode);
+    inverted.attach(invertedNode);
+
+    expect(new CameraDrive().getSettings().invertMouseY).toBe(false);
+    normal.look(40, 20);
+    inverted.look(40, 20);
+    normal.update(1 / 60);
+    inverted.update(1 / 60);
+
+    expect(normalNode.rotation.y).toBeCloseTo(invertedNode.rotation.y, 8);
+    expect(normalNode.rotation.x).toBeCloseTo(-invertedNode.rotation.x, 8);
+    expect(Math.abs(normalNode.rotation.x)).toBeGreaterThan(0.001);
+  });
+
+  it('切换鼠标垂直反转会清除残余视角，但保留已按下的移动键', () => {
+    const drive = new CameraDrive({
+      mode: 'keyboard-mouse',
+      invertMouseY: false,
+      speed: 3,
+      smoothing: 30,
+    });
+    const node = makeCameraNode();
+    drive.attach(node);
+    drive.press('KeyW');
+    drive.update(0.2);
+    drive.look(80, 40);
+    const rotationAtToggle = node.quaternion.clone();
+    const positionAtToggle = node.position.clone();
+
+    drive.setSettings({ invertMouseY: true });
+    drive.update(0.1);
+
+    expect(node.quaternion.angleTo(rotationAtToggle)).toBeLessThan(1e-9);
+    expect(node.position.distanceTo(positionAtToggle)).toBeGreaterThan(0.05);
+    expect(drive.hasInput).toBe(true);
+  });
+
   it('纯键盘模式忽略鼠标视角，切换模式会清除残余视角输入', () => {
     const drive = new CameraDrive({ mode: 'keyboard-mouse', mouseSensitivity: 1 });
     const node = makeCameraNode();

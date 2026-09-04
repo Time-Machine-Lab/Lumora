@@ -24,6 +24,8 @@ export interface CameraDriveSettings {
   rotateSpeed: number;
   /** 鼠标视角灵敏度倍率 */
   mouseSensitivity: number;
+  /** 仅反转鼠标拖动对应的垂直俯仰方向 */
+  invertMouseY: boolean;
   /** 平滑系数（1/秒）：速度向目标逼近的指数速率，越大越跟手 */
   smoothing: number;
 }
@@ -35,6 +37,7 @@ export const DEFAULT_CAMERA_DRIVE_SETTINGS: CameraDriveSettings = {
   holdDelay: 0.12,
   rotateSpeed: 1.2,
   mouseSensitivity: 1,
+  invertMouseY: false,
   smoothing: 8,
 };
 
@@ -155,6 +158,9 @@ export function normalizeCameraDriveSettings(
       CAMERA_DRIVE_LIMITS.mouseSensitivity.min,
       CAMERA_DRIVE_LIMITS.mouseSensitivity.max,
     ),
+    invertMouseY: typeof settings.invertMouseY === 'boolean'
+      ? settings.invertMouseY
+      : base.invertMouseY,
     smoothing: bounded(
       settings.smoothing,
       base.smoothing,
@@ -452,8 +458,13 @@ export class CameraDrive {
 
   setSettings(settings: Partial<CameraDriveSettings>): void {
     const previousMode = this.settings.mode;
+    const previousInvertMouseY = this.settings.invertMouseY;
     this.settings = normalizeCameraDriveSettings(settings, this.settings);
-    if (this.settings.mode !== previousMode) this.clearMotion();
+    if (this.settings.mode !== previousMode) {
+      this.clearMotion();
+    } else if (this.settings.invertMouseY !== previousInvertMouseY) {
+      this.cancelLook();
+    }
   }
 
   acceptsKey(code: string): boolean {
@@ -511,7 +522,12 @@ export class CameraDrive {
       !Number.isFinite(deltaY)
     ) return;
     this.lookDelta.x = THREE.MathUtils.clamp(this.lookDelta.x + deltaX, -MAX_LOOK_DELTA, MAX_LOOK_DELTA);
-    this.lookDelta.y = THREE.MathUtils.clamp(this.lookDelta.y + deltaY, -MAX_LOOK_DELTA, MAX_LOOK_DELTA);
+    const verticalDelta = this.settings.invertMouseY ? -deltaY : deltaY;
+    this.lookDelta.y = THREE.MathUtils.clamp(
+      this.lookDelta.y + verticalDelta,
+      -MAX_LOOK_DELTA,
+      MAX_LOOK_DELTA,
+    );
   }
 
   /** Clear queued pointer-look momentum without interrupting held keyboard input. */

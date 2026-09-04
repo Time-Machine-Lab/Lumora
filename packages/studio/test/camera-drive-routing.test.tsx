@@ -370,6 +370,35 @@ describe('camera drive keyboard routing', () => {
     expect(renderedCamera.quaternion.angleTo(beforeQuaternion)).toBeGreaterThan(0.001);
   });
 
+  it('requires a fresh right-button gesture after toggling mouse vertical inversion', async () => {
+    const studio = await mountStudio('lumora://drive-invert-mouse-y-boundary');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    const releasePointerCapture = vi.fn();
+    Object.assign(viewport, {
+      setPointerCapture: vi.fn(),
+      releasePointerCapture,
+    });
+    const look = vi.spyOn(CameraDrive.prototype, 'look');
+    await act(async () => delay(60));
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 31, clientX: 100, clientY: 100 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 31, clientX: 120, clientY: 110 });
+    expect(look).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(within(studio.root).getByRole('checkbox', { name: '鼠标垂直反转' }));
+    await act(async () => delay(40));
+    expect(releasePointerCapture).toHaveBeenCalledWith(31);
+    const callsAtToggle = look.mock.calls.length;
+
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 31, clientX: 150, clientY: 140 });
+    expect(look).toHaveBeenCalledTimes(callsAtToggle);
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 32, clientX: 150, clientY: 140 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 32, clientX: 170, clientY: 150 });
+    expect(look).toHaveBeenCalledTimes(callsAtToggle + 1);
+  });
+
   it('keyboard-mouse mode keeps translation and pointer look independent', async () => {
     const studio = await mountStudio('lumora://drive-independent-inputs');
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));

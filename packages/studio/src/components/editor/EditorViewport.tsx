@@ -804,10 +804,14 @@ function useCameraDrive(
       }
       const st = sessionRef.current?.state;
       if (st) {
-        const previousMode = drive.getSettings().mode;
+        const previousSettings = drive.getSettings();
         drive.setSettings(st.cameraControls);
-        if (drive.getSettings().mode !== previousMode) {
+        const nextSettings = drive.getSettings();
+        if (nextSettings.mode !== previousSettings.mode) {
           heldKeys.clear();
+          endLookGesture();
+        } else if (nextSettings.invertMouseY !== previousSettings.invertMouseY) {
+          drive.cancelLook();
           endLookGesture();
         }
       }
