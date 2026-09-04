@@ -129,9 +129,9 @@ function useViewportContextMenuGuard(viewportRef: React.RefObject<HTMLElement | 
         entry.closest('button, input, select, textarea, [contenteditable="true"]') !== null;
     });
     const onPointerDown = (event: PointerEvent) => {
-      // A new pointer sequence cannot belong to the context menu that was
-      // expected after the previous release.
-      clearPendingContextMenu();
+      // Every pointer sequence supersedes any stale gesture state before the
+      // current event is evaluated for viewport context-menu suppression.
+      clearAll();
       if (event.button !== 2 || !isWithinViewport(event) || isInteractiveTarget(event)) return;
       armGesture(event.pointerId);
     };

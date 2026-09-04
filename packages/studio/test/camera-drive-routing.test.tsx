@@ -481,6 +481,10 @@ describe('camera drive keyboard routing', () => {
     fireEvent.pointerUp(window, { button: 2, pointerId: 13, clientX: 90, clientY: 55 });
     fireEvent.pointerDown(document.body, { button: 2, buttons: 2, pointerId: 14 });
     expect(fireEvent.contextMenu(document.body)).toBe(true);
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 15, clientX: 80, clientY: 50 });
+    fireEvent.pointerDown(document.body, { button: 2, buttons: 2, pointerId: 16 });
+    expect(fireEvent.contextMenu(document.body)).toBe(true);
     const callsAtWindowRelease = look.mock.calls.length;
     fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 12, clientX: 100, clientY: 60 });
     expect(look).toHaveBeenCalledTimes(callsAtWindowRelease);

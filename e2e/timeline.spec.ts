@@ -441,6 +441,64 @@ test('does not expire a long-held right-drag before releasing outside the viewpo
   expect(await contextMenu).toBe(true);
 });
 
+test('allows a new outside right-click after an orphaned viewport pointerdown', async ({ page }) => {
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('view-mode-select').selectOption('sample-camera');
+  await expect(page.getByTestId('camera-control-status')).toContainText('主摄像机推镜');
+  const viewport = page.getByTestId('lumora-viewport');
+  const viewportBounds = await viewport.boundingBox();
+  const toolbarBounds = await page.getByTestId('lumora-toolbar').boundingBox();
+  if (!viewportBounds || !toolbarBounds) throw new Error('viewport or toolbar is unavailable');
+  await page.evaluate(() => {
+    const scope = globalThis as typeof globalThis & {
+      __lumoraOutsidePointerDowns?: number;
+      __lumoraOutsideContextMenus?: boolean[];
+    };
+    scope.__lumoraOutsidePointerDowns = 0;
+    scope.__lumoraOutsideContextMenus = [];
+    window.addEventListener('pointerdown', (event) => {
+      const target = event.composedPath()[0];
+      if (target instanceof Element && target.closest('[data-testid="lumora-toolbar"]')) {
+        scope.__lumoraOutsidePointerDowns! += 1;
+      }
+    }, true);
+    window.addEventListener('contextmenu', (event) => {
+      const target = event.composedPath()[0];
+      if (target instanceof Element && target.closest('[data-testid="lumora-toolbar"]')) {
+        scope.__lumoraOutsideContextMenus!.push(event.defaultPrevented);
+      }
+    });
+  });
+
+  // Seed the abnormal state directly: a real browser cannot begin a second
+  // physical right-click until the first button is released, while the bug is
+  // specifically that the application missed that terminating event.
+  await viewport.dispatchEvent('pointerdown', {
+    bubbles: true,
+    composed: true,
+    pointerId: 91,
+    pointerType: 'mouse',
+    button: 2,
+    buttons: 2,
+    clientX: viewportBounds.x + viewportBounds.width * 0.5,
+    clientY: viewportBounds.y + viewportBounds.height * 0.5,
+  });
+  await page.mouse.click(toolbarBounds.x + 8, toolbarBounds.y + toolbarBounds.height / 2, { button: 'right' });
+
+  const result = await page.evaluate(() => {
+    const scope = globalThis as typeof globalThis & {
+      __lumoraOutsidePointerDowns?: number;
+      __lumoraOutsideContextMenus?: boolean[];
+    };
+    return {
+      pointerDowns: scope.__lumoraOutsidePointerDowns ?? 0,
+      contextMenus: scope.__lumoraOutsideContextMenus ?? [],
+    };
+  });
+  expect(result.pointerDowns).toBeGreaterThan(0);
+  expect(result.contextMenus).toContain(false);
+});
+
 test('director free-drive orientation remains stable across pixel and line-mode wheel gestures', async ({ page }) => {
   const viewport = page.getByTestId('lumora-viewport');
   await hideViewportOverlays(page);
