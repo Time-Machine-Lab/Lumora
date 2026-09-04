@@ -34,7 +34,7 @@ function projectWithShortShots(): Project {
   };
 }
 
-function sessionHarness(options: { recording?: boolean } = {}) {
+function sessionHarness(options: { recording?: boolean; playing?: boolean } = {}) {
   const pause = vi.fn();
   const seek = vi.fn();
   const getTime = vi.fn(() => 0.5);
@@ -43,7 +43,7 @@ function sessionHarness(options: { recording?: boolean } = {}) {
       pause,
       seek,
       timeline: { getTime },
-      state: { recording: options.recording ?? false },
+      state: { recording: options.recording ?? false, playing: options.playing ?? false },
     } as unknown as TimelineSession,
     pause,
     seek,
@@ -1312,7 +1312,9 @@ describe('ExportWorkspace', () => {
   it('cancels an in-flight export and closes its encoder', async () => {
     const runtime = createStudioRuntime();
     const project = projectWithShortShots();
-    const { session } = sessionHarness();
+    runtime.editor.openProject(project);
+    runtime.editor.setViewMode({ cameraObjectId: 'sample-camera' });
+    const { session } = sessionHarness({ playing: true });
     const recorder = encoderDependencies({
       flush: () => new Promise<Blob>(() => undefined),
     });
@@ -1330,6 +1332,16 @@ describe('ExportWorkspace', () => {
       />,
     );
     fireEvent.click(screen.getByRole('button', { name: '导出 WebM' }));
+    expect(screen.getByRole('button', { name: '关闭导出' })).toBeDisabled();
+    expect(screen.getByTestId('export-camera-control-status')).toHaveTextContent(
+      '先取消或等待完成，再关闭导出',
+    );
+    expect(screen.getByTestId('export-camera-control-status')).toHaveTextContent(
+      '暂停播放后可手动操控',
+    );
+    expect(screen.getByTestId('export-camera-control-status')).toHaveTextContent(
+      '主摄像机推镜',
+    );
     fireEvent.click(await screen.findByRole('button', { name: '取消导出' }));
 
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('已取消'));

@@ -62,8 +62,23 @@ async function focusViewportByKeyboard(page: Page): Promise<void> {
 
 /** 画布截图：先等一帧渲染（seek/暂停后场景经 rAF 重绘） */
 async function canvasShot(page: Page): Promise<Buffer> {
+  await waitForStableFrame(page);
   await page.waitForTimeout(120);
   return page.locator('.lumora-viewport canvas').screenshot();
+}
+
+async function waitForStableFrame(page: Page, frameCount = 2): Promise<void> {
+  await page.evaluate(async (count) => {
+    await new Promise<void>((resolve) => {
+      let remaining = Math.max(1, count);
+      const tick = () => {
+        remaining -= 1;
+        if (remaining <= 0) resolve();
+        else requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+  }, frameCount);
 }
 
 /** 播放头横向位置（行内 px，含标签列）：186 + time * zoom */
@@ -98,11 +113,95 @@ async function cameraPose(
   page: Page,
   cameraId = 'sample-camera',
 ): Promise<{ position: [number, number, number]; rotation: [number, number, number]; focalLength: number | null }> {
+  await waitForStableFrame(page);
   const text = await page.getByTestId('camera-pose-readout').textContent();
   if (!text) throw new Error('位姿读取钩子不可用');
   const pose = JSON.parse(text)[cameraId];
   if (!pose) throw new Error(`机位 ${cameraId} 不在位姿钩子输出中`);
   return pose;
+}
+
+async function stableCameraPose(
+  page: Page,
+  cameraId = 'sample-camera',
+): ReturnType<typeof cameraPose> {
+  let previous = await cameraPose(page, cameraId);
+  let stableSamples = 0;
+  for (let attempt = 0; attempt < 90; attempt += 1) {
+    const current = await cameraPose(page, cameraId);
+    const focalDelta = Math.abs((current.focalLength ?? 0) - (previous.focalLength ?? 0));
+    if (
+      vectorDistance(current.position, previous.position) < 0.00001 &&
+      quaternionAngle(current.rotation, previous.rotation) < 0.00001 &&
+      focalDelta < 0.00001
+    ) {
+      stableSamples += 1;
+      if (stableSamples >= 2) return current;
+    } else {
+      stableSamples = 0;
+    }
+    previous = current;
+  }
+  throw new Error(`机位 ${cameraId} 未在稳定帧窗口内静止`);
+}
+
+async function rightDrag(
+  page: Page,
+  viewport: ReturnType<Page['getByTestId']>,
+  options: { leaveViewport?: boolean } = {},
+): Promise<boolean> {
+  const viewportBounds = await viewport.boundingBox();
+  if (!viewportBounds) throw new Error('viewport is unavailable');
+  const pageViewport = page.viewportSize();
+  if (!pageViewport) throw new Error('page viewport is unavailable');
+  const contextMenu = page.evaluate(() => new Promise<boolean>((resolve) => {
+    const handler = (event: MouseEvent) => {
+      cleanup();
+      resolve(event.defaultPrevented);
+    };
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      resolve(false);
+    }, 1_000);
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      document.removeEventListener('contextmenu', handler);
+    };
+    document.addEventListener('contextmenu', handler);
+  }));
+  const visibleLeft = Math.max(0, viewportBounds.x);
+  const visibleTop = Math.max(0, viewportBounds.y);
+  const visibleRight = Math.min(pageViewport.width, viewportBounds.x + viewportBounds.width);
+  const visibleBottom = Math.min(pageViewport.height, viewportBounds.y + viewportBounds.height);
+  if (visibleRight <= visibleLeft || visibleBottom <= visibleTop) throw new Error('viewport has no visible hit area');
+  const startX = visibleLeft + (visibleRight - visibleLeft) * 0.42;
+  const startY = visibleTop + (visibleBottom - visibleTop) * 0.52;
+  await page.mouse.move(startX, startY);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(
+    startX + viewportBounds.width * 0.18,
+    startY - viewportBounds.height * 0.1,
+    { steps: 8 },
+  );
+  if (options.leaveViewport) {
+    const toolbarBounds = await page.getByTestId('lumora-toolbar').boundingBox();
+    if (!toolbarBounds) throw new Error('toolbar is unavailable');
+    await page.mouse.move(toolbarBounds.x + 8, toolbarBounds.y + toolbarBounds.height / 2, { steps: 4 });
+  }
+  await page.mouse.up({ button: 'right' });
+  await waitForStableFrame(page);
+  return contextMenu;
+}
+
+async function moveReactRootIntoOpenShadowRoot(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const reactRoot = document.getElementById('root');
+    if (!reactRoot) throw new Error('React root is missing');
+    const host = document.createElement('div');
+    host.dataset.testid = 'e2e-shadow-host';
+    document.body.append(host);
+    host.attachShadow({ mode: 'open' }).append(reactRoot);
+  });
 }
 
 function vectorDistance(a: readonly number[], b: readonly number[]): number {
@@ -206,6 +305,198 @@ test('idle director view drives the rendered camera and reports its heading', as
   await expect(status).not.toHaveText(initialStatus ?? '');
   await expect.poll(() => arrow.evaluate((element) => (element as HTMLElement).style.transform))
     .not.toBe(initialArrowTransform);
+});
+
+test('camera takeover guidance and viewport context-menu suppression follow the active owner', async ({ page }) => {
+  const viewport = page.getByTestId('lumora-viewport');
+
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('view-mode-select').selectOption('sample-camera');
+  const status = page.getByTestId('camera-control-status');
+  await expect(status).toContainText('主摄像机推镜');
+  await expect(status).toContainText('主摄像机变焦');
+  await expect(status).not.toContainText('立方体旋转');
+  expect(await rightDrag(page, viewport)).toBe(true);
+
+  await page.getByRole('button', { name: /定位轨道/ }).click();
+  await expect(page.getByTestId('track-disabled-sample-track-camera-dolly')).toBeFocused();
+  await page.getByTestId('track-disabled-sample-track-camera-dolly').check();
+  await page.getByTestId('track-disabled-sample-track-camera-focus').check();
+  await expect(status).toHaveText('机位“主摄像机”可手动操控。');
+
+  await page.getByTestId('timeline-play').click();
+  await expect(status).toContainText('播放正在接管机位；暂停播放后可手动操控。');
+  expect(await rightDrag(page, viewport)).toBe(true);
+  await page.getByTestId('timeline-play').click();
+
+  await page.getByTestId('open-export-workspace').click();
+  await expect(page.getByTestId('export-workspace')).toBeVisible();
+  const exportStatus = page.getByTestId('export-camera-control-status');
+  await expect(exportStatus).toBeVisible();
+  await expect(exportStatus).toContainText('导出工作区正在接管视口；关闭导出工作区后可手动操控。');
+  expect(await rightDrag(page, viewport)).toBe(true);
+});
+
+test('real right-drag drives only an unblocked POV and suppresses complete gestures', async ({ page }) => {
+  const viewport = page.getByTestId('lumora-viewport');
+  const status = page.getByTestId('camera-control-status');
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('view-mode-select').selectOption('sample-camera');
+  const dolly = page.getByTestId('track-disabled-sample-track-camera-dolly');
+  const focus = page.getByTestId('track-disabled-sample-track-camera-focus');
+
+  await dolly.check();
+  await focus.check();
+  await expect(status).toHaveText('机位“主摄像机”可手动操控。');
+  const freeBefore = await stableCameraPose(page);
+  expect(await rightDrag(page, viewport)).toBe(true);
+  const freeAfter = await stableCameraPose(page);
+  expect(vectorDistance(freeAfter.position, freeBefore.position)).toBeLessThan(0.000001);
+  expect(quaternionAngle(freeAfter.rotation, freeBefore.rotation)).toBeGreaterThan(0.001);
+
+  await dolly.uncheck();
+  await focus.uncheck();
+  const trackBefore = await stableCameraPose(page);
+  expect(await rightDrag(page, viewport)).toBe(true);
+  const trackAfter = await stableCameraPose(page);
+  expect(vectorDistance(trackAfter.position, trackBefore.position)).toBeLessThan(0.000001);
+  expect(quaternionAngle(trackAfter.rotation, trackBefore.rotation)).toBeLessThan(0.000001);
+
+  await page.getByTestId('view-mode-select').selectOption('director');
+  await page.getByTestId('timeline-play').click();
+  const playbackBefore = await stableCameraPose(page, '__rendered__');
+  expect(await rightDrag(page, viewport)).toBe(true);
+  const playbackAfter = await stableCameraPose(page, '__rendered__');
+  expect(vectorDistance(playbackAfter.position, playbackBefore.position)).toBeLessThan(0.000001);
+  expect(quaternionAngle(playbackAfter.rotation, playbackBefore.rotation)).toBeLessThan(0.000001);
+  await page.getByTestId('timeline-play').click();
+
+  const resumedBefore = await stableCameraPose(page, '__rendered__');
+  expect(await rightDrag(page, viewport)).toBe(true);
+  const resumedAfter = await stableCameraPose(page, '__rendered__');
+  expect(quaternionAngle(resumedAfter.rotation, resumedBefore.rotation)).toBeGreaterThan(0.001);
+
+  await page.getByTestId('open-export-workspace').click();
+  await expect(page.getByTestId('export-workspace')).toBeVisible();
+  const viewportBounds = await viewport.boundingBox();
+  if (!viewportBounds) throw new Error('viewport is unavailable under export overlay');
+  const exportOverlayOwnsViewportPoint = await page.evaluate(({ x, y }) => {
+    const hit = document.elementFromPoint(x, y);
+    return hit?.closest('[data-testid="export-workspace"]') !== null;
+  }, {
+    x: viewportBounds.x + viewportBounds.width * 0.42,
+    y: viewportBounds.y + viewportBounds.height * 0.52,
+  });
+  expect(exportOverlayOwnsViewportPoint).toBe(true);
+  const exportBefore = await stableCameraPose(page, '__rendered__');
+  expect(await rightDrag(page, viewport)).toBe(true);
+  const exportAfter = await stableCameraPose(page, '__rendered__');
+  expect(vectorDistance(exportAfter.position, exportBefore.position)).toBeLessThan(0.000001);
+  expect(quaternionAngle(exportAfter.rotation, exportBefore.rotation)).toBeLessThan(0.000001);
+
+  await page.getByRole('button', { name: '关闭导出' }).click();
+  const outOfViewportBefore = await stableCameraPose(page, '__rendered__');
+  expect(await rightDrag(page, viewport, { leaveViewport: true })).toBe(true);
+  const outOfViewportAfter = await stableCameraPose(page, '__rendered__');
+  expect(quaternionAngle(outOfViewportAfter.rotation, outOfViewportBefore.rotation)).toBeGreaterThan(0.001);
+});
+
+test('suppresses an out-of-bounds release from an open ShadowRoot viewport', async ({ page }) => {
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('view-mode-select').selectOption('sample-camera');
+  await expect(page.getByTestId('camera-control-status')).toContainText('主摄像机推镜');
+  await moveReactRootIntoOpenShadowRoot(page);
+  const viewport = page.getByTestId('lumora-viewport');
+  await expect(viewport).toBeVisible();
+  await waitForStableFrame(page);
+  expect(await rightDrag(page, viewport, { leaveViewport: true })).toBe(true);
+});
+
+test('does not expire a long-held right-drag before releasing outside the viewport', async ({ page }) => {
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('view-mode-select').selectOption('sample-camera');
+  await expect(page.getByTestId('camera-control-status')).toContainText('主摄像机推镜');
+  const viewport = page.getByTestId('lumora-viewport');
+  const bounds = await viewport.boundingBox();
+  const toolbar = await page.getByTestId('lumora-toolbar').boundingBox();
+  if (!bounds || !toolbar) throw new Error('viewport or toolbar is unavailable');
+  const contextMenu = page.evaluate(() => new Promise<boolean>((resolve) => {
+    const handler = (event: MouseEvent) => {
+      document.removeEventListener('contextmenu', handler);
+      resolve(event.defaultPrevented);
+    };
+    document.addEventListener('contextmenu', handler);
+    window.setTimeout(() => {
+      document.removeEventListener('contextmenu', handler);
+      resolve(false);
+    }, 4_000);
+  }));
+  const startX = bounds.x + bounds.width * 0.5;
+  const startY = bounds.y + bounds.height * 0.5;
+  await page.mouse.move(startX, startY);
+  await page.mouse.down({ button: 'right' });
+  await page.waitForTimeout(2_300);
+  await page.mouse.move(toolbar.x + 8, toolbar.y + toolbar.height / 2, { steps: 4 });
+  await page.mouse.up({ button: 'right' });
+  expect(await contextMenu).toBe(true);
+});
+
+test('allows a new outside right-click after an orphaned viewport pointerdown', async ({ page }) => {
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('view-mode-select').selectOption('sample-camera');
+  await expect(page.getByTestId('camera-control-status')).toContainText('主摄像机推镜');
+  const viewport = page.getByTestId('lumora-viewport');
+  const viewportBounds = await viewport.boundingBox();
+  const toolbarBounds = await page.getByTestId('lumora-toolbar').boundingBox();
+  if (!viewportBounds || !toolbarBounds) throw new Error('viewport or toolbar is unavailable');
+  await page.evaluate(() => {
+    const scope = globalThis as typeof globalThis & {
+      __lumoraOutsidePointerDowns?: number;
+      __lumoraOutsideContextMenus?: boolean[];
+    };
+    scope.__lumoraOutsidePointerDowns = 0;
+    scope.__lumoraOutsideContextMenus = [];
+    window.addEventListener('pointerdown', (event) => {
+      const target = event.composedPath()[0];
+      if (target instanceof Element && target.closest('[data-testid="lumora-toolbar"]')) {
+        scope.__lumoraOutsidePointerDowns! += 1;
+      }
+    }, true);
+    window.addEventListener('contextmenu', (event) => {
+      const target = event.composedPath()[0];
+      if (target instanceof Element && target.closest('[data-testid="lumora-toolbar"]')) {
+        scope.__lumoraOutsideContextMenus!.push(event.defaultPrevented);
+      }
+    });
+  });
+
+  // Seed the abnormal state directly: a real browser cannot begin a second
+  // physical right-click until the first button is released, while the bug is
+  // specifically that the application missed that terminating event.
+  await viewport.dispatchEvent('pointerdown', {
+    bubbles: true,
+    composed: true,
+    pointerId: 91,
+    pointerType: 'mouse',
+    button: 2,
+    buttons: 2,
+    clientX: viewportBounds.x + viewportBounds.width * 0.5,
+    clientY: viewportBounds.y + viewportBounds.height * 0.5,
+  });
+  await page.mouse.click(toolbarBounds.x + 8, toolbarBounds.y + toolbarBounds.height / 2, { button: 'right' });
+
+  const result = await page.evaluate(() => {
+    const scope = globalThis as typeof globalThis & {
+      __lumoraOutsidePointerDowns?: number;
+      __lumoraOutsideContextMenus?: boolean[];
+    };
+    return {
+      pointerDowns: scope.__lumoraOutsidePointerDowns ?? 0,
+      contextMenus: scope.__lumoraOutsideContextMenus ?? [],
+    };
+  });
+  expect(result.pointerDowns).toBeGreaterThan(0);
+  expect(result.contextMenus).toContain(false);
 });
 
 test('director free-drive orientation remains stable across pixel and line-mode wheel gestures', async ({ page }) => {
@@ -938,6 +1229,30 @@ test('recording viewport remains operable at 760px and 375px and right drag surv
   await page.waitForTimeout(220);
   const afterDrag = await cameraPose(page);
   expect(vectorDistance(afterDrag.rotation, beforeDrag.rotation)).toBeGreaterThan(0.03);
+});
+
+test('embedded medium stage keeps a visible scene beside aggregate camera guidance', async ({ page }) => {
+  await page.setViewportSize({ width: 1024, height: 600 });
+  const studio = page.getByTestId('lumora-studio');
+  await studio.evaluate((element) => {
+    const node = element as HTMLElement;
+    node.style.width = '684px';
+    node.style.height = '600px';
+  });
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('view-mode-select').selectOption('sample-camera');
+  await page.getByTestId('timeline-play').click();
+  await page.waitForTimeout(120);
+
+  const measurements = await page.evaluate(() => {
+    const stage = document.querySelector<HTMLElement>('.lumora-studio__stage')!.getBoundingClientRect();
+    const scene = document.querySelector<HTMLElement>('.lumora-studio__scene-slot')!.getBoundingClientRect();
+    const status = document.querySelector<HTMLElement>('[data-testid="camera-control-status"]')!.getBoundingClientRect();
+    return { stageWidth: stage.width, sceneHeight: scene.height, statusBottom: status.bottom, sceneBottom: scene.bottom };
+  });
+  expect(measurements.stageWidth).toBeLessThan(900);
+  expect(measurements.sceneHeight).toBeGreaterThanOrEqual(280);
+  expect(measurements.statusBottom).toBeLessThanOrEqual(measurements.sceneBottom + 320);
 });
 
 test('recording control: keyboard-only mode ignores pointer look and records arrow rotation', async ({ page }) => {

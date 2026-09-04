@@ -26,6 +26,7 @@ import {
   DRIVE_KEY_CODES,
   getWorldRigidQuaternion,
   hasSingularWorldTransform,
+  isCameraTakeoverTrack,
   restoreObjectOnNode,
   SINGULAR_CAMERA_WARNING,
   syncRigidCameraProxy,
@@ -73,6 +74,106 @@ export function findObjectId(object: THREE.Object3D): string | null {
   return resolveOwnedIdAboveContent(object);
 }
 
+/** Keep a right-button gesture owned by the viewport through an out-of-bounds release. */
+function useViewportContextMenuGuard(viewportRef: React.RefObject<HTMLElement | null>): void {
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    let gesturePointerId: number | null = null;
+    let gestureExpiryTimer: number | null = null;
+    let pendingContextMenu = false;
+    let pendingContextMenuTimer: number | null = null;
+
+    const clearGestureExpiry = () => {
+      if (gestureExpiryTimer !== null) {
+        globalThis.clearTimeout(gestureExpiryTimer);
+        gestureExpiryTimer = null;
+      }
+    };
+    const clearPendingContextMenu = () => {
+      pendingContextMenu = false;
+      if (pendingContextMenuTimer !== null) {
+        globalThis.clearTimeout(pendingContextMenuTimer);
+        pendingContextMenuTimer = null;
+      }
+    };
+    const clearAll = () => {
+      gesturePointerId = null;
+      clearGestureExpiry();
+      clearPendingContextMenu();
+    };
+    const armGesture = (pointerId: number) => {
+      clearPendingContextMenu();
+      gesturePointerId = pointerId;
+      clearGestureExpiry();
+      // A stuck pointer stream is abnormal; normal long presses remain armed
+      // until pointerup/pointercancel rather than expiring after two seconds.
+      gestureExpiryTimer = globalThis.setTimeout(() => {
+        gesturePointerId = null;
+        gestureExpiryTimer = null;
+      }, 5 * 60_000);
+    };
+    const eventPath = (event: Event): EventTarget[] => {
+      const path = event.composedPath?.();
+      return path && path.length > 0 ? path : event.target ? [event.target] : [];
+    };
+    const isWithinViewport = (event: Event): boolean => {
+      const path = eventPath(event);
+      if (path.includes(viewport)) return true;
+      const target = event.target;
+      return target instanceof Node && (target === viewport || viewport.contains(target));
+    };
+    const isInteractiveTarget = (event: Event): boolean => eventPath(event).some((entry) => {
+      if (!(entry instanceof Element)) return false;
+      return entry.matches('button, input, select, textarea, [contenteditable="true"]') ||
+        entry.closest('button, input, select, textarea, [contenteditable="true"]') !== null;
+    });
+    const onPointerDown = (event: PointerEvent) => {
+      // Every pointer sequence supersedes any stale gesture state before the
+      // current event is evaluated for viewport context-menu suppression.
+      clearAll();
+      if (event.button !== 2 || !isWithinViewport(event) || isInteractiveTarget(event)) return;
+      armGesture(event.pointerId);
+    };
+    const onPointerUp = (event: PointerEvent) => {
+      if (event.pointerId !== gesturePointerId) return;
+      gesturePointerId = null;
+      clearGestureExpiry();
+      pendingContextMenu = true;
+      if (pendingContextMenuTimer !== null) globalThis.clearTimeout(pendingContextMenuTimer);
+      pendingContextMenuTimer = globalThis.setTimeout(clearPendingContextMenu, 10_000);
+    };
+    const onPointerCancel = (event: PointerEvent) => {
+      if (event.pointerId === gesturePointerId) clearAll();
+    };
+    const onContextMenu = (event: MouseEvent) => {
+      if (gesturePointerId !== null || pendingContextMenu || isWithinViewport(event)) {
+        event.preventDefault();
+        clearAll();
+      }
+    };
+    const onWindowBlur = () => clearAll();
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') clearAll();
+    };
+    window.addEventListener('pointerdown', onPointerDown, true);
+    window.addEventListener('pointerup', onPointerUp, true);
+    window.addEventListener('pointercancel', onPointerCancel, true);
+    window.addEventListener('contextmenu', onContextMenu, true);
+    window.addEventListener('blur', onWindowBlur);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      clearAll();
+      window.removeEventListener('pointerdown', onPointerDown, true);
+      window.removeEventListener('pointerup', onPointerUp, true);
+      window.removeEventListener('pointercancel', onPointerCancel, true);
+      window.removeEventListener('contextmenu', onContextMenu, true);
+      window.removeEventListener('blur', onWindowBlur);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [viewportRef]);
+}
+
 function normalizeEulerSignedZero(euler: THREE.Euler): void {
   const x = Object.is(euler.x, -0) ? 0 : euler.x;
   const y = Object.is(euler.y, -0) ? 0 : euler.y;
@@ -106,6 +207,7 @@ export function EditorViewport({
   liveTransformStore,
 }: EditorViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  useViewportContextMenuGuard(containerRef);
   const rootRef = useRef<THREE.Group | null>(null);
   const [sceneRootGeneration, setSceneRootGeneration] = useState(0);
   const cameraRef = useRef<THREE.Camera | null>(null);
@@ -261,6 +363,7 @@ export function EditorViewport({
       aria-label="3D scene viewport"
       tabIndex={0}
       onPointerDown={handlePointerDown}
+      onContextMenu={(event) => event.preventDefault()}
     >
       <Canvas
         dpr={[1, 2]}
@@ -430,7 +533,6 @@ function useCameraDrive(
     let lookPointerId: number | null = null;
     let lookClientX = 0;
     let lookClientY = 0;
-    let suppressNextContextMenu = false;
     const previousPrimaryPosition = new THREE.Vector3();
     const previousPrimaryQuaternion = new THREE.Quaternion();
     const currentPrimaryPosition = new THREE.Vector3();
@@ -453,7 +555,6 @@ function useCameraDrive(
 
     const clearDrive = () => {
       endLookGesture();
-      suppressNextContextMenu = false;
       heldKeys.clear();
       drive.stop();
       attachedId = null;
@@ -525,9 +626,7 @@ function useCameraDrive(
     };
 
     const hasActiveTrack = (cameraId: string): boolean =>
-      !!editor.getProject()?.tracks.some(
-        (track) => track.objectId === cameraId && track.keyframes.length > 0 && !track.disabled,
-      );
+      !!editor.getProject()?.tracks.some((track) => isCameraTakeoverTrack(track, cameraId));
 
     const canDriveCurrentCamera = (): boolean => {
       const st = sessionRef.current?.state;
@@ -582,7 +681,6 @@ function useCameraDrive(
     };
     const onPointerDown = (event: PointerEvent) => {
       if (event.button !== 2) return;
-      suppressNextContextMenu = false;
       if (lookPointerId !== null) return;
       const target = event.target;
       if (
@@ -599,7 +697,6 @@ function useCameraDrive(
       activityRef.current = true;
       lookClientX = event.clientX;
       lookClientY = event.clientY;
-      suppressNextContextMenu = true;
       viewportRef.current?.focus({ preventScroll: true });
       event.preventDefault();
       event.stopPropagation();
@@ -633,11 +730,6 @@ function useCameraDrive(
       if (event.pointerId !== lookPointerId) return;
       drive.cancelLook();
       endLookGesture();
-    };
-    const onContextMenu = (event: MouseEvent) => {
-      if (!suppressNextContextMenu) return;
-      event.preventDefault();
-      suppressNextContextMenu = false;
     };
     const onKeyUp = (event: KeyboardEvent) => {
       if (heldKeys.delete(event.code)) {
@@ -680,7 +772,6 @@ function useCameraDrive(
     viewport?.addEventListener('pointerup', onPointerUp);
     viewport?.addEventListener('pointercancel', onPointerCancel);
     viewport?.addEventListener('lostpointercapture', onLostPointerCapture);
-    viewport?.addEventListener('contextmenu', onContextMenu);
 
     const restoreIfNeeded = () => {
       if (attachedId === null || !attachedNode) return;
@@ -695,9 +786,7 @@ function useCameraDrive(
       // 绑定机位已有启用轨道：节点由轨道求值接管（回放驱动最后一次 apply
       // 已把播放头时刻的值写到节点），还原静态位姿会让画面与播放头脱节
       if (
-        project?.tracks.some(
-          (t) => t.objectId === restoreId && t.keyframes.length > 0 && !t.disabled,
-        )
+        project?.tracks.some((track) => isCameraTakeoverTrack(track, restoreId))
       ) {
         return;
       }
@@ -826,7 +915,6 @@ function useCameraDrive(
       viewport?.removeEventListener('pointerup', onPointerUp);
       viewport?.removeEventListener('pointercancel', onPointerCancel);
       viewport?.removeEventListener('lostpointercapture', onLostPointerCapture);
-      viewport?.removeEventListener('contextmenu', onContextMenu);
       restoreIfNeeded();
       clearDrive();
     };
