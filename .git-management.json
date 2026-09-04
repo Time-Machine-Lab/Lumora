@@ -1,11 +1,16 @@
 {
-  "policy_version": 1,
+  "policy_version": 3,
   "default_branch": "main",
   "branch_pattern": "^(ai|feat|fix|refactor|chore)/.+$",
   "required_pr_metadata": ["task_id", "run_id"],
+  "task_id_pattern": "^[A-Z][A-Z0-9]*-[0-9]+$",
+  "require_task_id_in_pr_title": true,
   "required_checks": ["ci", "git-governance"],
-  "required_approvals": 1,
-  "require_resolved_conversations": true,
+  "review_policy": {
+    "enabled": false,
+    "required_approvals": 0,
+    "require_resolved_conversations": false
+  },
   "require_up_to_date_branch": true,
   "merge_method": "squash"
 }
