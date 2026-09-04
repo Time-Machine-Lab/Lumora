@@ -553,6 +553,21 @@ function useCameraDrive(
       }
     };
 
+    const syncDriveSettings = () => {
+      const cameraControls = sessionRef.current?.state.cameraControls;
+      if (!cameraControls) return;
+      const previousSettings = drive.getSettings();
+      drive.setSettings(cameraControls);
+      const nextSettings = drive.getSettings();
+      if (nextSettings.mode !== previousSettings.mode) {
+        heldKeys.clear();
+        endLookGesture();
+      } else if (nextSettings.invertMouseY !== previousSettings.invertMouseY) {
+        drive.cancelLook();
+        endLookGesture();
+      }
+    };
+
     const clearDrive = () => {
       endLookGesture();
       heldKeys.clear();
@@ -650,8 +665,7 @@ function useCameraDrive(
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || !driveEnabledRef.current) return;
-      const liveSession = sessionRef.current;
-      if (liveSession) drive.setSettings(liveSession.state.cameraControls);
+      syncDriveSettings();
       const keyboardRoot = keyboardScopeRef?.current;
       if (keyboardRoot && !isKeyboardEventForStudio(keyboardRoot, event)) return;
       if ((event.ctrlKey || event.metaKey || event.altKey) && heldKeys.size > 0) {
@@ -689,7 +703,7 @@ function useCameraDrive(
       ) return;
       const liveSession = sessionRef.current;
       if (!liveSession) return;
-      drive.setSettings(liveSession.state.cameraControls);
+      syncDriveSettings();
       if (drive.getSettings().mode !== 'keyboard-mouse' || !canDriveCurrentCamera()) return;
       if (!attachCurrentCamera()) return;
       drive.cancelTranslationMomentum();
@@ -804,16 +818,7 @@ function useCameraDrive(
       }
       const st = sessionRef.current?.state;
       if (st) {
-        const previousSettings = drive.getSettings();
-        drive.setSettings(st.cameraControls);
-        const nextSettings = drive.getSettings();
-        if (nextSettings.mode !== previousSettings.mode) {
-          heldKeys.clear();
-          endLookGesture();
-        } else if (nextSettings.invertMouseY !== previousSettings.invertMouseY) {
-          drive.cancelLook();
-          endLookGesture();
-        }
+        syncDriveSettings();
       }
       // 可驾驶：选中机位 && 录制未暂停 && （暂停 || 录制中）&& 无启用轨道（录制中无视轨道；
       // 禁用轨道不阻止驾驶 —— 禁用 = 该通道暂不参与回放）

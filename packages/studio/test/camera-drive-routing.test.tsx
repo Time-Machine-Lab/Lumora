@@ -373,6 +373,7 @@ describe('camera drive keyboard routing', () => {
   it('requires a fresh right-button gesture after toggling mouse vertical inversion', async () => {
     const studio = await mountStudio('lumora://drive-invert-mouse-y-boundary');
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
     const viewport = within(studio.root).getByTestId('lumora-viewport');
     const releasePointerCapture = vi.fn();
     Object.assign(viewport, {
@@ -386,17 +387,24 @@ describe('camera drive keyboard routing', () => {
     fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 31, clientX: 120, clientY: 110 });
     expect(look).toHaveBeenCalledTimes(1);
 
+    const rotationAtToggle = camera.quaternion.clone();
     fireEvent.click(within(studio.root).getByRole('checkbox', { name: '鼠标垂直反转' }));
-    await act(async () => delay(40));
+    fireEvent.keyDown(studio.root, { key: 'w', code: 'KeyW', repeat: true });
     expect(releasePointerCapture).toHaveBeenCalledWith(31);
     const callsAtToggle = look.mock.calls.length;
 
     fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 31, clientX: 150, clientY: 140 });
+    await act(async () => delay(40));
     expect(look).toHaveBeenCalledTimes(callsAtToggle);
+    expect(camera.quaternion.angleTo(rotationAtToggle)).toBeLessThan(1e-9);
+    fireEvent.keyUp(studio.root, { key: 'w', code: 'KeyW' });
 
+    const rotationBeforeFreshGesture = camera.quaternion.clone();
     fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 32, clientX: 150, clientY: 140 });
     fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 32, clientX: 170, clientY: 150 });
     expect(look).toHaveBeenCalledTimes(callsAtToggle + 1);
+    await act(async () => delay(40));
+    expect(camera.quaternion.angleTo(rotationBeforeFreshGesture)).toBeGreaterThan(0.001);
   });
 
   it('keyboard-mouse mode keeps translation and pointer look independent', async () => {

@@ -471,6 +471,20 @@ test('mouse vertical inversion reverses only pitch and resets an active gesture'
   await expect(page.getByTestId('camera-control-invert-mouse-y')).not.toBeChecked();
 });
 
+test('mouse vertical inversion keeps a touch-sized target on narrow screens', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 667 });
+  const invertMouseY = page.getByTestId('camera-control-invert-mouse-y');
+  const hitTarget = invertMouseY.locator('..');
+  await expect(invertMouseY).toBeVisible();
+
+  const bounds = await hitTarget.boundingBox();
+  expect(bounds).not.toBeNull();
+  expect(bounds!.height).toBeGreaterThanOrEqual(44);
+
+  await hitTarget.click({ position: { x: bounds!.width - 2, y: bounds!.height - 2 } });
+  await expect(invertMouseY).toBeChecked();
+});
+
 test('suppresses an out-of-bounds release from an open ShadowRoot viewport', async ({ page }) => {
   await page.getByTestId('tree-row-sample-camera').click();
   await page.getByTestId('view-mode-select').selectOption('sample-camera');
