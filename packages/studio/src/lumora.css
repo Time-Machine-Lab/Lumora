@@ -1678,9 +1678,14 @@
   color: var(--lumora-warning, #ffd166);
 }
 
+.lumora-camera-controls__blocker {
+  display: block;
+}
+
 .lumora-camera-controls__locate {
   margin-left: 6px;
-  padding: 1px 5px;
+  min-height: 32px;
+  padding: 4px 8px;
   border: 1px solid currentColor;
   border-radius: 4px;
   background: transparent;
@@ -1692,6 +1697,10 @@
 .lumora-camera-controls__locate:focus-visible {
   outline: 2px solid var(--lumora-accent);
   outline-offset: 1px;
+}
+
+.lumora-export__camera-blocker {
+  display: block;
 }
 
 .lumora-recording-shortcut__dialog {
@@ -2443,6 +2452,56 @@
   .lumora-studio__scene-slot {
     flex-basis: 220px;
     min-height: 220px;
+  }
+}
+
+/* Embedded hosts can be narrower than the browser viewport. Keep the scene
+   usable when the stage itself crosses the compact-layout threshold. */
+@container (max-width: 900px) {
+  .lumora-studio__body {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .lumora-studio__sidebar,
+  .lumora-inspector {
+    width: 100%;
+    max-width: none;
+    min-height: 0;
+  }
+
+  .lumora-studio__sidebar {
+    border-right: 0;
+    border-bottom: 1px solid var(--lumora-border);
+  }
+
+  .lumora-inspector {
+    max-height: 300px;
+    border-left: 0;
+    border-top: 1px solid var(--lumora-border);
+  }
+
+  .lumora-studio__viewport {
+    order: -1;
+    flex: 0 0 auto;
+    min-height: 360px;
+  }
+
+  .lumora-studio__scene-slot {
+    flex: 0 0 auto;
+    min-height: 280px;
+    height: clamp(280px, 45cqw, 420px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }
 

@@ -74,6 +74,63 @@ export function findObjectId(object: THREE.Object3D): string | null {
   return resolveOwnedIdAboveContent(object);
 }
 
+/** Keep a right-button gesture owned by the viewport through an out-of-bounds release. */
+function useViewportContextMenuGuard(viewportRef: React.RefObject<HTMLElement | null>): void {
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    let gesturePointerId: number | null = null;
+    let expiryTimer: number | null = null;
+    const clearGesture = () => {
+      gesturePointerId = null;
+      if (expiryTimer !== null) {
+        globalThis.clearTimeout(expiryTimer);
+        expiryTimer = null;
+      }
+    };
+    const armGesture = (pointerId: number) => {
+      gesturePointerId = pointerId;
+      if (expiryTimer !== null) globalThis.clearTimeout(expiryTimer);
+      expiryTimer = globalThis.setTimeout(clearGesture, 2_000);
+    };
+    const isInteractiveTarget = (target: EventTarget | null) =>
+      target instanceof HTMLElement &&
+      !!target.closest('button, input, select, textarea, [contenteditable="true"]');
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (event.button !== 2 || !(target instanceof Node) || !viewport.contains(target) || isInteractiveTarget(target)) return;
+      armGesture(event.pointerId);
+    };
+    const onPointerUp = (event: PointerEvent) => {
+      if (event.pointerId !== gesturePointerId) return;
+      // Keep the marker until the browser emits contextmenu, which can target
+      // the element under the release point rather than the viewport.
+    };
+    const onPointerCancel = (event: PointerEvent) => {
+      if (event.pointerId === gesturePointerId) clearGesture();
+    };
+    const onContextMenu = (event: MouseEvent) => {
+      const target = event.target;
+      const insideViewport = target instanceof Node && viewport.contains(target);
+      if (gesturePointerId !== null || insideViewport) {
+        event.preventDefault();
+        clearGesture();
+      }
+    };
+    window.addEventListener('pointerdown', onPointerDown, true);
+    window.addEventListener('pointerup', onPointerUp, true);
+    window.addEventListener('pointercancel', onPointerCancel, true);
+    window.addEventListener('contextmenu', onContextMenu, true);
+    return () => {
+      clearGesture();
+      window.removeEventListener('pointerdown', onPointerDown, true);
+      window.removeEventListener('pointerup', onPointerUp, true);
+      window.removeEventListener('pointercancel', onPointerCancel, true);
+      window.removeEventListener('contextmenu', onContextMenu, true);
+    };
+  }, [viewportRef]);
+}
+
 function normalizeEulerSignedZero(euler: THREE.Euler): void {
   const x = Object.is(euler.x, -0) ? 0 : euler.x;
   const y = Object.is(euler.y, -0) ? 0 : euler.y;
@@ -107,6 +164,7 @@ export function EditorViewport({
   liveTransformStore,
 }: EditorViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  useViewportContextMenuGuard(containerRef);
   const rootRef = useRef<THREE.Group | null>(null);
   const [sceneRootGeneration, setSceneRootGeneration] = useState(0);
   const cameraRef = useRef<THREE.Camera | null>(null);

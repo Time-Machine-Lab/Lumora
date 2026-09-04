@@ -52,6 +52,68 @@ export function isCameraTakeoverTrack(track: TrackData, cameraId: string): boole
   return track.objectId === cameraId && track.keyframes.length > 0 && !track.disabled;
 }
 
+export interface CameraDriveBlockerInput {
+  driveEnabled: boolean;
+  overwritePending: boolean;
+  recordingPaused: boolean;
+  playing: boolean;
+  recording: boolean;
+  cameraId: string | null;
+  cameraName: string | null;
+  tracks: readonly TrackData[];
+}
+
+export interface CameraDriveBlocker {
+  kind: 'export' | 'overwrite' | 'recording-paused' | 'playback' | 'tracks';
+  message: string;
+  tracks?: readonly TrackData[];
+}
+
+/**
+ * Resolve every active owner of manual camera input. The list is deliberately
+ * independent: clearing one owner must not promise that another owner is gone.
+ */
+export function getCameraDriveBlockers(input: CameraDriveBlockerInput): CameraDriveBlocker[] {
+  const blockers: CameraDriveBlocker[] = [];
+  if (!input.driveEnabled) {
+    blockers.push({
+      kind: 'export',
+      message: '导出工作区正在接管视口；关闭导出工作区后可手动操控。',
+    });
+  }
+  if (input.overwritePending) {
+    blockers.push({
+      kind: 'overwrite',
+      message: '正在等待录制覆盖确认；完成或放弃确认后可手动操控。',
+    });
+  }
+  if (input.recordingPaused) {
+    blockers.push({
+      kind: 'recording-paused',
+      message: '录制已暂停；继续录制或停止录制后可手动操控。',
+    });
+  }
+  if (input.playing && !input.recording) {
+    blockers.push({
+      kind: 'playback',
+      message: '播放正在接管机位；暂停播放后可手动操控。',
+    });
+  }
+  if (!input.recording && input.cameraId && input.cameraName) {
+    const takeoverTracks = input.tracks.filter((track) => isCameraTakeoverTrack(track, input.cameraId!));
+    if (takeoverTracks.length > 0) {
+      blockers.push({
+        kind: 'tracks',
+        tracks: takeoverTracks,
+        message:
+          `启用轨道${takeoverTracks.map((track) => `“${track.name}”`).join('、')}` +
+          `正在接管机位“${input.cameraName}”；禁用这些轨道后可手动操控。`,
+      });
+    }
+  }
+  return blockers;
+}
+
 function bounded(value: number | undefined, fallback: number, min: number, max: number): number {
   return typeof value === 'number' && Number.isFinite(value)
     ? Math.min(max, Math.max(min, value))

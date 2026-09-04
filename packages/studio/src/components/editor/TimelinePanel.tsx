@@ -10,7 +10,7 @@
  * 区块与播放头全部以 `time * zoom` 在同一坐标内定位，滚动同步、无 186px 错位。
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { MAX_TIMELINE_ZOOM, MIN_TIMELINE_ZOOM } from '@lumora/core';
 import type { Project, SceneEditor, ViewState } from '@lumora/core';
 import { findObject } from '@lumora/core';
@@ -19,7 +19,7 @@ import { projectContentFingerprint } from './timeline-thumbnail-cache';
 import { RecordingShortcutSettings } from './RecordingShortcutSettings';
 import type { KeyboardShortcut } from './recording-shortcut';
 import { DEFAULT_RECORDING_SHORTCUT, formatShortcut } from './recording-shortcut';
-import { CAMERA_DRIVE_LIMITS, isCameraTakeoverTrack } from './camera-drive';
+import { CAMERA_DRIVE_LIMITS, getCameraDriveBlockers } from './camera-drive';
 
 /** 标签列宽度：标尺/轨道/分镜共用，测试与坐标换算引用此常量 */
 export const TIMELINE_LABEL_WIDTH = 186;
@@ -91,6 +91,7 @@ export function TimelinePanel({
   onRecordingShortcutChange = () => false,
 }: TimelinePanelProps) {
   const { timeline, state } = session;
+  const cameraControlsTitleId = useId();
   const time = usePlayheadTime(session);
   const zoom = state.zoom;
   const zoomRef = useRef(zoom);
@@ -112,13 +113,6 @@ export function TimelinePanel({
     const object = findObject(project, cameraId);
     return object?.type === 'camera' ? object : null;
   }, [project, session.recorder.recordingCameraId, state.recording, view.viewMode]);
-  const takeoverTracks = useMemo(
-    () => driveCamera && !state.recording
-      ? project.tracks.filter((track) => isCameraTakeoverTrack(track, driveCamera.id))
-      : [],
-    [driveCamera, project.tracks, state.recording],
-  );
-
   const bodyRef = useRef<HTMLDivElement>(null);
   const trackLaneRefs = useRef(new Map<string, HTMLDivElement>());
   const rulerRef = useRef<HTMLDivElement>(null);
@@ -306,51 +300,48 @@ export function TimelinePanel({
     [editor],
   );
 
+  const blockers = useMemo(
+    () => getCameraDriveBlockers({
+      driveEnabled,
+      overwritePending: state.overwritePending,
+      recordingPaused: state.recordingPaused,
+      playing: state.playing,
+      recording: state.recording,
+      cameraId: driveCamera?.id ?? null,
+      cameraName: driveCamera?.name ?? null,
+      tracks: project.tracks,
+    }),
+    [driveCamera, driveEnabled, project.tracks, state.overwritePending, state.playing, state.recording, state.recordingPaused],
+  );
+  const driveBlocked = blockers.length > 0;
   const locateTakeoverTrack = useCallback(() => {
-    const firstTrack = takeoverTracks[0];
+    const firstTrack = blockers.find((blocker) => blocker.kind === 'tracks')?.tracks?.[0];
     if (!firstTrack) return;
     const lane = trackLaneRefs.current.get(firstTrack.id);
     if (!lane) return;
-    lane.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+    const prefersReducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    lane.scrollIntoView?.({ block: 'nearest', behavior: prefersReducedMotion ? 'auto' : 'smooth' });
     lane.querySelector<HTMLInputElement>('input[type="checkbox"]')?.focus();
-  }, [takeoverTracks]);
-
-  let driveStatus: React.ReactNode;
-  let driveBlocked = false;
-  if (!driveEnabled) {
-    driveBlocked = true;
-    driveStatus = '导出工作区正在接管视口。关闭导出工作区后可手动操控。';
-  } else if (state.overwritePending) {
-    driveBlocked = true;
-    driveStatus = '正在等待录制覆盖确认。完成或取消确认后可手动操控。';
-  } else if (state.recordingPaused) {
-    driveBlocked = true;
-    driveStatus = '录制已暂停。继续录制后可手动操控。';
-  } else if (state.playing && !state.recording) {
-    driveBlocked = true;
-    driveStatus = '播放正在接管机位。暂停播放后可手动操控。';
-  } else if (takeoverTracks.length > 0 && driveCamera) {
-    driveBlocked = true;
-    driveStatus = (
-      <>
-        启用轨道{takeoverTracks.map((track, index) => (
-          <span key={track.id}>{index > 0 ? '、' : ''}“{track.name}”</span>
-        ))}正在接管机位“{driveCamera.name}”。禁用这些轨道后可手动操控。
-        <button
-          type="button"
-          className="lumora-camera-controls__locate"
-          aria-label="定位到接管轨道"
-          onClick={locateTakeoverTrack}
-        >
-          定位轨道
-        </button>
-      </>
-    );
-  } else if (driveCamera) {
-    driveStatus = `机位“${driveCamera.name}”可手动操控。`;
-  } else {
-    driveStatus = '导演视图可手动操控。';
-  }
+  }, [blockers]);
+  const driveStatus = blockers.length > 0
+    ? blockers.map((blocker) => (
+      <span className="lumora-camera-controls__blocker" key={blocker.kind}>
+        {blocker.message}
+        {blocker.kind === 'tracks' && (
+          <button
+            type="button"
+            className="lumora-camera-controls__locate"
+            aria-label="定位轨道：禁用接管轨道"
+            onClick={locateTakeoverTrack}
+          >
+            定位轨道
+          </button>
+        )}
+      </span>
+    ))
+    : driveCamera
+      ? `机位“${driveCamera.name}”可手动操控。`
+      : '导演视图可手动操控。';
 
   const recordClick = () => {
     if (state.recording) {
@@ -415,9 +406,10 @@ export function TimelinePanel({
         <div
           className="lumora-camera-controls"
           data-testid="camera-control-settings"
-          aria-label="机位操控"
+          role="group"
+          aria-labelledby={cameraControlsTitleId}
         >
-          <span className="lumora-camera-controls__title">机位操控</span>
+          <span id={cameraControlsTitleId} className="lumora-camera-controls__title">机位操控</span>
           <div className="lumora-camera-controls__modes" role="group" aria-label="机位操控模式">
             <button
               type="button"

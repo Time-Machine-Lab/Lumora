@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { RefObject } from 'react';
+import { findObject } from '@lumora/core';
 import type { Project, ShotClipData } from '@lumora/core';
 import type { StudioRuntime } from '../../runtime/studio-runtime';
 import type { TimelineSession } from '../../hooks/use-timeline-session';
@@ -21,6 +22,7 @@ import type {
   WebmSupport,
   WebmSupportProbe,
 } from '../../export/preview-export';
+import { getCameraDriveBlockers } from '../editor/camera-drive';
 
 export type ThumbnailCapture = (cameraObjectId?: string | null) => string | null;
 export type ExportFrameCapture = ProjectFrameCapture;
@@ -119,6 +121,8 @@ export function ExportWorkspace({
   supportProbe,
   recordingDependencies,
 }: ExportWorkspaceProps) {
+  const workspaceTitleId = useId();
+  const cameraStatusId = useId();
   useEventRefresh(runtime.events, ['contribution:changed', 'plugin:state-changed']);
   const [range, setRange] = useState('all');
   const [resolution, setResolution] = useState<PreviewResolution>('720p');
@@ -152,6 +156,25 @@ export function ExportWorkspace({
     detectedSupport.checkKey === supportCheckKey
       ? detectedSupport.support
       : CHECKING_WEBM_SUPPORT
+  );
+  const view = runtime.editor.getView();
+  const povCamera = useMemo(() => {
+    if (view.viewMode === 'director') return null;
+    const camera = findObject(project, view.viewMode.cameraObjectId);
+    return camera?.type === 'camera' ? camera : null;
+  }, [project, view.viewMode]);
+  const cameraDriveBlockers = useMemo(
+    () => getCameraDriveBlockers({
+      driveEnabled: false,
+      overwritePending: session.state.overwritePending,
+      recordingPaused: session.state.recordingPaused,
+      playing: session.state.playing,
+      recording: session.state.recording,
+      cameraId: povCamera?.id ?? null,
+      cameraName: povCamera?.name ?? null,
+      tracks: project.tracks,
+    }),
+    [povCamera, project.tracks, session.state.overwritePending, session.state.playing, session.state.recording, session.state.recordingPaused],
   );
 
   useEffect(() => {
@@ -576,20 +599,31 @@ export function ExportWorkspace({
     <section
       className="lumora-export"
       data-testid="export-workspace"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={workspaceTitleId}
+      aria-describedby={cameraStatusId}
       onKeyDown={stopActivationKeyPropagation}
+      onContextMenu={(event) => event.preventDefault()}
     >
       <header className="lumora-export__header">
         <div>
-          <h2>导出</h2>
+          <h2 id={workspaceTitleId}>导出</h2>
           <p data-testid="export-summary">
             {selectedShots.length} 个分镜 · {selectedDuration.toFixed(2)} 秒
           </p>
           <p
             className="lumora-export__camera-notice"
             data-testid="export-camera-control-status"
+            id={cameraStatusId}
             role="note"
+            aria-live="polite"
           >
-            导出工作区正在接管视口。关闭工作区即可恢复手动操控；导出进行中请先取消或等待完成。
+            {cameraDriveBlockers.map((blocker) => (
+              <span className="lumora-export__camera-blocker" key={blocker.kind}>
+                {blocker.message}
+              </span>
+            ))}
           </p>
         </div>
         <button

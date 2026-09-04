@@ -519,7 +519,7 @@ describe('camera drive keyboard routing', () => {
     const firstLane = within(studio.root).getByTestId('track-lane-sample-track-camera-dolly');
     const scrollIntoView = vi.fn();
     Object.assign(firstLane, { scrollIntoView });
-    fireEvent.click(within(studio.root).getByRole('button', { name: '定位到接管轨道' }));
+    fireEvent.click(within(studio.root).getByRole('button', { name: /定位轨道/ }));
 
     expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', behavior: 'smooth' });
     expect(within(firstLane).getByTestId('track-disabled-sample-track-camera-dolly')).toHaveFocus();
@@ -541,7 +541,7 @@ describe('camera drive keyboard routing', () => {
     const status = within(studio.root).getByTestId('camera-control-status');
     expect(status).toHaveTextContent('机位“俯拍机位”可手动操控');
     expect(status).not.toHaveTextContent('立方体旋转');
-    expect(within(studio.root).queryByRole('button', { name: '定位到接管轨道' })).not.toBeInTheDocument();
+    expect(within(studio.root).queryByRole('button', { name: /定位轨道/ })).not.toBeInTheDocument();
   });
 
   it('explains that playback must be paused before camera drive resumes', async () => {
@@ -552,9 +552,8 @@ describe('camera drive keyboard routing', () => {
     });
     fireEvent.click(within(studio.root).getByTestId('timeline-play'));
 
-    expect(within(studio.root).getByTestId('camera-control-status')).toHaveTextContent(
-      '播放正在接管机位。暂停播放后可手动操控。',
-    );
+    const status = within(studio.root).getByTestId('camera-control-status');
+    expect(status).toHaveTextContent('播放正在接管机位；暂停播放后可手动操控。');
   });
 
   it('explains that the export workspace must close before camera drive resumes', async () => {
@@ -567,8 +566,41 @@ describe('camera drive keyboard routing', () => {
     await screen.findByTestId('export-workspace');
 
     expect(within(studio.root).getByTestId('camera-control-status')).toHaveTextContent(
-      '导出工作区正在接管视口。关闭导出工作区后可手动操控。',
+      '导出工作区正在接管视口；关闭导出工作区后可手动操控。',
     );
+  });
+
+  it('aggregates export, playback, and track blockers without a false recovery promise', async () => {
+    const studio = await mountStudio(createSampleProject());
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    fireEvent.change(within(studio.root).getByTestId('view-mode-select'), {
+      target: { value: 'sample-camera' },
+    });
+    fireEvent.click(within(studio.root).getByTestId('timeline-play'));
+    fireEvent.click(within(studio.root).getByTestId('open-export-workspace'));
+    await screen.findByTestId('export-workspace');
+
+    const exportStatus = within(studio.root).getByTestId('export-camera-control-status');
+    expect(exportStatus).toHaveTextContent('导出工作区正在接管视口；关闭导出工作区后可手动操控。');
+    expect(exportStatus).toHaveTextContent('播放正在接管机位；暂停播放后可手动操控。');
+    expect(exportStatus).toHaveTextContent('启用轨道“主摄像机推镜”、“主摄像机变焦”正在接管机位“主摄像机”；禁用这些轨道后可手动操控。');
+
+    fireEvent.click(within(studio.root).getByRole('button', { name: '关闭导出' }));
+    expect(within(studio.root).getByTestId('camera-control-status')).toHaveTextContent(
+      '播放正在接管机位；暂停播放后可手动操控。',
+    );
+    expect(within(studio.root).getByTestId('camera-control-status')).toHaveTextContent('主摄像机推镜');
+  });
+
+  it('defines the current POV as the camera view, independent of tree selection in director mode', async () => {
+    const studio = await mountStudio(createSampleProject());
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+
+    const status = within(studio.root).getByTestId('camera-control-status');
+    expect(within(studio.root).getByTestId('view-mode-select')).toHaveValue('director');
+    expect(status).toHaveTextContent('导演视图可手动操控。');
+    expect(status).not.toHaveTextContent('主摄像机推镜');
+    expect(within(studio.root).queryByRole('button', { name: /定位轨道/ })).not.toBeInTheDocument();
   });
 
   it('lost pointer capture clears queued look while held keyboard movement continues', async () => {
