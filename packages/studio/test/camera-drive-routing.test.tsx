@@ -484,11 +484,213 @@ describe('camera drive keyboard routing', () => {
 
     fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 15, clientX: 80, clientY: 50 });
     fireEvent.pointerDown(document.body, { button: 2, buttons: 2, pointerId: 16 });
+    expect(fireEvent.contextMenu(document.body)).toBe(false);
+    fireEvent.pointerUp(window, { button: 2, pointerId: 15 });
+    expect(fireEvent.contextMenu(document.body)).toBe(false);
     expect(fireEvent.contextMenu(document.body)).toBe(true);
     const callsAtWindowRelease = look.mock.calls.length;
     fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 12, clientX: 100, clientY: 60 });
     expect(look).toHaveBeenCalledTimes(callsAtWindowRelease);
   });
+
+  it.each([
+    { label: 'touch pointer with a different id', pointerId: 72, pointerType: 'touch' },
+    { label: 'pen pointer with a different id', pointerId: 73, pointerType: 'pen' },
+    { label: 'touch pointer reusing the owner id', pointerId: 71, pointerType: 'touch' },
+  ])('keeps the mouse context-menu owner through a secondary $label', async ({ pointerId, pointerType }) => {
+    const studio = await mountStudio(`lumora://drive-secondary-context-${pointerType}-${pointerId}`);
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    Object.assign(viewport, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+    await act(async () => delay(60));
+
+    fireEvent.pointerDown(viewport, {
+      button: 2,
+      buttons: 2,
+      pointerId: 71,
+      pointerType: 'mouse',
+      clientX: 40,
+      clientY: 40,
+    });
+    const secondaryContextMenu = new PointerEvent('contextmenu', {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      button: 2,
+      pointerId,
+      pointerType,
+    });
+    expect(viewport.dispatchEvent(secondaryContextMenu)).toBe(false);
+    expect(secondaryContextMenu.defaultPrevented).toBe(true);
+    fireEvent.pointerUp(window, { button: 2, pointerId: 71, pointerType: 'mouse' });
+
+    expect(fireEvent.contextMenu(document.body)).toBe(false);
+    expect(fireEvent.contextMenu(document.body)).toBe(true);
+  });
+
+  it('keeps the active owner when a context-menu event has no pointer identity', async () => {
+    const studio = await mountStudio('lumora://drive-unknown-context-owner');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const viewport = within(studio.root).getByTestId('lumora-viewport');
+    Object.assign(viewport, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+    await act(async () => delay(60));
+
+    fireEvent.pointerDown(viewport, {
+      button: 2,
+      buttons: 2,
+      pointerId: 74,
+      pointerType: 'mouse',
+      clientX: 40,
+      clientY: 40,
+    });
+    expect(fireEvent.contextMenu(viewport)).toBe(false);
+    fireEvent.pointerUp(window, { button: 2, pointerId: 74, pointerType: 'mouse' });
+
+    expect(fireEvent.contextMenu(document.body)).toBe(false);
+    expect(fireEvent.contextMenu(document.body)).toBe(true);
+  });
+
+  it.each([
+    { ownerId: 81, ownerType: 'touch', secondaryId: 82, secondaryType: 'touch' },
+    { ownerId: 83, ownerType: 'pen', secondaryId: 84, secondaryType: 'pen' },
+    { ownerId: 85, ownerType: 'mouse', secondaryId: 85, secondaryType: 'pen' },
+  ])(
+    'matches context-menu ownership by pointer id and type ($ownerType -> $secondaryType)',
+    async ({ ownerId, ownerType, secondaryId, secondaryType }) => {
+      const studio = await mountStudio(`lumora://drive-context-owner-${ownerType}-${secondaryType}`);
+      const viewport = within(studio.root).getByTestId('lumora-viewport');
+      await act(async () => delay(60));
+
+      fireEvent.pointerDown(viewport, {
+        button: 2,
+        buttons: 2,
+        pointerId: ownerId,
+        pointerType: ownerType,
+        clientX: 50,
+        clientY: 50,
+      });
+      fireEvent.pointerDown(viewport, {
+        button: 0,
+        buttons: 1,
+        pointerId: secondaryId,
+        pointerType: secondaryType,
+        clientX: 60,
+        clientY: 60,
+      });
+      fireEvent.pointerUp(window, {
+        button: 0,
+        pointerId: secondaryId,
+        pointerType: secondaryType,
+      });
+      fireEvent.pointerUp(window, {
+        button: 2,
+        pointerId: ownerId,
+        pointerType: ownerType,
+      });
+
+      expect(fireEvent.contextMenu(document.body)).toBe(false);
+      expect(fireEvent.contextMenu(document.body)).toBe(true);
+    },
+  );
+
+  it.each(['touch', 'pen'] as const)(
+    'blocks a secondary %s pointer before selection and outer pointer handlers',
+    async (pointerType) => {
+      const studio = await mountStudio(`lumora://drive-secondary-${pointerType}`);
+      act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+      const viewport = within(studio.root).getByTestId('lumora-viewport');
+      Object.assign(viewport, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+      const outerPointerDown = vi.fn();
+      window.addEventListener('pointerdown', outerPointerDown);
+      await act(async () => delay(60));
+
+      fireEvent.pointerDown(viewport, {
+        button: 2,
+        buttons: 2,
+        pointerId: 91,
+        pointerType: 'mouse',
+        clientX: 40,
+        clientY: 40,
+      });
+      outerPointerDown.mockClear();
+      const secondaryPointerDown = new PointerEvent('pointerdown', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: 0,
+        buttons: 1,
+        pointerId: 92,
+        pointerType,
+        clientX: 50,
+        clientY: 50,
+      });
+      const dispatched = viewport.dispatchEvent(secondaryPointerDown);
+
+      expect(dispatched).toBe(false);
+      expect(secondaryPointerDown.defaultPrevented).toBe(true);
+      expect(outerPointerDown).not.toHaveBeenCalled();
+      expect(studio.handle.current!.runtime.editor.getSelection()).toEqual(['sample-camera']);
+      window.removeEventListener('pointerdown', outerPointerDown);
+    },
+  );
+
+  it.each([
+    { label: 'touch pointer', pointerId: 102, pointerType: 'touch' },
+    { label: 'pen pointer', pointerId: 103, pointerType: 'pen' },
+    { label: 'pen pointer reusing the owner id', pointerId: 101, pointerType: 'pen' },
+  ])(
+    'blocks a pre-existing secondary $label move at the viewport capture boundary',
+    async ({ pointerId, pointerType }) => {
+      const studio = await mountStudio(`lumora://drive-pre-existing-secondary-${pointerType}-${pointerId}`);
+      act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+      const viewport = within(studio.root).getByTestId('lumora-viewport');
+      const canvas = within(viewport).getByTestId('mock-canvas');
+      Object.assign(viewport, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+      const innerPointerMove = vi.fn();
+      const outerPointerMove = vi.fn();
+      canvas.addEventListener('pointermove', innerPointerMove);
+      window.addEventListener('pointermove', outerPointerMove);
+      await act(async () => delay(60));
+
+      fireEvent.pointerDown(canvas, {
+        button: 0,
+        buttons: 1,
+        pointerId,
+        pointerType,
+        clientX: 30,
+        clientY: 30,
+      });
+      fireEvent.pointerDown(viewport, {
+        button: 2,
+        buttons: 2,
+        pointerId: 101,
+        pointerType: 'mouse',
+        clientX: 40,
+        clientY: 40,
+      });
+      const selectionBeforeMove = studio.handle.current!.runtime.editor.getSelection();
+      const secondaryMove = new PointerEvent('pointermove', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: -1,
+        buttons: 1,
+        pointerId,
+        pointerType,
+        clientX: 50,
+        clientY: 50,
+      });
+      const dispatched = canvas.dispatchEvent(secondaryMove);
+
+      expect(dispatched).toBe(false);
+      expect(secondaryMove.defaultPrevented).toBe(true);
+      expect(innerPointerMove).not.toHaveBeenCalled();
+      expect(outerPointerMove).not.toHaveBeenCalled();
+      expect(studio.handle.current!.runtime.editor.getSelection()).toEqual(selectionBeforeMove);
+      canvas.removeEventListener('pointermove', innerPointerMove);
+      window.removeEventListener('pointermove', outerPointerMove);
+    },
+  );
 
   it.each(['track', 'playback', 'export'] as const)(
     'suppresses the viewport context menu while %s disables camera drive',

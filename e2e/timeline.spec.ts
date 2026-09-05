@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import type { Page } from '@playwright/test';
+import type { CDPSession, Page } from '@playwright/test';
 import { resolve } from 'node:path';
 import { Euler, Quaternion } from 'three';
 
@@ -202,6 +202,84 @@ async function moveReactRootIntoOpenShadowRoot(page: Page): Promise<void> {
     document.body.append(host);
     host.attachShadow({ mode: 'open' }).append(reactRoot);
   });
+}
+
+async function dispatchChromiumPointerDown(
+  client: CDPSession,
+  pointerType: 'touch' | 'pen',
+  x: number,
+  y: number,
+): Promise<void> {
+  if (pointerType === 'touch') {
+    await client.send('Input.dispatchTouchEvent', {
+      type: 'touchStart',
+      touchPoints: [{ x, y, id: 41, radiusX: 2, radiusY: 2, force: 1 }],
+    });
+    return;
+  }
+  await client.send('Input.dispatchMouseEvent', {
+    type: 'mousePressed',
+    x,
+    y,
+    button: 'left',
+    buttons: 1,
+    clickCount: 1,
+    pointerType: 'pen',
+  });
+}
+
+async function dispatchChromiumPointerMove(
+  client: CDPSession,
+  pointerType: 'touch' | 'pen',
+  x: number,
+  y: number,
+): Promise<void> {
+  if (pointerType === 'touch') {
+    await client.send('Input.dispatchTouchEvent', {
+      type: 'touchMove',
+      touchPoints: [{ x, y, id: 41, radiusX: 2, radiusY: 2, force: 1 }],
+    });
+    return;
+  }
+  await client.send('Input.dispatchMouseEvent', {
+    type: 'mouseMoved',
+    x,
+    y,
+    button: 'none',
+    buttons: 1,
+    pointerType: 'pen',
+  });
+}
+
+async function dispatchChromiumPointerUp(
+  client: CDPSession,
+  pointerType: 'touch' | 'pen',
+  x: number,
+  y: number,
+): Promise<void> {
+  if (pointerType === 'touch') {
+    await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    return;
+  }
+  await client.send('Input.dispatchMouseEvent', {
+    type: 'mouseReleased',
+    x,
+    y,
+    button: 'left',
+    buttons: 0,
+    clickCount: 1,
+    pointerType: 'pen',
+  });
+}
+
+async function dispatchChromiumPointer(
+  client: CDPSession,
+  pointerType: 'touch' | 'pen',
+  x: number,
+  y: number,
+): Promise<void> {
+  await dispatchChromiumPointerDown(client, pointerType, x, y);
+  await dispatchChromiumPointerUp(client, pointerType, x, y);
 }
 
 function vectorDistance(a: readonly number[], b: readonly number[]): number {
@@ -441,7 +519,7 @@ test('does not expire a long-held right-drag before releasing outside the viewpo
   expect(await contextMenu).toBe(true);
 });
 
-test('allows a new outside right-click after an orphaned viewport pointerdown', async ({ page }) => {
+test('allows a new outside right-click after blur recovers an orphaned viewport pointerdown', async ({ page }) => {
   await page.getByTestId('tree-row-sample-camera').click();
   await page.getByTestId('view-mode-select').selectOption('sample-camera');
   await expect(page.getByTestId('camera-control-status')).toContainText('主摄像机推镜');
@@ -470,9 +548,8 @@ test('allows a new outside right-click after an orphaned viewport pointerdown', 
     });
   });
 
-  // Seed the abnormal state directly: a real browser cannot begin a second
-  // physical right-click until the first button is released, while the bug is
-  // specifically that the application missed that terminating event.
+  // Seed the abnormal state directly, then use the explicit blur recovery path.
+  // A different pointer pair must not implicitly steal or clear the owner.
   await viewport.dispatchEvent('pointerdown', {
     bubbles: true,
     composed: true,
@@ -483,6 +560,7 @@ test('allows a new outside right-click after an orphaned viewport pointerdown', 
     clientX: viewportBounds.x + viewportBounds.width * 0.5,
     clientY: viewportBounds.y + viewportBounds.height * 0.5,
   });
+  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
   await page.mouse.click(toolbarBounds.x + 8, toolbarBounds.y + toolbarBounds.height / 2, { button: 'right' });
 
   const result = await page.evaluate(() => {
@@ -498,6 +576,230 @@ test('allows a new outside right-click after an orphaned viewport pointerdown', 
   expect(result.pointerDowns).toBeGreaterThan(0);
   expect(result.contextMenus).toContain(false);
 });
+
+for (const pointerType of ['touch', 'pen'] as const) {
+  test(`active camera look isolates a real Chromium ${pointerType} pointer`, async ({ page, browserName }) => {
+    test.skip(browserName !== 'chromium', 'CDP pointer injection is a Chromium regression');
+    await startRecording(page);
+    await hideViewportOverlays(page);
+    const viewport = page.getByTestId('lumora-viewport');
+    const bounds = await viewport.boundingBox();
+    if (!bounds) throw new Error('viewport is unavailable');
+    const x = bounds.x + bounds.width * 0.5;
+    const y = bounds.y + bounds.height * 0.5;
+    await page.evaluate((secondaryType) => {
+      const scope = globalThis as typeof globalThis & {
+        __lumoraSecondaryPointerCaptures?: number;
+        __lumoraSecondaryPointerBubbles?: number;
+        __lumoraSecondaryPointerIdentity?: { pointerId: number; pointerType: string };
+        __lumoraSecondaryMoveCaptures?: number;
+        __lumoraSecondaryMoveBubbles?: number;
+      };
+      scope.__lumoraSecondaryPointerCaptures = 0;
+      scope.__lumoraSecondaryPointerBubbles = 0;
+      scope.__lumoraSecondaryPointerIdentity = undefined;
+      scope.__lumoraSecondaryMoveCaptures = 0;
+      scope.__lumoraSecondaryMoveBubbles = 0;
+      window.addEventListener('pointerdown', (event) => {
+        if (
+          event.pointerType === secondaryType &&
+          event.composedPath().includes(document.querySelector('[data-testid="lumora-viewport"]'))
+        ) {
+          scope.__lumoraSecondaryPointerCaptures! += 1;
+          scope.__lumoraSecondaryPointerIdentity = {
+            pointerId: event.pointerId,
+            pointerType: event.pointerType,
+          };
+        }
+      }, true);
+      window.addEventListener('pointerdown', (event) => {
+        if (event.pointerType === secondaryType) scope.__lumoraSecondaryPointerBubbles! += 1;
+      });
+      window.addEventListener('pointermove', (event) => {
+        if (event.pointerType === secondaryType) scope.__lumoraSecondaryMoveCaptures! += 1;
+      }, true);
+      window.addEventListener('pointermove', (event) => {
+        if (event.pointerType === secondaryType) scope.__lumoraSecondaryMoveBubbles! += 1;
+      });
+    }, pointerType);
+
+    const ownerStarted = await viewport.evaluate((element, point) => {
+      const down = new PointerEvent('pointerdown', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: 2,
+        buttons: 2,
+        pointerId: 31,
+        pointerType: 'mouse',
+        clientX: point.x - 30,
+        clientY: point.y + 20,
+      });
+      element.dispatchEvent(down);
+      const move = new PointerEvent('pointermove', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: -1,
+        buttons: 2,
+        pointerId: 31,
+        pointerType: 'mouse',
+        clientX: point.x + 30,
+        clientY: point.y - 20,
+      });
+      element.dispatchEvent(move);
+      return { down: down.defaultPrevented, move: move.defaultPrevented };
+    }, { x, y });
+    expect(ownerStarted).toEqual({ down: true, move: true });
+    const cameraBefore = await stableCameraPose(page, 'sample-camera');
+    const directorBefore = await stableCameraPose(page, '__rendered__');
+    const client = await page.context().newCDPSession(page);
+    await dispatchChromiumPointer(client, pointerType, x, y);
+    await page.waitForTimeout(100);
+
+    const observed = await page.evaluate(() => {
+      const scope = globalThis as typeof globalThis & {
+        __lumoraSecondaryPointerCaptures?: number;
+        __lumoraSecondaryPointerBubbles?: number;
+        __lumoraSecondaryPointerIdentity?: { pointerId: number; pointerType: string };
+      };
+      return {
+        captures: scope.__lumoraSecondaryPointerCaptures ?? 0,
+        bubbles: scope.__lumoraSecondaryPointerBubbles ?? 0,
+        identity: scope.__lumoraSecondaryPointerIdentity ?? null,
+      };
+    });
+    expect(observed).toMatchObject({ captures: 1, bubbles: 0 });
+    expect(observed.identity?.pointerType).toBe(pointerType);
+    if (!observed.identity) throw new Error('secondary pointer identity was not captured');
+    const secondaryContextMenuAllowed = await viewport.evaluate((element, identity) => {
+      const event = new PointerEvent('contextmenu', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: 2,
+        pointerId: identity.pointerId,
+        pointerType: identity.pointerType,
+      });
+      return element.dispatchEvent(event);
+    }, observed.identity);
+    expect(secondaryContextMenuAllowed).toBe(false);
+    await expect(page.getByTestId('tree-row-sample-camera')).toHaveAttribute('aria-selected', 'true');
+    const cameraAfter = await stableCameraPose(page, 'sample-camera');
+    const directorAfter = await stableCameraPose(page, '__rendered__');
+    expect(vectorDistance(cameraAfter.position, cameraBefore.position)).toBeLessThan(0.000001);
+    expect(quaternionAngle(cameraAfter.rotation, cameraBefore.rotation)).toBeLessThan(0.00005);
+    expect(vectorDistance(directorAfter.position, directorBefore.position)).toBeLessThan(0.000001);
+    expect(quaternionAngle(directorAfter.rotation, directorBefore.rotation)).toBeLessThan(0.000001);
+
+    await viewport.dispatchEvent('pointermove', {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      button: -1,
+      buttons: 2,
+      pointerId: 31,
+      pointerType: 'mouse',
+      clientX: x + 70,
+      clientY: y - 45,
+    });
+    const cameraAfterOwnerMove = await stableCameraPose(page, 'sample-camera');
+    expect(quaternionAngle(cameraAfterOwnerMove.rotation, cameraAfter.rotation)).toBeGreaterThan(0.001);
+
+    await page.evaluate(() => {
+      document.body.dispatchEvent(new PointerEvent('pointerup', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: 2,
+        buttons: 0,
+        pointerId: 31,
+        pointerType: 'mouse',
+      }));
+    });
+    const outsideContextMenuSequence = await page.evaluate(() => [0, 1].map(() => {
+      const event = new PointerEvent('contextmenu', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: 2,
+        pointerId: 31,
+        pointerType: 'mouse',
+      });
+      document.body.dispatchEvent(event);
+      return event.defaultPrevented;
+    }));
+    expect([
+      !secondaryContextMenuAllowed,
+      ...outsideContextMenuSequence,
+    ]).toEqual([true, true, false]);
+
+    await page.evaluate(() => {
+      const scope = globalThis as typeof globalThis & {
+        __lumoraSecondaryMoveCaptures?: number;
+        __lumoraSecondaryMoveBubbles?: number;
+      };
+      scope.__lumoraSecondaryMoveCaptures = 0;
+      scope.__lumoraSecondaryMoveBubbles = 0;
+    });
+    await dispatchChromiumPointerDown(client, pointerType, x, y);
+    const secondOwnerStarted = await viewport.evaluate((element, point) => {
+      const event = new PointerEvent('pointerdown', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: 2,
+        buttons: 2,
+        pointerId: 32,
+        pointerType: 'mouse',
+        clientX: point.x - 20,
+        clientY: point.y + 10,
+      });
+      element.dispatchEvent(event);
+      return event.defaultPrevented;
+    }, { x, y });
+    expect(secondOwnerStarted).toBe(true);
+    const selectionBeforePreExistingMove = await page
+      .getByTestId('tree-row-sample-camera')
+      .getAttribute('aria-selected');
+    const cameraBeforePreExistingMove = await stableCameraPose(page, 'sample-camera');
+    const directorBeforePreExistingMove = await stableCameraPose(page, '__rendered__');
+    await dispatchChromiumPointerMove(client, pointerType, x + 12, y + 12);
+    await page.waitForTimeout(100);
+    const movePropagation = await page.evaluate(() => {
+      const scope = globalThis as typeof globalThis & {
+        __lumoraSecondaryMoveCaptures?: number;
+        __lumoraSecondaryMoveBubbles?: number;
+      };
+      return {
+        captures: scope.__lumoraSecondaryMoveCaptures ?? 0,
+        bubbles: scope.__lumoraSecondaryMoveBubbles ?? 0,
+      };
+    });
+    expect(movePropagation).toEqual({ captures: 1, bubbles: 0 });
+    expect(await page.getByTestId('tree-row-sample-camera').getAttribute('aria-selected'))
+      .toBe(selectionBeforePreExistingMove);
+    const cameraAfterPreExistingMove = await stableCameraPose(page, 'sample-camera');
+    const directorAfterPreExistingMove = await stableCameraPose(page, '__rendered__');
+    expect(vectorDistance(cameraAfterPreExistingMove.position, cameraBeforePreExistingMove.position)).toBeLessThan(0.000001);
+    expect(quaternionAngle(cameraAfterPreExistingMove.rotation, cameraBeforePreExistingMove.rotation)).toBeLessThan(0.00005);
+    expect(vectorDistance(directorAfterPreExistingMove.position, directorBeforePreExistingMove.position)).toBeLessThan(0.000001);
+    expect(quaternionAngle(directorAfterPreExistingMove.rotation, directorBeforePreExistingMove.rotation)).toBeLessThan(0.000001);
+    await dispatchChromiumPointerUp(client, pointerType, x + 12, y + 12);
+    await client.detach();
+    await page.evaluate(() => {
+      document.body.dispatchEvent(new PointerEvent('pointerup', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: 2,
+        buttons: 0,
+        pointerId: 32,
+        pointerType: 'mouse',
+      }));
+    });
+  });
+}
 
 test('director free-drive orientation remains stable across pixel and line-mode wheel gestures', async ({ page }) => {
   const viewport = page.getByTestId('lumora-viewport');
