@@ -52,6 +52,11 @@ export interface TimelineSessionState {
 
 export type StopRecordingResult = { ok: true } | { ok: false; message: string };
 
+export interface CameraControlSettingsSnapshot {
+  settings: CameraDriveSettings;
+  invertMouseYRevision: number;
+}
+
 export interface TimelineSession {
   timeline: TimelineController;
   recorder: TimelineRecorder;
@@ -65,6 +70,7 @@ export interface TimelineSession {
   setLoop(enabled: boolean): void;
   setCaptureSource(source: CaptureSource | null): void;
   setCameraControlSettings(settings: Partial<CameraDriveSettings>): void;
+  getCameraControlSettingsSnapshot(): CameraControlSettingsSnapshot;
   /** 开始录制指定机位；已有录制轨道时进入覆盖确认 */
   startRecording(cameraObjectId: string): void;
   confirmOverwrite(): void;
@@ -82,6 +88,8 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
   const recorderRef = useRef<TimelineRecorder | null>(null);
   if (!recorderRef.current) recorderRef.current = new TimelineRecorder();
   const recorder = recorderRef.current;
+  const cameraControlSettingsRef = useRef<CameraDriveSettings>({ ...DEFAULT_CAMERA_DRIVE_SETTINGS });
+  const invertMouseYRevisionRef = useRef(0);
 
   const [state, setState] = useState<TimelineSessionState>(() => ({
     playing: timeline.isPlaying(),
@@ -335,11 +343,19 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
   );
 
   const setCameraControlSettings = useCallback((settings: Partial<CameraDriveSettings>) => {
-    setState((current) => ({
-      ...current,
-      cameraControls: normalizeCameraDriveSettings(settings, current.cameraControls),
-    }));
+    const previous = cameraControlSettingsRef.current;
+    const next = normalizeCameraDriveSettings(settings, previous);
+    if (next.invertMouseY !== previous.invertMouseY) {
+      invertMouseYRevisionRef.current += 1;
+    }
+    cameraControlSettingsRef.current = next;
+    setState((current) => ({ ...current, cameraControls: next }));
   }, []);
+
+  const getCameraControlSettingsSnapshot = useCallback((): CameraControlSettingsSnapshot => ({
+    settings: { ...cameraControlSettingsRef.current },
+    invertMouseYRevision: invertMouseYRevisionRef.current,
+  }), []);
 
   const beginRecording = useCallback(
     (cameraObjectId: string) => {
@@ -509,6 +525,7 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       setLoop,
       setCaptureSource,
       setCameraControlSettings,
+      getCameraControlSettingsSnapshot,
       startRecording,
       confirmOverwrite,
       cancelOverwrite,

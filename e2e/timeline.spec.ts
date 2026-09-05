@@ -401,6 +401,127 @@ test('real right-drag drives only an unblocked POV and suppresses complete gestu
   expect(quaternionAngle(outOfViewportAfter.rotation, outOfViewportBefore.rotation)).toBeGreaterThan(0.001);
 });
 
+test('mouse vertical inversion reverses only pitch and resets an active gesture', async ({ page }) => {
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('view-mode-select').selectOption('sample-camera');
+  await page.getByTestId('track-disabled-sample-track-camera-dolly').check();
+  await page.getByTestId('track-disabled-sample-track-camera-focus').check();
+  await expect(page.getByTestId('camera-control-status')).toHaveText('机位“主摄像机”可手动操控。');
+
+  const viewport = page.getByTestId('lumora-viewport');
+  const bounds = await viewport.boundingBox();
+  if (!bounds) throw new Error('viewport is unavailable');
+  const startX = bounds.x + bounds.width * 0.5;
+  const startY = bounds.y + bounds.height * 0.45;
+  const invertMouseY = page.getByTestId('camera-control-invert-mouse-y');
+  await expect(invertMouseY).not.toBeChecked();
+
+  const dragVertically = async () => {
+    await page.mouse.move(startX, startY);
+    await page.mouse.down({ button: 'right' });
+    await page.mouse.move(startX, startY + 48, { steps: 6 });
+    await page.mouse.up({ button: 'right' });
+    return stableCameraPose(page);
+  };
+
+  const normalBefore = await stableCameraPose(page);
+  const normalAfter = await dragVertically();
+  const normalPitch = normalAfter.rotation[0] - normalBefore.rotation[0];
+  const normalYaw = normalAfter.rotation[1] - normalBefore.rotation[1];
+  expect(Math.abs(normalPitch)).toBeGreaterThan(0.01);
+  expect(Math.abs(normalYaw)).toBeLessThan(0.005);
+
+  await invertMouseY.check();
+  await expect(invertMouseY).toBeChecked();
+  const invertedBefore = await stableCameraPose(page);
+  const invertedAfter = await dragVertically();
+  const invertedPitch = invertedAfter.rotation[0] - invertedBefore.rotation[0];
+  const invertedYaw = invertedAfter.rotation[1] - invertedBefore.rotation[1];
+  expect(Math.abs(invertedPitch)).toBeGreaterThan(0.01);
+  expect(invertedPitch * normalPitch).toBeLessThan(0);
+  expect(Math.abs(invertedYaw)).toBeLessThan(0.005);
+
+  await invertMouseY.uncheck();
+  const restoredBefore = await stableCameraPose(page);
+  const restoredAfter = await dragVertically();
+  const restoredPitch = restoredAfter.rotation[0] - restoredBefore.rotation[0];
+  expect(restoredPitch * normalPitch).toBeGreaterThan(0);
+
+  await page.mouse.move(startX, startY);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(startX, startY + 20);
+  const poseAtToggle = await stableCameraPose(page);
+  await invertMouseY.evaluate((input) => (input as HTMLInputElement).click());
+  await expect(invertMouseY).toBeChecked();
+  await page.waitForTimeout(300);
+  const afterBoundary = await cameraPose(page);
+  expect(quaternionAngle(afterBoundary.rotation, poseAtToggle.rotation)).toBeLessThan(0.001);
+
+  await page.mouse.move(startX, startY + 70, { steps: 5 });
+  await page.waitForTimeout(300);
+  const afterStaleMove = await cameraPose(page);
+  expect(quaternionAngle(afterStaleMove.rotation, afterBoundary.rotation)).toBeLessThan(0.001);
+  await page.mouse.up({ button: 'right' });
+
+  const freshAfter = await dragVertically();
+  expect(quaternionAngle(freshAfter.rotation, afterStaleMove.rotation)).toBeGreaterThan(0.01);
+
+  await page.mouse.move(startX, startY);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(startX, startY + 20);
+  const poseAtDoubleToggle = await stableCameraPose(page);
+  await invertMouseY.evaluate((input) => {
+    (input as HTMLInputElement).click();
+    (input as HTMLInputElement).click();
+  });
+  await expect(invertMouseY).toBeChecked();
+  await page.mouse.move(startX, startY + 70, { steps: 5 });
+  await page.waitForTimeout(300);
+  const afterDoubleToggle = await cameraPose(page);
+  expect(quaternionAngle(afterDoubleToggle.rotation, poseAtDoubleToggle.rotation)).toBeLessThan(0.001);
+  await page.mouse.up({ button: 'right' });
+
+  await page.reload();
+  await page.getByTestId('open-sample-project').click();
+  await expect(page.getByTestId('camera-control-invert-mouse-y')).not.toBeChecked();
+});
+
+test('mouse vertical inversion keeps a touch-sized target on narrow screens', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 667 });
+  const invertMouseY = page.getByTestId('camera-control-invert-mouse-y');
+  const hitTarget = invertMouseY.locator('..');
+  await expect(invertMouseY).toBeVisible();
+
+  const bounds = await hitTarget.boundingBox();
+  expect(bounds).not.toBeNull();
+  expect(bounds!.height).toBeGreaterThanOrEqual(44);
+
+  await hitTarget.click({ position: { x: bounds!.width - 2, y: bounds!.height - 2 } });
+  await expect(invertMouseY).toBeChecked();
+});
+
+test('mouse vertical inversion keeps a touch-sized target in a narrow embedded host', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const studio = page.getByTestId('lumora-studio');
+  await studio.evaluate((element) => {
+    element.style.width = '400px';
+    element.style.maxWidth = '400px';
+    element.style.flex = '0 0 400px';
+  });
+
+  const stage = studio.locator('.lumora-studio__stage');
+  const stageBounds = await stage.boundingBox();
+  expect(stageBounds).not.toBeNull();
+  expect(stageBounds!.width).toBeLessThanOrEqual(520);
+
+  const invertMouseY = page.getByTestId('camera-control-invert-mouse-y');
+  const hitTarget = invertMouseY.locator('..');
+  await expect(invertMouseY).toBeVisible();
+  const bounds = await hitTarget.boundingBox();
+  expect(bounds).not.toBeNull();
+  expect(bounds!.height).toBeGreaterThanOrEqual(44);
+});
+
 test('suppresses an out-of-bounds release from an open ShadowRoot viewport', async ({ page }) => {
   await page.getByTestId('tree-row-sample-camera').click();
   await page.getByTestId('view-mode-select').selectOption('sample-camera');

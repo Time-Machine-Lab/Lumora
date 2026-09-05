@@ -481,6 +481,18 @@ export function TimelinePanel({
               {state.cameraControls.mouseSensitivity.toFixed(1)}
             </span>
           </label>
+          <label className="lumora-check lumora-camera-controls__invert">
+            <input
+              type="checkbox"
+              aria-label="鼠标垂直反转"
+              data-testid="camera-control-invert-mouse-y"
+              checked={state.cameraControls.invertMouseY}
+              onChange={(event) => session.setCameraControlSettings({
+                invertMouseY: event.target.checked,
+              })}
+            />
+            垂直反转
+          </label>
           <span
             className={`lumora-camera-controls__status${driveBlocked ? ' lumora-camera-controls__status--blocked' : ''}`}
             data-testid="camera-control-status"

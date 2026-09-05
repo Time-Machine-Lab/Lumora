@@ -51,6 +51,7 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     expect(live().state.snapEnabled).toBe(true);
     expect(live().state.loopEnabled).toBe(true);
     expect(live().state.cameraControls.mode).toBe('keyboard-mouse');
+    expect(live().state.cameraControls.invertMouseY).toBe(false);
   });
 
   it('机位操控参数按会话保存、过滤非有限值并夹取范围，切换项目后保持', () => {
@@ -60,6 +61,7 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
       speed: 99,
       tapStep: -1,
       mouseSensitivity: Number.NaN,
+      invertMouseY: true,
     }));
 
     expect(live().state.cameraControls).toMatchObject({
@@ -67,6 +69,7 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
       speed: CAMERA_DRIVE_LIMITS.speed.max,
       tapStep: CAMERA_DRIVE_LIMITS.tapStep.min,
       mouseSensitivity: 1,
+      invertMouseY: true,
     });
 
     act(() => editor.openProject({ ...createSampleProject(), uri: 'lumora://camera-controls-next' }));
@@ -75,7 +78,23 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
       speed: CAMERA_DRIVE_LIMITS.speed.max,
       tapStep: CAMERA_DRIVE_LIMITS.tapStep.min,
       mouseSensitivity: 1,
+      invertMouseY: true,
     });
+
+    act(() => live().setCameraControlSettings({ invertMouseY: false }));
+    expect(live().state.cameraControls.invertMouseY).toBe(false);
+  });
+
+  it('重新挂载编辑器会话后，鼠标垂直反转随其他机位参数恢复默认值', () => {
+    mount();
+    act(() => live().setCameraControlSettings({ invertMouseY: true }));
+    expect(live().state.cameraControls.invertMouseY).toBe(true);
+
+    unmount?.();
+    unmount = null;
+    mount();
+
+    expect(live().state.cameraControls.invertMouseY).toBe(false);
   });
 
   it('togglePlay 切换播放状态', () => {

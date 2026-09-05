@@ -81,6 +81,10 @@ function makeSession(timeline: TimelineController, recorder: TimelineRecorder): 
     setLoop: () => {},
     setCaptureSource: () => {},
     setCameraControlSettings: () => {},
+    getCameraControlSettingsSnapshot: () => ({
+      settings: { ...DEFAULT_CAMERA_DRIVE_SETTINGS },
+      invertMouseYRevision: 0,
+    }),
     startRecording: () => {},
     confirmOverwrite: () => {},
     cancelOverwrite: () => {},

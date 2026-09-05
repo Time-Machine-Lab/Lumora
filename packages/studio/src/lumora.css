@@ -1658,6 +1658,37 @@
   opacity: 0.45;
 }
 
+.lumora-camera-controls__invert {
+  flex: 0 0 auto;
+  min-height: 24px;
+  padding: 0 4px;
+  font-size: 11px;
+}
+
+.lumora-camera-controls__invert input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--lumora-accent);
+}
+
+.lumora-camera-controls__invert input:focus-visible {
+  outline: 2px solid var(--lumora-accent);
+  outline-offset: 1px;
+}
+
+@media (max-width: 520px) {
+  .lumora-camera-controls__invert {
+    min-height: 44px;
+  }
+}
+
+@container (max-width: 520px) {
+  .lumora-camera-controls__invert {
+    min-height: 44px;
+  }
+}
+
 .lumora-camera-controls__value {
   width: 28px;
   color: var(--lumora-text);

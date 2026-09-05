@@ -521,7 +521,9 @@ function useCameraDrive(
 
   useEffect(() => {
     if (!session) return;
-    const drive = new CameraDrive();
+    const initialSettingsSnapshot = session.getCameraControlSettingsSnapshot();
+    const drive = new CameraDrive(initialSettingsSnapshot.settings);
+    let syncedInvertMouseYRevision = initialSettingsSnapshot.invertMouseYRevision;
     let raf = 0;
     let last = performance.now();
     let attachedId: string | null = null;
@@ -550,6 +552,23 @@ function useCameraDrive(
         viewport?.releasePointerCapture(pointerId);
       } catch {
         // Pointer capture can already be released by the browser.
+      }
+    };
+
+    const syncDriveSettings = () => {
+      const snapshot = sessionRef.current?.getCameraControlSettingsSnapshot();
+      if (!snapshot) return;
+      const previousSettings = drive.getSettings();
+      const invertMouseYChanged = snapshot.invertMouseYRevision !== syncedInvertMouseYRevision;
+      drive.setSettings(snapshot.settings);
+      const nextSettings = drive.getSettings();
+      syncedInvertMouseYRevision = snapshot.invertMouseYRevision;
+      if (nextSettings.mode !== previousSettings.mode) {
+        heldKeys.clear();
+        endLookGesture();
+      } else if (invertMouseYChanged) {
+        drive.cancelLook();
+        endLookGesture();
       }
     };
 
@@ -650,8 +669,7 @@ function useCameraDrive(
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || !driveEnabledRef.current) return;
-      const liveSession = sessionRef.current;
-      if (liveSession) drive.setSettings(liveSession.state.cameraControls);
+      syncDriveSettings();
       const keyboardRoot = keyboardScopeRef?.current;
       if (keyboardRoot && !isKeyboardEventForStudio(keyboardRoot, event)) return;
       if ((event.ctrlKey || event.metaKey || event.altKey) && heldKeys.size > 0) {
@@ -689,7 +707,7 @@ function useCameraDrive(
       ) return;
       const liveSession = sessionRef.current;
       if (!liveSession) return;
-      drive.setSettings(liveSession.state.cameraControls);
+      syncDriveSettings();
       if (drive.getSettings().mode !== 'keyboard-mouse' || !canDriveCurrentCamera()) return;
       if (!attachCurrentCamera()) return;
       drive.cancelTranslationMomentum();
@@ -707,6 +725,7 @@ function useCameraDrive(
       }
     };
     const onPointerMove = (event: PointerEvent) => {
+      syncDriveSettings();
       if (lookPointerId === null || event.pointerId !== lookPointerId) return;
       if ((event.buttons & 2) === 0) {
         endLookGesture();
@@ -804,12 +823,7 @@ function useCameraDrive(
       }
       const st = sessionRef.current?.state;
       if (st) {
-        const previousMode = drive.getSettings().mode;
-        drive.setSettings(st.cameraControls);
-        if (drive.getSettings().mode !== previousMode) {
-          heldKeys.clear();
-          endLookGesture();
-        }
+        syncDriveSettings();
       }
       // 可驾驶：选中机位 && 录制未暂停 && （暂停 || 录制中）&& 无启用轨道（录制中无视轨道；
       // 禁用轨道不阻止驾驶 —— 禁用 = 该通道暂不参与回放）
