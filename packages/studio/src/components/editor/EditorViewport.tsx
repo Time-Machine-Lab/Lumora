@@ -80,6 +80,7 @@ function useViewportContextMenuGuard(viewportRef: React.RefObject<HTMLElement | 
     const viewport = viewportRef.current;
     if (!viewport) return;
     let gesturePointerId: number | null = null;
+    let gesturePointerType: string | null = null;
     let gestureExpiryTimer: number | null = null;
     let pendingContextMenu = false;
     let pendingContextMenuTimer: number | null = null;
@@ -99,20 +100,30 @@ function useViewportContextMenuGuard(viewportRef: React.RefObject<HTMLElement | 
     };
     const clearAll = () => {
       gesturePointerId = null;
+      gesturePointerType = null;
       clearGestureExpiry();
       clearPendingContextMenu();
     };
-    const armGesture = (pointerId: number) => {
+    const clearGesture = () => {
+      gesturePointerId = null;
+      gesturePointerType = null;
+      clearGestureExpiry();
+    };
+    const armGesture = (pointerId: number, pointerType: string) => {
       clearPendingContextMenu();
       gesturePointerId = pointerId;
+      gesturePointerType = pointerType;
       clearGestureExpiry();
       // A stuck pointer stream is abnormal; normal long presses remain armed
       // until pointerup/pointercancel rather than expiring after two seconds.
       gestureExpiryTimer = globalThis.setTimeout(() => {
         gesturePointerId = null;
+        gesturePointerType = null;
         gestureExpiryTimer = null;
       }, 5 * 60_000);
     };
+    const isGestureOwner = (event: Pick<PointerEvent, 'pointerId' | 'pointerType'>): boolean =>
+      event.pointerId === gesturePointerId && event.pointerType === gesturePointerType;
     const eventPath = (event: Event): EventTarget[] => {
       const path = event.composedPath?.();
       return path && path.length > 0 ? path : event.target ? [event.target] : [];
@@ -129,25 +140,42 @@ function useViewportContextMenuGuard(viewportRef: React.RefObject<HTMLElement | 
         entry.closest('button, input, select, textarea, [contenteditable="true"]') !== null;
     });
     const onPointerDown = (event: PointerEvent) => {
-      // Every pointer sequence supersedes any stale gesture state before the
-      // current event is evaluated for viewport context-menu suppression.
-      clearAll();
+      if (gesturePointerId !== null) return;
+      clearPendingContextMenu();
       if (event.button !== 2 || !isWithinViewport(event) || isInteractiveTarget(event)) return;
-      armGesture(event.pointerId);
+      armGesture(event.pointerId, event.pointerType);
     };
     const onPointerUp = (event: PointerEvent) => {
-      if (event.pointerId !== gesturePointerId) return;
-      gesturePointerId = null;
-      clearGestureExpiry();
+      if (!isGestureOwner(event)) return;
+      clearGesture();
       pendingContextMenu = true;
       if (pendingContextMenuTimer !== null) globalThis.clearTimeout(pendingContextMenuTimer);
       pendingContextMenuTimer = globalThis.setTimeout(clearPendingContextMenu, 10_000);
     };
+    const onPointerMove = (event: PointerEvent) => {
+      if (isGestureOwner(event) && (event.buttons & 2) === 0) clearAll();
+    };
     const onPointerCancel = (event: PointerEvent) => {
-      if (event.pointerId === gesturePointerId) clearAll();
+      if (isGestureOwner(event)) clearAll();
+    };
+    const onLostPointerCapture = (event: PointerEvent) => {
+      if (isGestureOwner(event)) clearAll();
     };
     const onContextMenu = (event: MouseEvent) => {
-      if (gesturePointerId !== null || pendingContextMenu || isWithinViewport(event)) {
+      if (gesturePointerId !== null) {
+        event.preventDefault();
+        const pointerEvent = event as MouseEvent & Partial<Pick<PointerEvent, 'pointerId' | 'pointerType'>>;
+        if (
+          typeof pointerEvent.pointerId === 'number' &&
+          typeof pointerEvent.pointerType === 'string' &&
+          pointerEvent.pointerType.length > 0 &&
+          isGestureOwner(pointerEvent as Pick<PointerEvent, 'pointerId' | 'pointerType'>)
+        ) {
+          clearAll();
+        }
+        return;
+      }
+      if (pendingContextMenu || isWithinViewport(event)) {
         event.preventDefault();
         clearAll();
       }
@@ -157,18 +185,22 @@ function useViewportContextMenuGuard(viewportRef: React.RefObject<HTMLElement | 
       if (document.visibilityState === 'hidden') clearAll();
     };
     window.addEventListener('pointerdown', onPointerDown, true);
+    window.addEventListener('pointermove', onPointerMove, true);
     window.addEventListener('pointerup', onPointerUp, true);
     window.addEventListener('pointercancel', onPointerCancel, true);
     window.addEventListener('contextmenu', onContextMenu, true);
     window.addEventListener('blur', onWindowBlur);
+    viewport.addEventListener('lostpointercapture', onLostPointerCapture);
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       clearAll();
       window.removeEventListener('pointerdown', onPointerDown, true);
+      window.removeEventListener('pointermove', onPointerMove, true);
       window.removeEventListener('pointerup', onPointerUp, true);
       window.removeEventListener('pointercancel', onPointerCancel, true);
       window.removeEventListener('contextmenu', onContextMenu, true);
       window.removeEventListener('blur', onWindowBlur);
+      viewport.removeEventListener('lostpointercapture', onLostPointerCapture);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, [viewportRef]);
@@ -531,6 +563,7 @@ function useCameraDrive(
     let mirrorNode: THREE.Object3D | null = null;
     const heldKeys = new Set<string>();
     let lookPointerId: number | null = null;
+    let lookPointerType: string | null = null;
     let lookClientX = 0;
     let lookClientY = 0;
     const previousPrimaryPosition = new THREE.Vector3();
@@ -545,6 +578,7 @@ function useCameraDrive(
       if (lookPointerId === null) return;
       const pointerId = lookPointerId;
       lookPointerId = null;
+      lookPointerType = null;
       const viewport = viewportRef.current;
       try {
         viewport?.releasePointerCapture(pointerId);
@@ -647,6 +681,16 @@ function useCameraDrive(
         (!hasTracks || st.recording)
       );
     };
+    const isLookOwner = (event: Pick<PointerEvent, 'pointerId' | 'pointerType'>): boolean =>
+      event.pointerId === lookPointerId && event.pointerType === lookPointerType;
+    const blockSecondaryPointer = (event: PointerEvent): boolean => {
+      if (lookPointerId === null || isLookOwner(event)) return false;
+      if (event.currentTarget === viewportRef.current) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return true;
+    };
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || !driveEnabledRef.current) return;
@@ -680,6 +724,7 @@ function useCameraDrive(
       }
     };
     const onPointerDown = (event: PointerEvent) => {
+      if (blockSecondaryPointer(event)) return;
       if (event.button !== 2) return;
       if (lookPointerId !== null) return;
       const target = event.target;
@@ -694,6 +739,7 @@ function useCameraDrive(
       if (!attachCurrentCamera()) return;
       drive.cancelTranslationMomentum();
       lookPointerId = event.pointerId;
+      lookPointerType = event.pointerType;
       activityRef.current = true;
       lookClientX = event.clientX;
       lookClientY = event.clientY;
@@ -707,7 +753,8 @@ function useCameraDrive(
       }
     };
     const onPointerMove = (event: PointerEvent) => {
-      if (lookPointerId === null || event.pointerId !== lookPointerId) return;
+      if (blockSecondaryPointer(event)) return;
+      if (lookPointerId === null || !isLookOwner(event)) return;
       if ((event.buttons & 2) === 0) {
         endLookGesture();
         return;
@@ -721,13 +768,15 @@ function useCameraDrive(
       event.preventDefault();
     };
     const onPointerUp = (event: PointerEvent) => {
-      if (event.pointerId === lookPointerId) endLookGesture();
+      if (blockSecondaryPointer(event)) return;
+      if (isLookOwner(event)) endLookGesture();
     };
     const onPointerCancel = (event: PointerEvent) => {
-      if (event.pointerId === lookPointerId) clearDrive();
+      if (blockSecondaryPointer(event)) return;
+      if (isLookOwner(event)) clearDrive();
     };
     const onLostPointerCapture = (event: PointerEvent) => {
-      if (event.pointerId !== lookPointerId) return;
+      if (lookPointerId === null || !isLookOwner(event)) return;
       drive.cancelLook();
       endLookGesture();
     };
@@ -768,9 +817,9 @@ function useCameraDrive(
     document.addEventListener('focusout', onFocusOut);
     const viewport = viewportRef.current;
     viewport?.addEventListener('pointerdown', onPointerDown, true);
-    viewport?.addEventListener('pointermove', onPointerMove);
-    viewport?.addEventListener('pointerup', onPointerUp);
-    viewport?.addEventListener('pointercancel', onPointerCancel);
+    viewport?.addEventListener('pointermove', onPointerMove, true);
+    viewport?.addEventListener('pointerup', onPointerUp, true);
+    viewport?.addEventListener('pointercancel', onPointerCancel, true);
     viewport?.addEventListener('lostpointercapture', onLostPointerCapture);
 
     const restoreIfNeeded = () => {
@@ -911,9 +960,9 @@ function useCameraDrive(
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
       viewport?.removeEventListener('pointerdown', onPointerDown, true);
-      viewport?.removeEventListener('pointermove', onPointerMove);
-      viewport?.removeEventListener('pointerup', onPointerUp);
-      viewport?.removeEventListener('pointercancel', onPointerCancel);
+      viewport?.removeEventListener('pointermove', onPointerMove, true);
+      viewport?.removeEventListener('pointerup', onPointerUp, true);
+      viewport?.removeEventListener('pointercancel', onPointerCancel, true);
       viewport?.removeEventListener('lostpointercapture', onLostPointerCapture);
       restoreIfNeeded();
       clearDrive();
