@@ -389,7 +389,7 @@ describe('camera drive keyboard routing', () => {
 
     const rotationAtToggle = camera.quaternion.clone();
     fireEvent.click(within(studio.root).getByRole('checkbox', { name: '鼠标垂直反转' }));
-    fireEvent.keyDown(studio.root, { key: 'w', code: 'KeyW', repeat: true });
+    await act(async () => delay(40));
     expect(releasePointerCapture).toHaveBeenCalledWith(31);
     const callsAtToggle = look.mock.calls.length;
 
@@ -407,32 +407,65 @@ describe('camera drive keyboard routing', () => {
     expect(camera.quaternion.angleTo(rotationBeforeFreshGesture)).toBeGreaterThan(0.001);
   });
 
-  it('requires a fresh right-button gesture after mouse inversion is toggled twice in one batch', async () => {
+  it('clears queued look and requires a fresh pointer after a same-batch double inversion toggle', async () => {
     const studio = await mountStudio('lumora://drive-invert-mouse-y-double-toggle');
     act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
     const viewport = within(studio.root).getByTestId('lumora-viewport');
+    const setPointerCapture = vi.fn();
     const releasePointerCapture = vi.fn();
     Object.assign(viewport, {
-      setPointerCapture: vi.fn(),
+      setPointerCapture,
       releasePointerCapture,
     });
-    const look = vi.spyOn(CameraDrive.prototype, 'look');
     await act(async () => delay(60));
 
+    const rotationBeforePendingLook = camera.quaternion.clone();
     fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 41, clientX: 100, clientY: 100 });
     fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 41, clientX: 120, clientY: 110 });
-    expect(look).toHaveBeenCalledTimes(1);
+    expect(camera.quaternion.angleTo(rotationBeforePendingLook)).toBeLessThan(1e-9);
 
     const invertMouseY = within(studio.root).getByRole('checkbox', { name: '鼠标垂直反转' });
     act(() => {
       invertMouseY.click();
       invertMouseY.click();
-      fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 41, clientX: 150, clientY: 140 });
     });
+    await act(async () => delay(40));
 
     expect(invertMouseY).not.toBeChecked();
+    expect(setPointerCapture).toHaveBeenNthCalledWith(1, 41);
     expect(releasePointerCapture).toHaveBeenCalledWith(41);
-    expect(look).toHaveBeenCalledTimes(1);
+    expect(camera.quaternion.angleTo(rotationBeforePendingLook)).toBeLessThan(1e-9);
+
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 41, clientX: 150, clientY: 140 });
+    await act(async () => delay(40));
+    expect(camera.quaternion.angleTo(rotationBeforePendingLook)).toBeLessThan(1e-9);
+
+    fireEvent.pointerDown(viewport, { button: 2, buttons: 2, pointerId: 42, clientX: 150, clientY: 140 });
+    fireEvent.pointerMove(viewport, { buttons: 2, pointerId: 42, clientX: 180, clientY: 155 });
+    expect(setPointerCapture).toHaveBeenNthCalledWith(2, 42);
+    await act(async () => delay(40));
+    expect(camera.quaternion.angleTo(rotationBeforePendingLook)).toBeGreaterThan(0.001);
+  });
+
+  it('keeps a held W key active across an inversion toggle and repeat keydown', async () => {
+    const studio = await mountStudio('lumora://drive-invert-mouse-y-held-key');
+    act(() => studio.handle.current!.runtime.editor.setSelection(['sample-camera']));
+    const camera = findNode(studio.scene, 'sample-camera')!;
+    await act(async () => delay(60));
+
+    const positionBeforeHold = camera.position.clone();
+    fireEvent.keyDown(studio.root, { key: 'w', code: 'KeyW' });
+    await act(async () => delay(180));
+    const positionAtToggle = camera.position.clone();
+    expect(positionAtToggle.distanceTo(positionBeforeHold)).toBeGreaterThan(0.01);
+
+    fireEvent.click(within(studio.root).getByRole('checkbox', { name: '鼠标垂直反转' }));
+    fireEvent.keyDown(studio.root, { key: 'w', code: 'KeyW', repeat: true });
+    await act(async () => delay(180));
+    fireEvent.keyUp(studio.root, { key: 'w', code: 'KeyW' });
+
+    expect(camera.position.distanceTo(positionAtToggle)).toBeGreaterThan(0.01);
   });
 
   it('keyboard-mouse mode keeps translation and pointer look independent', async () => {
