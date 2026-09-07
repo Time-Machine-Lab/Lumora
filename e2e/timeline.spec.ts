@@ -337,6 +337,55 @@ test('camera takeover guidance and viewport context-menu suppression follow the 
   expect(await rightDrag(page, viewport)).toBe(true);
 });
 
+test('mouse vertical inversion is accessible and survives off/on/reload', async ({ page }) => {
+  const invert = page.getByTestId('camera-control-invert-y');
+  await expect(invert).toHaveAccessibleName('鼠标垂直反转');
+  await expect(invert).not.toBeChecked();
+
+  await invert.check();
+  await expect(invert).toBeChecked();
+  await page.reload();
+  await page.getByTestId('open-sample-project').click();
+  await expect(page.getByTestId('camera-control-invert-y')).toBeChecked();
+
+  await page.getByTestId('camera-control-invert-y').uncheck();
+  await page.reload();
+  await page.getByTestId('open-sample-project').click();
+  await expect(page.getByTestId('camera-control-invert-y')).not.toBeChecked();
+});
+
+test('non-camera cube recording creates position/rotation tracks and replays them', async ({ page }) => {
+  await page.getByTestId('tree-row-sample-cube').click();
+  const record = page.getByTestId('timeline-record');
+  await expect(record).toBeEnabled();
+  await record.click();
+  await expect(page.getByTestId('overwrite-confirm')).toBeVisible();
+  await page.getByText('覆盖录制').click();
+  await expect(record).toHaveText('■');
+
+  const viewport = page.getByTestId('lumora-viewport');
+  await viewport.focus();
+  const initialPosition = await page.getByTestId('inspector-axis-2').inputValue();
+  await page.keyboard.down('w');
+  await page.waitForTimeout(350);
+  await page.keyboard.up('w');
+  await page.keyboard.down('ArrowRight');
+  await page.waitForTimeout(350);
+  await page.keyboard.up('ArrowRight');
+
+  await record.click();
+  await expect(record).not.toHaveText('■');
+  await expect(page.locator('.lumora-timeline__lane').filter({ hasText: '录制立方体·位置' })).toHaveCount(1);
+  await expect(page.locator('.lumora-timeline__lane').filter({ hasText: '录制立方体·旋转' })).toHaveCount(1);
+
+  // The selected object is reserved for gizmo edits; move selection away so playback owns the cube.
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('timeline-play').click();
+  await page.waitForTimeout(500);
+  await expect.poll(() => page.getByTestId('inspector-axis-2').inputValue()).not.toBe(initialPosition);
+  await page.getByTestId('timeline-play').click();
+});
+
 test('real right-drag drives only an unblocked POV and suppresses complete gestures', async ({ page }) => {
   const viewport = page.getByTestId('lumora-viewport');
   const status = page.getByTestId('camera-control-status');

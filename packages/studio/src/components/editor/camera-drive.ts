@@ -24,6 +24,8 @@ export interface CameraDriveSettings {
   rotateSpeed: number;
   /** 鼠标视角灵敏度倍率 */
   mouseSensitivity: number;
+  /** 鼠标垂直视角方向是否反转 */
+  invertMouseY: boolean;
   /** 平滑系数（1/秒）：速度向目标逼近的指数速率，越大越跟手 */
   smoothing: number;
 }
@@ -35,8 +37,38 @@ export const DEFAULT_CAMERA_DRIVE_SETTINGS: CameraDriveSettings = {
   holdDelay: 0.12,
   rotateSpeed: 1.2,
   mouseSensitivity: 1,
+  invertMouseY: false,
   smoothing: 8,
 };
+
+export const INVERT_MOUSE_Y_STORAGE_KEY = 'lumora.camera-invert-y.v1';
+
+type BooleanStorage = Pick<Storage, 'getItem' | 'setItem'>;
+
+function getBooleanStorage(storage?: BooleanStorage): BooleanStorage | null {
+  if (storage) return storage;
+  try {
+    return typeof window !== 'undefined' && window.localStorage ? window.localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+export function loadInvertMouseY(storage?: BooleanStorage): boolean {
+  const value = getBooleanStorage(storage)?.getItem(INVERT_MOUSE_Y_STORAGE_KEY);
+  return value === 'true';
+}
+
+export function saveInvertMouseY(enabled: boolean, storage?: BooleanStorage): boolean {
+  const target = getBooleanStorage(storage);
+  if (!target) return false;
+  try {
+    target.setItem(INVERT_MOUSE_Y_STORAGE_KEY, String(enabled));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export const CAMERA_DRIVE_LIMITS = Object.freeze({
   speed: Object.freeze({ min: 0.1, max: 20 }),
@@ -155,6 +187,7 @@ export function normalizeCameraDriveSettings(
       CAMERA_DRIVE_LIMITS.mouseSensitivity.min,
       CAMERA_DRIVE_LIMITS.mouseSensitivity.max,
     ),
+    invertMouseY: typeof settings.invertMouseY === 'boolean' ? settings.invertMouseY : base.invertMouseY,
     smoothing: bounded(
       settings.smoothing,
       base.smoothing,
@@ -613,7 +646,8 @@ export class CameraDrive {
 
     if (this.settings.mode === 'keyboard-mouse' && this.lookDelta.lengthSq() > 1e-9) {
       const yaw = -this.lookDelta.x * k * mouseSensitivity * LOOK_RADIANS_PER_PIXEL;
-      const pitch = this.lookDelta.y * k * mouseSensitivity * LOOK_RADIANS_PER_PIXEL;
+      const pitch =
+        this.lookDelta.y * (this.settings.invertMouseY ? -1 : 1) * k * mouseSensitivity * LOOK_RADIANS_PER_PIXEL;
       rotateOnWorldAxis(target, UP_VECTOR, yaw);
       rotateOnLocalAxis(target, pitch);
       this.lookDelta.multiplyScalar(1 - k);

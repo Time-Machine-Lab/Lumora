@@ -841,7 +841,7 @@ export class SceneEditor {
     const nextTracks = project.tracks.map((t) => {
       const incoming = byKey.get(`${t.objectId}\u0000${t.targetPath}`);
       // 录制覆盖：整体替换关键帧并重新启用（禁用轨道录制后必须可回放）
-      return incoming ? { ...t, keyframes: incoming.keyframes, disabled: false } : t;
+      return incoming ? { ...t, name: incoming.name, keyframes: incoming.keyframes, disabled: false } : t;
     });
     const existingKeys = new Set(project.tracks.map((t) => `${t.objectId}\u0000${t.targetPath}`));
     for (const track of owned) {

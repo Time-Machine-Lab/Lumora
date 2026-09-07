@@ -3,7 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SceneEditor, createGroupObject, createSampleProject, getProjectDuration } from '@lumora/core';
 import type { RenderHookResult } from '@testing-library/react';
 import type { CaptureNodeSample } from '../src/components/editor/camera-drive';
-import { CAMERA_DRIVE_LIMITS } from '../src/components/editor/camera-drive';
+import {
+  CAMERA_DRIVE_LIMITS,
+  INVERT_MOUSE_Y_STORAGE_KEY,
+} from '../src/components/editor/camera-drive';
 import { useTimelineSession } from '../src/hooks/use-timeline-session';
 import type { TimelineSession } from '../src/hooks/use-timeline-session';
 
@@ -76,6 +79,24 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
       tapStep: CAMERA_DRIVE_LIMITS.tapStep.min,
       mouseSensitivity: 1,
     });
+  });
+
+  it('鼠标垂直反转按 off/on/reload 持久化', () => {
+    localStorage.removeItem(INVERT_MOUSE_Y_STORAGE_KEY);
+    mount();
+    expect(live().state.cameraControls.invertMouseY).toBe(false);
+
+    act(() => live().setCameraControlSettings({ invertMouseY: true }));
+    expect(live().state.cameraControls.invertMouseY).toBe(true);
+    expect(localStorage.getItem(INVERT_MOUSE_Y_STORAGE_KEY)).toBe('true');
+
+    unmount?.();
+    unmount = null;
+    mount();
+    expect(live().state.cameraControls.invertMouseY).toBe(true);
+
+    act(() => live().setCameraControlSettings({ invertMouseY: false }));
+    expect(localStorage.getItem(INVERT_MOUSE_Y_STORAGE_KEY)).toBe('false');
   });
 
   it('togglePlay 切换播放状态', () => {

@@ -123,7 +123,7 @@ export function PlaybackDriver({
           continue;
         }
         if (skip?.has(objectId)) continue;
-        if (recorder.active && objectId === recorder.recordingCameraId) continue;
+        if (recorder.active && objectId === recorder.recordingObjectId) continue;
         const object = project.objects.find((candidate) => candidate.id === objectId);
         if (!object) {
           pendingRestoreTargets.delete(objectId);
@@ -136,7 +136,7 @@ export function PlaybackDriver({
       }
       for (const track of project.tracks) {
         if (track.disabled) continue;
-        if (recorder.active && track.objectId === recorder.recordingCameraId) continue;
+        if (recorder.active && track.objectId === recorder.recordingObjectId) continue;
         if (skip?.has(track.objectId)) continue;
         const node = findNode(root, track.objectId);
         if (!node) continue;
@@ -160,7 +160,7 @@ export function PlaybackDriver({
       const project = editor.getProject();
       if (!root || !project) return;
       for (const object of project.objects) {
-        if (recorder.active && object.id === recorder.recordingCameraId) continue;
+        if (recorder.active && object.id === recorder.recordingObjectId) continue;
         const node = findNode(root, object.id);
         if (!node) continue;
         restoreObjectOnNode(node, object);

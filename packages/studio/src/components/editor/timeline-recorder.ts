@@ -8,7 +8,7 @@ import type { TrackSample } from '@lumora/core';
 import type { CaptureNodeSample } from './camera-drive';
 
 /** 采样源：给定机位对象 id 返回节点通道值；无节点或不可采时返回 null */
-export type CaptureSource = (cameraObjectId: string) => CaptureNodeSample | null;
+export type CaptureSource = (objectId: string) => CaptureNodeSample | null;
 
 export interface RecorderChannels {
   position: TrackSample[];
@@ -18,7 +18,7 @@ export interface RecorderChannels {
 }
 
 export class TimelineRecorder {
-  private cameraId: string | null = null;
+  private objectId: string | null = null;
   /** 录制绑定项目身份：提交前须与当前项目 uri 一致，否则样本作废（TML-52 审查第 7 项） */
   private projectUri: string | null = null;
   private paused = true;
@@ -33,11 +33,16 @@ export class TimelineRecorder {
   }
 
   get active(): boolean {
-    return this.cameraId !== null;
+    return this.objectId !== null;
   }
 
+  get recordingObjectId(): string | null {
+    return this.objectId;
+  }
+
+  /** Backwards-compatible alias for integrations that still call this a camera take. */
   get recordingCameraId(): string | null {
-    return this.cameraId;
+    return this.objectId;
   }
 
   get boundProjectUri(): string | null {
@@ -49,8 +54,8 @@ export class TimelineRecorder {
   }
 
   /** 开始录制：绑定机位（及所属项目）并清空上一轮样本 */
-  start(cameraObjectId: string, projectUri: string | null): void {
-    this.cameraId = cameraObjectId;
+  start(objectId: string, projectUri: string | null): void {
+    this.objectId = objectId;
     this.projectUri = projectUri;
     this.paused = false;
     this.positionSamples = [];
@@ -72,7 +77,7 @@ export class TimelineRecorder {
   /** 采样当前时刻节点状态；返回是否采集到样本 */
   sample(time: number): boolean {
     if (!this.active || this.paused || !this.source) return false;
-    const capture = this.source(this.cameraId!);
+    const capture = this.source(this.objectId!);
     if (!capture) return false;
     this.positionSamples.push({ time, value: capture.position });
     this.rotationSamples.push({ time, value: capture.rotation });
@@ -102,7 +107,7 @@ export class TimelineRecorder {
   stop(): RecorderChannels | null {
     if (!this.active) return null;
     const channels = this.snapshot()!;
-    this.cameraId = null;
+    this.objectId = null;
     this.projectUri = null;
     this.paused = true;
     this.positionSamples = [];
