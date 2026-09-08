@@ -485,8 +485,11 @@ export class CameraDrive {
 
   setSettings(settings: Partial<CameraDriveSettings>): void {
     const previousMode = this.settings.mode;
+    const previousInvertMouseY = this.settings.invertMouseY;
     this.settings = normalizeCameraDriveSettings(settings, this.settings);
-    if (this.settings.mode !== previousMode) this.clearMotion();
+    if (this.settings.mode !== previousMode || this.settings.invertMouseY !== previousInvertMouseY) {
+      this.clearMotion();
+    }
   }
 
   acceptsKey(code: string): boolean {
@@ -663,11 +666,10 @@ export class CameraDrive {
   }
 
   private applyFocal(node: THREE.Object3D, focalLength: number): void {
+    if (!(node instanceof THREE.PerspectiveCamera)) return;
     (node.userData as Record<string, unknown>).focalLength = focalLength;
-    if (node instanceof THREE.PerspectiveCamera) {
-      node.fov = focalLengthToFovDeg(focalLength);
-      node.updateProjectionMatrix();
-    }
+    node.fov = focalLengthToFovDeg(focalLength);
+    node.updateProjectionMatrix();
   }
 }
 
@@ -683,9 +685,9 @@ export interface CaptureNodeSample {
 
 /** 把录制机位节点映射为采样通道值（focalLength 优先读 userData，否则由 fov 反推） */
 export function captureCameraSample(node: THREE.Object3D): CaptureNodeSample {
-  const focal =
-    (node.userData as Record<string, unknown>).focalLength ??
-    (node instanceof THREE.PerspectiveCamera ? fovDegToFocalLength(node.fov) : null);
+  const focal = node instanceof THREE.PerspectiveCamera
+    ? (node.userData as Record<string, unknown>).focalLength ?? fovDegToFocalLength(node.fov)
+    : null;
   return {
     position: [node.position.x, node.position.y, node.position.z],
     rotation: [node.rotation.x, node.rotation.y, node.rotation.z],

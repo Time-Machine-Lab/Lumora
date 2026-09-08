@@ -805,8 +805,12 @@ function useCameraDrive(
       const st = sessionRef.current?.state;
       if (st) {
         const previousMode = drive.getSettings().mode;
+        const previousInvertMouseY = drive.getSettings().invertMouseY;
         drive.setSettings(st.cameraControls);
-        if (drive.getSettings().mode !== previousMode) {
+        if (
+          drive.getSettings().mode !== previousMode ||
+          drive.getSettings().invertMouseY !== previousInvertMouseY
+        ) {
           heldKeys.clear();
           endLookGesture();
         }
@@ -1175,9 +1179,15 @@ function CameraPoseReadout({
       if (!root || !project) return;
       const poses: Record<string, unknown> = {};
       for (const object of project.objects) {
-        if (object.type !== 'camera') continue;
         const node = findNode(root, object.id);
         if (!node) continue;
+        if (object.type !== 'camera') {
+          poses[object.id] = {
+            position: [node.position.x, node.position.y, node.position.z],
+            rotation: [node.rotation.x, node.rotation.y, node.rotation.z],
+          };
+          continue;
+        }
         const focal = (node.userData as Record<string, unknown>).focalLength;
         poses[object.id] = {
           position: [node.position.x, node.position.y, node.position.z],

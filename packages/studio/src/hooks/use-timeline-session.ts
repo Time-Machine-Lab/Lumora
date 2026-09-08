@@ -463,6 +463,7 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       const label = object.name;
       const tracks: TrackData[] = [];
       for (const channel of ['position', 'rotation', 'focalLength'] as const) {
+        if (channel === 'focalLength' && object.type !== 'camera') continue;
         const samples = channels[channel];
         if (!samples || samples.length === 0) continue;
         // 通道语义传给抽稀：rotation 按 slerp 角距离判定（与回放求值同源，
@@ -478,7 +479,10 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
         const result = editor.commitRecordingTracks(tracks, '录制关键帧');
         if (!result.ok) {
           showToast(result.error.message, 'error');
-          setState((s) => ({ ...s, recording: true, recordingPaused: true, playing: false }));
+          recorder.stop();
+          recordedSessionTokenRef.current = null;
+          recordedProjectUriRef.current = null;
+          setState((s) => ({ ...s, recording: false, recordingPaused: false, playing: false }));
           return { ok: false, message: result.error.message };
         }
       }

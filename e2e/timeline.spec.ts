@@ -145,6 +145,18 @@ async function stableCameraPose(
   throw new Error(`机位 ${cameraId} 未在稳定帧窗口内静止`);
 }
 
+async function objectPose(
+  page: Page,
+  objectId: string,
+): Promise<{ position: [number, number, number]; rotation: [number, number, number] }> {
+  await waitForStableFrame(page);
+  const text = await page.getByTestId('camera-pose-readout').textContent();
+  if (!text) throw new Error('scene pose readout unavailable');
+  const pose = JSON.parse(text)[objectId];
+  if (!pose) throw new Error(`scene object ${objectId} is not in the pose readout`);
+  return pose;
+}
+
 async function rightDrag(
   page: Page,
   viewport: ReturnType<Page['getByTestId']>,
@@ -354,8 +366,37 @@ test('mouse vertical inversion is accessible and survives off/on/reload', async 
   await expect(page.getByTestId('camera-control-invert-y')).not.toBeChecked();
 });
 
+test('changing invertMouseY while holding right button ends the active look gesture', async ({ page }) => {
+  const viewport = page.getByTestId('lumora-viewport');
+  const bounds = await viewport.boundingBox();
+  if (!bounds) throw new Error('viewport is unavailable');
+  await startRecording(page);
+  await viewport.focus();
+  const before = await cameraPose(page);
+  await viewport.click({ position: { x: bounds.width * 0.45, y: bounds.height * 0.5 } });
+  await page.mouse.move(bounds.x + bounds.width * 0.45, bounds.y + bounds.height * 0.5);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(bounds.x + bounds.width * 0.45, bounds.y + bounds.height * 0.35, { steps: 4 });
+  await page.waitForTimeout(80);
+  const during = await cameraPose(page);
+  const invert = page.getByTestId('camera-control-invert-y');
+  await invert.evaluate((element) => (element as HTMLInputElement).click());
+  const afterToggle = await cameraPose(page);
+  await page.mouse.move(bounds.x + bounds.width * 0.45, bounds.y + bounds.height * 0.65, { steps: 4 });
+  await page.waitForTimeout(120);
+  const afterMove = await cameraPose(page);
+  await page.mouse.up({ button: 'right' });
+
+  expect(quaternionAngle(during.rotation, before.rotation)).toBeGreaterThan(0.0001);
+  expect(quaternionAngle(afterMove.rotation, afterToggle.rotation)).toBeLessThan(0.0001);
+  await page.getByTestId('timeline-record').click();
+});
+
 test('non-camera cube recording creates position/rotation tracks and replays them', async ({ page }) => {
   await page.getByTestId('tree-row-sample-cube').click();
+  await expect(page.getByTestId('tree-row-sample-cube')).toHaveAttribute('aria-selected', 'true');
+  await page.getByRole('button', { name: '纯键盘操控' }).click();
+  await expect(page.getByTestId('tree-row-sample-cube')).toHaveAttribute('aria-selected', 'true');
   const record = page.getByTestId('timeline-record');
   await expect(record).toBeEnabled();
   await record.click();
@@ -365,7 +406,7 @@ test('non-camera cube recording creates position/rotation tracks and replays the
 
   const viewport = page.getByTestId('lumora-viewport');
   await viewport.focus();
-  const initialPosition = await page.getByTestId('inspector-axis-2').inputValue();
+  const initialPose = await objectPose(page, 'sample-cube');
   await page.keyboard.down('w');
   await page.waitForTimeout(350);
   await page.keyboard.up('w');
@@ -382,7 +423,11 @@ test('non-camera cube recording creates position/rotation tracks and replays the
   await page.getByTestId('tree-row-sample-camera').click();
   await page.getByTestId('timeline-play').click();
   await page.waitForTimeout(500);
-  await expect.poll(() => page.getByTestId('inspector-axis-2').inputValue()).not.toBe(initialPosition);
+  await expect.poll(async () => {
+    const pose = await objectPose(page, 'sample-cube');
+    return vectorDistance(pose.position, initialPose.position) > 0.001 ||
+      vectorDistance(pose.rotation, initialPose.rotation) > 0.001;
+  }).toBe(true);
   await page.getByTestId('timeline-play').click();
 });
 

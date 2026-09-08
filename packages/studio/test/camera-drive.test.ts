@@ -754,6 +754,19 @@ describe('CameraDrive：键鼠驾驶积分器', () => {
     expect(drive.acceptsKey('ArrowLeft')).toBe(true);
   });
 
+  it('clears queued look when invertMouseY changes', () => {
+    const drive = new CameraDrive({ mode: 'keyboard-mouse', mouseSensitivity: 1, smoothing: 8, invertMouseY: false });
+    const node = makeCameraNode();
+    drive.attach(node);
+    drive.look(0, 80);
+    drive.setSettings({ invertMouseY: true });
+    const before = node.quaternion.clone();
+    drive.update(0.1);
+
+    expect(node.quaternion.angleTo(before)).toBeLessThan(1e-9);
+    expect(drive.hasInput).toBe(false);
+  });
+
   it('鼠标视角限幅且残余输入逐帧衰减，不会产生单帧无界跳变', () => {
     const huge = new CameraDrive({ mode: 'keyboard-mouse', mouseSensitivity: 1, smoothing: 8 });
     const bounded = new CameraDrive({ mode: 'keyboard-mouse', mouseSensitivity: 1, smoothing: 8 });
@@ -815,7 +828,18 @@ describe('captureCameraSample / restoreObjectOnNode', () => {
     const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 100);
     expect(captureCameraSample(camera).focalLength).toBeGreaterThan(0);
     const group = new THREE.Group();
+    group.userData.focalLength = 24;
     expect(captureCameraSample(group).focalLength).toBeNull();
+  });
+
+  it('does not write focalLength when a focal shortcut targets a non-camera node', () => {
+    const drive = new CameraDrive({ mode: 'keyboard-mouse', smoothing: 8 });
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1));
+    drive.attach(mesh);
+    drive.press('BracketRight');
+    drive.update(0.2);
+
+    expect(mesh.userData.focalLength).toBeUndefined();
   });
 
   it('restoreObjectOnNode 还原静态位姿与相机参数，清除驾驶焦距标记', () => {

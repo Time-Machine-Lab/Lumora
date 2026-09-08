@@ -175,19 +175,25 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
       failed = live().stopRecording();
     });
     expect(failed!).toEqual({ ok: false, message: '模拟录制提交失败' });
-    expect(live().recorder.active).toBe(true);
-    expect(live().recorder.isPaused).toBe(true);
-    expect(live().state.recording).toBe(true);
-    expect(live().state.recordingPaused).toBe(true);
-
-    commit.mockRestore();
-    let retried: ReturnType<TimelineSession['stopRecording']>;
-    act(() => {
-      retried = live().stopRecording();
-    });
-    expect(retried!).toEqual({ ok: true });
     expect(live().recorder.active).toBe(false);
     expect(live().state.recording).toBe(false);
+    expect(live().state.recordingPaused).toBe(false);
+
+    commit.mockRestore();
+    expect(live().stopRecording()).toEqual({ ok: true });
+  });
+
+  it('non-camera recording filters focal samples and commits position/rotation', () => {
+    mount();
+    act(() => live().setCaptureSource(() => ({ position: [1, 0, 0], rotation: [0, 0.25, 0], focalLength: 35 })));
+    act(() => live().startRecording('sample-cube'));
+    act(() => vi.advanceTimersByTime(300));
+
+    expect(live().stopRecording()).toEqual({ ok: true });
+    expect(live().recorder.active).toBe(false);
+    expect(live().state.recording).toBe(false);
+    expect(editor.getProject()!.tracks.filter((track) => track.objectId === 'sample-cube').map((track) => track.targetPath).sort())
+      .toEqual(['position', 'rotation']);
   });
 
   it('B1 回归：约 5s 持续录制中会话对象身份稳定 —— 驾驶输入不再被会话重建清空', () => {

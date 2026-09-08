@@ -520,11 +520,11 @@ describe('LumoraStudio', () => {
 
     await expect(handle.current!.close()).resolves.toEqual({ ok: false, message: '模拟录制提交失败' });
     expect(dispose).not.toHaveBeenCalled();
-    expect(stop).not.toHaveBeenCalled();
+    expect(stop).toHaveBeenCalledTimes(1);
 
     commit.mockReturnValue({ ok: true });
     await expect(handle.current!.close()).resolves.toEqual(expect.objectContaining({ ok: true }));
-    expect(commit).toHaveBeenCalledTimes(2);
+    expect(commit).toHaveBeenCalledTimes(1);
     expect(stop).toHaveBeenCalledTimes(1);
     expect(dispose).toHaveBeenCalledTimes(1);
   });
