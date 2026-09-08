@@ -21,7 +21,9 @@ import { TimelineRecorder } from '../components/editor/timeline-recorder';
 import type { CaptureSource } from '../components/editor/timeline-recorder';
 import {
   DEFAULT_CAMERA_DRIVE_SETTINGS,
+  loadInvertMouseY,
   normalizeCameraDriveSettings,
+  saveInvertMouseY,
 } from '../components/editor/camera-drive';
 import type { CameraDriveSettings } from '../components/editor/camera-drive';
 import { showToast } from '../components/editor/toasts';
@@ -65,8 +67,8 @@ export interface TimelineSession {
   setLoop(enabled: boolean): void;
   setCaptureSource(source: CaptureSource | null): void;
   setCameraControlSettings(settings: Partial<CameraDriveSettings>): void;
-  /** 开始录制指定机位；已有录制轨道时进入覆盖确认 */
-  startRecording(cameraObjectId: string): void;
+  /** 开始录制指定对象；已有录制轨道时进入覆盖确认 */
+  startRecording(objectId: string): void;
   confirmOverwrite(): void;
   cancelOverwrite(): void;
   /** 恢复暂停中的录制（同时恢复播放） */
@@ -93,10 +95,10 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     zoom: timeline.getZoom(),
     snapEnabled: timeline.isSnapEnabled(),
     loopEnabled: timeline.isLoopEnabled(),
-    cameraControls: { ...DEFAULT_CAMERA_DRIVE_SETTINGS },
+    cameraControls: { ...DEFAULT_CAMERA_DRIVE_SETTINGS, invertMouseY: loadInvertMouseY() },
   }));
 
-  const pendingRecordingRef = useRef<{ sessionToken: number; cameraId: string } | null>(null);
+  const pendingRecordingRef = useRef<{ sessionToken: number; objectId: string } | null>(null);
   /** 本 hook 观察中的项目会话令牌：project:changed 里据此判定「会话切换」
    *  （打开/重开/重置）。与 recordedSessionTokenRef 分离 —— 后者仅录制时非空，
    *  不能作为会话变化依据（从未录制时不得把每次编辑误判为切换） */
@@ -111,12 +113,12 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
    *  调用返回前切换项目或执行另一录制动作。只有仍持有当前代、会话和机位的
    *  外层动作才允许写 React 状态。 */
   const recordingOperationGenerationRef = useRef(0);
-  type RecordingOperation = { generation: number; sessionToken: number; cameraId: string };
+  type RecordingOperation = { generation: number; sessionToken: number; objectId: string };
   const captureRecordingOperation = useCallback(
-    (cameraId: string): RecordingOperation => ({
+    (objectId: string): RecordingOperation => ({
       generation: ++recordingOperationGenerationRef.current,
       sessionToken: editor.getSessionToken(),
-      cameraId,
+      objectId,
     }),
     [editor],
   );
@@ -124,7 +126,7 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     (operation: RecordingOperation): boolean =>
       recordingOperationGenerationRef.current === operation.generation &&
       editor.isCurrentSession(operation.sessionToken) &&
-      recorder.recordingCameraId === operation.cameraId,
+      recorder.recordingObjectId === operation.objectId,
     [editor, recorder],
   );
 
@@ -202,8 +204,8 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
         }
         if (!recorder.active) {
           if (!runWhileCurrent(() => timeline.setDuration(getProjectDuration(project)))) return;
-        } else if (!project.objects.some((o) => o.id === recorder.recordingCameraId)) {
-          // 录制中绑定机位被删除/撤销：采样源已失效，取消录制并把时长收敛回
+        } else if (!project.objects.some((o) => o.id === recorder.recordingObjectId)) {
+          // 录制中绑定对象被删除/撤销：采样源已失效，取消录制并把时长收敛回
           // 项目时长（录制扩容出的时长不得残留，复审阻断 3）
           cancelRecording();
           if (!isCurrentPayload()) return;
@@ -259,7 +261,7 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     const pauseOnHidden = () => {
       const r = recorderRef.current!;
       if (r.active && !r.isPaused) {
-        const operation = captureRecordingOperation(r.recordingCameraId!);
+        const operation = captureRecordingOperation(r.recordingObjectId!);
         r.pause();
         timelineRef.current!.pause();
         if (isRecordingOperationCurrent(operation)) {
@@ -281,16 +283,16 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     if (recorder.active) {
       // 录制期间播放键 = 暂停/恢复录制（采样随播放头一起停）
       if (recorder.isPaused) {
-        const cameraId = recorder.recordingCameraId!;
-        const operation = captureRecordingOperation(cameraId);
+        const recordingObjectId = recorder.recordingObjectId!;
+        const operation = captureRecordingOperation(recordingObjectId);
         recorder.resume();
         timeline.play();
         if (isRecordingOperationCurrent(operation)) {
           setState((s) => ({ ...s, recording: true, recordingPaused: false, playing: true }));
         }
       } else {
-        const cameraId = recorder.recordingCameraId!;
-        const operation = captureRecordingOperation(cameraId);
+        const recordingObjectId = recorder.recordingObjectId!;
+        const operation = captureRecordingOperation(recordingObjectId);
         recorder.pause();
         timeline.pause();
         if (isRecordingOperationCurrent(operation)) {
@@ -304,8 +306,8 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
 
   const pause = useCallback(() => {
     if (recorder.active) {
-      const cameraId = recorder.recordingCameraId!;
-      const operation = captureRecordingOperation(cameraId);
+      const recordingObjectId = recorder.recordingObjectId!;
+      const operation = captureRecordingOperation(recordingObjectId);
       recorder.pause();
       timeline.pause();
       if (isRecordingOperationCurrent(operation)) {
@@ -339,19 +341,20 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       ...current,
       cameraControls: normalizeCameraDriveSettings(settings, current.cameraControls),
     }));
+    if (typeof settings.invertMouseY === 'boolean') saveInvertMouseY(settings.invertMouseY);
   }, []);
 
   const beginRecording = useCallback(
-    (cameraObjectId: string) => {
+    (objectId: string) => {
       const project = editor.getProject();
       const projectUri = project?.uri ?? null;
       const sessionToken = editor.getSessionToken();
       // 绑定身份后再采样：项目切换/重开/相机删除时按身份取消（审查第 7 项；
       // 复审阻断 3：会话令牌参与绑定，同 URI 重开不视为同一会话）
-      recorder.start(cameraObjectId, projectUri);
+      recorder.start(objectId, projectUri);
       recordedSessionTokenRef.current = sessionToken;
       recordedProjectUriRef.current = projectUri;
-      const operation = captureRecordingOperation(cameraObjectId);
+      const operation = captureRecordingOperation(objectId);
       timeline.play();
       if (isRecordingOperationCurrent(operation)) {
         setState((s) => ({ ...s, recording: true, recordingPaused: false }));
@@ -371,20 +374,20 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
     if (!pending) return;
     if (!editor.isCurrentSession(pending.sessionToken)) return;
     const project = editor.getProject();
-    const camera = project?.objects.find((o) => o.id === pending.cameraId);
-    if (!camera || camera.type !== 'camera') {
-      showToast('目标机位已不存在，无法录制', 'error');
+    const object = project?.objects.find((o) => o.id === pending.objectId);
+    if (!object) {
+      showToast('目标对象已不存在，无法录制', 'error');
       return;
     }
-    beginRecording(pending.cameraId);
+    beginRecording(pending.objectId);
   }, [beginRecording, editor]);
 
   const startRecording = useCallback(
-    (cameraObjectId: string) => {
+    (objectId: string) => {
       if (recorder.active) {
         if (recorder.isPaused) {
-          const cameraId = recorder.recordingCameraId!;
-          const operation = captureRecordingOperation(cameraId);
+          const recordingObjectId = recorder.recordingObjectId!;
+          const operation = captureRecordingOperation(recordingObjectId);
           recorder.resume();
           timeline.play();
           if (isRecordingOperationCurrent(operation)) {
@@ -395,20 +398,20 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       }
       const project = editor.getProject();
       if (!project) return;
-      const camera = project.objects.find((o) => o.id === cameraObjectId);
-      if (!camera || camera.type !== 'camera') return;
+      const object = project.objects.find((o) => o.id === objectId);
+      if (!object) return;
       const hasRecorded = project.tracks.some(
-        (t) => t.objectId === cameraObjectId && t.keyframes.length > 0,
+        (t) => t.objectId === objectId && t.keyframes.length > 0,
       );
       if (hasRecorded) {
         pendingRecordingRef.current = {
           sessionToken: editor.getSessionToken(),
-          cameraId: cameraObjectId,
+          objectId,
         };
         setState((s) => ({ ...s, overwritePending: true }));
         return;
       }
-      beginRecording(cameraObjectId);
+      beginRecording(objectId);
     },
     [captureRecordingOperation, editor, isRecordingOperationCurrent, recorder, timeline, beginRecording],
   );
@@ -420,8 +423,8 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
 
   const resumeRecording = useCallback(() => {
     if (recorder.active && recorder.isPaused) {
-      const cameraId = recorder.recordingCameraId!;
-      const operation = captureRecordingOperation(cameraId);
+      const recordingObjectId = recorder.recordingObjectId!;
+      const operation = captureRecordingOperation(recordingObjectId);
       recorder.resume();
       timeline.play();
       if (isRecordingOperationCurrent(operation)) {
@@ -447,19 +450,20 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
       setState((s) => ({ ...s, recording: false, recordingPaused: false }));
       return { ok: true };
     }
-    const cameraObjectId = recorder.recordingCameraId;
+    const recordingObjectId = recorder.recordingObjectId;
     const projectUri = recorder.boundProjectUri;
     const channels = recorder.snapshot();
     // 停止时重验绑定身份：项目已切换或相机已删除 → 丢弃样本，不提交
     const project = editor.getProject();
-    const camera =
-      channels && project && project.uri === projectUri && cameraObjectId
-        ? (project.objects.find((o) => o.id === cameraObjectId) ?? null)
+    const object =
+      channels && project && project.uri === projectUri && recordingObjectId
+        ? (project.objects.find((o) => o.id === recordingObjectId) ?? null)
         : null;
-    if (camera && channels && cameraObjectId) {
-      const label = camera.name;
+    if (object && channels && recordingObjectId) {
+      const label = object.name;
       const tracks: TrackData[] = [];
       for (const channel of ['position', 'rotation', 'focalLength'] as const) {
+        if (channel === 'focalLength' && object.type !== 'camera') continue;
         const samples = channels[channel];
         if (!samples || samples.length === 0) continue;
         // 通道语义传给抽稀：rotation 按 slerp 角距离判定（与回放求值同源，
@@ -467,7 +471,7 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
         const keyframes = simplifySamples(samples, { channel }) as TrackKeyframeData[];
         if (keyframes.length === 0) continue;
         tracks.push(
-          createTrack(cameraObjectId, channel as TrackTargetPath, `录制${label}·${CHANNEL_LABELS[channel]}`, keyframes),
+          createTrack(recordingObjectId, channel as TrackTargetPath, `录制${label}·${CHANNEL_LABELS[channel]}`, keyframes),
         );
       }
       if (tracks.length > 0) {
@@ -475,6 +479,8 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
         const result = editor.commitRecordingTracks(tracks, '录制关键帧');
         if (!result.ok) {
           showToast(result.error.message, 'error');
+          // Keep the paused recorder/session alive so the host can retry the
+          // atomic commit on the next close() without losing its samples.
           setState((s) => ({ ...s, recording: true, recordingPaused: true, playing: false }));
           return { ok: false, message: result.error.message };
         }

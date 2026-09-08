@@ -511,10 +511,10 @@ describe('LumoraStudio', () => {
       focalLength: null,
     });
     const stop = vi.spyOn(TimelineRecorder.prototype, 'stop');
-    const commit = vi.spyOn(handle.current!.runtime.editor, 'commitRecordingTracks').mockReturnValue({
+    const commit = vi.spyOn(handle.current!.runtime.editor, 'commitRecordingTracks').mockImplementationOnce(() => ({
       ok: false,
       error: new Error('模拟录制提交失败'),
-    });
+    }));
     const dispose = vi.spyOn(handle.current!.runtime, 'dispose');
     screen.getByTestId('timeline-record').click();
 
@@ -522,11 +522,12 @@ describe('LumoraStudio', () => {
     expect(dispose).not.toHaveBeenCalled();
     expect(stop).not.toHaveBeenCalled();
 
-    commit.mockReturnValue({ ok: true });
     await expect(handle.current!.close()).resolves.toEqual(expect.objectContaining({ ok: true }));
     expect(commit).toHaveBeenCalledTimes(2);
     expect(stop).toHaveBeenCalledTimes(1);
     expect(dispose).toHaveBeenCalledTimes(1);
+    expect((commit.mock.calls[1]?.[0] ?? []).filter((track) => track.objectId === 'sample-camera').map((track) => track.targetPath).sort())
+      .toEqual(['position', 'rotation']);
   });
 
   it('录制提交同步事件重入 close() 时复用已发布的 single-flight，不重复最终化', async () => {

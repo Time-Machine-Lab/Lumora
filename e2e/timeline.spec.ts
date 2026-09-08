@@ -145,6 +145,18 @@ async function stableCameraPose(
   throw new Error(`机位 ${cameraId} 未在稳定帧窗口内静止`);
 }
 
+async function objectPose(
+  page: Page,
+  objectId: string,
+): Promise<{ position: [number, number, number]; rotation: [number, number, number] }> {
+  await waitForStableFrame(page);
+  const text = await page.getByTestId('camera-pose-readout').textContent();
+  if (!text) throw new Error('scene pose readout unavailable');
+  const pose = JSON.parse(text)[objectId];
+  if (!pose) throw new Error(`scene object ${objectId} is not in the pose readout`);
+  return pose;
+}
+
 async function rightDrag(
   page: Page,
   viewport: ReturnType<Page['getByTestId']>,
@@ -335,6 +347,88 @@ test('camera takeover guidance and viewport context-menu suppression follow the 
   await expect(exportStatus).toBeVisible();
   await expect(exportStatus).toContainText('导出工作区正在接管视口；关闭导出工作区后可手动操控。');
   expect(await rightDrag(page, viewport)).toBe(true);
+});
+
+test('mouse vertical inversion is accessible and survives off/on/reload', async ({ page }) => {
+  const invert = page.getByTestId('camera-control-invert-y');
+  await expect(invert).toHaveAccessibleName('鼠标垂直反转');
+  await expect(invert).not.toBeChecked();
+
+  await invert.check();
+  await expect(invert).toBeChecked();
+  await page.reload();
+  await page.getByTestId('open-sample-project').click();
+  await expect(page.getByTestId('camera-control-invert-y')).toBeChecked();
+
+  await page.getByTestId('camera-control-invert-y').uncheck();
+  await page.reload();
+  await page.getByTestId('open-sample-project').click();
+  await expect(page.getByTestId('camera-control-invert-y')).not.toBeChecked();
+});
+
+test('changing invertMouseY while holding right button ends the active look gesture', async ({ page }) => {
+  const viewport = page.getByTestId('lumora-viewport');
+  const bounds = await viewport.boundingBox();
+  if (!bounds) throw new Error('viewport is unavailable');
+  await startRecording(page);
+  await viewport.focus();
+  const before = await cameraPose(page);
+  await viewport.click({ position: { x: bounds.width * 0.45, y: bounds.height * 0.5 } });
+  await page.mouse.move(bounds.x + bounds.width * 0.45, bounds.y + bounds.height * 0.5);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(bounds.x + bounds.width * 0.45, bounds.y + bounds.height * 0.35, { steps: 4 });
+  await page.waitForTimeout(80);
+  const during = await cameraPose(page);
+  const invert = page.getByTestId('camera-control-invert-y');
+  await invert.evaluate((element) => (element as HTMLInputElement).click());
+  const afterToggle = await cameraPose(page);
+  await page.mouse.move(bounds.x + bounds.width * 0.45, bounds.y + bounds.height * 0.65, { steps: 4 });
+  await page.waitForTimeout(120);
+  const afterMove = await cameraPose(page);
+  await page.mouse.up({ button: 'right' });
+
+  expect(quaternionAngle(during.rotation, before.rotation)).toBeGreaterThan(0.0001);
+  expect(quaternionAngle(afterMove.rotation, afterToggle.rotation)).toBeLessThan(0.0001);
+  await page.getByTestId('timeline-record').click();
+});
+
+test('non-camera cube recording creates position/rotation tracks and replays them', async ({ page }) => {
+  await page.getByTestId('tree-row-sample-cube').click();
+  await expect(page.getByTestId('tree-row-sample-cube')).toHaveAttribute('aria-selected', 'true');
+  await page.getByRole('button', { name: '纯键盘操控' }).click();
+  await expect(page.getByTestId('tree-row-sample-cube')).toHaveAttribute('aria-selected', 'true');
+  const record = page.getByTestId('timeline-record');
+  await expect(record).toBeEnabled();
+  await record.click();
+  await expect(page.getByTestId('overwrite-confirm')).toBeVisible();
+  await page.getByText('覆盖录制').click();
+  await expect(record).toHaveText('■');
+
+  const viewport = page.getByTestId('lumora-viewport');
+  await viewport.focus();
+  const initialPose = await objectPose(page, 'sample-cube');
+  await page.keyboard.down('w');
+  await page.waitForTimeout(350);
+  await page.keyboard.up('w');
+  await page.keyboard.down('ArrowRight');
+  await page.waitForTimeout(350);
+  await page.keyboard.up('ArrowRight');
+
+  await record.click();
+  await expect(record).not.toHaveText('■');
+  await expect(page.locator('.lumora-timeline__lane').filter({ hasText: '录制立方体·位置' })).toHaveCount(1);
+  await expect(page.locator('.lumora-timeline__lane').filter({ hasText: '录制立方体·旋转' })).toHaveCount(1);
+
+  // The selected object is reserved for gizmo edits; move selection away so playback owns the cube.
+  await page.getByTestId('tree-row-sample-camera').click();
+  await page.getByTestId('timeline-play').click();
+  await page.waitForTimeout(500);
+  await expect.poll(async () => {
+    const pose = await objectPose(page, 'sample-cube');
+    return vectorDistance(pose.position, initialPose.position) > 0.001 ||
+      vectorDistance(pose.rotation, initialPose.rotation) > 0.001;
+  }).toBe(true);
+  await page.getByTestId('timeline-play').click();
 });
 
 test('real right-drag drives only an unblocked POV and suppresses complete gestures', async ({ page }) => {

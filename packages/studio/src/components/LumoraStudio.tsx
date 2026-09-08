@@ -519,8 +519,8 @@ export const LumoraStudio = forwardRef<LumoraStudioHandle, LumoraStudioProps>(fu
         const project = editor.getProject();
         const selection = editor.getSelection();
         const selected = project && selection.length === 1 ? findObject(project, selection[0]!) : null;
-        if (selected?.type === 'camera') activeSession.startRecording(selected.id);
-        else showToast('请先选择一个机位再开始录制', 'error');
+        if (selected) activeSession.startRecording(selected.id);
+        else showToast('请先选择一个可动画对象再开始录制', 'error');
         return;
       }
       if ((event.ctrlKey || event.metaKey) && key === 'z') {

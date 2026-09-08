@@ -97,22 +97,21 @@ export function TimelinePanel({
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
 
-  const selectedCamera = useMemo(() => {
+  const selectedObject = useMemo(() => {
     if (selection.length !== 1) return null;
     const object = findObject(project, selection[0]!);
-    return object && object.type === 'camera' ? object : null;
+    return object ?? null;
   }, [project, selection]);
 
-  const driveCamera = useMemo(() => {
-    const cameraId = state.recording
-      ? session.recorder.recordingCameraId
+  const driveObject = useMemo(() => {
+    const objectId = state.recording
+      ? session.recorder.recordingObjectId
       : view.viewMode === 'director'
         ? null
         : view.viewMode.cameraObjectId;
-    if (!cameraId) return null;
-    const object = findObject(project, cameraId);
-    return object?.type === 'camera' ? object : null;
-  }, [project, session.recorder.recordingCameraId, state.recording, view.viewMode]);
+    if (!objectId) return null;
+    return findObject(project, objectId) ?? null;
+  }, [project, session.recorder.recordingObjectId, state.recording, view.viewMode]);
   const bodyRef = useRef<HTMLDivElement>(null);
   const trackLaneRefs = useRef(new Map<string, HTMLDivElement>());
   const rulerRef = useRef<HTMLDivElement>(null);
@@ -307,11 +306,11 @@ export function TimelinePanel({
       recordingPaused: state.recordingPaused,
       playing: state.playing,
       recording: state.recording,
-      cameraId: driveCamera?.id ?? null,
-      cameraName: driveCamera?.name ?? null,
+      cameraId: driveObject?.id ?? null,
+      cameraName: driveObject?.name ?? null,
       tracks: project.tracks,
     }),
-    [driveCamera, driveEnabled, project.tracks, state.overwritePending, state.playing, state.recording, state.recordingPaused],
+    [driveObject, driveEnabled, project.tracks, state.overwritePending, state.playing, state.recording, state.recordingPaused],
   );
   const driveBlocked = blockers.length > 0;
   const locateTakeoverTrack = useCallback(() => {
@@ -339,8 +338,8 @@ export function TimelinePanel({
         )}
       </span>
     ))
-    : driveCamera
-      ? `机位“${driveCamera.name}”可手动操控。`
+    : driveObject
+      ? `${driveObject.type === 'camera' ? '机位' : '对象'}“${driveObject.name}”可手动操控。`
       : '导演视图可手动操控。';
 
   const recordClick = () => {
@@ -349,7 +348,7 @@ export function TimelinePanel({
       else session.stopRecording();
       return;
     }
-    if (selectedCamera) session.startRecording(selectedCamera.id);
+    if (selectedObject) session.startRecording(selectedObject.id);
   };
 
   // 覆盖确认模态：真模态语义 —— 初始聚焦首个可聚焦项（容器不再拿焦点，消除
@@ -386,15 +385,15 @@ export function TimelinePanel({
           className={`lumora-timeline__record${state.recording ? ' lumora-timeline__record--on' : ''}`}
           data-testid="timeline-record"
           title={
-            !selectedCamera && !state.recording
-              ? `选中一个机位后开始录制（${formatShortcut(recordingShortcut)}）`
+            !selectedObject && !state.recording
+              ? `选中一个可动画对象后开始录制（${formatShortcut(recordingShortcut)}）`
               : state.recordingPaused
                 ? `继续录制（${formatShortcut(recordingShortcut)}）`
                 : state.recording
                   ? `停止录制（${formatShortcut(recordingShortcut)}）`
-                  : `录制机位运动（${formatShortcut(recordingShortcut)}）`
+                  : `录制对象运动（${formatShortcut(recordingShortcut)}）`
           }
-          disabled={!selectedCamera && !state.recording}
+          disabled={!selectedObject && !state.recording}
           onClick={recordClick}
         >
           {state.recordingPaused ? '▶' : state.recording ? '■' : '●'}
@@ -480,6 +479,17 @@ export function TimelinePanel({
             <span className="lumora-camera-controls__value" aria-hidden="true">
               {state.cameraControls.mouseSensitivity.toFixed(1)}
             </span>
+          </label>
+          <label className="lumora-check lumora-camera-controls__invert">
+            <input
+              type="checkbox"
+              aria-label="鼠标垂直反转"
+              data-testid="camera-control-invert-y"
+              checked={state.cameraControls.invertMouseY}
+              disabled={state.cameraControls.mode === 'keyboard-only'}
+              onChange={(event) => session.setCameraControlSettings({ invertMouseY: event.target.checked })}
+            />
+            鼠标垂直反转
           </label>
           <span
             className={`lumora-camera-controls__status${driveBlocked ? ' lumora-camera-controls__status--blocked' : ''}`}

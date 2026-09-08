@@ -24,6 +24,8 @@ export interface CameraDriveSettings {
   rotateSpeed: number;
   /** 鼠标视角灵敏度倍率 */
   mouseSensitivity: number;
+  /** 鼠标垂直视角方向是否反转 */
+  invertMouseY: boolean;
   /** 平滑系数（1/秒）：速度向目标逼近的指数速率，越大越跟手 */
   smoothing: number;
 }
@@ -35,8 +37,43 @@ export const DEFAULT_CAMERA_DRIVE_SETTINGS: CameraDriveSettings = {
   holdDelay: 0.12,
   rotateSpeed: 1.2,
   mouseSensitivity: 1,
+  invertMouseY: false,
   smoothing: 8,
 };
+
+export const INVERT_MOUSE_Y_STORAGE_KEY = 'lumora.camera-invert-y.v1';
+
+type BooleanStorage = Pick<Storage, 'getItem' | 'setItem'>;
+
+function getBooleanStorage(storage?: BooleanStorage): BooleanStorage | null {
+  if (storage) return storage;
+  try {
+    return typeof window !== 'undefined' && window.localStorage ? window.localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+export function loadInvertMouseY(storage?: BooleanStorage): boolean {
+  const target = getBooleanStorage(storage);
+  if (!target) return false;
+  try {
+    return target.getItem(INVERT_MOUSE_Y_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export function saveInvertMouseY(enabled: boolean, storage?: BooleanStorage): boolean {
+  const target = getBooleanStorage(storage);
+  if (!target) return false;
+  try {
+    target.setItem(INVERT_MOUSE_Y_STORAGE_KEY, String(enabled));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export const CAMERA_DRIVE_LIMITS = Object.freeze({
   speed: Object.freeze({ min: 0.1, max: 20 }),
@@ -155,6 +192,7 @@ export function normalizeCameraDriveSettings(
       CAMERA_DRIVE_LIMITS.mouseSensitivity.min,
       CAMERA_DRIVE_LIMITS.mouseSensitivity.max,
     ),
+    invertMouseY: typeof settings.invertMouseY === 'boolean' ? settings.invertMouseY : base.invertMouseY,
     smoothing: bounded(
       settings.smoothing,
       base.smoothing,
@@ -452,8 +490,11 @@ export class CameraDrive {
 
   setSettings(settings: Partial<CameraDriveSettings>): void {
     const previousMode = this.settings.mode;
+    const previousInvertMouseY = this.settings.invertMouseY;
     this.settings = normalizeCameraDriveSettings(settings, this.settings);
-    if (this.settings.mode !== previousMode) this.clearMotion();
+    if (this.settings.mode !== previousMode || this.settings.invertMouseY !== previousInvertMouseY) {
+      this.clearMotion();
+    }
   }
 
   acceptsKey(code: string): boolean {
@@ -613,7 +654,8 @@ export class CameraDrive {
 
     if (this.settings.mode === 'keyboard-mouse' && this.lookDelta.lengthSq() > 1e-9) {
       const yaw = -this.lookDelta.x * k * mouseSensitivity * LOOK_RADIANS_PER_PIXEL;
-      const pitch = this.lookDelta.y * k * mouseSensitivity * LOOK_RADIANS_PER_PIXEL;
+      const pitch =
+        this.lookDelta.y * (this.settings.invertMouseY ? -1 : 1) * k * mouseSensitivity * LOOK_RADIANS_PER_PIXEL;
       rotateOnWorldAxis(target, UP_VECTOR, yaw);
       rotateOnLocalAxis(target, pitch);
       this.lookDelta.multiplyScalar(1 - k);
@@ -629,11 +671,10 @@ export class CameraDrive {
   }
 
   private applyFocal(node: THREE.Object3D, focalLength: number): void {
+    if (!(node instanceof THREE.PerspectiveCamera)) return;
     (node.userData as Record<string, unknown>).focalLength = focalLength;
-    if (node instanceof THREE.PerspectiveCamera) {
-      node.fov = focalLengthToFovDeg(focalLength);
-      node.updateProjectionMatrix();
-    }
+    node.fov = focalLengthToFovDeg(focalLength);
+    node.updateProjectionMatrix();
   }
 }
 
@@ -649,9 +690,9 @@ export interface CaptureNodeSample {
 
 /** 把录制机位节点映射为采样通道值（focalLength 优先读 userData，否则由 fov 反推） */
 export function captureCameraSample(node: THREE.Object3D): CaptureNodeSample {
-  const focal =
-    (node.userData as Record<string, unknown>).focalLength ??
-    (node instanceof THREE.PerspectiveCamera ? fovDegToFocalLength(node.fov) : null);
+  const focal = node instanceof THREE.PerspectiveCamera
+    ? (node.userData as Record<string, unknown>).focalLength ?? fovDegToFocalLength(node.fov)
+    : null;
   return {
     position: [node.position.x, node.position.y, node.position.z],
     rotation: [node.rotation.x, node.rotation.y, node.rotation.z],

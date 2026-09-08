@@ -231,15 +231,15 @@ export function EditorViewport({
 
   // Selection chooses the idle drive target. Once recording starts, the
   // recorder owns that identity until the session ends, even if selection changes.
-  const selectedCameraId = useMemo(() => {
+  const selectedObjectId = useMemo(() => {
     if (!project || selection.length !== 1) return null;
     const object = findObject(project, selection[0]!);
-    return object && object.type === 'camera' ? object.id : null;
+    return object?.id ?? null;
   }, [project, selection]);
   const povCameraId = view.viewMode !== 'director' ? view.viewMode.cameraObjectId : null;
   const drivenCameraId = session?.state.recording
-    ? session.recorder.recordingCameraId
-    : povCameraId ?? selectedCameraId;
+    ? session.recorder.recordingObjectId
+    : povCameraId ?? (selectedObjectId && findObject(project!, selectedObjectId)?.type === 'camera' ? selectedObjectId : null);
 
   useCameraDrive(
     session,
@@ -258,10 +258,10 @@ export function EditorViewport({
   // 录制采样源：视口把机位节点映射为通道样本（录制期间节点由驾驶/静止接管）
   useEffect(() => {
     if (!session) return;
-    session.setCaptureSource((cameraId) => {
+    session.setCaptureSource((objectId) => {
       const root = rootRef.current;
       if (!root) return null;
-      const node = findNode(root, cameraId);
+      const node = findNode(root, objectId);
       if (!node) return null;
       return captureCameraSample(node);
     });
@@ -805,8 +805,12 @@ function useCameraDrive(
       const st = sessionRef.current?.state;
       if (st) {
         const previousMode = drive.getSettings().mode;
+        const previousInvertMouseY = drive.getSettings().invertMouseY;
         drive.setSettings(st.cameraControls);
-        if (drive.getSettings().mode !== previousMode) {
+        if (
+          drive.getSettings().mode !== previousMode ||
+          drive.getSettings().invertMouseY !== previousInvertMouseY
+        ) {
           heldKeys.clear();
           endLookGesture();
         }
@@ -1175,9 +1179,15 @@ function CameraPoseReadout({
       if (!root || !project) return;
       const poses: Record<string, unknown> = {};
       for (const object of project.objects) {
-        if (object.type !== 'camera') continue;
         const node = findNode(root, object.id);
         if (!node) continue;
+        if (object.type !== 'camera') {
+          poses[object.id] = {
+            position: [node.position.x, node.position.y, node.position.z],
+            rotation: [node.rotation.x, node.rotation.y, node.rotation.z],
+          };
+          continue;
+        }
         const focal = (node.userData as Record<string, unknown>).focalLength;
         poses[object.id] = {
           position: [node.position.x, node.position.y, node.position.z],

@@ -3,7 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SceneEditor, createGroupObject, createSampleProject, getProjectDuration } from '@lumora/core';
 import type { RenderHookResult } from '@testing-library/react';
 import type { CaptureNodeSample } from '../src/components/editor/camera-drive';
-import { CAMERA_DRIVE_LIMITS } from '../src/components/editor/camera-drive';
+import {
+  CAMERA_DRIVE_LIMITS,
+  INVERT_MOUSE_Y_STORAGE_KEY,
+} from '../src/components/editor/camera-drive';
 import { useTimelineSession } from '../src/hooks/use-timeline-session';
 import type { TimelineSession } from '../src/hooks/use-timeline-session';
 
@@ -78,6 +81,24 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     });
   });
 
+  it('鼠标垂直反转按 off/on/reload 持久化', () => {
+    localStorage.removeItem(INVERT_MOUSE_Y_STORAGE_KEY);
+    mount();
+    expect(live().state.cameraControls.invertMouseY).toBe(false);
+
+    act(() => live().setCameraControlSettings({ invertMouseY: true }));
+    expect(live().state.cameraControls.invertMouseY).toBe(true);
+    expect(localStorage.getItem(INVERT_MOUSE_Y_STORAGE_KEY)).toBe('true');
+
+    unmount?.();
+    unmount = null;
+    mount();
+    expect(live().state.cameraControls.invertMouseY).toBe(true);
+
+    act(() => live().setCameraControlSettings({ invertMouseY: false }));
+    expect(localStorage.getItem(INVERT_MOUSE_Y_STORAGE_KEY)).toBe('false');
+  });
+
   it('togglePlay 切换播放状态', () => {
     mount();
     act(() => live().togglePlay());
@@ -144,29 +165,50 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     act(() => live().startRecording('sample-camera'));
     act(() => live().confirmOverwrite());
     act(() => vi.advanceTimersByTime(300));
-    const commit = vi.spyOn(editor, 'commitRecordingTracks').mockReturnValue({
+    const commit = vi.spyOn(editor, 'commitRecordingTracks').mockImplementationOnce(() => ({
       ok: false,
       error: new Error('模拟录制提交失败'),
-    });
+    }));
 
     let failed: ReturnType<TimelineSession['stopRecording']>;
     act(() => {
       failed = live().stopRecording();
     });
     expect(failed!).toEqual({ ok: false, message: '模拟录制提交失败' });
+    expect(commit).toHaveBeenCalledTimes(1);
     expect(live().recorder.active).toBe(true);
     expect(live().recorder.isPaused).toBe(true);
     expect(live().state.recording).toBe(true);
     expect(live().state.recordingPaused).toBe(true);
+    expect(live().state.playing).toBe(false);
+    expect(live().timeline.getTime()).toBeGreaterThan(0);
 
-    commit.mockRestore();
-    let retried: ReturnType<TimelineSession['stopRecording']>;
+    let retry!: ReturnType<TimelineSession['stopRecording']>;
     act(() => {
-      retried = live().stopRecording();
+      retry = live().stopRecording();
     });
-    expect(retried!).toEqual({ ok: true });
+    expect(retry).toEqual({ ok: true });
+    expect(commit).toHaveBeenCalledTimes(2);
     expect(live().recorder.active).toBe(false);
     expect(live().state.recording).toBe(false);
+    expect(live().state.recordingPaused).toBe(false);
+    expect(live().timeline.getTime()).toBe(0);
+    expect(live().state.duration).toBeCloseTo(getProjectDuration(editor.getProject()!), 6);
+    expect(editor.getProject()!.tracks.filter((track) => track.objectId === 'sample-camera').map((track) => track.targetPath).sort())
+      .toEqual(['focalLength', 'position', 'rotation']);
+  });
+
+  it('non-camera recording filters focal samples and commits position/rotation', () => {
+    mount();
+    act(() => live().setCaptureSource(() => ({ position: [1, 0, 0], rotation: [0, 0.25, 0], focalLength: 35 })));
+    act(() => live().startRecording('sample-cube'));
+    act(() => vi.advanceTimersByTime(300));
+
+    expect(live().stopRecording()).toEqual({ ok: true });
+    expect(live().recorder.active).toBe(false);
+    expect(live().state.recording).toBe(false);
+    expect(editor.getProject()!.tracks.filter((track) => track.objectId === 'sample-cube').map((track) => track.targetPath).sort())
+      .toEqual(['position', 'rotation']);
   });
 
   it('B1 回归：约 5s 持续录制中会话对象身份稳定 —— 驾驶输入不再被会话重建清空', () => {

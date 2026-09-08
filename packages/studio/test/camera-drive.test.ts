@@ -5,13 +5,17 @@ import type { SceneObjectData } from '@lumora/core';
 import {
   CAMERA_DRIVE_LIMITS,
   CameraDrive,
+  DEFAULT_CAMERA_DRIVE_SETTINGS,
+  INVERT_MOUSE_Y_STORAGE_KEY,
   MAX_FOCAL_MM,
   MIN_FOCAL_MM,
   applyCameraWorldDelta,
   captureCameraSample,
   hasSingularWorldTransform,
+  loadInvertMouseY,
   getWorldOrthonormalQuaternion,
   getWorldRigidQuaternion,
+  saveInvertMouseY,
   restoreObjectOnNode,
   syncRigidCameraProxy,
 } from '../src/components/editor/camera-drive';
@@ -38,6 +42,48 @@ function makeCompensatedNearSingularCamera(): THREE.PerspectiveCamera {
 }
 
 describe('CameraDrive：键鼠驾驶积分器', () => {
+  it('鼠标垂直反转只反转 look 的 Y 增量，水平增量保持一致', () => {
+    const normalNode = makeCameraNode();
+    const invertedNode = makeCameraNode();
+    const normal = new CameraDrive({ ...DEFAULT_CAMERA_DRIVE_SETTINGS, smoothing: 30, invertMouseY: false });
+    const inverted = new CameraDrive({ ...DEFAULT_CAMERA_DRIVE_SETTINGS, smoothing: 30, invertMouseY: true });
+    normal.attach(normalNode);
+    inverted.attach(invertedNode);
+    normal.look(12, 8);
+    inverted.look(12, 8);
+    normal.update(0.1);
+    inverted.update(0.1);
+
+    expect(invertedNode.rotation.y).toBeCloseTo(normalNode.rotation.y, 8);
+    expect(invertedNode.rotation.x).toBeCloseTo(-normalNode.rotation.x, 8);
+  });
+
+  it('鼠标垂直反转设置可保存、读取，并区分关闭与开启', () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    };
+
+    expect(INVERT_MOUSE_Y_STORAGE_KEY).toContain('invert');
+    expect(loadInvertMouseY(storage)).toBe(false);
+    expect(saveInvertMouseY(true, storage)).toBe(true);
+    expect(loadInvertMouseY(storage)).toBe(true);
+    expect(saveInvertMouseY(false, storage)).toBe(true);
+    expect(loadInvertMouseY(storage)).toBe(false);
+  });
+
+  it('falls back to disabled when restricted storage throws on read', () => {
+    const storage = {
+      getItem: () => {
+        throw new Error('storage blocked');
+      },
+      setItem: () => undefined,
+    };
+
+    expect(loadInvertMouseY(storage)).toBe(false);
+  });
+
   it('applies a world-space camera delta through a transformed parent', () => {
     const parent = new THREE.Group();
     parent.position.set(3, -2, 4);
@@ -719,6 +765,19 @@ describe('CameraDrive：键鼠驾驶积分器', () => {
     expect(drive.acceptsKey('ArrowLeft')).toBe(true);
   });
 
+  it('clears queued look when invertMouseY changes', () => {
+    const drive = new CameraDrive({ mode: 'keyboard-mouse', mouseSensitivity: 1, smoothing: 8, invertMouseY: false });
+    const node = makeCameraNode();
+    drive.attach(node);
+    drive.look(0, 80);
+    drive.setSettings({ invertMouseY: true });
+    const before = node.quaternion.clone();
+    drive.update(0.1);
+
+    expect(node.quaternion.angleTo(before)).toBeLessThan(1e-9);
+    expect(drive.hasInput).toBe(false);
+  });
+
   it('鼠标视角限幅且残余输入逐帧衰减，不会产生单帧无界跳变', () => {
     const huge = new CameraDrive({ mode: 'keyboard-mouse', mouseSensitivity: 1, smoothing: 8 });
     const bounded = new CameraDrive({ mode: 'keyboard-mouse', mouseSensitivity: 1, smoothing: 8 });
@@ -780,7 +839,18 @@ describe('captureCameraSample / restoreObjectOnNode', () => {
     const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 100);
     expect(captureCameraSample(camera).focalLength).toBeGreaterThan(0);
     const group = new THREE.Group();
+    group.userData.focalLength = 24;
     expect(captureCameraSample(group).focalLength).toBeNull();
+  });
+
+  it('does not write focalLength when a focal shortcut targets a non-camera node', () => {
+    const drive = new CameraDrive({ mode: 'keyboard-mouse', smoothing: 8 });
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1));
+    drive.attach(mesh);
+    drive.press('BracketRight');
+    drive.update(0.2);
+
+    expect(mesh.userData.focalLength).toBeUndefined();
   });
 
   it('restoreObjectOnNode 还原静态位姿与相机参数，清除驾驶焦距标记', () => {

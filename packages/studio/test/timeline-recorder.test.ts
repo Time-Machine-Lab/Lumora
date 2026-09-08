@@ -30,6 +30,22 @@ describe('TimelineRecorder：采样采集器', () => {
     expect(channels.focalLength).toHaveLength(2);
   });
 
+  it('可绑定非摄像机对象并只采集位置/旋转通道', () => {
+    const recorder = new TimelineRecorder();
+    recorder.setCaptureSource(
+      fixedSource({ position: [4, 5, 6], rotation: [0.1, 0.2, 0.3], focalLength: null }),
+    );
+    recorder.start('cube', 'lumora://test');
+
+    expect(recorder.recordingObjectId).toBe('cube');
+    expect(recorder.recordingCameraId).toBe('cube');
+    expect(recorder.sample(0)).toBe(true);
+    const channels = recorder.stop()!;
+    expect(channels.position).toHaveLength(1);
+    expect(channels.rotation).toHaveLength(1);
+    expect(channels.focalLength).toBeNull();
+  });
+
   it('未 start 时 sample/stop 均为 no-op', () => {
     const recorder = new TimelineRecorder();
     recorder.setCaptureSource(fixedSource(FIXED));
