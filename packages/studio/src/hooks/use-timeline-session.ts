@@ -479,10 +479,9 @@ export function useTimelineSession(editor: SceneEditor): TimelineSession {
         const result = editor.commitRecordingTracks(tracks, '录制关键帧');
         if (!result.ok) {
           showToast(result.error.message, 'error');
-          recorder.stop();
-          recordedSessionTokenRef.current = null;
-          recordedProjectUriRef.current = null;
-          setState((s) => ({ ...s, recording: false, recordingPaused: false, playing: false }));
+          // Keep the paused recorder/session alive so the host can retry the
+          // atomic commit on the next close() without losing its samples.
+          setState((s) => ({ ...s, recording: true, recordingPaused: true, playing: false }));
           return { ok: false, message: result.error.message };
         }
       }

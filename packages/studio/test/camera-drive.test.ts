@@ -73,6 +73,17 @@ describe('CameraDrive：键鼠驾驶积分器', () => {
     expect(loadInvertMouseY(storage)).toBe(false);
   });
 
+  it('falls back to disabled when restricted storage throws on read', () => {
+    const storage = {
+      getItem: () => {
+        throw new Error('storage blocked');
+      },
+      setItem: () => undefined,
+    };
+
+    expect(loadInvertMouseY(storage)).toBe(false);
+  });
+
   it('applies a world-space camera delta through a transformed parent', () => {
     const parent = new THREE.Group();
     parent.position.set(3, -2, 4);

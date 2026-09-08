@@ -55,8 +55,13 @@ function getBooleanStorage(storage?: BooleanStorage): BooleanStorage | null {
 }
 
 export function loadInvertMouseY(storage?: BooleanStorage): boolean {
-  const value = getBooleanStorage(storage)?.getItem(INVERT_MOUSE_Y_STORAGE_KEY);
-  return value === 'true';
+  const target = getBooleanStorage(storage);
+  if (!target) return false;
+  try {
+    return target.getItem(INVERT_MOUSE_Y_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
 }
 
 export function saveInvertMouseY(enabled: boolean, storage?: BooleanStorage): boolean {

@@ -165,22 +165,37 @@ describe('useTimelineSession：录制/回放会话（AC1 数据链路 + AC2 失�
     act(() => live().startRecording('sample-camera'));
     act(() => live().confirmOverwrite());
     act(() => vi.advanceTimersByTime(300));
-    const commit = vi.spyOn(editor, 'commitRecordingTracks').mockReturnValue({
+    const commit = vi.spyOn(editor, 'commitRecordingTracks').mockImplementationOnce(() => ({
       ok: false,
       error: new Error('模拟录制提交失败'),
-    });
+    }));
 
     let failed: ReturnType<TimelineSession['stopRecording']>;
     act(() => {
       failed = live().stopRecording();
     });
     expect(failed!).toEqual({ ok: false, message: '模拟录制提交失败' });
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(live().recorder.active).toBe(true);
+    expect(live().recorder.isPaused).toBe(true);
+    expect(live().state.recording).toBe(true);
+    expect(live().state.recordingPaused).toBe(true);
+    expect(live().state.playing).toBe(false);
+    expect(live().timeline.getTime()).toBeGreaterThan(0);
+
+    let retry!: ReturnType<TimelineSession['stopRecording']>;
+    act(() => {
+      retry = live().stopRecording();
+    });
+    expect(retry).toEqual({ ok: true });
+    expect(commit).toHaveBeenCalledTimes(2);
     expect(live().recorder.active).toBe(false);
     expect(live().state.recording).toBe(false);
     expect(live().state.recordingPaused).toBe(false);
-
-    commit.mockRestore();
-    expect(live().stopRecording()).toEqual({ ok: true });
+    expect(live().timeline.getTime()).toBe(0);
+    expect(live().state.duration).toBeCloseTo(getProjectDuration(editor.getProject()!), 6);
+    expect(editor.getProject()!.tracks.filter((track) => track.objectId === 'sample-camera').map((track) => track.targetPath).sort())
+      .toEqual(['focalLength', 'position', 'rotation']);
   });
 
   it('non-camera recording filters focal samples and commits position/rotation', () => {
